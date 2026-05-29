@@ -939,3 +939,20 @@ func TestRoleSwitchIfNeed_FollowerToLeader_CaughtUp(t *testing.T) {
 	_, ok := findEvent(events, types.FollowerToLeaderReq)
 	assert.True(t, ok)
 }
+
+// ==================== Orphan Learner Regression Tests ====================
+
+// TestLearner_NotifySync_ClearsSuspend verifies that stepLearner's NotifySync
+// branch clears n.suspend, mirroring stepFollower's behavior. Without this,
+// a learner that was suspended (e.g. after an empty sync round) would stay
+// suspended forever and never resume issuing sync requests via tickSync.
+func TestLearner_NotifySync_ClearsSuspend(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	makeLearner(n, 3, 2)
+	n.suspend = true
+	n.Step(types.Event{Type: types.NotifySync, Term: 3, From: 2})
+	assert.False(t, n.suspend, "learner should be unsuspended after NotifySync")
+	events := collectEvents(n)
+	_, ok := findEvent(events, types.SyncReq)
+	assert.True(t, ok, "learner should send SyncReq after NotifySync")
+}

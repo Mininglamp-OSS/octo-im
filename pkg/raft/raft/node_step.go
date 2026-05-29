@@ -324,6 +324,7 @@ func (n *Node) stepLearner(e types.Event) error {
 		}
 	case types.NotifySync:
 		n.idleTick = 0
+		n.suspend = false // 解除挂起，允许后续 tickSync
 		n.sendSyncReq()
 		n.advance()
 	case types.SyncResp: // 同步返回
