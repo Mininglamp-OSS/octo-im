@@ -956,3 +956,76 @@ func TestLearner_NotifySync_ClearsSuspend(t *testing.T) {
 	_, ok := findEvent(events, types.SyncReq)
 	assert.True(t, ok, "learner should send SyncReq after NotifySync")
 }
+
+// TestRoleSwitchIfNeed_OrphanLearner_CaughtUp_Promotes verifies that a
+// learner stuck in cfg.Learners after a completed migration (MigrateFrom
+// and MigrateTo both zero) is still promoted to follower once its log
+// catches up to within LearnerToFollowerMinLogGap of the leader.
+func TestRoleSwitchIfNeed_OrphanLearner_CaughtUp_Promotes(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	makeLeader(n, 3)
+	n.cfg.Learners = []uint64{4}
+	n.cfg.MigrateTo = 0
+	n.cfg.MigrateFrom = 0
+	n.queue.lastLogIndex = 10
+	n.opts.LearnerToFollowerMinLogGap = 100
+	n.replicaSync[4] = &SyncInfo{}
+	// Orphan learner is close enough: Index + gap = 105 > lastLogIndex=10
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5})
+	assert.True(t, n.replicaSync[4].roleSwitching, "orphan learner should be marked as switching")
+	events := collectEvents(n)
+	_, ok := findEvent(events, types.LearnerToFollowerReq)
+	assert.True(t, ok, "orphan learner should be promoted to follower")
+}
+
+// TestRoleSwitchIfNeed_OrphanLearner_NotCaughtUp_NoOp verifies that the
+// orphan-learner fallback does not fire prematurely while the learner is
+// still far behind the leader's log.
+func TestRoleSwitchIfNeed_OrphanLearner_NotCaughtUp_NoOp(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	makeLeader(n, 3)
+	n.cfg.Learners = []uint64{4}
+	n.cfg.MigrateTo = 0
+	n.cfg.MigrateFrom = 0
+	n.queue.lastLogIndex = 1000
+	n.opts.LearnerToFollowerMinLogGap = 100
+	n.replicaSync[4] = &SyncInfo{}
+	// Orphan learner is far behind: Index + gap = 105 <= lastLogIndex=1000
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5})
+	assert.False(t, n.replicaSync[4].roleSwitching, "orphan learner should not switch when far behind")
+	events := collectEvents(n)
+	assert.Equal(t, 0, countEvents(events, types.LearnerToFollowerReq))
+}
+
+// TestRoleSwitchIfNeed_OrphanLearner_RoleSwitching_NoOp verifies that a
+// repeat call while a promotion is already in flight does not double-fire
+// the LearnerToFollowerReq.
+func TestRoleSwitchIfNeed_OrphanLearner_RoleSwitching_NoOp(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	makeLeader(n, 3)
+	n.cfg.Learners = []uint64{4}
+	n.cfg.MigrateTo = 0
+	n.cfg.MigrateFrom = 0
+	n.queue.lastLogIndex = 10
+	n.opts.LearnerToFollowerMinLogGap = 100
+	n.replicaSync[4] = &SyncInfo{roleSwitching: true}
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5})
+	events := collectEvents(n)
+	assert.Equal(t, 0, countEvents(events, types.LearnerToFollowerReq))
+}
+
+// TestRoleSwitchIfNeed_NonLearner_NoMigration_NoOp guards against regressing
+// the original early-return guarantee: a non-learner replica with no active
+// migration must never trigger any role-switch traffic.
+func TestRoleSwitchIfNeed_NonLearner_NoMigration_NoOp(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	makeLeader(n, 3)
+	n.cfg.MigrateTo = 0
+	n.cfg.MigrateFrom = 0
+	n.replicaSync[2] = &SyncInfo{}
+	n.roleSwitchIfNeed(types.Event{From: 2, Index: 100})
+	events := collectEvents(n)
+	assert.Equal(t, 0, countEvents(events, types.LearnerToLeaderReq))
+	assert.Equal(t, 0, countEvents(events, types.LearnerToFollowerReq))
+	assert.Equal(t, 0, countEvents(events, types.FollowerToLeaderReq))
+}

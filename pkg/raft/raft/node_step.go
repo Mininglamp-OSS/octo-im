@@ -558,6 +558,21 @@ func (n *Node) committedIndexForFollow(leaderCommittedIndex uint64) uint64 {
 func (n *Node) roleSwitchIfNeed(e types.Event) {
 	// 没有需要切换的配置
 	if n.cfg.MigrateTo == 0 || n.cfg.MigrateFrom == 0 {
+		// 兜底：处理 orphan learner —— 在 Learners 列表中但前次迁移已完成
+		// （MigrateFrom/MigrateTo 已清零）。这种 learner 没有任何迁移标记可
+		// 触发晋升，会永远卡在 learner 角色。在这里检测它并在日志追上后
+		// 主动晋升为 follower。
+		if n.isLearner(e.From) {
+			syncInfo := n.replicaSync[e.From]
+			if syncInfo == nil || syncInfo.roleSwitching {
+				return
+			}
+			// 与正常 learner→follower 分支保持一致的日志差距判定
+			if e.Index+n.opts.LearnerToFollowerMinLogGap > n.queue.lastLogIndex {
+				syncInfo.roleSwitching = true
+				n.sendLearnerToFollowerReq(e.From)
+			}
+		}
 		return
 	}
 
