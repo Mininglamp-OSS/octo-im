@@ -324,6 +324,7 @@ func (n *Node) stepLearner(e types.Event) error {
 		}
 	case types.NotifySync:
 		n.idleTick = 0
+		n.suspend = false // 解除挂起，允许后续 tickSync
 		n.sendSyncReq()
 		n.advance()
 	case types.SyncResp: // 同步返回
@@ -557,6 +558,31 @@ func (n *Node) committedIndexForFollow(leaderCommittedIndex uint64) uint64 {
 func (n *Node) roleSwitchIfNeed(e types.Event) {
 	// 没有需要切换的配置
 	if n.cfg.MigrateTo == 0 || n.cfg.MigrateFrom == 0 {
+		// 兜底：处理 orphan learner —— 在 Learners 列表中但前次迁移已完成
+		// （MigrateFrom/MigrateTo 已清零）。这种 learner 没有任何迁移标记可
+		// 触发晋升，会永远卡在 learner 角色。在这里检测它并在日志追上后
+		// 主动晋升为 follower。
+		//
+		// 注意：外层条件用的是 ||，所以当只清零了一半（例如 MigrateFrom!=0
+		// 而 MigrateTo==0）时也会进入这里。这种半清零状态属于迁移进行中，
+		// 不应触发 orphan 晋升，因此内层必须同时校验两者都为 0。
+		if n.isLearner(e.From) && n.cfg.MigrateTo == 0 && n.cfg.MigrateFrom == 0 {
+			syncInfo := n.replicaSync[e.From]
+			if syncInfo == nil || syncInfo.roleSwitching {
+				return
+			}
+			// 与正常 learner→follower 分支保持一致：单副本集群必须完全追上
+			// 领导者的日志，否则用 gap-based 判定。
+			if len(n.cfg.Replicas) == 1 {
+				if e.Index > n.queue.lastLogIndex {
+					syncInfo.roleSwitching = true
+					n.sendLearnerToFollowerReq(e.From)
+				}
+			} else if e.Index+n.opts.LearnerToFollowerMinLogGap > n.queue.lastLogIndex {
+				syncInfo.roleSwitching = true
+				n.sendLearnerToFollowerReq(e.From)
+			}
+		}
 		return
 	}
 

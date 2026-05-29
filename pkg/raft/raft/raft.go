@@ -592,24 +592,39 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 func (r *Raft) learnTo(learnerId uint64) (types.Config, error) {
 	cfg := r.node.Config().Clone()
 
-	if learnerId != cfg.MigrateTo {
+	// orphan learner: 前次迁移已完成（MigrateFrom/MigrateTo 都为 0），
+	// 但 learnerId 仍残留在 cfg.Learners 中。此时既无迁移源也无迁移目标，
+	// 不能走常规迁移路径，否则会被 learnerId != cfg.MigrateTo 误拒绝。
+	orphan := cfg.MigrateTo == 0 && cfg.MigrateFrom == 0 &&
+		wkutil.ArrayContainsUint64(cfg.Learners, learnerId)
+
+	if !orphan && learnerId != cfg.MigrateTo {
 		r.Warn("learnerId not equal migrateTo", zap.Uint64("learnerId", learnerId), zap.Uint64("migrateTo", cfg.MigrateTo))
 		return types.Config{}, errors.New("learnerId not equal migrateTo")
 	}
 
 	cfg.Learners = wkutil.RemoveUint64(cfg.Learners, learnerId)
 
-	if !wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo) {
-		cfg.Replicas = append(cfg.Replicas, cfg.MigrateTo)
+	if orphan {
+		// orphan: 把 learnerId 直接加入 Replicas，不切换 leader，不移除旧节点。
+		if !wkutil.ArrayContainsUint64(cfg.Replicas, learnerId) {
+			cfg.Replicas = append(cfg.Replicas, learnerId)
+		}
+	} else {
+		// 正常迁移路径
+		if !wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo) {
+			cfg.Replicas = append(cfg.Replicas, cfg.MigrateTo)
+		}
+
+		if cfg.MigrateFrom != cfg.MigrateTo {
+			cfg.Replicas = wkutil.RemoveUint64(cfg.Replicas, cfg.MigrateFrom)
+		}
+
+		if cfg.MigrateFrom == r.LeaderId() { // 学习者转领导
+			cfg.Leader = cfg.MigrateTo
+		}
 	}
 
-	if cfg.MigrateFrom != cfg.MigrateTo {
-		cfg.Replicas = wkutil.RemoveUint64(cfg.Replicas, cfg.MigrateFrom)
-	}
-
-	if cfg.MigrateFrom == r.LeaderId() { // 学习者转领导
-		cfg.Leader = cfg.MigrateTo
-	}
 	cfg.MigrateFrom = 0
 	cfg.MigrateTo = 0
 
