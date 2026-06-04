@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'Dockerfile*'
+      - 'web/Dockerfile*'
       - 'docker/**'
       - '.hadolint.yaml'
       - '.github/workflows/docker-lint.yml'
@@ -12,6 +13,7 @@ on:
     branches: [main]
     paths:
       - 'Dockerfile*'
+      - 'web/Dockerfile*'
       - 'docker/**'
       - '.hadolint.yaml'
       - '.github/workflows/docker-lint.yml'
@@ -19,3 +21,5 @@ on:
 jobs:
   docker-lint:
     uses: Mininglamp-OSS/.github/.github/workflows/reusable-docker-lint.yml@main
+    with:
+      dockerfiles: 'Dockerfile web/Dockerfile'
