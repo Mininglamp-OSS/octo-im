@@ -245,8 +245,6 @@ github.com/Microsoft/go-winio v0.4.3/go.mod h1:VhR8bwka0BXejwEJY73c50VrPtXAaKcyv
 github.com/Microsoft/go-winio v0.4.9/go.mod h1:VhR8bwka0BXejwEJY73c50VrPtXAaKcyvVC4A4RozmA=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
-github.com/Mininglamp-OSS/wkrpc v0.0.0-20260613104221-1f5f7474c595 h1:dXSs8pB29c9IW3qGGlPVJ+W/N6tzLZ3ykk21ILdAqE4=
-github.com/Mininglamp-OSS/wkrpc v0.0.0-20260613104221-1f5f7474c595/go.mod h1:JXp1IM0XGJxq987jDEP/63dmb8/pEyXw12es04gUjuI=
 github.com/NYTimes/gziphandler v0.0.0-20170623195520-56545f4a5d46/go.mod h1:3wb06e3pkSAbeQ52E9H9iFoQsEEwGN64994WTCIhntQ=
 github.com/NYTimes/gziphandler v1.0.1/go.mod h1:3wb06e3pkSAbeQ52E9H9iFoQsEEwGN64994WTCIhntQ=
 github.com/OneOfOne/xxhash v1.2.2 h1:KMrpdQIwFcEqXDklaen+P1axHaj9BSKzvpUUfnHldSE=
@@ -278,6 +276,8 @@ github.com/WuKongIM/crypto v0.0.0-20240416072338-b872b70b395f h1:erzPrCjuS7yvfpM
 github.com/WuKongIM/crypto v0.0.0-20240416072338-b872b70b395f/go.mod h1:gS8ErzMrBY+zJfxwFFzUzR9S2jFo/FTyEVr4pedbfbA=
 github.com/WuKongIM/wklog v0.0.0-20250123094253-32484fb54d05 h1:z6Zu0VFnXA/+IcNAI/G0QgvIZZlU4aF6pf/fPP780hY=
 github.com/WuKongIM/wklog v0.0.0-20250123094253-32484fb54d05/go.mod h1:/juNjLcqcoW/NkNi4rxnhDvDAUo76w3qIZ4dgLkZvH0=
+github.com/WuKongIM/wkrpc v0.0.0-20250312122115-5e44de72d2c8 h1:oybJMy0RJ5DGYiE26hT0Ud2uKUUXP50LCEXonhwrgik=
+github.com/WuKongIM/wkrpc v0.0.0-20250312122115-5e44de72d2c8/go.mod h1:JXp1IM0XGJxq987jDEP/63dmb8/pEyXw12es04gUjuI=
 github.com/abdullin/seq v0.0.0-20160510034733-d5467c17e7af/go.mod h1:5Jv4cbFiHJMsVxt52+i0Ha45fjshj6wxYr1r19tB9bw=
 github.com/aerospike/aerospike-client-go v1.27.0/go.mod h1:zj8LBEnWBDOVEIJt8LvaRvDG5ARAoa5dBeHaB472NRc=
 github.com/agnivade/levenshtein v1.0.1/go.mod h1:CURSv5d9Uaml+FovSIICkLbAUZ9S4RqaHDIsdSBg7lM=
