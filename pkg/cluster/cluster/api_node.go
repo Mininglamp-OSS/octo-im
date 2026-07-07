@@ -268,7 +268,9 @@ func (s *Server) nodeChannelsGet(c *wkhttp.Context) {
 					channelClusterConfigResp.ActiveFormat = "未运行"
 				}
 				channelClusterConfigResp.LastMessageSeq = statusResp.LastMsgSeq
-				channelClusterConfigResp.LastAppendTime = myUptime(time.Since(time.Unix(int64(statusResp.LastMsgTime/1e9), 0)))
+				if statusResp.LastMsgTime > 0 {
+					channelClusterConfigResp.LastAppendTime = myUptime(time.Since(time.Unix(int64(statusResp.LastMsgTime/1e9), 0)))
+				}
 				break
 			}
 		}
