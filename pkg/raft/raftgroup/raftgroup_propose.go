@@ -128,6 +128,9 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 		case <-ctx.Done():
 			rg.Error("propose batch until applied timeout", zap.String("raftKey", raftKey), zap.Uint64("leader", raft.LeaderId()), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
 			// rg.wait.put(applyProcess) // 这里不需要put，因为如果这里put了，那么在waitApply中wait会出现close of nil channel
+			// Mark done under the bucket lock so clean() removes it from the progresses
+			// slice immediately, preventing unbounded growth on repeated timeouts.
+			rg.wait.markDone(applyProcess)
 			return nil, ctx.Err()
 		case <-rg.stopper.ShouldStop():
 			rg.Error("propose batch until applied stopped", zap.String("raftKey", raftKey), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
@@ -224,6 +227,8 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 		}
 		return result.(types.ProposeRespSet), nil
 	case <-ctx.Done():
+		// Trigger removes the key from fowardProposeWait map to prevent a map leak.
+		rg.fowardProposeWait.Trigger(key, ctx.Err())
 		rg.Error("foward propose timeout", zap.String("raftKey", raft.Key()))
 		return nil, ctx.Err()
 	case <-rg.stopper.ShouldStop():

@@ -38,6 +38,13 @@ func (m *wait) put(progress *progress) {
 	m.buckets[m.bucketIndex(progress.key)].put(progress)
 }
 
+// markDone marks a progress entry as done under the bucket lock, then immediately
+// removes it from the progresses slice via clean(). Use this on timeout paths
+// where put() cannot be called (putting would close the channel prematurely).
+func (m *wait) markDone(p *progress) {
+	m.buckets[m.bucketIndex(p.key)].markDone(p)
+}
+
 func fnv32(key string) uint32 {
 	const (
 		offset32 = 2166136261
@@ -141,6 +148,16 @@ func (m *waitBucket) didApply(key string, maxLogIndex uint64) {
 		}
 	}
 	// 清理
+	m.clean()
+}
+
+// markDone sets p.done = true under the bucket lock and immediately cleans the
+// progresses slice. This is the lock-safe counterpart to the timeout path in
+// ProposeBatchUntilAppliedTimeout where put() must not be called.
+func (m *waitBucket) markDone(p *progress) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p.done = true
 	m.clean()
 }
 
