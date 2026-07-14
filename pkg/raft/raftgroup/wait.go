@@ -38,6 +38,14 @@ func (m *wait) put(progress *progress) {
 	m.buckets[m.bucketIndex(progress.key)].put(progress)
 }
 
+// cancel marks a timed-out progress entry as done so that the next clean()
+// call inside didApply can reclaim it.  It does NOT close waitC — the
+// channel was created with a buffer of 1, so a concurrent didApply send
+// will drain harmlessly; the channel itself will be GC'd with the struct.
+func (m *wait) cancel(progress *progress) {
+	m.buckets[m.bucketIndex(progress.key)].cancel(progress)
+}
+
 func fnv32(key string) uint32 {
 	const (
 		offset32 = 2166136261
@@ -148,6 +156,18 @@ func (m *waitBucket) put(progress *progress) {
 	close(progress.waitC)
 	progress.reset()
 	m.progressPool.Put(progress)
+}
+
+// cancel marks the progress as done under the bucket lock so that the next
+// clean() call (triggered by any future didApply) will remove it from the
+// slice.  Unlike put(), it does NOT close waitC because a racing didApply
+// goroutine may still hold a reference and attempt a send; leaving the
+// buffered channel open lets that send succeed silently and the channel is
+// then GC'd together with the struct.
+func (m *waitBucket) cancel(p *progress) {
+	m.mu.Lock()
+	p.done = true
+	m.mu.Unlock()
 }
 
 // 清理已完成的

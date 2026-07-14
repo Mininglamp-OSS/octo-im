@@ -127,7 +127,11 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 			return resps, nil
 		case <-ctx.Done():
 			rg.Error("propose batch until applied timeout", zap.String("raftKey", raftKey), zap.Uint64("leader", raft.LeaderId()), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
-			// rg.wait.put(applyProcess) // 这里不需要put，因为如果这里put了，那么在waitApply中wait会出现close of nil channel
+			// Mark the progress entry as done so that waitBucket.clean() can
+			// reclaim it on the next didApply call.  We must NOT call
+			// rg.wait.put() here because put() closes waitC and a concurrent
+			// didApply goroutine might still attempt a send on it.
+			rg.wait.cancel(applyProcess)
 			return nil, ctx.Err()
 		case <-rg.stopper.ShouldStop():
 			rg.Error("propose batch until applied stopped", zap.String("raftKey", raftKey), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
@@ -224,6 +228,8 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 		}
 		return result.(types.ProposeRespSet), nil
 	case <-ctx.Done():
+		// Clean up the fowardProposeWait map entry so it does not leak.
+		rg.fowardProposeWait.Trigger(key, ctx.Err())
 		rg.Error("foward propose timeout", zap.String("raftKey", raft.Key()))
 		return nil, ctx.Err()
 	case <-rg.stopper.ShouldStop():
