@@ -666,7 +666,6 @@ func build(cfg Config) (_ *App, err error) {
 			status:      app.channelLog,
 			localNodeID: cfg.Node.ID,
 		},
-		Activator:    activateCommittedReplayChannel,
 		Delivery:     app.deliveryApp,
 		Conversation: app.conversationProjector,
 		Logger:       app.logger.Named("committed.replay"),

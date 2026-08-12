@@ -35,7 +35,16 @@ type sendMessageHeaderRequest struct {
 	SyncOnce int `json:"sync_once"`
 }
 
-type sendMessageResponse struct {
+type legacySendMessageResponse struct {
+	MessageID   int64                   `json:"message_id"`
+	MessageSeq  uint64                  `json:"message_seq"`
+	ClientMsgNo string                  `json:"client_msg_no"`
+	Reason      uint8                   `json:"reason"`
+	Status      int                     `json:"status"`
+	Data        sendMessageResponseData `json:"data"`
+}
+
+type durableSendMessageResponse struct {
 	Status int                     `json:"status"`
 	Data   sendMessageResponseData `json:"data"`
 }
@@ -47,6 +56,14 @@ type sendMessageResponseData struct {
 }
 
 func (s *Server) handleSendMessage(c *gin.Context) {
+	s.handleMessageSend(c, false)
+}
+
+func (s *Server) handleSendDurableMessage(c *gin.Context) {
+	s.handleMessageSend(c, true)
+}
+
+func (s *Server) handleMessageSend(c *gin.Context, requireDurableResult bool) {
 	var req sendMessageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeJSONError(c, http.StatusBadRequest, "invalid request")
@@ -88,6 +105,10 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 	reqCtx, traceCtx := tracectx.Ensure(reqCtx, nil)
 	noPersist := req.Header.NoPersist != 0 || req.NoPersist != 0
 	syncOnce := req.Header.SyncOnce != 0 || req.SyncOnce != 0
+	if requireDurableResult && (req.ClientMsgNo == "" || noPersist) {
+		writeJSONError(c, http.StatusBadRequest, "durable message requires client_msg_no and persistence")
+		return
+	}
 	channelID := req.ChannelID
 	channelType := req.ChannelType
 	if requestScoped {
@@ -117,6 +138,22 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		writeJSONError(c, http.StatusInternalServerError, err.Error())
 		return
 	}
+	data := sendMessageResponseData{
+		MessageID:   result.MessageID,
+		MessageSeq:  result.MessageSeq,
+		ClientMsgNo: req.ClientMsgNo,
+	}
+	if !requireDurableResult {
+		c.JSON(http.StatusOK, legacySendMessageResponse{
+			MessageID:   result.MessageID,
+			MessageSeq:  result.MessageSeq,
+			ClientMsgNo: req.ClientMsgNo,
+			Reason:      uint8(result.Reason),
+			Status:      http.StatusOK,
+			Data:        data,
+		})
+		return
+	}
 	if result.Reason != frame.ReasonSuccess {
 		writeJSONError(c, http.StatusForbidden, "message rejected")
 		return
@@ -125,15 +162,7 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		writeJSONError(c, http.StatusInternalServerError, "message did not commit")
 		return
 	}
-
-	c.JSON(http.StatusOK, sendMessageResponse{
-		Status: http.StatusOK,
-		Data: sendMessageResponseData{
-			MessageID:   result.MessageID,
-			MessageSeq:  result.MessageSeq,
-			ClientMsgNo: req.ClientMsgNo,
-		},
-	})
+	c.JSON(http.StatusOK, durableSendMessageResponse{Status: http.StatusOK, Data: data})
 }
 
 func writeJSONError(c *gin.Context, status int, message string) {

@@ -405,7 +405,7 @@ func TestCORSPreflightHandlesUserTokenRoute(t *testing.T) {
 	require.Contains(t, rec.Header().Get("Access-Control-Allow-Headers"), "Authorization")
 }
 
-func TestSendMessageMapsJSONToUsecaseCommand(t *testing.T) {
+func TestSendDurableMessageMapsJSONToUsecaseCommand(t *testing.T) {
 	msgs := &recordingMessageUsecase{
 		result: message.SendResult{
 			MessageID:  99,
@@ -432,7 +432,7 @@ func TestSendMessageMapsJSONToUsecaseCommand(t *testing.T) {
 	require.NoError(t, err)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewReader(payload))
+	req := httptest.NewRequest(http.MethodPost, "/message/send/durable", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 
 	srv.Engine().ServeHTTP(rec, req)
@@ -535,7 +535,7 @@ func TestSendMessagePassesPrecomposedPersonChannelToUsecase(t *testing.T) {
 	require.Equal(t, "u1@u2", msgs.calls[0].ChannelID)
 }
 
-func TestSendMessageRejectsBusinessDenial(t *testing.T) {
+func TestSendDurableMessageRejectsBusinessDenial(t *testing.T) {
 	msgs := &recordingMessageUsecase{
 		result: message.SendResult{Reason: frame.ReasonSubscriberNotExist},
 	}
@@ -552,7 +552,7 @@ func TestSendMessageRejectsBusinessDenial(t *testing.T) {
 	require.NoError(t, err)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewReader(payload))
+	req := httptest.NewRequest(http.MethodPost, "/message/send/durable", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 
 	srv.Engine().ServeHTTP(rec, req)
@@ -565,14 +565,34 @@ func TestSendMessageRejectsBusinessDenial(t *testing.T) {
 	require.Equal(t, uint8(frame.ChannelTypeGroup), msgs.calls[0].ChannelType)
 }
 
-func TestSendMessageRejectsZeroDurableResult(t *testing.T) {
+func TestSendMessagePreservesLegacyBusinessDenialReason(t *testing.T) {
+	msgs := &recordingMessageUsecase{
+		result: message.SendResult{Reason: frame.ReasonSubscriberNotExist},
+	}
+	srv := New(Options{Messages: msgs})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewBufferString(`{"from_uid":"u1","channel_id":"g1","channel_type":2,"client_msg_no":"api-legacy-denied","payload":"aGk="}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Engine().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got struct {
+		Reason uint8 `json:"reason"`
+	}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&got))
+	require.Equal(t, uint8(frame.ReasonSubscriberNotExist), got.Reason)
+}
+
+func TestSendDurableMessageRejectsZeroDurableResult(t *testing.T) {
 	msgs := &recordingMessageUsecase{
 		result: message.SendResult{Reason: frame.ReasonSuccess},
 	}
 	srv := New(Options{Messages: msgs})
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewBufferString(`{"from_uid":"u1","channel_id":"u2","channel_type":1,"client_msg_no":"fedg0-zero","payload":"aGk="}`))
+	req := httptest.NewRequest(http.MethodPost, "/message/send/durable", bytes.NewBufferString(`{"from_uid":"u1","channel_id":"u2","channel_type":1,"client_msg_no":"fedg0-zero","payload":"aGk="}`))
 	req.Header.Set("Content-Type", "application/json")
 
 	srv.Engine().ServeHTTP(rec, req)
