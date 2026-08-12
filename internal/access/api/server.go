@@ -112,9 +112,12 @@ type LegacyRouteNodeAddresses struct {
 type Options struct {
 	ListenAddr string
 	Messages   MessageUsecase
-	CMDSync    CMDSyncUsecase
-	Users      UserUsecase
-	Channels   ChannelUsecase
+	// TrustedMessageDeviceID marks sends from the administrative HTTP message
+	// endpoint as trusted while keeping the requested FromUID as the author.
+	TrustedMessageDeviceID string
+	CMDSync                CMDSyncUsecase
+	Users                  UserUsecase
+	Channels               ChannelUsecase
 	// PluginRoutes handles open Phase 1 plugin public routes when the plugin subsystem is enabled.
 	PluginRoutes             PluginRouteUsecase
 	TestMode                 bool
@@ -150,6 +153,7 @@ type Server struct {
 	listenAddr               string
 	addr                     string
 	messages                 MessageUsecase
+	trustedMessageDeviceID   string
 	cmdSync                  CMDSyncUsecase
 	users                    UserUsecase
 	channels                 ChannelUsecase
@@ -193,6 +197,7 @@ func New(opts Options) *Server {
 		engine:                   engine,
 		listenAddr:               opts.ListenAddr,
 		messages:                 opts.Messages,
+		trustedMessageDeviceID:   opts.TrustedMessageDeviceID,
 		cmdSync:                  opts.CMDSync,
 		users:                    opts.Users,
 		channels:                 opts.Channels,

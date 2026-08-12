@@ -123,6 +123,7 @@ func (s *Server) handleMessageSend(c *gin.Context, requireDurableResult bool) {
 		Topic:              req.Topic,
 		Expire:             req.Expire,
 		FromUID:            req.FromUID,
+		DeviceID:           s.trustedMessageDeviceID,
 		ChannelID:          channelID,
 		ChannelType:        channelType,
 		RequestSubscribers: req.Subscribers,

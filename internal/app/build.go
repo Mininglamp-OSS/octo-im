@@ -960,6 +960,7 @@ func build(cfg Config) (_ *App, err error) {
 		app.api = accessapi.New(accessapi.Options{
 			ListenAddr:               cfg.API.ListenAddr,
 			Messages:                 app.messageApp,
+			TrustedMessageDeviceID:   cfg.Message.SystemDeviceID,
 			CMDSync:                  cmdSyncAPI,
 			Users:                    clusterUsers,
 			Channels:                 app.channelApp,
