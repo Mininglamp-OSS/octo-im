@@ -104,6 +104,9 @@ func (a *App) prepareSend(ctx context.Context, cmd SendCommand) (preparedSend, b
 			return preparedSend{err: err}, true
 		}
 		cmd.ChannelID = channelID
+		if isFederationShadowPersonChannel(cmd.ChannelID) {
+			return preparedSend{result: SendResult{Reason: frame.ReasonNotAllowSend}}, true
+		}
 	} else if cmd.ChannelType == frame.ChannelTypeAgent {
 		channelID, err := normalizeAgentSendChannel(cmd.FromUID, cmd.ChannelID)
 		if err != nil {
