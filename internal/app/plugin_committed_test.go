@@ -162,6 +162,8 @@ func TestNewBuildsMessageNotifyWebhookReplayerWhenEnabled(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, app.Stop()) })
 
 	require.NotNil(t, app.messageNotifyReplayer)
+	require.Nil(t, app.committedReplayer.cfg.Activator, "legacy committed replay must keep its existing activation behavior")
+	require.NotNil(t, app.messageNotifyReplayer.cfg.Activator, "webhook replay must activate persisted channels before reading replay state")
 	messageFanout := messageAppDispatcherForTest(t, app)
 	fanout, ok := messageFanout.(committedFanout)
 	require.Truef(t, ok, "message dispatcher should be committedFanout, got %T", messageFanout)

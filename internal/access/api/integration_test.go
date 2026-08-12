@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -69,18 +70,23 @@ func TestAPIServerSendMessageWithRealMessageApp(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var got sendMessageResponse
+	var got struct {
+		MessageID   int64  `json:"message_id"`
+		MessageSeq  uint64 `json:"message_seq"`
+		ClientMsgNo string `json:"client_msg_no"`
+		Reason      uint8  `json:"reason"`
+	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
-	require.Equal(t, http.StatusOK, got.Status)
-	require.Equal(t, int64(66), got.Data.MessageID)
-	require.Equal(t, uint64(7), got.Data.MessageSeq)
-	require.Equal(t, "api-real-message", got.Data.ClientMsgNo)
+	require.Equal(t, int64(66), got.MessageID)
+	require.Equal(t, uint64(7), got.MessageSeq)
+	require.Equal(t, "api-real-message", got.ClientMsgNo)
+	require.Equal(t, uint8(frame.ReasonSuccess), got.Reason)
 	require.Len(t, cluster.appendRequests, 1)
 	require.Equal(t, runtimechannelid.ToCommandChannel(runtimechannelid.EncodePersonChannel("u1", "u2")), cluster.appendRequests[0].ChannelID.ID)
 	require.True(t, cluster.appendRequests[0].Message.Framer.SyncOnce)
 }
 
-func TestAPIServerSendMessageRejectsNoPersistWithoutDurableResult(t *testing.T) {
+func TestAPIServerSendMessagePreservesLegacyNoPersistSuccess(t *testing.T) {
 	msgApp := message.New(message.Options{})
 	srv := New(Options{
 		ListenAddr: "127.0.0.1:0",
@@ -116,10 +122,85 @@ func TestAPIServerSendMessageRejectsNoPersistWithoutDurableResult(t *testing.T) 
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
-	var got map[string]string
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got struct {
+		MessageSeq uint64 `json:"message_seq"`
+		Reason     uint8  `json:"reason"`
+	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
-	require.Equal(t, "message did not commit", got["error"])
+	require.Zero(t, got.MessageSeq)
+	require.Equal(t, uint8(frame.ReasonSuccess), got.Reason)
+}
+
+func TestAPIServerSendDurableMessageReturnsFinalEnvelope(t *testing.T) {
+	cluster := &fakeChannelAppender{result: channel.AppendResult{MessageID: 88, MessageSeq: 9}}
+	msgApp := message.New(message.Options{
+		IdentityStore:   &fakeIdentityStore{},
+		ChannelStore:    &fakeChannelStore{},
+		ChannelAppender: cluster,
+	})
+	srv := New(Options{Messages: msgApp})
+
+	body := map[string]any{
+		"from_uid":      "u1",
+		"channel_id":    "u2",
+		"channel_type":  float64(frame.ChannelTypePerson),
+		"client_msg_no": "durable-api-message",
+		"payload":       base64.StdEncoding.EncodeToString([]byte("hi")),
+	}
+	payload, err := json.Marshal(body)
+	require.NoError(t, err)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send/durable", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Engine().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.JSONEq(t, `{"status":200,"data":{"message_id":88,"message_seq":9,"client_msg_no":"durable-api-message"}}`, rec.Body.String())
+}
+
+func TestAPIServerSendDurableMessageRejectsNonDurableRequests(t *testing.T) {
+	testCases := []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "missing client message number",
+			body: map[string]any{
+				"from_uid":     "u1",
+				"channel_id":   "u2",
+				"channel_type": float64(frame.ChannelTypePerson),
+				"payload":      base64.StdEncoding.EncodeToString([]byte("hi")),
+			},
+		},
+		{
+			name: "no persist",
+			body: map[string]any{
+				"from_uid":      "u1",
+				"channel_id":    "u2",
+				"channel_type":  float64(frame.ChannelTypePerson),
+				"client_msg_no": "durable-no-persist",
+				"payload":       base64.StdEncoding.EncodeToString([]byte("hi")),
+				"header":        map[string]any{"no_persist": float64(1)},
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			srv := New(Options{Messages: message.New(message.Options{})})
+			payload, err := json.Marshal(testCase.body)
+			require.NoError(t, err)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/message/send/durable", bytes.NewReader(payload))
+			req.Header.Set("Content-Type", "application/json")
+
+			srv.Engine().ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+		})
+	}
 }
 
 func TestAPIServerSendMessageSubscribersWithRealMessageApp(t *testing.T) {
@@ -167,12 +248,17 @@ func TestAPIServerSendMessageSubscribersWithRealMessageApp(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var got sendMessageResponse
+	var got struct {
+		MessageID   int64  `json:"message_id"`
+		MessageSeq  uint64 `json:"message_seq"`
+		ClientMsgNo string `json:"client_msg_no"`
+		Reason      uint8  `json:"reason"`
+	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
-	require.Equal(t, http.StatusOK, got.Status)
-	require.Equal(t, int64(77), got.Data.MessageID)
-	require.Equal(t, uint64(8), got.Data.MessageSeq)
-	require.Equal(t, "api-directed-message", got.Data.ClientMsgNo)
+	require.Equal(t, int64(77), got.MessageID)
+	require.Equal(t, uint64(8), got.MessageSeq)
+	require.Equal(t, "api-directed-message", got.ClientMsgNo)
+	require.Equal(t, uint8(frame.ReasonSuccess), got.Reason)
 	require.Len(t, cluster.appendRequests, 1)
 	require.True(t, runtimechannelid.IsCommandChannel(cluster.appendRequests[0].ChannelID.ID))
 	require.Equal(t, frame.ChannelTypeTemp, cluster.appendRequests[0].ChannelID.Type)
