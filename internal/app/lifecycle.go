@@ -224,10 +224,20 @@ func (a *App) startCommittedReplay(ctx context.Context) error {
 	if a.startCommittedReplayFn != nil {
 		return a.startCommittedReplayFn(ctx)
 	}
-	if a.committedReplayer == nil {
-		return nil
+	if a.committedReplayer != nil {
+		if err := a.committedReplayer.Start(ctx); err != nil {
+			return err
+		}
 	}
-	return a.committedReplayer.Start(ctx)
+	if a.messageNotifyReplayer != nil {
+		if err := a.messageNotifyReplayer.Start(ctx); err != nil {
+			if a.committedReplayer != nil {
+				_ = a.committedReplayer.StopContext(ctx)
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *App) startChannelMigration(ctx context.Context) error {
@@ -378,10 +388,14 @@ func (a *App) stopCommittedReplay(ctx context.Context) error {
 	if a.stopCommittedReplayFn != nil {
 		return a.stopCommittedReplayFn(ctx)
 	}
-	if a.committedReplayer == nil {
-		return nil
+	var joined error
+	if a.messageNotifyReplayer != nil {
+		joined = errors.Join(joined, a.messageNotifyReplayer.StopContext(ctx))
 	}
-	return a.committedReplayer.StopContext(ctx)
+	if a.committedReplayer != nil {
+		joined = errors.Join(joined, a.committedReplayer.StopContext(ctx))
+	}
+	return joined
 }
 
 func (a *App) stopChannelMigration(ctx context.Context) error {

@@ -419,6 +419,7 @@ func (a *App) hasDeliveryRuntimeLifecycle(includeStopOnly bool) bool {
 
 func (a *App) hasCommittedReplayLifecycle(includeStopOnly bool) bool {
 	return a.committedReplayer != nil ||
+		a.messageNotifyReplayer != nil ||
 		a.startCommittedReplayFn != nil ||
 		(includeStopOnly && (a.stopCommittedReplayFn != nil || a.committedReplayOn.Load()))
 }

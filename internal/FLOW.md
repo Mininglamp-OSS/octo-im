@@ -247,6 +247,7 @@ online.Registry.Connection(sessionID)
    ├─ Delivery（投递管理器）
    ├─ CommittedDispatcher（有界分片队列，异步分发已提交事件）
    ├─ CommittedReplay（从 Channel Log 补偿已提交事件）
+   ├─ MessageNotifyReplay（可选：向 octo-server 发送已提交消息的签名 HTTP 回调）
    ├─ ChannelMigration（执行权威迁移任务）
    ├─ ChannelRetention（按权威元数据推进频道消息保留边界）
    ├─ Message（消息用例）
@@ -353,7 +354,11 @@ message.App.Send(ctx, cmd)
 request-scoped durable CMD：用 RequestSubscribers 构建 CMD conversation intent，并按 UID owner 路由到 pending updater
       ↓
 dispatcher.SubmitCommitted(ctx, messageevents.MessageCommitted)
-  ├─ committedFanout（提交到 asyncCommittedDispatcher；插件启用时额外提交到 pluginCommittedRouter）
+  ├─ committedFanout
+  │   ├─ asyncCommittedDispatcher（实时 delivery / conversation）
+  │   ├─ committedReplayer（标记默认补偿 cursor 为 dirty）
+  │   ├─ MessageNotifyReplay（可选；标记 `message_notify_v1` cursor 为 dirty）
+  │   └─ pluginCommittedRouter（可选；只路由 PersistAfter 到 Channel owner）
   └─ asyncCommittedDispatcher
       ├─ 按 ChannelID + ChannelType 选择固定分片队列
       ├─ 队列满时不失败 Send，改走 best-effort conversation fallback
@@ -368,6 +373,13 @@ committed_replay 后台从已提交 Channel Log 补偿未分发事件
   ├─ 普通 CMD intent 由 delivery resolver 的 UID page observer 重新产生
   ├─ delivery 接受后批量推进 cursor；active hint 失败只记录告警
   └─ 记录 replay lag / pass duration 指标
+
+可选 MessageNotifyReplay 使用同一 Channel Log，但有**独立** cursor `message_notify_v1`：
+  ├─ 将一条 committed message 编码为与 octo-server `modules/webhook.MsgResp` 兼容的单元素 JSON 数组
+  ├─ 对最终原始 JSON body 计算 `HMAC-SHA256`，发送 `X-Signature-256: sha256=<lowercase hex>`
+  ├─ 仅 HTTP 200 才推进该 cursor；超时、网络错误和任意非 200 均保留 cursor，后续/重启从 Channel Log 重放
+  ├─ 不与 realtime delivery / conversation 的 cursor 共享，因此 webhook 故障不会阻塞客户端投递补偿
+  └─ 该路径是至少一次回调；HTTP 响应丢失可能重复，接收端必须按 message 唯一键幂等
   ↓
 返回 SendResult{MessageID, MessageSeq}
   ↓
@@ -673,6 +685,7 @@ handleRecvAck(ctx, pkt)
 
 ### 🔴 配置
 - **Cluster.Slots 静态配置已废弃**: 必须使用 `Cluster.InitialSlotCount` 走 Controller 管理的动态 Slot 分配
+- **签名 msg.notify 必须 fail-closed**: 只有 `WK_WEBHOOK_MSG_NOTIFY_ENABLED=true` 时才构建独立 replayer；此时 `WK_WEBHOOK_HTTP_ADDR`（绝对 HTTP(S) URL）和 `WK_WEBHOOK_MSG_NOTIFY_SECRET` 必须同时存在，缺失/非法配置直接启动失败。Secret 只能由部署注入，不得写入示例配置、日志、健康接口或错误响应；`WK_WEBHOOK_TIMEOUT` 默认 15s。
 
 ### 🔴 元数据同步
 - **channelMetaSync 不再做全量 scan**: steady-state 不再 `ListChannelRuntimeMeta()` 预热本地所有副本频道，业务路径按需激活
@@ -684,6 +697,7 @@ handleRecvAck(ctx, pkt)
 - **committed dispatcher 溢出不影响 durable send**: 队列满只记录指标并触发 best-effort conversation fallback，Sendack 仍只由 Channel Log quorum commit 决定。
 - **committed dispatcher 停止依赖 replay 补偿**: 停止时不再接收新队列任务，未启动/停止中的提交返回内部错误供调用方记录；队列内未处理实时投递可被丢弃并由 committed_replay 兜底补发。
 - **committed_replay 是补偿路径，不阻塞 Sendack**: Sendack 仍只等待 Channel Log quorum commit；后台 replayer 以 Channel Log 为真相，用批量 cursor 兜底补发 delivery / conversation，active hint 是可丢弃的 best-effort 路径。
+- **MessageNotifyReplay 与默认 replay 隔离**: 签名 callback 使用 `message_notify_v1` 独立 cursor，严格以 HTTP 200 为确认；不能把请求已发出、2xx 其他状态或响应 body 解释为成功。接收端必须可承受重复回调，发送端不能为了“止损”在没有 DLQ 前静默跳过失败消息。
 - **性能指标走窄接口注入**: message append、meta refresh、dispatch queue、delivery resolve/push、runtime gauge 和 replay lag 由 `internal/app` 组合根接入 `pkg/metrics`，低层包不直接依赖具体 metrics registry。
 - **诊断 trace 只走窄链路**: access/gateway 与 access/api 负责创建或校验节点内 diagnostics trace context；`message.SendCommand.TraceID` 把它传到 message 用例和 channel append；gateway send/sendack 与 durable send 的 `pkg/observability/sendtrace` 事件携带 diagnostics-safe `channel_key`，支持按频道 debug match 采样；`internal/app` 组合根负责安装 diagnostics store 的 sendtrace sink 并在 Stop 时恢复。
 
@@ -723,4 +737,4 @@ GOWORK=off go test ./internal -run TestInternalImportBoundaries -count=1
 ---
 
 **文档版本**: v2.1
-**最后更新**: 2026-05-16
+**最后更新**: 2026-08-12

@@ -674,6 +674,14 @@ func buildAppConfig(v *viper.Viper) (app.Config, error) {
 	if err != nil {
 		return app.Config{}, err
 	}
+	messageNotifyEnabled, err := parseBool(v, "WK_WEBHOOK_MSG_NOTIFY_ENABLED")
+	if err != nil {
+		return app.Config{}, err
+	}
+	messageNotifyTimeout, err := parseDuration(v, "WK_WEBHOOK_TIMEOUT")
+	if err != nil {
+		return app.Config{}, err
+	}
 
 	cfg := app.Config{
 		TestMode: testMode,
@@ -811,6 +819,12 @@ func buildAppConfig(v *viper.Viper) (app.Config, error) {
 			PresenceCacheTTL: deliveryPresenceCacheTTL,
 			AckBatchMaxWait:  deliveryAckBatchMaxWait,
 			AckBatchMaxSize:  deliveryAckBatchMaxSize,
+		},
+		Webhook: app.WebhookConfig{
+			HTTPAddr:         stringValue(v, "WK_WEBHOOK_HTTP_ADDR"),
+			MsgNotifyEnabled: messageNotifyEnabled,
+			MsgNotifySecret:  stringValue(v, "WK_WEBHOOK_MSG_NOTIFY_SECRET"),
+			Timeout:          messageNotifyTimeout,
 		},
 		Plugin: app.PluginConfig{
 			Enable:     pluginEnable,

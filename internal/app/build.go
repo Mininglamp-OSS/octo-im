@@ -664,8 +664,34 @@ func build(cfg Config) (_ *App, err error) {
 		Logger:       app.logger.Named("committed.replay"),
 		Metrics:      messageMetrics,
 	})
-	deliverySubmitDispatcher := committedFanout{subscribers: []committedSubscriber{app.committedDispatcher, app.committedReplayer}}
+	if cfg.Webhook.MsgNotifyEnabled {
+		notifier, notifierErr := newMessageNotifyWebhook(messageNotifyWebhookConfig{
+			URL:     cfg.Webhook.HTTPAddr,
+			Secret:  cfg.Webhook.MsgNotifySecret,
+			Timeout: cfg.Webhook.Timeout,
+		})
+		if notifierErr != nil {
+			return nil, notifierErr
+		}
+		app.messageNotifyReplayer = newCommittedReplayer(committedReplayerConfig{
+			Log: channelStoreCommittedReplayLog{
+				engine:      app.channelLogDB,
+				status:      app.channelLog,
+				localNodeID: cfg.Node.ID,
+			},
+			Delivery:   notifier,
+			CursorName: messageNotifyWebhookCursorName,
+			Logger:     app.logger.Named("webhook.msg_notify"),
+		})
+	}
+
+	deliverySubscribers := []committedSubscriber{app.committedDispatcher, app.committedReplayer}
 	committedSubscribers := []committedSubscriber{app.committedDispatcher, app.committedReplayer}
+	if app.messageNotifyReplayer != nil {
+		deliverySubscribers = append(deliverySubscribers, app.messageNotifyReplayer)
+		committedSubscribers = append(committedSubscribers, app.messageNotifyReplayer)
+	}
+	deliverySubmitDispatcher := committedFanout{subscribers: deliverySubscribers}
 	if app.pluginApp != nil {
 		committedSubscribers = append(committedSubscribers, pluginCommittedRouter{
 			localNodeID:   cfg.Node.ID,

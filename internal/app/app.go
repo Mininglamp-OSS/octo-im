@@ -70,6 +70,7 @@ type App struct {
 	cmdConversationIntents    cmdConversationIntentRouter
 	committedDispatcher       *asyncCommittedDispatcher
 	committedReplayer         *committedReplayer
+	messageNotifyReplayer     *committedReplayer
 	channelMigrationExecutor  *channelmigrationruntime.Executor
 	channelMigrationLifecycle *channelMigrationLifecycle
 	channelRetentionWorker    *appretention.Worker

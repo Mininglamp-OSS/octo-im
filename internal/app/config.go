@@ -35,6 +35,8 @@ type Config struct {
 	Message MessageConfig
 	// Delivery configures realtime delivery routing and fanout.
 	Delivery DeliveryConfig
+	// Webhook configures optional signed callbacks for committed messages.
+	Webhook WebhookConfig
 	// Plugin configures node-local PDK-compatible plugin execution.
 	Plugin PluginConfig
 	// API configures the public HTTP API entry point.
@@ -245,6 +247,19 @@ type DeliveryConfig struct {
 	// AckBatchMaxSize flushes remote delivery acknowledgements immediately once
 	// the pending owner-node batch reaches this size. Zero uses a safe default.
 	AckBatchMaxSize int
+}
+
+// WebhookConfig controls the signed HTTP callback used for committed msg.notify events.
+type WebhookConfig struct {
+	// HTTPAddr is the absolute HTTP(S) endpoint that receives the msg.notify payload.
+	HTTPAddr string
+	// MsgNotifyEnabled enables durable replay of committed messages to HTTPAddr.
+	MsgNotifyEnabled bool
+	// MsgNotifySecret is the HMAC-SHA256 secret injected by deployment configuration.
+	// It must never be written to logs, health responses, or checked-in configuration files.
+	MsgNotifySecret string
+	// Timeout bounds one message notification HTTP request. Zero uses the safe default.
+	Timeout time.Duration
 }
 
 // ChannelMessageRetentionConfig controls cluster-authoritative channel message retention.
@@ -813,6 +828,17 @@ func (c *Config) ApplyDefaultsAndValidate() error {
 	}
 	if c.Gateway.SendTimeout <= 0 && c.Gateway.sendTimeoutSet {
 		return fmt.Errorf("%w: gateway send timeout must be > 0", ErrInvalidConfig)
+	}
+	if c.Webhook.Timeout < 0 {
+		return fmt.Errorf("%w: message notify webhook timeout must be > 0", ErrInvalidConfig)
+	}
+	if c.Webhook.MsgNotifyEnabled {
+		if c.Webhook.Timeout == 0 {
+			c.Webhook.Timeout = defaultMessageNotifyWebhookTimeout
+		}
+		if err := validateMessageNotifyWebhookConfig(c.Webhook); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+		}
 	}
 	if c.Manager.ListenAddr != "" && c.Manager.AuthOn {
 		if c.Manager.JWTSecret == "" {

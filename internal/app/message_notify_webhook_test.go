@@ -108,6 +108,62 @@ func TestMessageNotifyWebhookRejectsIncompleteConfig(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestMessageNotifyWebhookRejectsInvalidConfig(t *testing.T) {
+	tests := []messageNotifyWebhookConfig{
+		{URL: "ftp://octo.example.test/hook", Secret: "test-secret"},
+		{URL: "https://user:password@octo.example.test/hook", Secret: "test-secret"},
+		{URL: "https://octo.example.test/hook", Secret: "test-secret", Timeout: -time.Second},
+	}
+	for _, cfg := range tests {
+		_, err := newMessageNotifyWebhook(cfg)
+		require.Error(t, err)
+	}
+}
+
+func TestMessageNotifyWebhookUsesDefaultTimeoutAndNilContext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	notifier, err := newMessageNotifyWebhook(messageNotifyWebhookConfig{
+		URL:    server.URL,
+		Secret: "test-message-notify-secret",
+	})
+	require.NoError(t, err)
+	require.Equal(t, defaultMessageNotifyWebhookTimeout, notifier.client.Timeout)
+	require.NoError(t, notifier.SubmitCommitted(nil, deliveryruntime.CommittedEnvelope{Message: channel.Message{
+		MessageID: 1, MessageSeq: 1, ChannelID: "group-1", ChannelType: frame.ChannelTypeGroup,
+	}}))
+}
+
+func TestMessageNotifyWebhookRejectsOutOfRangeIdentifiers(t *testing.T) {
+	_, err := messageNotifyWebhookPayloadFromMessage(channel.Message{MessageID: ^uint64(0)})
+	require.Error(t, err)
+
+	_, err = messageNotifyWebhookPayloadFromMessage(channel.Message{MessageID: 1, MessageSeq: uint64(^uint32(0)) + 1})
+	require.Error(t, err)
+}
+
+func TestMessageNotifyWebhookReturnsTransportError(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	endpoint := server.URL
+	server.Close()
+
+	notifier, err := newMessageNotifyWebhook(messageNotifyWebhookConfig{
+		URL:     endpoint,
+		Secret:  "test-message-notify-secret",
+		Timeout: time.Second,
+	})
+	require.NoError(t, err)
+	require.Error(t, notifier.SubmitCommitted(context.Background(), deliveryruntime.CommittedEnvelope{Message: channel.Message{
+		MessageID: 1, MessageSeq: 1, ChannelID: "group-1", ChannelType: frame.ChannelTypeGroup,
+	}}))
+
+	var unconfigured *messageNotifyWebhook
+	require.Error(t, unconfigured.SubmitCommitted(context.Background(), deliveryruntime.CommittedEnvelope{}))
+}
+
 func TestMessageNotifyWebhookReplaysAfterNonOKResponse(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

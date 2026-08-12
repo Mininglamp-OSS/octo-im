@@ -212,6 +212,14 @@ WK_CONVERSATION_GROUP_ACTIVE_FANOUT_INTERVAL=5m
 WK_CONVERSATION_GROUP_ACTIVE_FANOUT_MAX_SUBSCRIBERS=0
 
 WK_API_LISTEN_ADDR=0.0.0.0:5001
+# Optional durable msg.notify callback for octo-server's message persistence endpoint.
+# When enabled, the IM process signs the exact JSON request body with HMAC-SHA256 and
+# advances its independent durable replay cursor only after HTTP 200. Inject the secret
+# through deployment-managed environment configuration; do not commit a real value here.
+WK_WEBHOOK_HTTP_ADDR=
+WK_WEBHOOK_MSG_NOTIFY_ENABLED=false
+# WK_WEBHOOK_MSG_NOTIFY_SECRET=
+WK_WEBHOOK_TIMEOUT=15s
 # Enables unauthenticated /bench/v1/* APIs for wkbench-only benchmark environments.
 # Keep false in production and shared environments because these routes intentionally skip auth.
 WK_BENCH_API_ENABLE=false
