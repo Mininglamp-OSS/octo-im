@@ -19,6 +19,9 @@ type sendMessageRequest struct {
 	Payload       string                   `json:"payload"`
 	Subscribers   []string                 `json:"subscribers"`
 	Header        sendMessageHeaderRequest `json:"header"`
+	Setting       uint8                    `json:"setting"`
+	Topic         string                   `json:"topic"`
+	Expire        uint32                   `json:"expire"`
 	NoPersist     int                      `json:"no_persist"`
 	SyncOnce      int                      `json:"sync_once"`
 }
@@ -26,14 +29,21 @@ type sendMessageRequest struct {
 type sendMessageHeaderRequest struct {
 	// NoPersist marks the send as non-durable when non-zero.
 	NoPersist int `json:"no_persist"`
+	// RedDot controls whether the persisted message increments unread indicators.
+	RedDot int `json:"red_dot"`
 	// SyncOnce marks the send as a one-shot command-channel message when non-zero.
 	SyncOnce int `json:"sync_once"`
 }
 
 type sendMessageResponse struct {
-	MessageID  int64  `json:"message_id"`
-	MessageSeq uint64 `json:"message_seq"`
-	Reason     uint8  `json:"reason"`
+	Status int                     `json:"status"`
+	Data   sendMessageResponseData `json:"data"`
+}
+
+type sendMessageResponseData struct {
+	MessageID   int64  `json:"message_id"`
+	MessageSeq  uint64 `json:"message_seq"`
+	ClientMsgNo string `json:"client_msg_no"`
 }
 
 func (s *Server) handleSendMessage(c *gin.Context) {
@@ -87,7 +97,10 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 
 	result, err := s.messages.Send(reqCtx, message.SendCommand{
 		TraceID:            traceCtx.TraceID,
-		Framer:             frame.Framer{NoPersist: noPersist, SyncOnce: syncOnce},
+		Framer:             frame.Framer{NoPersist: noPersist, RedDot: req.Header.RedDot != 0, SyncOnce: syncOnce},
+		Setting:            frame.Setting(req.Setting),
+		Topic:              req.Topic,
+		Expire:             req.Expire,
 		FromUID:            req.FromUID,
 		ChannelID:          channelID,
 		ChannelType:        channelType,
@@ -104,11 +117,22 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		writeJSONError(c, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if result.Reason != frame.ReasonSuccess {
+		writeJSONError(c, http.StatusForbidden, "message rejected")
+		return
+	}
+	if result.MessageID <= 0 || result.MessageSeq == 0 {
+		writeJSONError(c, http.StatusInternalServerError, "message did not commit")
+		return
+	}
 
 	c.JSON(http.StatusOK, sendMessageResponse{
-		MessageID:  result.MessageID,
-		MessageSeq: result.MessageSeq,
-		Reason:     uint8(result.Reason),
+		Status: http.StatusOK,
+		Data: sendMessageResponseData{
+			MessageID:   result.MessageID,
+			MessageSeq:  result.MessageSeq,
+			ClientMsgNo: req.ClientMsgNo,
+		},
 	})
 }
 

@@ -32,9 +32,11 @@ Current flow:
     `pkg/channel` record, checkpoint, history, retention, committed-cursor, and
     query callers onto the typed `ChannelLog` core while keeping seq/offset
     conversion at the channel boundary.
-13. Compatibility durable payloads continue to use FNV-64a payload hashes so
-    handler idempotency checks compare the same value that was encoded into the
-    `channel.Record` payload.
+13. Compatibility durable payloads continue to store FNV-64a payload hashes
+    for storage integrity checks. Handler idempotency first uses the durable
+    sender/client index, then reads the structured message and compares the
+    full caller-visible write intent; it must not treat the payload hash alone
+    as an idempotency verdict.
 14. Schema and key helpers define the durable message table layout.
 
 Storage code in this package must not import Pebble directly.

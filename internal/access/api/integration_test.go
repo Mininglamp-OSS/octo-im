@@ -53,11 +53,12 @@ func TestAPIServerSendMessageWithRealMessageApp(t *testing.T) {
 	}, 2*time.Second, 20*time.Millisecond)
 
 	body := map[string]any{
-		"from_uid":     "u1",
-		"channel_id":   "u2",
-		"channel_type": float64(frame.ChannelTypePerson),
-		"payload":      base64.StdEncoding.EncodeToString([]byte("hi")),
-		"sync_once":    float64(1),
+		"from_uid":      "u1",
+		"channel_id":    "u2",
+		"channel_type":  float64(frame.ChannelTypePerson),
+		"client_msg_no": "api-real-message",
+		"payload":       base64.StdEncoding.EncodeToString([]byte("hi")),
+		"sync_once":     float64(1),
 	}
 	payload, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -68,21 +69,18 @@ func TestAPIServerSendMessageWithRealMessageApp(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var got struct {
-		MessageID  int64  `json:"message_id"`
-		MessageSeq uint64 `json:"message_seq"`
-		Reason     uint8  `json:"reason"`
-	}
+	var got sendMessageResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
-	require.Equal(t, int64(66), got.MessageID)
-	require.Equal(t, uint64(7), got.MessageSeq)
-	require.Equal(t, uint8(frame.ReasonSuccess), got.Reason)
+	require.Equal(t, http.StatusOK, got.Status)
+	require.Equal(t, int64(66), got.Data.MessageID)
+	require.Equal(t, uint64(7), got.Data.MessageSeq)
+	require.Equal(t, "api-real-message", got.Data.ClientMsgNo)
 	require.Len(t, cluster.appendRequests, 1)
 	require.Equal(t, runtimechannelid.ToCommandChannel(runtimechannelid.EncodePersonChannel("u1", "u2")), cluster.appendRequests[0].ChannelID.ID)
 	require.True(t, cluster.appendRequests[0].Message.Framer.SyncOnce)
 }
 
-func TestAPIServerSendMessageNoPersistHeaderSkipsClusterRequirement(t *testing.T) {
+func TestAPIServerSendMessageRejectsNoPersistWithoutDurableResult(t *testing.T) {
 	msgApp := message.New(message.Options{})
 	srv := New(Options{
 		ListenAddr: "127.0.0.1:0",
@@ -118,22 +116,15 @@ func TestAPIServerSendMessageNoPersistHeaderSkipsClusterRequirement(t *testing.T
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var got struct {
-		MessageID  int64  `json:"message_id"`
-		MessageSeq uint64 `json:"message_seq"`
-		Reason     uint8  `json:"reason"`
-	}
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	var got map[string]string
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
-	require.Zero(t, got.MessageID)
-	require.Zero(t, got.MessageSeq)
-	require.Equal(t, uint8(frame.ReasonSuccess), got.Reason)
+	require.Equal(t, "message did not commit", got["error"])
 }
 
 func TestAPIServerSendMessageSubscribersWithRealMessageApp(t *testing.T) {
 	cluster := &fakeChannelAppender{
-		result: channel.AppendResult{MessageID: 77, MessageSeq: 0},
+		result: channel.AppendResult{MessageID: 77, MessageSeq: 8},
 	}
 	dispatcher := &apiRecordingCommittedDispatcher{}
 	msgApp := message.New(message.Options{
@@ -159,9 +150,10 @@ func TestAPIServerSendMessageSubscribersWithRealMessageApp(t *testing.T) {
 	}, 2*time.Second, 20*time.Millisecond)
 
 	body := map[string]any{
-		"from_uid":    "system",
-		"payload":     base64.StdEncoding.EncodeToString([]byte("cmd")),
-		"subscribers": []string{"u1", "u2", "u1"},
+		"from_uid":      "system",
+		"client_msg_no": "api-directed-message",
+		"payload":       base64.StdEncoding.EncodeToString([]byte("cmd")),
+		"subscribers":   []string{"u1", "u2", "u1"},
 		"header": map[string]any{
 			"sync_once": float64(1),
 		},
@@ -175,14 +167,12 @@ func TestAPIServerSendMessageSubscribersWithRealMessageApp(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var got struct {
-		MessageID  int64  `json:"message_id"`
-		MessageSeq uint64 `json:"message_seq"`
-		Reason     uint8  `json:"reason"`
-	}
+	var got sendMessageResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
-	require.Equal(t, int64(77), got.MessageID)
-	require.Equal(t, uint8(frame.ReasonSuccess), got.Reason)
+	require.Equal(t, http.StatusOK, got.Status)
+	require.Equal(t, int64(77), got.Data.MessageID)
+	require.Equal(t, uint64(8), got.Data.MessageSeq)
+	require.Equal(t, "api-directed-message", got.Data.ClientMsgNo)
 	require.Len(t, cluster.appendRequests, 1)
 	require.True(t, runtimechannelid.IsCommandChannel(cluster.appendRequests[0].ChannelID.ID))
 	require.Equal(t, frame.ChannelTypeTemp, cluster.appendRequests[0].ChannelID.Type)

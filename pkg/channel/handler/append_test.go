@@ -839,14 +839,22 @@ func TestAppendIdempotencyHitReturnsStoredMessageFromUniqueIndex(t *testing.T) {
 		ClientMsgNo: "m1",
 	}
 	store := &fakeAppendLookupStore{
-		hit:       core.IdempotencyEntry{MessageID: 11, MessageSeq: 7, Offset: 6},
-		hitHash:   hashPayload([]byte("payload")),
-		lookupOK:  true,
-		message:   core.Message{MessageID: 11, MessageSeq: 7, Payload: []byte("payload"), FromUID: "u1", ClientMsgNo: "m1"},
+		hit:      core.IdempotencyEntry{MessageID: 11, MessageSeq: 7, Offset: 6},
+		hitHash:  hashPayload([]byte("payload")),
+		lookupOK: true,
+		message: core.Message{
+			MessageID:   11,
+			MessageSeq:  7,
+			Payload:     []byte("payload"),
+			FromUID:     "u1",
+			ClientMsgNo: "m1",
+			ChannelID:   key.ChannelID.ID,
+			ChannelType: key.ChannelID.Type,
+		},
 		messageOK: true,
 	}
 
-	result, ok, err := resolveIdempotentAppendFromStore(store, key, hashPayload([]byte("payload")))
+	result, ok, err := resolveIdempotentAppendFromStore(store, key, store.message)
 	if err != nil {
 		t.Fatalf("resolveIdempotentAppendFromStore() error = %v", err)
 	}

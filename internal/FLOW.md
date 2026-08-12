@@ -385,7 +385,9 @@ API Server 解析请求体
 messages.Send(ctx, cmd)
   └─ 同 Gateway 路径
   ↓
-返回 HTTP 响应 {message_id, message_seq}
+仅在权限判定和 quorum durable append 已完成后返回 HTTP 200：
+`{status: 200, data: {message_id, message_seq, client_msg_no}}`。业务拒绝、
+持久化错误或零 ID/seq 都不能伪装成成功响应。
 ```
 
 ### 4.4 投递流程

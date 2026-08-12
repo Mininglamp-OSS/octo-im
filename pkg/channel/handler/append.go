@@ -162,7 +162,6 @@ type appendBatchDraft struct {
 	// channelID is the authoritative channel identity copied into every draft message.
 	channelID       channel.ChannelID
 	drafts          []channel.Message // Draft messages with channel fields and generated MessageID applied.
-	payloadHashes   []uint64          // Precomputed payload hashes reused by idempotency checks and encoding.
 	idempotencyKeys []channel.IdempotencyKey
 	newIndexes      []int // Request indexes still requiring a replica append.
 	duplicateOf     []int // duplicateOf[i] points at the first same-key item in this batch, or -1.
@@ -172,7 +171,6 @@ func newAppendBatchDraft(channelID channel.ChannelID, messages []channel.Message
 	batch := appendBatchDraft{
 		channelID:       channelID,
 		drafts:          make([]channel.Message, len(messages)),
-		payloadHashes:   make([]uint64, len(messages)),
 		idempotencyKeys: make([]channel.IdempotencyKey, 0, len(messages)),
 		duplicateOf:     make([]int, len(messages)),
 	}
@@ -184,7 +182,6 @@ func newAppendBatchDraft(channelID channel.ChannelID, messages []channel.Message
 		draft.ChannelID = channelID.ID
 		draft.ChannelType = channelID.Type
 		batch.drafts[i] = draft
-		batch.payloadHashes[i] = hashPayload(draft.Payload)
 		if key, ok := idempotencyKeyForDraft(channelID, draft); ok {
 			batch.idempotencyKeys = append(batch.idempotencyKeys, key)
 		}
@@ -200,7 +197,7 @@ func (b *appendBatchDraft) resolveIdempotency(store appendIdempotencyStore, item
 			b.newIndexes = append(b.newIndexes, i)
 			continue
 		}
-		stored, found, err := resolveIdempotentAppendFromStore(store, idKey, b.payloadHashes[i])
+		stored, found, err := resolveIdempotentAppendFromStore(store, idKey, draft)
 		if err != nil {
 			items[i].Err = err
 			continue
@@ -210,7 +207,7 @@ func (b *appendBatchDraft) resolveIdempotency(store appendIdempotencyStore, item
 			continue
 		}
 		if first, ok := idempotentNew[idKey]; ok {
-			if b.payloadHashes[first] != b.payloadHashes[i] {
+			if !channel.SameIdempotencyRequest(b.drafts[first], draft) {
 				items[i].Err = channel.ErrIdempotencyConflict
 				continue
 			}
@@ -260,7 +257,7 @@ func (b *appendBatchDraft) encodeRecords(generator channel.MessageIDGenerator, i
 	for _, idx := range b.newIndexes {
 		draft := b.drafts[idx]
 		draft.MessageID = generator.Next()
-		encoded, err := encodeMessageWithPayloadHash(draft, b.payloadHashes[idx])
+		encoded, err := encodeMessage(draft)
 		if err != nil {
 			items[idx].Err = err
 			continue
@@ -329,16 +326,13 @@ type appendIdempotencyStore interface {
 	GetMessageBySeq(seq uint64) (channel.Message, bool, error)
 }
 
-func resolveIdempotentAppendFromStore(store appendIdempotencyStore, key channel.IdempotencyKey, payloadHash uint64) (channel.AppendResult, bool, error) {
-	entry, storedPayloadHash, ok, err := store.LookupIdempotency(key)
+func resolveIdempotentAppendFromStore(store appendIdempotencyStore, key channel.IdempotencyKey, request channel.Message) (channel.AppendResult, bool, error) {
+	entry, _, ok, err := store.LookupIdempotency(key)
 	if err != nil {
 		return channel.AppendResult{}, false, err
 	}
 	if !ok {
 		return channel.AppendResult{}, false, nil
-	}
-	if storedPayloadHash != payloadHash {
-		return channel.AppendResult{}, true, channel.ErrIdempotencyConflict
 	}
 	msg, ok, err := store.GetMessageBySeq(entry.MessageSeq)
 	if err != nil {
@@ -346,6 +340,9 @@ func resolveIdempotentAppendFromStore(store appendIdempotencyStore, key channel.
 	}
 	if !ok {
 		return channel.AppendResult{}, true, channel.ErrStaleMeta
+	}
+	if !channel.SameIdempotencyRequest(msg, request) {
+		return channel.AppendResult{}, true, channel.ErrIdempotencyConflict
 	}
 	msg.MessageSeq = entry.MessageSeq
 	return channel.AppendResult{MessageID: msg.MessageID, MessageSeq: msg.MessageSeq, Message: msg}, true, nil

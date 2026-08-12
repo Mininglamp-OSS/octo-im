@@ -60,9 +60,11 @@ Handler 层:
      若 WriteFence 仍带 token，则本地写入准入 fail-closed 返回 ErrWriteFenced；即使 wall-clock TTL 已过，也必须等权威 meta 清除/升级 fence 后才重新放行
   ③ 若 `FromUID` 和 `ClientMsgNo` 同时存在，则通过 `LookupIdempotency()` 命中
      `uidx_from_uid_client_msg_no`，再用 `GetMessageBySeq()` 取回已落盘消息
-     命中且 PayloadHash 匹配 → 返回旧结果；Hash 不匹配 → ErrIdempotencyConflict
+     命中且 `(channel_id, channel_type, from_uid, client_msg_no, NoPersist, RedDot,
+     SyncOnce, setting, topic, expire, payload)` 完全一致 → 返回旧结果；任一字段不一致
+     → ErrIdempotencyConflict。这样持久化索引只负责定位，完整请求比较不依赖可碰撞的摘要。
      AppendBatch 会先逐项解析已落盘幂等结果，再在批内按 `(ChannelID, FromUID, ClientMsgNo)` 合并重复项；
-     相同 key 且 PayloadHash 不同的后续项返回 `ErrIdempotencyConflict`，不会进入 replica append
+     相同 key 且完整可见写入意图不同的后续项返回 `ErrIdempotencyConflict`，不会进入 replica append
      为了支撑 store 的 trusted append 快路径，Handler 会在同一进程内按幂等 key 对“尚未解析落盘结果”的 append
      加短生命周期互斥锁，覆盖幂等查询、MessageID 分配和 replica append；同 key 并发重试会等第一条提交后再命中旧结果，
      不依赖 store 写路径再次读取二级索引兜底
@@ -265,7 +267,7 @@ System (0x17): prefix + key + tableID + systemID + ...
 
 - **per-channel 互斥锁**: `channel.go:lockApplyMeta` 使用引用计数的 per-key 锁，保证同一频道的 ApplyMeta 串行执行。Handler → Runtime 失败时会 RestoreMeta 回滚。
 - **结构化 `message` 表才是持久化真相**: `channel.Record.Payload` 现在只是 ingress/egress 兼容层；排查落盘问题时优先看 `pkg/db/message/read.go`、`pkg/db/message/codec.go`，不要再把 raw payload 当作唯一来源。
-- **幂等命中依赖唯一索引 + PayloadHash**: 幂等检查走 `uidx_from_uid_client_msg_no`，并且必须校验 FNV-64a PayloadHash 一致，否则返回 `ErrIdempotencyConflict`；不再通过扫描原始日志后解码比对。
+- **幂等命中依赖唯一索引 + 完整写入意图**: 幂等检查先走 `uidx_from_uid_client_msg_no`，再读取命中的结构化消息并严格比较 channel、作者、key、持久化 header、setting、topic、expire 和 payload；任一差异返回 `ErrIdempotencyConflict`。索引中的 FNV-64a `payload_hash` 仅用于存储完整性校验，不能单独作为幂等判定。
 - **按 MessageID / ClientMsgNo 查询已经是索引直达**: `MessageID` 命中唯一索引，`ClientMsgNo` 命中 `(client_msg_no, message_seq)` 索引分页；不要再写“全表扫描后过滤”的调用路径。
 - **旧版 messagesync 只读 committed message 表**: `handler/message_sync.go:SyncMessages` 复用 `ListMessagesBySeq()`，按旧版 `start_message_seq` / `end_message_seq` / `pull_mode` 语义裁剪结果，并始终按 `message_seq` 升序返回给 HTTP API。
 - **Group Commit 窗口**: 默认 1ms/64条/64KB，配置在 `replica/replica.go:effectiveAppendGroupCommit*`。调大会增加延迟但提高吞吐。

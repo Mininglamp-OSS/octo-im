@@ -486,7 +486,7 @@ func TestSendMessageMapsSyncOnceAliasesToUsecaseCommand(t *testing.T) {
 
 func TestSendMessageMapsSubscribersToUsecaseCommand(t *testing.T) {
 	msgs := &recordingMessageUsecase{
-		result: message.SendResult{Reason: frame.ReasonSuccess},
+		result: message.SendResult{MessageID: 1, MessageSeq: 1, Reason: frame.ReasonSuccess},
 	}
 	srv := New(Options{Messages: msgs})
 
