@@ -9,6 +9,8 @@ import (
 
 	core "github.com/WuKongIM/WuKongIM/pkg/channel"
 	store "github.com/WuKongIM/WuKongIM/pkg/db/message"
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAppendUsesRuntimeKeyAndReturnsMessageSeq(t *testing.T) {
@@ -423,6 +425,78 @@ func TestAppendReturnsExistingEntryOnIdempotentRetry(t *testing.T) {
 	}
 	if rt.channels[KeyFromChannelID(id)].appendCalls != 1 {
 		t.Fatalf("Append() calls = %d, want 1", rt.channels[KeyFromChannelID(id)].appendCalls)
+	}
+}
+
+func TestAppendRejectsIdempotencyDriftInDurableMessageFields(t *testing.T) {
+	base := core.Message{
+		FromUID:     "u1",
+		ClientMsgNo: "same",
+		Framer:      frame.Framer{RedDot: true},
+		Setting:     frame.Setting(3),
+		Topic:       "topic-a",
+		Expire:      60,
+		Payload:     []byte("payload"),
+	}
+	testCases := []struct {
+		name   string
+		mutate func(*core.Message)
+	}{
+		{
+			name: "header",
+			mutate: func(message *core.Message) {
+				message.Framer.SyncOnce = true
+			},
+		},
+		{
+			name: "setting",
+			mutate: func(message *core.Message) {
+				message.Setting = frame.Setting(4)
+			},
+		},
+		{
+			name: "topic",
+			mutate: func(message *core.Message) {
+				message.Topic = "topic-b"
+			},
+		},
+		{
+			name: "expire",
+			mutate: func(message *core.Message) {
+				message.Expire = 61
+			},
+		},
+		{
+			name: "payload",
+			mutate: func(message *core.Message) {
+				message.Payload = []byte("different-payload")
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			id := core.ChannelID{ID: "idempotency-" + testCase.name, Type: 2}
+			svc, _, _ := newAppendService(t, id)
+
+			first, err := svc.Append(context.Background(), core.AppendRequest{
+				ChannelID:             id,
+				SupportsMessageSeqU64: true,
+				Message:               base,
+			})
+			require.NoError(t, err)
+			require.NotZero(t, first.MessageID)
+			require.NotZero(t, first.MessageSeq)
+
+			second := base
+			testCase.mutate(&second)
+			_, err = svc.Append(context.Background(), core.AppendRequest{
+				ChannelID:             id,
+				SupportsMessageSeqU64: true,
+				Message:               second,
+			})
+			require.ErrorIs(t, err, core.ErrIdempotencyConflict)
+		})
 	}
 }
 
