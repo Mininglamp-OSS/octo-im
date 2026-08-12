@@ -52,6 +52,42 @@ func TestCommittedReplayerAdvancesCursorWithoutConversationFlush(t *testing.T) {
 	require.Equal(t, uint64(2), source.cursors[channel.ChannelKey("channel/1/c1")])
 }
 
+func TestCommittedReplayerActivatesPersistedChannelBeforeReadingReplayState(t *testing.T) {
+	key := channel.ChannelKey("channel/2/fedg0-restart")
+	source := &fakeCommittedReplayLog{
+		channels: []committedReplayChannel{{
+			Key: key,
+			ID:  channel.ChannelID{ID: "fedg0-restart", Type: frame.ChannelTypeGroup},
+		}},
+		committed: map[channel.ChannelKey]uint64{key: 0},
+		messages: map[channel.ChannelKey][]channel.Message{
+			key: {{
+				MessageID:   11,
+				MessageSeq:  1,
+				ChannelID:   "fedg0-restart",
+				ChannelType: frame.ChannelTypeGroup,
+				Payload:     []byte("persisted before restart"),
+			}},
+		},
+	}
+	delivery := &fakeCommittedReplayDelivery{}
+	var activated []channel.ChannelKey
+	replayer := newCommittedReplayer(committedReplayerConfig{
+		Log:      source,
+		Delivery: delivery,
+		Activator: func(_ context.Context, got channel.ChannelKey) error {
+			activated = append(activated, got)
+			source.committed[got] = 1
+			return nil
+		},
+	})
+
+	require.NoError(t, replayer.RunOnce(context.Background()))
+	require.Equal(t, []channel.ChannelKey{key}, activated)
+	require.Equal(t, []uint64{1}, delivery.messageSeqs())
+	require.Equal(t, uint64(1), source.cursors[key])
+}
+
 func TestCommittedReplaySubmitsDurableCommandMessagesThroughDeliveryOnly(t *testing.T) {
 	key := channel.ChannelKey("channel/2/g1____cmd")
 	source := &fakeCommittedReplayLog{
