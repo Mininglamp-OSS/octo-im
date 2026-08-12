@@ -61,6 +61,9 @@ type committedReplayMetrics interface {
 type committedReplayerConfig struct {
 	// Log is the durable source of committed messages and replay cursors.
 	Log committedReplayLog
+	// Activator makes a persisted channel runtime-ready before the replay log
+	// asks it for a committed frontier. It must not bootstrap unknown channels.
+	Activator func(context.Context, channel.ChannelKey) error
 	// Delivery receives replayed committed messages for realtime fanout.
 	Delivery committedReplayDelivery
 	// Conversation receives replayed committed messages as best-effort active hints.
@@ -318,6 +321,11 @@ func (r *committedReplayer) clearDirty(key channel.ChannelKey) {
 }
 
 func (r *committedReplayer) replayChannel(ctx context.Context, ch committedReplayChannel) (uint64, error) {
+	if r.cfg.Activator != nil {
+		if err := r.cfg.Activator(ctx, ch.Key); err != nil {
+			return 0, err
+		}
+	}
 	cursor, ok, err := r.cfg.Log.LoadCommittedDispatchCursor(ctx, ch.Key, r.cfg.CursorName)
 	if err != nil {
 		return 0, err

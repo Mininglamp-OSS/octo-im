@@ -644,6 +644,13 @@ func build(cfg Config) (_ *App, err error) {
 	if app.metrics != nil {
 		messageMetrics = app.metrics.Message
 	}
+	activateCommittedReplayChannel := func(ctx context.Context, key channel.ChannelKey) error {
+		if app.channelMetaSync == nil {
+			return channel.ErrInvalidConfig
+		}
+		_, err := app.channelMetaSync.ActivateByKey(ctx, key, channelruntime.ActivationSourceReplay)
+		return err
+	}
 	app.committedDispatcher = newAsyncCommittedDispatcher(asyncCommittedDispatcherConfig{
 		LocalNodeID:  cfg.Node.ID,
 		Logger:       app.logger.Named("delivery.route"),
@@ -659,6 +666,7 @@ func build(cfg Config) (_ *App, err error) {
 			status:      app.channelLog,
 			localNodeID: cfg.Node.ID,
 		},
+		Activator:    activateCommittedReplayChannel,
 		Delivery:     app.deliveryApp,
 		Conversation: app.conversationProjector,
 		Logger:       app.logger.Named("committed.replay"),
@@ -679,6 +687,7 @@ func build(cfg Config) (_ *App, err error) {
 				status:      app.channelLog,
 				localNodeID: cfg.Node.ID,
 			},
+			Activator:  activateCommittedReplayChannel,
 			Delivery:   notifier,
 			CursorName: messageNotifyWebhookCursorName,
 			Logger:     app.logger.Named("webhook.msg_notify"),

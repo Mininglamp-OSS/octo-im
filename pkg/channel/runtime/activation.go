@@ -13,6 +13,10 @@ const (
 	ActivationSourceFetch    ActivationSource = "fetch"
 	ActivationSourceProbe    ActivationSource = "probe"
 	ActivationSourceLaneOpen ActivationSource = "lane_open"
+	// ActivationSourceReplay activates persisted channels so durable side-effect
+	// replayers can recover after a process restart without bootstrapping an
+	// unknown channel.
+	ActivationSourceReplay ActivationSource = "replay"
 )
 
 type Activator interface {
