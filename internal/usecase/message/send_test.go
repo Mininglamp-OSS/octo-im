@@ -220,6 +220,76 @@ func TestSendRejectsUnauthenticatedSender(t *testing.T) {
 	require.Equal(t, SendResult{}, result)
 }
 
+func TestSendRejectsFederationShadowPersonEndpoints(t *testing.T) {
+	const shadowUID = "__fed_0123456789abcdef0123456789abcdef"
+
+	tests := []struct {
+		name      string
+		fromUID   string
+		channelID string
+	}{
+		{name: "ordinary sender to shadow", fromUID: "u1", channelID: shadowUID},
+		{name: "shadow sender to ordinary user", fromUID: shadowUID, channelID: "u1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			appender := &fakeChannelAppender{}
+			app := New(Options{Now: fixedNowFn, ChannelAppender: appender})
+
+			result, err := app.Send(context.Background(), SendCommand{
+				FromUID:     tt.fromUID,
+				ChannelID:   tt.channelID,
+				ChannelType: frame.ChannelTypePerson,
+				Payload:     []byte("must not persist"),
+			})
+
+			require.NoError(t, err)
+			require.Equal(t, frame.ReasonNotAllowSend, result.Reason)
+			require.Empty(t, appender.sendRequests)
+			require.Empty(t, appender.sendBatchRequests)
+		})
+	}
+}
+
+func TestSendFederationShadowPolicyDoesNotBlockGroupAuthorOrLookalikeUID(t *testing.T) {
+	const shadowUID = "__fed_0123456789abcdef0123456789abcdef"
+
+	tests := []struct {
+		name        string
+		fromUID     string
+		channelID   string
+		channelType uint8
+	}{
+		{name: "shadow group author", fromUID: shadowUID, channelID: "g1", channelType: frame.ChannelTypeGroup},
+		{name: "person target is only a prefix lookalike", fromUID: "u1", channelID: "__fed_not-a-shadow", channelType: frame.ChannelTypePerson},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			appender := &fakeChannelAppender{sendBatchReplies: []fakeChannelAppenderSendBatchReply{{
+				result: channel.AppendBatchResult{Items: []channel.AppendBatchItemResult{{
+					MessageID:  42,
+					MessageSeq: 1,
+				}}},
+			}}}
+			app := New(Options{Now: fixedNowFn, ChannelAppender: appender})
+
+			result, err := app.Send(context.Background(), SendCommand{
+				FromUID:     tt.fromUID,
+				ChannelID:   tt.channelID,
+				ChannelType: tt.channelType,
+				Payload:     []byte("allowed"),
+			})
+
+			require.NoError(t, err)
+			require.Equal(t, frame.ReasonSuccess, result.Reason)
+			require.Equal(t, uint64(1), result.MessageSeq)
+			require.Len(t, appender.sendBatchRequests, 1)
+		})
+	}
+}
+
 func TestSendBatchSingleItemMatchesSend(t *testing.T) {
 	newApp := func() (*App, *fakeChannelAppender) {
 		cluster := &fakeChannelAppender{sendBatchReplies: []fakeChannelAppenderSendBatchReply{{
