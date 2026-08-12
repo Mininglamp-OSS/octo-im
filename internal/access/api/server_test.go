@@ -451,6 +451,27 @@ func TestSendDurableMessageMapsJSONToUsecaseCommand(t *testing.T) {
 	require.True(t, msgs.calls[0].Framer.RedDot)
 }
 
+func TestSendDurableMessageMarksAdministrativeSendAsTrusted(t *testing.T) {
+	msgs := &recordingMessageUsecase{
+		result: message.SendResult{MessageID: 99, MessageSeq: 7, Reason: frame.ReasonSuccess},
+	}
+	srv := New(Options{
+		Messages:               msgs,
+		TrustedMessageDeviceID: "trusted-manager-device",
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send/durable", bytes.NewBufferString(`{"from_uid":"shadow-user","channel_id":"g1","channel_type":2,"client_msg_no":"api-trusted-1","payload":"aGk="}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Engine().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, msgs.calls, 1)
+	require.Equal(t, "shadow-user", msgs.calls[0].FromUID)
+	require.Equal(t, "trusted-manager-device", msgs.calls[0].DeviceID)
+}
+
 func TestSendMessageMapsSyncOnceAliasesToUsecaseCommand(t *testing.T) {
 	tests := []struct {
 		name string
