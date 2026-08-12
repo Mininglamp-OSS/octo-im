@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/contracts/messageevents"
 	deliveryruntime "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
@@ -145,6 +146,27 @@ func TestNewBuildsPluginCommittedRouterWhenPluginEnabled(t *testing.T) {
 	require.Len(t, deliveryFanout.subscribers, 2)
 	require.Same(t, app.committedDispatcher, deliveryFanout.subscribers[0])
 	require.Same(t, app.committedReplayer, deliveryFanout.subscribers[1])
+}
+
+func TestNewBuildsMessageNotifyWebhookReplayerWhenEnabled(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Webhook = WebhookConfig{
+		HTTPAddr:         "http://127.0.0.1:18080/v1/webhook/message/notify",
+		MsgNotifyEnabled: true,
+		MsgNotifySecret:  "test-message-notify-secret",
+		Timeout:          time.Second,
+	}
+
+	app, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, app.Stop()) })
+
+	require.NotNil(t, app.messageNotifyReplayer)
+	messageFanout := messageAppDispatcherForTest(t, app)
+	fanout, ok := messageFanout.(committedFanout)
+	require.Truef(t, ok, "message dispatcher should be committedFanout, got %T", messageFanout)
+	require.Len(t, fanout.subscribers, 3)
+	require.Same(t, app.messageNotifyReplayer, fanout.subscribers[2])
 }
 
 type fakePluginCommittedOwnerResolver struct {

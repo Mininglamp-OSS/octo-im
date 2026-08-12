@@ -177,6 +177,44 @@ func TestLoadConfigParsesPluginConfig(t *testing.T) {
 	require.True(t, cfg.Plugin.FailOpen)
 }
 
+func TestLoadConfigParsesMessageNotifyWebhook(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConf(t, dir, "wukongim.conf",
+		"WK_NODE_ID=1",
+		"WK_NODE_DATA_DIR="+filepath.Join(dir, "node-1"),
+		"WK_CLUSTER_LISTEN_ADDR=127.0.0.1:7000",
+		`WK_CLUSTER_NODES=[{"id":1,"addr":"127.0.0.1:7000"}]`,
+		"WK_CLUSTER_SLOT_COUNT=1",
+		"WK_WEBHOOK_HTTP_ADDR=http://127.0.0.1:8080/v1/webhook/message/notify",
+		"WK_WEBHOOK_MSG_NOTIFY_ENABLED=true",
+		"WK_WEBHOOK_MSG_NOTIFY_SECRET=test-message-notify-secret",
+		"WK_WEBHOOK_TIMEOUT=3s",
+	)
+
+	cfg, err := loadConfig(path)
+	require.NoError(t, err)
+	require.Equal(t, "http://127.0.0.1:8080/v1/webhook/message/notify", cfg.Webhook.HTTPAddr)
+	require.True(t, cfg.Webhook.MsgNotifyEnabled)
+	require.Equal(t, "test-message-notify-secret", cfg.Webhook.MsgNotifySecret)
+	require.Equal(t, 3*time.Second, cfg.Webhook.Timeout)
+}
+
+func TestLoadConfigRejectsEnabledMessageNotifyWebhookWithoutSecret(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConf(t, dir, "wukongim.conf",
+		"WK_NODE_ID=1",
+		"WK_NODE_DATA_DIR="+filepath.Join(dir, "node-1"),
+		"WK_CLUSTER_LISTEN_ADDR=127.0.0.1:7000",
+		`WK_CLUSTER_NODES=[{"id":1,"addr":"127.0.0.1:7000"}]`,
+		"WK_CLUSTER_SLOT_COUNT=1",
+		"WK_WEBHOOK_HTTP_ADDR=http://127.0.0.1:8080/v1/webhook/message/notify",
+		"WK_WEBHOOK_MSG_NOTIFY_ENABLED=true",
+	)
+
+	_, err := loadConfig(path)
+	require.ErrorContains(t, err, "message notify webhook secret")
+}
+
 func TestLoadConfigPrefersEnvironmentVariablesForPluginConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := writeConf(t, dir, "wukongim.conf",
