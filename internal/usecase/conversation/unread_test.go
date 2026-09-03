@@ -16,9 +16,10 @@ func TestClearUnreadAdvancesReadSeqToLatestMessage(t *testing.T) {
 	repo.latest[key("g1", 2)] = testMessage("g1", 2, 10, "u2", 100, "c1")
 
 	app := New(Options{
-		States: repo,
-		Facts:  repo,
-		Now:    func() time.Time { return now },
+		States:             repo,
+		Facts:              repo,
+		AuthoritativeFacts: repo,
+		Now:                func() time.Time { return now },
 	})
 
 	err := app.ClearUnread(context.Background(), ClearUnreadCommand{
@@ -44,9 +45,10 @@ func TestClearUnreadUsesClientMessageSeqWhenLatestFactMissing(t *testing.T) {
 	repo := newConversationSyncRepoStub()
 
 	app := New(Options{
-		States: repo,
-		Facts:  repo,
-		Now:    func() time.Time { return now },
+		States:             repo,
+		Facts:              repo,
+		AuthoritativeFacts: repo,
+		Now:                func() time.Time { return now },
 	})
 
 	err := app.ClearUnread(context.Background(), ClearUnreadCommand{
@@ -83,9 +85,10 @@ func TestSetUnreadAdvancesReadSeqFromLatestMessage(t *testing.T) {
 	repo.latest[key("g1", 2)] = testMessage("g1", 2, 10, "u2", 100, "c1")
 
 	app := New(Options{
-		States: repo,
-		Facts:  repo,
-		Now:    func() time.Time { return now },
+		States:             repo,
+		Facts:              repo,
+		AuthoritativeFacts: repo,
+		Now:                func() time.Time { return now },
 	})
 
 	err := app.SetUnread(context.Background(), SetUnreadCommand{
@@ -121,8 +124,9 @@ func TestSetUnreadDoesNotMoveReadSeqBackward(t *testing.T) {
 	repo.latest[key("g1", 2)] = testMessage("g1", 2, 10, "u2", 100, "c1")
 
 	app := New(Options{
-		States: repo,
-		Facts:  repo,
+		States:             repo,
+		Facts:              repo,
+		AuthoritativeFacts: repo,
 	})
 
 	err := app.SetUnread(context.Background(), SetUnreadCommand{
@@ -146,8 +150,9 @@ func TestSetUnreadUsesAuthoritativeLatestMessage(t *testing.T) {
 		},
 	}
 	app := New(Options{
-		States: base,
-		Facts:  facts,
+		States:             base,
+		Facts:              base,
+		AuthoritativeFacts: facts,
 	})
 
 	err := app.SetUnread(context.Background(), SetUnreadCommand{
@@ -164,14 +169,54 @@ func TestSetUnreadUsesAuthoritativeLatestMessage(t *testing.T) {
 	require.Equal(t, uint64(7), base.upsertedStates[0].ReadSeq)
 }
 
+func TestSetUnreadFailsClosedWithoutAuthoritativeFacts(t *testing.T) {
+	repo := newConversationSyncRepoStub()
+	repo.latest[key("g1", 2)] = testMessage("g1", 2, 10, "u2", 100, "stale")
+	app := New(Options{States: repo, Facts: repo})
+
+	err := app.SetUnread(context.Background(), SetUnreadCommand{
+		UID:         "u1",
+		ChannelID:   "g1",
+		ChannelType: 2,
+		Unread:      0,
+	})
+
+	require.ErrorContains(t, err, "authoritative message facts store not configured")
+	require.Empty(t, repo.latestLoads)
+	require.Empty(t, repo.upsertedStates)
+}
+
+func TestSetUnreadDoesNotWriteWhenAuthoritativeReadFails(t *testing.T) {
+	base := newConversationSyncRepoStub()
+	facts := &authoritativeConversationFactsStub{
+		conversationSyncRepoStub: base,
+		err:                      channel.ErrNotReady,
+	}
+	app := New(Options{States: base, Facts: base, AuthoritativeFacts: facts})
+
+	err := app.SetUnread(context.Background(), SetUnreadCommand{
+		UID:         "u1",
+		ChannelID:   "g1",
+		ChannelType: 2,
+		Unread:      0,
+	})
+
+	require.ErrorIs(t, err, channel.ErrNotReady)
+	require.Empty(t, base.upsertedStates)
+}
+
 type authoritativeConversationFactsStub struct {
 	*conversationSyncRepoStub
 	latest map[ConversationKey]channel.Message
 	loads  []ConversationKey
+	err    error
 }
 
 func (s *authoritativeConversationFactsStub) LoadLatestMessagesAuthoritative(_ context.Context, keys []ConversationKey) (map[ConversationKey]channel.Message, error) {
 	s.loads = append(s.loads, keys...)
+	if s.err != nil {
+		return nil, s.err
+	}
 	out := make(map[ConversationKey]channel.Message, len(keys))
 	for _, key := range keys {
 		if msg, ok := s.latest[key]; ok {

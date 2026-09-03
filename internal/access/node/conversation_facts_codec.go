@@ -3,19 +3,29 @@ package node
 import "fmt"
 
 var (
-	conversationFactsRequestMagic  = [...]byte{'W', 'K', 'C', 'F', 1}
-	conversationFactsResponseMagic = [...]byte{'W', 'K', 'C', 'G', 1}
+	conversationFactsRequestMagicV1 = [...]byte{'W', 'K', 'C', 'F', 1}
+	conversationFactsRequestMagicV2 = [...]byte{'W', 'K', 'C', 'F', 2}
+	conversationFactsResponseMagic  = [...]byte{'W', 'K', 'C', 'G', 1}
 )
 
 // encodeConversationFactsRequestBinary encodes conversation fact lookups without JSON reflection.
 func encodeConversationFactsRequestBinary(req conversationFactsRequest) ([]byte, error) {
-	dst := make([]byte, 0, len(conversationFactsRequestMagic)+128+len(req.Op))
-	dst = append(dst, conversationFactsRequestMagic[:]...)
+	useV2 := req.Op == conversationFactsOpLatestAuthoritative || req.ExpectedChannelEpoch != 0 || req.ExpectedLeaderEpoch != 0
+	magic := conversationFactsRequestMagicV1[:]
+	if useV2 {
+		magic = conversationFactsRequestMagicV2[:]
+	}
+	dst := make([]byte, 0, len(magic)+144+len(req.Op))
+	dst = append(dst, magic...)
 	dst = appendString(dst, req.Op)
 	dst = appendConversationFactsChannelKey(dst, req.Key)
 	dst = appendConversationFactsChannelKeys(dst, req.Keys)
 	dst = appendNodeInt(dst, req.Limit)
 	dst = appendNodeInt(dst, req.MaxBytes)
+	if useV2 {
+		dst = appendUvarint(dst, req.ExpectedChannelEpoch)
+		dst = appendUvarint(dst, req.ExpectedLeaderEpoch)
+	}
 	return dst, nil
 }
 
@@ -23,7 +33,8 @@ func decodeConversationFactsRequest(body []byte) (conversationFactsRequest, erro
 	if !isConversationFactsRequestBinary(body) {
 		return conversationFactsRequest{}, fmt.Errorf("access/node: invalid conversation facts request codec")
 	}
-	offset := len(conversationFactsRequestMagic)
+	isV2 := hasMagic(body, conversationFactsRequestMagicV2[:])
+	offset := len(conversationFactsRequestMagicV1)
 	var req conversationFactsRequest
 	var err error
 	if req.Op, offset, err = readString(body, offset); err != nil {
@@ -40,6 +51,14 @@ func decodeConversationFactsRequest(body []byte) (conversationFactsRequest, erro
 	}
 	if req.MaxBytes, offset, err = readNodeInt(body, offset, "conversation facts max bytes"); err != nil {
 		return conversationFactsRequest{}, err
+	}
+	if isV2 {
+		if req.ExpectedChannelEpoch, offset, err = readUvarint(body, offset); err != nil {
+			return conversationFactsRequest{}, err
+		}
+		if req.ExpectedLeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+			return conversationFactsRequest{}, err
+		}
 	}
 	if offset != len(body) {
 		return conversationFactsRequest{}, fmt.Errorf("access/node: trailing conversation facts request bytes")
@@ -79,7 +98,7 @@ func decodeConversationFactsResponseBinary(body []byte) (conversationFactsRespon
 }
 
 func isConversationFactsRequestBinary(body []byte) bool {
-	return hasMagic(body, conversationFactsRequestMagic[:])
+	return hasMagic(body, conversationFactsRequestMagicV1[:]) || hasMagic(body, conversationFactsRequestMagicV2[:])
 }
 
 func isConversationFactsResponseBinary(body []byte) bool {

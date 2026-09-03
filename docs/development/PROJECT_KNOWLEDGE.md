@@ -18,6 +18,8 @@
 - `ActiveAt` is a best-effort hint: updates may be batched, throttled, dropped, and merged from cache during `ListUserConversationActive`.
 - Deleting a conversation clears current active visibility through `DeletedToSeq`; a later message with a larger sequence must be allowed to reactivate it.
 - Delete without an explicit message sequence must first resolve the latest Channel Log sequence; if no sequence is available, do not install a zero delete barrier.
+- Conversation read-cursor mutations must resolve the latest message through a leader-required, epoch-fenced read; a readable follower is not authoritative even when it is `CommitReady`.
+- Ordinary conversation sync remains best-effort per channel: a transiently not-ready remote channel must not fail the user's whole conversation list.
 - Duplicate/stale delete barriers must not clear an `ActiveAt` written by a newer message.
 - Legacy channel allowlist, denylist, and temporary-subscriber APIs are backed by namespaced slot subscriber lists until dedicated metadata tables exist.
 - Legacy system UID APIs are backed by the namespaced slot subscriber list `__wk_internal_system_uids__`.

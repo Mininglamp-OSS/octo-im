@@ -152,6 +152,23 @@ func TestFetchReturnsNotReadyWhenCommitHWIsProvisional(t *testing.T) {
 	}
 }
 
+func TestFetchRequireLeaderRejectsFollower(t *testing.T) {
+	id := core.ChannelID{ID: "c1", Type: 1}
+	svc, rt, _ := newAppendService(t, id)
+	rt.channels[KeyFromChannelID(id)].status.Role = core.ReplicaRoleFollower
+
+	_, err := svc.Fetch(context.Background(), core.FetchRequest{
+		ChannelID:     id,
+		FromSeq:       1,
+		Limit:         1,
+		MaxBytes:      1024,
+		RequireLeader: true,
+	})
+	if err != core.ErrNotLeader {
+		t.Fatalf("expected ErrNotLeader, got %v", err)
+	}
+}
+
 func TestFetchMessagesFromStoreUsesStructuredScan(t *testing.T) {
 	st := &fakeFetchStore{
 		messages: []core.Message{

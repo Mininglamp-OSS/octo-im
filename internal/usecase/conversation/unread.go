@@ -60,14 +60,10 @@ func validateUnreadTarget(uid, channelID string, channelType uint8) error {
 }
 
 func (a *App) latestConversationSeq(ctx context.Context, key ConversationKey, fallback uint64) (uint64, bool, error) {
-	if a.facts == nil {
-		return 0, false, errors.New("message facts store not configured")
+	if a.authoritativeFacts == nil {
+		return 0, false, errors.New("authoritative message facts store not configured")
 	}
-	loadLatest := a.facts.LoadLatestMessages
-	if authoritative, ok := a.facts.(authoritativeMessageFactsStore); ok {
-		loadLatest = authoritative.LoadLatestMessagesAuthoritative
-	}
-	latestByKey, err := loadLatest(ctx, []ConversationKey{key})
+	latestByKey, err := a.authoritativeFacts.LoadLatestMessagesAuthoritative(ctx, []ConversationKey{key})
 	if err != nil {
 		return 0, false, err
 	}

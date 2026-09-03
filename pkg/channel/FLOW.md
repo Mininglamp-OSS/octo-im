@@ -41,6 +41,7 @@ type Cluster interface {
 | `ReplicaState` | types.go | 副本状态：Role、运行时 CommitHW(`HW`)、持久化 CheckpointHW、`CommitReady`、LEO、Epoch、retention floor |
 | `AppendRequest` | types.go | 追加请求：ChannelID, Message, ExpectedChannelEpoch, ExpectedLeaderEpoch；`TraceID` / `Attempt` 仅用于节点内 diagnostics |
 | `AppendBatchRequest` | types.go | 同一 ChannelID 内按请求顺序追加多条消息；逐项结果与输入下标对齐，单条 `Append` 是其兼容包装 |
+| `FetchRequest` | types.go | 已提交消息读取请求；`RequireLeader=true` 时同时拒绝 follower 与 fenced former leader，仅供需要权威读语义的调用方使用 |
 | `Checkpoint` | types.go | 检查点：Epoch + LogStartOffset + HW；用于冷恢复下界与 reconcile 后的持久化提交水位 |
 | `RetentionView` / `RetentionReset` | types.go | retention 规划视图与 follower 低于逻辑 floor 时的 typed reset |
 | `FenceAndDrainRequest` / `DrainResult` | types.go | migration cutover 写栅栏下的 leader drain 请求与证明结果 |
@@ -101,7 +102,7 @@ Replica 层 (replica/append.go + replica/append_pipeline.go):
   ① 校验 Limit > 0, MaxBytes > 0
   ② 加载 Meta，检查频道状态非 Deleting/Deleted
   ③ 从 Runtime 获取 HandlerChannel → runtime.Channel(key)
-  ④ 若 `CommitReady=false`，直接返回 ErrNotReady，不再从 Checkpoint 猜 committed frontier
+  ④ `RequireLeader=true` 且本地副本不是当前 Leader 时返回 `ErrNotLeader`；若 `CommitReady=false`，返回 `ErrNotReady`，不再从 Checkpoint 猜 committed frontier
   ⑤ handler/fetch.go 将 `FromSeq=0` 或低于 retention/snapshot floor 的请求夹到 `MinAvailableSeq`
   ⑥ 直接调用 `message.ChannelStore.ListMessagesBySeq(startSeq, ...)` 扫描结构化 `message` 表
   ⑦ 读取结果按运行时 CommitHW 和 `MinAvailableSeq` 裁剪，不再通过 compat `ChannelStore.Read()` + DurableMessage 解码重建消息

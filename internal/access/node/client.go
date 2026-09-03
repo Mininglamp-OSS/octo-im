@@ -390,6 +390,36 @@ func (c *Client) LoadLatestConversationMessage(ctx context.Context, nodeID uint6
 	return resp.Messages[0], true, nil
 }
 
+func (c *Client) LoadLatestConversationMessageAuthoritative(ctx context.Context, nodeID uint64, key channel.ChannelID, maxBytes int, expectedChannelEpoch, expectedLeaderEpoch uint64) (channel.Message, bool, error) {
+	resp, err := callConversationFactsDirect(ctx, c, nodeID, conversationFactsRequest{
+		Op:                   conversationFactsOpLatestAuthoritative,
+		Key:                  newConversationFactsChannelKey(key),
+		MaxBytes:             maxBytes,
+		ExpectedChannelEpoch: expectedChannelEpoch,
+		ExpectedLeaderEpoch:  expectedLeaderEpoch,
+	})
+	if err != nil {
+		return channel.Message{}, false, normalizeConversationFactsRPCError(err)
+	}
+	switch resp.Status {
+	case rpcStatusOK:
+	case rpcStatusNotLeader:
+		return channel.Message{}, false, channel.ErrNotLeader
+	case rpcStatusNoLeader:
+		return channel.Message{}, false, raftcluster.ErrNoLeader
+	case conversationFactsStatusNotReady:
+		return channel.Message{}, false, channel.ErrNotReady
+	case conversationFactsStatusStaleMeta:
+		return channel.Message{}, false, channel.ErrStaleMeta
+	default:
+		return channel.Message{}, false, fmt.Errorf("access/node: unexpected authoritative conversation facts status %q", resp.Status)
+	}
+	if len(resp.Messages) == 0 {
+		return channel.Message{}, false, nil
+	}
+	return resp.Messages[0], true, nil
+}
+
 func (c *Client) LoadLatestConversationMessages(ctx context.Context, nodeID uint64, keys []channel.ChannelID, maxBytes int) (map[channel.ChannelID]channel.Message, error) {
 	resp, err := callConversationFactsDirect(ctx, c, nodeID, conversationFactsRequest{
 		Op:       conversationFactsOpLatest,
@@ -480,6 +510,31 @@ func callConversationFactsDirect(ctx context.Context, c *Client, nodeID uint64, 
 		return conversationFactsResponse{}, err
 	}
 	return decodeConversationFactsResponse(respBody)
+}
+
+func normalizeConversationFactsRPCError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, channel.ErrNotLeader) ||
+		errors.Is(err, channel.ErrStaleMeta) ||
+		errors.Is(err, channel.ErrNotReady) ||
+		errors.Is(err, raftcluster.ErrNoLeader) {
+		return err
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, channel.ErrNotLeader.Error()):
+		return channel.ErrNotLeader
+	case strings.Contains(msg, channel.ErrStaleMeta.Error()):
+		return channel.ErrStaleMeta
+	case strings.Contains(msg, channel.ErrNotReady.Error()):
+		return channel.ErrNotReady
+	case strings.Contains(msg, raftcluster.ErrNoLeader.Error()):
+		return raftcluster.ErrNoLeader
+	default:
+		return err
+	}
 }
 
 func callAuthoritativeRPC[T authoritativeRPCResponse](

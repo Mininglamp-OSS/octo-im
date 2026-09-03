@@ -10,7 +10,7 @@ import (
 
 func TestConversationFactsBinaryCodecRoundTrip(t *testing.T) {
 	req := conversationFactsRequest{
-		Op: conversationFactsOpLatest,
+		Op: conversationFactsOpLatestAuthoritative,
 		Key: newConversationFactsChannelKey(channel.ChannelID{
 			ID:   "g1",
 			Type: 2,
@@ -19,8 +19,10 @@ func TestConversationFactsBinaryCodecRoundTrip(t *testing.T) {
 			newConversationFactsChannelKey(channel.ChannelID{ID: "g1", Type: 2}),
 			newConversationFactsChannelKey(channel.ChannelID{ID: "g2", Type: 3}),
 		},
-		Limit:    5,
-		MaxBytes: 1024,
+		Limit:                5,
+		MaxBytes:             1024,
+		ExpectedChannelEpoch: 11,
+		ExpectedLeaderEpoch:  12,
 	}
 	reqBody, err := encodeConversationFactsRequestBinary(req)
 	require.NoError(t, err)
@@ -64,17 +66,150 @@ func TestConversationFactsRPCRejectsJSONPayload(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestLoadLatestConversationMessageReturnsNotReady(t *testing.T) {
-	msg, ok, err := loadLatestConversationMessage(context.Background(), notReadyConversationFactsLog{}, channel.ChannelID{ID: "g1", Type: 2}, 1024)
+func TestLoadLatestConversationMessageStrictReturnsNotReady(t *testing.T) {
+	msg, ok, err := loadLatestConversationMessageStrict(context.Background(), notReadyConversationFactsLog{}, channel.ChannelID{ID: "g1", Type: 2}, 1024)
 	require.ErrorIs(t, err, channel.ErrNotReady)
 	require.False(t, ok)
 	require.Equal(t, channel.Message{}, msg)
 }
 
-func TestLoadRecentConversationMessagesReturnsNotReady(t *testing.T) {
-	msgs, err := loadRecentConversationMessages(context.Background(), notReadyConversationFactsLog{}, channel.ChannelID{ID: "g1", Type: 2}, 10, 1024)
+func TestLoadRecentConversationMessagesStrictReturnsNotReady(t *testing.T) {
+	msgs, err := loadRecentConversationMessagesStrict(context.Background(), notReadyConversationFactsLog{}, channel.ChannelID{ID: "g1", Type: 2}, 10, 1024)
 	require.ErrorIs(t, err, channel.ErrNotReady)
 	require.Nil(t, msgs)
+}
+
+func TestConversationFactsRPCOrdinaryLatestKeepsNotReadyAsEmpty(t *testing.T) {
+	adapter := New(Options{ChannelLog: notReadyConversationFactsLog{}})
+	body := mustEncodeConversationFactsRequest(t, conversationFactsRequest{
+		Op:       conversationFactsOpLatest,
+		Key:      newConversationFactsChannelKey(channel.ChannelID{ID: "g1", Type: 2}),
+		MaxBytes: 1024,
+	})
+
+	respBody, err := adapter.handleConversationFactsRPC(context.Background(), body)
+	require.NoError(t, err)
+	resp, err := decodeConversationFactsResponse(respBody)
+	require.NoError(t, err)
+	require.Equal(t, rpcStatusOK, resp.Status)
+	require.Empty(t, resp.Messages)
+}
+
+func TestConversationFactsRPCOrdinaryBatchDoesNotFailOnNotReadyChannel(t *testing.T) {
+	adapter := New(Options{ChannelLog: notReadyConversationFactsLog{}})
+	body := mustEncodeConversationFactsRequest(t, conversationFactsRequest{
+		Op: conversationFactsOpLatest,
+		Keys: []conversationFactsChannelKey{
+			newConversationFactsChannelKey(channel.ChannelID{ID: "g1", Type: 2}),
+			newConversationFactsChannelKey(channel.ChannelID{ID: "g2", Type: 2}),
+		},
+		MaxBytes: 1024,
+	})
+
+	respBody, err := adapter.handleConversationFactsRPC(context.Background(), body)
+	require.NoError(t, err)
+	resp, err := decodeConversationFactsResponse(respBody)
+	require.NoError(t, err)
+	require.Equal(t, rpcStatusOK, resp.Status)
+	require.Len(t, resp.Entries, 2)
+	require.Empty(t, resp.Entries[0].Messages)
+	require.Empty(t, resp.Entries[1].Messages)
+}
+
+func TestConversationFactsRPCAuthoritativeLatestReturnsNotReadyStatus(t *testing.T) {
+	adapter := New(Options{ChannelLog: notReadyConversationFactsLog{}, LocalNodeID: 1})
+	body := mustEncodeConversationFactsRequest(t, conversationFactsRequest{
+		Op:                   conversationFactsOpLatestAuthoritative,
+		Key:                  newConversationFactsChannelKey(channel.ChannelID{ID: "g1", Type: 2}),
+		MaxBytes:             1024,
+		ExpectedChannelEpoch: 11,
+		ExpectedLeaderEpoch:  12,
+	})
+
+	respBody, err := adapter.handleConversationFactsRPC(context.Background(), body)
+	require.NoError(t, err)
+	resp, err := decodeConversationFactsResponse(respBody)
+	require.NoError(t, err)
+	require.Equal(t, conversationFactsStatusNotReady, resp.Status)
+}
+
+func TestConversationFactsRPCAuthoritativeLatestRejectsFollower(t *testing.T) {
+	log := &recordingAuthoritativeConversationFactsLog{
+		status: channel.ChannelRuntimeStatus{Leader: 2, LeaderEpoch: 12, CommittedSeq: 7},
+	}
+	adapter := New(Options{ChannelLog: log, LocalNodeID: 1})
+	body := mustEncodeConversationFactsRequest(t, conversationFactsRequest{
+		Op:                   conversationFactsOpLatestAuthoritative,
+		Key:                  newConversationFactsChannelKey(channel.ChannelID{ID: "g1", Type: 2}),
+		MaxBytes:             1024,
+		ExpectedChannelEpoch: 11,
+		ExpectedLeaderEpoch:  12,
+	})
+
+	respBody, err := adapter.handleConversationFactsRPC(context.Background(), body)
+	require.NoError(t, err)
+	resp, err := decodeConversationFactsResponse(respBody)
+	require.NoError(t, err)
+	require.Equal(t, rpcStatusNotLeader, resp.Status)
+	require.Empty(t, log.fetches)
+}
+
+func TestConversationFactsRPCAuthoritativeLatestFencesEpochsAndRequiresLeader(t *testing.T) {
+	log := &recordingAuthoritativeConversationFactsLog{
+		status: channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 12, CommittedSeq: 7},
+		fetch: channel.FetchResult{Messages: []channel.Message{{
+			ChannelID:   "g1",
+			ChannelType: 2,
+			MessageSeq:  7,
+		}},
+		},
+	}
+	adapter := New(Options{ChannelLog: log, LocalNodeID: 1})
+	body := mustEncodeConversationFactsRequest(t, conversationFactsRequest{
+		Op:                   conversationFactsOpLatestAuthoritative,
+		Key:                  newConversationFactsChannelKey(channel.ChannelID{ID: "g1", Type: 2}),
+		MaxBytes:             1024,
+		ExpectedChannelEpoch: 11,
+		ExpectedLeaderEpoch:  12,
+	})
+
+	respBody, err := adapter.handleConversationFactsRPC(context.Background(), body)
+	require.NoError(t, err)
+	resp, err := decodeConversationFactsResponse(respBody)
+	require.NoError(t, err)
+	require.Equal(t, rpcStatusOK, resp.Status)
+	require.Len(t, resp.Messages, 1)
+	require.Equal(t, []channel.FetchRequest{{
+		ChannelID:            channel.ChannelID{ID: "g1", Type: 2},
+		FromSeq:              7,
+		Limit:                1,
+		MaxBytes:             1024,
+		ExpectedChannelEpoch: 11,
+		ExpectedLeaderEpoch:  12,
+		RequireLeader:        true,
+	}}, log.fetches)
+}
+
+func TestConversationFactsAuthoritativeClientPreservesNotLeaderStatus(t *testing.T) {
+	network := newFakeClusterNetwork(nil, nil)
+	New(Options{
+		Cluster:     network.cluster(2),
+		ChannelLog:  &recordingAuthoritativeConversationFactsLog{status: channel.ChannelRuntimeStatus{Leader: 3, LeaderEpoch: 12, CommittedSeq: 7}},
+		LocalNodeID: 2,
+	})
+	client := NewClient(network.cluster(1))
+
+	_, ok, err := client.LoadLatestConversationMessageAuthoritative(
+		context.Background(),
+		2,
+		channel.ChannelID{ID: "g1", Type: 2},
+		1024,
+		11,
+		12,
+	)
+
+	require.ErrorIs(t, err, channel.ErrNotLeader)
+	require.False(t, ok)
 }
 
 func TestConversationFactsRPCRefreshesStaleMetaForBatchRecentLoads(t *testing.T) {
@@ -139,6 +274,31 @@ type refreshableConversationFactsLog struct {
 	status    channel.ChannelRuntimeStatus
 	fetch     channel.FetchResult
 	refreshed bool
+}
+
+type recordingAuthoritativeConversationFactsLog struct {
+	status    channel.ChannelRuntimeStatus
+	statusErr error
+	fetch     channel.FetchResult
+	fetchErr  error
+	fetches   []channel.FetchRequest
+}
+
+func (l *recordingAuthoritativeConversationFactsLog) Status(channel.ChannelID) (channel.ChannelRuntimeStatus, error) {
+	return l.status, l.statusErr
+}
+
+func (l *recordingAuthoritativeConversationFactsLog) Fetch(_ context.Context, req channel.FetchRequest) (channel.FetchResult, error) {
+	l.fetches = append(l.fetches, req)
+	return l.fetch, l.fetchErr
+}
+
+func (l *recordingAuthoritativeConversationFactsLog) Append(context.Context, channel.AppendRequest) (channel.AppendResult, error) {
+	return channel.AppendResult{}, nil
+}
+
+func (l *recordingAuthoritativeConversationFactsLog) AppendBatch(context.Context, channel.AppendBatchRequest) (channel.AppendBatchResult, error) {
+	return channel.AppendBatchResult{}, nil
 }
 
 func (l *refreshableConversationFactsLog) Status(channel.ChannelID) (channel.ChannelRuntimeStatus, error) {

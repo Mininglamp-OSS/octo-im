@@ -215,6 +215,8 @@ type FetchRequest struct {
 	MaxBytes             int
 	ExpectedChannelEpoch uint64
 	ExpectedLeaderEpoch  uint64
+	// RequireLeader rejects reads from followers and fenced former leaders.
+	RequireLeader bool
 }
 
 type FetchResult struct {

@@ -34,6 +34,9 @@ func (s *service) Fetch(_ context.Context, req channel.FetchRequest) (channel.Fe
 		return channel.FetchResult{}, channel.ErrStaleMeta
 	}
 	state := group.Status()
+	if req.RequireLeader && state.Role != channel.ReplicaRoleLeader {
+		return channel.FetchResult{}, channel.ErrNotLeader
+	}
 	if !state.CommitReady {
 		return channel.FetchResult{}, channel.ErrNotReady
 	}

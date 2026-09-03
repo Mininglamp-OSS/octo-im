@@ -18,6 +18,7 @@ import (
 	testdatausecase "github.com/WuKongIM/WuKongIM/internal/usecase/testdata"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/user"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 	"github.com/stretchr/testify/require"
@@ -1436,6 +1437,32 @@ func TestConversationSetUnreadRejectsInvalidLegacyRequest(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.JSONEq(t, `{"msg":"UID cannot be empty","status":400}`, rec.Body.String())
 	require.Empty(t, conversations.setUnreadCommands)
+}
+
+func TestConversationMutationsReturnServiceUnavailableForRetryableClusterErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "not ready", err: channel.ErrNotReady},
+		{name: "stale metadata", err: channel.ErrStaleMeta},
+		{name: "not leader", err: channel.ErrNotLeader},
+		{name: "no leader", err: raftcluster.ErrNoLeader},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conversations := &recordingConversationUsecase{setUnreadErr: tt.err}
+			srv := New(Options{Conversations: conversations})
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/conversations/setUnread", bytes.NewBufferString(`{"uid":"u1","channel_id":"g1","channel_type":2,"unread":3}`))
+			req.Header.Set("Content-Type", "application/json")
+			srv.Engine().ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+			require.JSONEq(t, `{"msg":"retry required","status":503}`, rec.Body.String())
+		})
+	}
 }
 
 type recordingMessageUsecase struct {

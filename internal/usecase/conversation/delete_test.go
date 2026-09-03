@@ -14,11 +14,12 @@ func TestDeleteConversationHidesStateClearsActiveAtAndRemovesHotHint(t *testing.
 	now := time.Unix(123, 0)
 	repo := newConversationDeleteRepoStub()
 	app := New(Options{
-		States:  repo,
-		Deletes: repo,
-		Facts:   repo,
-		Now:     func() time.Time { return now },
-		Async:   func(fn func()) { fn() },
+		States:             repo,
+		Deletes:            repo,
+		Facts:              repo,
+		AuthoritativeFacts: repo,
+		Now:                func() time.Time { return now },
+		Async:              func(fn func()) { fn() },
 	})
 
 	err := app.DeleteConversation(context.Background(), DeleteConversationCommand{
@@ -48,13 +49,21 @@ func TestDeleteConversationHidesStateClearsActiveAtAndRemovesHotHint(t *testing.
 func TestDeleteConversationUsesLatestMessageSeqWhenCommandSeqIsZero(t *testing.T) {
 	now := time.Unix(123, 0)
 	repo := newConversationDeleteRepoStub()
-	repo.latest[key("g1", 2)] = channel.Message{ChannelID: "g1", ChannelType: 2, MessageSeq: 15}
+	repo.latest[key("g1", 2)] = channel.Message{ChannelID: "g1", ChannelType: 2, MessageSeq: 8}
+	baseFacts := newConversationSyncRepoStub()
+	authoritativeFacts := &authoritativeConversationFactsStub{
+		conversationSyncRepoStub: baseFacts,
+		latest: map[ConversationKey]channel.Message{
+			key("g1", 2): {ChannelID: "g1", ChannelType: 2, MessageSeq: 15},
+		},
+	}
 	app := New(Options{
-		States:  repo,
-		Deletes: repo,
-		Facts:   repo,
-		Now:     func() time.Time { return now },
-		Async:   func(fn func()) { fn() },
+		States:             repo,
+		Deletes:            repo,
+		Facts:              repo,
+		AuthoritativeFacts: authoritativeFacts,
+		Now:                func() time.Time { return now },
+		Async:              func(fn func()) { fn() },
 	})
 
 	err := app.DeleteConversation(context.Background(), DeleteConversationCommand{
@@ -65,15 +74,17 @@ func TestDeleteConversationUsesLatestMessageSeqWhenCommandSeqIsZero(t *testing.T
 
 	require.NoError(t, err)
 	require.Equal(t, uint64(15), repo.hides[0].DeletedToSeq)
-	require.Equal(t, []ConversationKey{key("g1", 2)}, repo.latestLoads)
+	require.Equal(t, []ConversationKey{key("g1", 2)}, authoritativeFacts.loads)
+	require.Empty(t, repo.latestLoads)
 }
 
 func TestDeleteConversationReturnsErrorWhenLatestMessageSeqMissing(t *testing.T) {
 	repo := newConversationDeleteRepoStub()
 	app := New(Options{
-		States:  repo,
-		Deletes: repo,
-		Facts:   repo,
+		States:             repo,
+		Deletes:            repo,
+		Facts:              repo,
+		AuthoritativeFacts: repo,
 	})
 
 	err := app.DeleteConversation(context.Background(), DeleteConversationCommand{
@@ -103,9 +114,10 @@ func TestDeleteConversationDoesNotWaitForHotHintRemoval(t *testing.T) {
 		}
 	}
 	app := New(Options{
-		States:  repo,
-		Deletes: repo,
-		Facts:   repo,
+		States:             repo,
+		Deletes:            repo,
+		Facts:              repo,
+		AuthoritativeFacts: repo,
 	})
 
 	done := make(chan error, 1)
@@ -153,11 +165,12 @@ func TestDeleteConversationAllowsNewerMessageReactivation(t *testing.T) {
 	})
 	repo.cache = cache
 	app := New(Options{
-		States:  repo,
-		Deletes: repo,
-		Facts:   repo,
-		Now:     func() time.Time { return now },
-		Async:   func(fn func()) { fn() },
+		States:             repo,
+		Deletes:            repo,
+		Facts:              repo,
+		AuthoritativeFacts: repo,
+		Now:                func() time.Time { return now },
+		Async:              func(fn func()) { fn() },
 	})
 	require.NoError(t, cache.SubmitHints(context.Background(), []metadb.UserConversationActiveHint{
 		{UID: "u1", ChannelID: "g1", ChannelType: 2, ActiveAt: 100, MessageSeq: 10},
@@ -233,6 +246,10 @@ func (r *conversationDeleteRepoStub) LoadLatestMessages(_ context.Context, keys 
 		}
 	}
 	return out, nil
+}
+
+func (r *conversationDeleteRepoStub) LoadLatestMessagesAuthoritative(ctx context.Context, keys []ConversationKey) (map[ConversationKey]channel.Message, error) {
+	return r.LoadLatestMessages(ctx, keys)
 }
 
 func (r *conversationDeleteRepoStub) LoadRecentMessages(context.Context, ConversationKey, int) ([]channel.Message, error) {

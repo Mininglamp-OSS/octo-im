@@ -244,6 +244,10 @@ func (r *conversationSyncRepoStub) LoadLatestMessages(_ context.Context, keys []
 	return out, nil
 }
 
+func (r *conversationSyncRepoStub) LoadLatestMessagesAuthoritative(ctx context.Context, keys []ConversationKey) (map[ConversationKey]channel.Message, error) {
+	return r.LoadLatestMessages(ctx, keys)
+}
+
 func (r *conversationSyncRepoStub) LoadRecentMessages(_ context.Context, key ConversationKey, limit int) ([]channel.Message, error) {
 	if r.recentLoadErr != nil {
 		return nil, r.recentLoadErr
