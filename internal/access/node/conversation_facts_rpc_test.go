@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelhandler "github.com/WuKongIM/WuKongIM/pkg/channel/handler"
 	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel/runtime"
+	channelstore "github.com/WuKongIM/WuKongIM/pkg/db/message"
 	"github.com/stretchr/testify/require"
 )
 
@@ -304,6 +306,51 @@ func TestConversationFactsAuthoritativeClientPreservesNotLeaderStatus(t *testing
 	require.False(t, ok)
 }
 
+func TestConversationFactsAuthoritativeClientPreservesPermanentChannelStatuses(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     channel.Status
+		wantStatus string
+		wantErr    error
+	}{
+		{name: "deleting", status: channel.StatusDeleting, wantStatus: conversationFactsStatusChannelDeleting, wantErr: channel.ErrChannelDeleting},
+		{name: "deleted", status: channel.StatusDeleted, wantStatus: conversationFactsStatusChannelNotFound, wantErr: channel.ErrChannelNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := newPermanentStatusConversationFactsLog(t, tt.status)
+			network := newFakeClusterNetwork(nil, nil)
+			adapter := New(Options{Cluster: network.cluster(2), ChannelLog: log, LocalNodeID: 2})
+			requestBody := mustEncodeConversationFactsRequest(t, conversationFactsRequest{
+				Op:                   conversationFactsOpLatestAuthoritative,
+				Key:                  newConversationFactsChannelKey(channel.ChannelID{ID: "g1", Type: 2}),
+				MaxBytes:             1024,
+				ExpectedChannelEpoch: 11,
+				ExpectedLeaderEpoch:  12,
+			})
+
+			responseBody, err := adapter.handleConversationFactsRPC(context.Background(), requestBody)
+			require.NoError(t, err)
+			response, err := decodeConversationFactsResponse(responseBody)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantStatus, response.Status)
+
+			client := NewClient(network.cluster(1))
+			_, ok, err := client.LoadLatestConversationMessageAuthoritative(
+				context.Background(),
+				2,
+				channel.ChannelID{ID: "g1", Type: 2},
+				1024,
+				11,
+				12,
+			)
+
+			require.ErrorIs(t, err, tt.wantErr)
+			require.False(t, ok)
+		})
+	}
+}
+
 func TestConversationFactsAuthoritativeClientTreatsLegacyPeerCodecAsNotReady(t *testing.T) {
 	client := NewClient(remoteErrorCluster{err: errors.New("nodetransport: remote error: access/node: invalid conversation facts request codec")})
 
@@ -321,7 +368,8 @@ func TestConversationFactsAuthoritativeClientTreatsLegacyPeerCodecAsNotReady(t *
 }
 
 func TestConversationFactsAuthoritativeClientTreatsTransportFailureAsRouteUnavailable(t *testing.T) {
-	client := NewClient(remoteErrorCluster{err: errors.New("dial tcp 10.0.0.2:11110: connect: connection refused")})
+	transportErr := errors.New("dial tcp 10.0.0.2:11110: connect: connection refused")
+	client := NewClient(remoteErrorCluster{err: transportErr})
 
 	_, ok, err := client.LoadLatestConversationMessageAuthoritative(
 		context.Background(),
@@ -334,6 +382,7 @@ func TestConversationFactsAuthoritativeClientTreatsTransportFailureAsRouteUnavai
 
 	require.ErrorIs(t, err, ErrConversationFactsRouteUnavailable)
 	require.ErrorIs(t, err, channel.ErrNotReady)
+	require.ErrorIs(t, err, transportErr)
 	require.False(t, ok)
 }
 
@@ -427,6 +476,57 @@ type recordingAuthoritativeConversationFactsLog struct {
 	fetch     channel.FetchResult
 	fetchErr  error
 	fetches   []channel.FetchRequest
+}
+
+type permanentStatusConversationFactsLog struct {
+	channel.MetaRollbackService
+	status channel.ChannelRuntimeStatus
+}
+
+func (l permanentStatusConversationFactsLog) Status(channel.ChannelID) (channel.ChannelRuntimeStatus, error) {
+	return l.status, nil
+}
+
+type emptyConversationFactsHandlerRuntime struct{}
+
+func (emptyConversationFactsHandlerRuntime) Channel(channel.ChannelKey) (channel.HandlerChannel, bool) {
+	return nil, false
+}
+
+type conversationFactsMessageIDs struct{}
+
+func (conversationFactsMessageIDs) Next() uint64 { return 1 }
+
+func newPermanentStatusConversationFactsLog(t *testing.T, status channel.Status) ChannelLog {
+	t.Helper()
+
+	engine, err := channelstore.Open(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, engine.Close()) })
+
+	service, err := channelhandler.New(channelhandler.Config{
+		Runtime:    emptyConversationFactsHandlerRuntime{},
+		Store:      engine,
+		MessageIDs: conversationFactsMessageIDs{},
+	})
+	require.NoError(t, err)
+	id := channel.ChannelID{ID: "g1", Type: 2}
+	require.NoError(t, service.ApplyMeta(channel.Meta{
+		ID:          id,
+		Epoch:       11,
+		LeaderEpoch: 12,
+		Leader:      2,
+		Status:      status,
+	}))
+
+	return permanentStatusConversationFactsLog{
+		MetaRollbackService: service,
+		status: channel.ChannelRuntimeStatus{
+			Leader:       2,
+			LeaderEpoch:  12,
+			CommittedSeq: 7,
+		},
+	}
 }
 
 func (l *recordingAuthoritativeConversationFactsLog) Status(channel.ChannelID) (channel.ChannelRuntimeStatus, error) {

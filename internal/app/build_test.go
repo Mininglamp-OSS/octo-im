@@ -185,7 +185,7 @@ func TestChannelLogConversationFactsAuthoritativeFencesStaleLocalLeaderEpoch(t *
 	require.Equal(t, 1, metas.invalidateCalls)
 }
 
-func TestChannelLogConversationFactsAuthoritativeTreatsDeletedLocalChannelAsEmpty(t *testing.T) {
+func TestChannelLogConversationFactsAuthoritativePreservesDeletedLocalChannelError(t *testing.T) {
 	id := channel.ChannelID{ID: "g1", Type: 2}
 	cluster := &readyConversationFactsCluster{
 		status:   channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 12, CommittedSeq: 10},
@@ -202,8 +202,40 @@ func TestChannelLogConversationFactsAuthoritativeTreatsDeletedLocalChannelAsEmpt
 
 	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
 
-	require.NoError(t, err)
+	require.ErrorIs(t, err, channel.ErrChannelNotFound)
 	require.Empty(t, got)
+}
+
+func TestChannelLogConversationFactsAuthoritativePreservesRemotePermanentChannelErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "deleting", err: channel.ErrChannelDeleting},
+		{name: "deleted", err: channel.ErrChannelNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := channel.ChannelID{ID: "g1", Type: 2}
+			metas := &staticConversationFactsMetas{metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{
+				id: {ChannelID: id.ID, ChannelType: int64(id.Type), ChannelEpoch: 11, LeaderEpoch: 12, Leader: 2},
+			}}
+			remote := &recordingConversationFactsRemote{authoritativeErrByNode: map[uint64]error{2: tt.err}}
+			facts := channelLogConversationFacts{
+				cluster:     staleConversationFactsCluster{},
+				remote:      remote,
+				metaRefresh: metas,
+				localNodeID: 1,
+			}
+
+			got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
+
+			require.ErrorIs(t, err, tt.err)
+			require.Empty(t, got)
+			require.Len(t, remote.authoritativeLatestCalls, 1)
+			require.Zero(t, metas.invalidateCalls)
+		})
+	}
 }
 
 func TestChannelLogConversationFactsAuthoritativeRefreshesAndRetriesStaleLeader(t *testing.T) {

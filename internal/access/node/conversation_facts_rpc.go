@@ -14,6 +14,8 @@ const (
 	conversationFactsOpLatest              = "latest"
 	conversationFactsOpLatestAuthoritative = "latest_authoritative"
 	conversationFactsOpRecent              = "recent"
+	conversationFactsStatusChannelDeleting = "channel_deleting"
+	conversationFactsStatusChannelNotFound = "channel_not_found"
 	conversationFactsStatusNotReady        = "not_ready"
 	conversationFactsStatusStaleMeta       = "stale_meta"
 )
@@ -131,12 +133,14 @@ func (a *Adapter) handleConversationFactsRPC(ctx context.Context, body []byte) (
 	default:
 		return nil, fmt.Errorf("access/node: unknown conversation facts op %q", req.Op)
 	}
-	if errors.Is(err, channel.ErrChannelNotFound) {
+	if req.Op != conversationFactsOpLatestAuthoritative && errors.Is(err, channel.ErrChannelNotFound) {
 		err = nil
 	}
 	if err != nil {
-		if status, ok := conversationFactsErrorStatus(err); ok {
-			return encodeConversationFactsResponse(conversationFactsResponse{Status: status})
+		if req.Op == conversationFactsOpLatestAuthoritative {
+			if status, ok := conversationFactsErrorStatus(err); ok {
+				return encodeConversationFactsResponse(conversationFactsResponse{Status: status})
+			}
 		}
 		return nil, err
 	}
@@ -286,9 +290,6 @@ func LoadLatestConversationMessageAuthoritative(ctx context.Context, cluster Con
 		ExpectedLeaderEpoch:  expectedLeaderEpoch,
 		RequireLeader:        true,
 	})
-	if errors.Is(err, channel.ErrChannelNotFound) {
-		return channel.Message{}, false, nil
-	}
 	if err != nil {
 		return channel.Message{}, false, err
 	}
@@ -300,6 +301,10 @@ func LoadLatestConversationMessageAuthoritative(ctx context.Context, cluster Con
 
 func conversationFactsErrorStatus(err error) (string, bool) {
 	switch {
+	case errors.Is(err, channel.ErrChannelDeleting):
+		return conversationFactsStatusChannelDeleting, true
+	case errors.Is(err, channel.ErrChannelNotFound):
+		return conversationFactsStatusChannelNotFound, true
 	case errors.Is(err, channel.ErrNotLeader):
 		return rpcStatusNotLeader, true
 	case errors.Is(err, channel.ErrNotReady):

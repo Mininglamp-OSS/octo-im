@@ -23,6 +23,7 @@
 - Read-cursor route resolution must use non-bootstrapping metadata activation; an unknown client-supplied channel ID must not create runtime metadata.
 - A leader-reroute retry must invalidate cached channel metadata before refreshing it; otherwise both attempts can target the same former leader.
 - Conversation mutation APIs must map transient internal routing failures to a stable retryable response and never expose raw internal errors.
+- Authoritative conversation-facts RPC must preserve permanent channel states so local and remote mutation paths return the same result without retrying.
 - During mixed-version rollout, a peer that does not understand the authoritative conversation-facts codec must fail closed with a retryable response; never fall back to an unfenced legacy read.
 - Ordinary conversation sync remains best-effort per channel: a transiently not-ready remote channel must not fail the user's whole conversation list.
 - Duplicate/stale delete barriers must not clear an `ActiveAt` written by a newer message.

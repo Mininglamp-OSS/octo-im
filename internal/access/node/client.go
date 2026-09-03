@@ -541,7 +541,7 @@ func normalizeConversationFactsRPCError(err error) error {
 		strings.Contains(msg, "unsupported conversation facts op"):
 		return fmt.Errorf("%w: peer does not support authoritative conversation facts", channel.ErrNotReady)
 	default:
-		return fmt.Errorf("%w: %w: %v", ErrConversationFactsRouteUnavailable, channel.ErrNotReady, err)
+		return fmt.Errorf("%w: %w: %w", ErrConversationFactsRouteUnavailable, channel.ErrNotReady, err)
 	}
 }
 
@@ -553,6 +553,10 @@ func conversationFactsResponseError(status string) error {
 		return channel.ErrNotLeader
 	case rpcStatusNoLeader:
 		return raftcluster.ErrNoLeader
+	case conversationFactsStatusChannelDeleting:
+		return channel.ErrChannelDeleting
+	case conversationFactsStatusChannelNotFound:
+		return channel.ErrChannelNotFound
 	case conversationFactsStatusNotReady:
 		return channel.ErrNotReady
 	case conversationFactsStatusStaleMeta:
