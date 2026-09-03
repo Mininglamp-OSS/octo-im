@@ -104,6 +104,7 @@ func TestApplyMetaLeaderLeaseRenewalDoesNotGateAppendsWhileCheckpointPending(t *
 
 	st := r.Status()
 	require.True(t, st.CommitReady)
+	require.Equal(t, renewed.LeaseUntil, st.LeaseUntil)
 	require.Equal(t, uint64(1), st.LEO)
 	require.Equal(t, uint64(1), st.HW)
 	require.Equal(t, uint64(0), st.CheckpointHW)

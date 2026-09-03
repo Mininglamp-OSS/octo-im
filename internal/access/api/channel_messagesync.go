@@ -64,11 +64,15 @@ func (s *Server) handleChannelMessageSync(c *gin.Context) {
 }
 
 func writeLegacyJSONError(c *gin.Context, message string) {
+	writeLegacyJSONErrorStatus(c, http.StatusBadRequest, message)
+}
+
+func writeLegacyJSONErrorStatus(c *gin.Context, status int, message string) {
 	if c == nil {
 		return
 	}
-	c.JSON(http.StatusBadRequest, gin.H{
+	c.JSON(status, gin.H{
 		"msg":    message,
-		"status": http.StatusBadRequest,
+		"status": status,
 	})
 }

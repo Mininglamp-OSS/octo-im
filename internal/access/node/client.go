@@ -384,6 +384,29 @@ func (c *Client) LoadLatestConversationMessage(ctx context.Context, nodeID uint6
 	if err != nil {
 		return channel.Message{}, false, err
 	}
+	if err := conversationFactsResponseError(resp.Status); err != nil {
+		return channel.Message{}, false, err
+	}
+	if len(resp.Messages) == 0 {
+		return channel.Message{}, false, nil
+	}
+	return resp.Messages[0], true, nil
+}
+
+func (c *Client) LoadLatestConversationMessageAuthoritative(ctx context.Context, nodeID uint64, key channel.ChannelID, maxBytes int, expectedChannelEpoch, expectedLeaderEpoch uint64) (channel.Message, bool, error) {
+	resp, err := callConversationFactsDirect(ctx, c, nodeID, conversationFactsRequest{
+		Op:                   conversationFactsOpLatestAuthoritative,
+		Key:                  newConversationFactsChannelKey(key),
+		MaxBytes:             maxBytes,
+		ExpectedChannelEpoch: expectedChannelEpoch,
+		ExpectedLeaderEpoch:  expectedLeaderEpoch,
+	})
+	if err != nil {
+		return channel.Message{}, false, normalizeConversationFactsRPCError(err)
+	}
+	if err := conversationFactsResponseError(resp.Status); err != nil {
+		return channel.Message{}, false, err
+	}
 	if len(resp.Messages) == 0 {
 		return channel.Message{}, false, nil
 	}
@@ -397,6 +420,9 @@ func (c *Client) LoadLatestConversationMessages(ctx context.Context, nodeID uint
 		MaxBytes: maxBytes,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := conversationFactsResponseError(resp.Status); err != nil {
 		return nil, err
 	}
 	out := make(map[channel.ChannelID]channel.Message, len(resp.Entries))
@@ -419,6 +445,9 @@ func (c *Client) LoadRecentConversationMessages(ctx context.Context, nodeID uint
 	if err != nil {
 		return nil, err
 	}
+	if err := conversationFactsResponseError(resp.Status); err != nil {
+		return nil, err
+	}
 	return append([]channel.Message(nil), resp.Messages...), nil
 }
 
@@ -430,6 +459,9 @@ func (c *Client) LoadRecentConversationMessagesBatch(ctx context.Context, nodeID
 		MaxBytes: maxBytes,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := conversationFactsResponseError(resp.Status); err != nil {
 		return nil, err
 	}
 	out := make(map[channel.ChannelID][]channel.Message, len(resp.Entries))
@@ -480,6 +512,58 @@ func callConversationFactsDirect(ctx context.Context, c *Client, nodeID uint64, 
 		return conversationFactsResponse{}, err
 	}
 	return decodeConversationFactsResponse(respBody)
+}
+
+func normalizeConversationFactsRPCError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, channel.ErrNotLeader) ||
+		errors.Is(err, channel.ErrStaleMeta) ||
+		errors.Is(err, channel.ErrNotReady) ||
+		errors.Is(err, raftcluster.ErrNoLeader) {
+		return err
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, channel.ErrNotLeader.Error()):
+		return channel.ErrNotLeader
+	case strings.Contains(msg, channel.ErrStaleMeta.Error()):
+		return channel.ErrStaleMeta
+	case strings.Contains(msg, channel.ErrNotReady.Error()):
+		return channel.ErrNotReady
+	case strings.Contains(msg, raftcluster.ErrNoLeader.Error()):
+		return raftcluster.ErrNoLeader
+	// These fragments are a temporary wire-compatibility contract with peers
+	// that predate the authoritative conversation-facts operation.
+	case strings.Contains(msg, "invalid conversation facts request codec"),
+		strings.Contains(msg, "unknown conversation facts op"),
+		strings.Contains(msg, "unsupported conversation facts op"):
+		return fmt.Errorf("%w: peer does not support authoritative conversation facts", channel.ErrNotReady)
+	default:
+		return fmt.Errorf("%w: %w: %w", ErrConversationFactsRouteUnavailable, channel.ErrNotReady, err)
+	}
+}
+
+func conversationFactsResponseError(status string) error {
+	switch status {
+	case rpcStatusOK:
+		return nil
+	case rpcStatusNotLeader:
+		return channel.ErrNotLeader
+	case rpcStatusNoLeader:
+		return raftcluster.ErrNoLeader
+	case conversationFactsStatusChannelDeleting:
+		return channel.ErrChannelDeleting
+	case conversationFactsStatusChannelNotFound:
+		return channel.ErrChannelNotFound
+	case conversationFactsStatusNotReady:
+		return channel.ErrNotReady
+	case conversationFactsStatusStaleMeta:
+		return channel.ErrStaleMeta
+	default:
+		return fmt.Errorf("access/node: unexpected conversation facts status %q", status)
+	}
 }
 
 func callAuthoritativeRPC[T authoritativeRPCResponse](

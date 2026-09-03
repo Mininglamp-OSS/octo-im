@@ -17,6 +17,7 @@ type Options struct {
 	States                ConversationStateStore
 	Deletes               ConversationDeleteStore
 	Facts                 MessageFactsStore
+	AuthoritativeFacts    AuthoritativeMessageFactsStore
 	Now                   func() time.Time
 	ActiveScanLimit       int
 	ChannelProbeBatchSize int
@@ -26,12 +27,13 @@ type Options struct {
 }
 
 type App struct {
-	states          ConversationStateStore
-	deletes         ConversationDeleteStore
-	facts           MessageFactsStore
-	now             func() time.Time
-	async           func(func())
-	activeScanLimit int
+	states             ConversationStateStore
+	deletes            ConversationDeleteStore
+	facts              MessageFactsStore
+	authoritativeFacts AuthoritativeMessageFactsStore
+	now                func() time.Time
+	async              func(func())
+	activeScanLimit    int
 }
 
 func New(opts Options) *App {
@@ -51,11 +53,12 @@ func New(opts Options) *App {
 	}
 
 	return &App{
-		states:          opts.States,
-		deletes:         opts.Deletes,
-		facts:           opts.Facts,
-		now:             opts.Now,
-		async:           opts.Async,
-		activeScanLimit: opts.ActiveScanLimit,
+		states:             opts.States,
+		deletes:            opts.Deletes,
+		facts:              opts.Facts,
+		authoritativeFacts: opts.AuthoritativeFacts,
+		now:                opts.Now,
+		async:              opts.Async,
+		activeScanLimit:    opts.ActiveScanLimit,
 	}
 }

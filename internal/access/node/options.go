@@ -17,6 +17,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/usecase/plugin/pluginproto"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel/runtime"
 	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	channelstore "github.com/WuKongIM/WuKongIM/pkg/db/message"
 	"github.com/WuKongIM/WuKongIM/pkg/metrics"
@@ -53,6 +54,8 @@ type ChannelLog interface {
 
 type ChannelMetaRefresher interface {
 	RefreshChannelMeta(ctx context.Context, id channel.ChannelID) (channel.Meta, error)
+	ActivateByID(ctx context.Context, id channel.ChannelID, source channelruntime.ActivationSource) (channel.Meta, error)
+	InvalidateChannelMeta(id channel.ChannelID)
 }
 
 // ChannelLeaderRepairer repairs a channel leader on the authoritative slot leader.

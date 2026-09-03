@@ -18,6 +18,14 @@
 - `ActiveAt` is a best-effort hint: updates may be batched, throttled, dropped, and merged from cache during `ListUserConversationActive`.
 - Deleting a conversation clears current active visibility through `DeletedToSeq`; a later message with a larger sequence must be allowed to reactivate it.
 - Delete without an explicit message sequence must first resolve the latest Channel Log sequence; if no sequence is available, do not install a zero delete barrier.
+- Delete without an explicit message sequence returns a stable conflict response when no latest message payload is available; this client-reachable condition is not an internal server failure.
+- Conversation read-cursor mutations must resolve the latest message through a leader-required, epoch-fenced read; a readable follower, lease-expired leader, write-fenced leader, or drained former leader is not authoritative even when it is `CommitReady`.
+- Read-cursor route resolution must use non-bootstrapping metadata activation; an unknown client-supplied channel ID must not create runtime metadata.
+- A leader-reroute retry must invalidate cached channel metadata before refreshing it; otherwise both attempts can target the same former leader.
+- Conversation mutation APIs must map transient internal routing failures to a stable retryable response and never expose raw internal errors.
+- Authoritative conversation-facts RPC must preserve permanent channel states so local and remote mutation paths return the same result without retrying.
+- During mixed-version rollout, a peer that does not understand the authoritative conversation-facts codec must fail closed with a retryable response; never fall back to an unfenced legacy read.
+- Ordinary conversation sync remains best-effort per channel: a transiently not-ready remote channel must not fail the user's whole conversation list.
 - Duplicate/stale delete barriers must not clear an `ActiveAt` written by a newer message.
 - Legacy channel allowlist, denylist, and temporary-subscriber APIs are backed by namespaced slot subscriber lists until dedicated metadata tables exist.
 - Legacy system UID APIs are backed by the namespaced slot subscriber list `__wk_internal_system_uids__`.

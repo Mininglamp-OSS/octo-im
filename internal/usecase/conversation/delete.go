@@ -29,7 +29,7 @@ func (a *App) DeleteConversation(ctx context.Context, cmd DeleteConversationComm
 			return err
 		}
 		if !ok || latestSeq == 0 {
-			return errors.New("conversation latest message not found")
+			return ErrLatestMessageUnavailable
 		}
 		deleteSeq = latestSeq
 	}

@@ -6,6 +6,7 @@ import (
 
 	runtimechannelplane "github.com/WuKongIM/WuKongIM/internal/runtime/channelplane"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel/runtime"
 	"github.com/stretchr/testify/require"
 )
 
@@ -90,3 +91,9 @@ func (r *recordingNodeMetaRefresher) RefreshChannelMeta(context.Context, channel
 	r.calls++
 	return channel.Meta{}, nil
 }
+
+func (r *recordingNodeMetaRefresher) ActivateByID(ctx context.Context, id channel.ChannelID, _ channelruntime.ActivationSource) (channel.Meta, error) {
+	return r.RefreshChannelMeta(ctx, id)
+}
+
+func (r *recordingNodeMetaRefresher) InvalidateChannelMeta(channel.ChannelID) {}

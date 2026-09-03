@@ -140,6 +140,8 @@ type HandlerBuildConfig struct {
 	Store      any
 	Runtime    HandlerRuntime
 	MessageIDs MessageIDGenerator
+	// Now supplies the same clock used by the runtime for lease decisions.
+	Now func() time.Time
 }
 
 type cluster struct {
@@ -216,6 +218,7 @@ func New(cfg Config) (Cluster, error) {
 		Store:      cfg.Store,
 		Runtime:    runtimeValue,
 		MessageIDs: cfg.MessageIDs,
+		Now:        cfg.Now,
 	})
 	if err != nil {
 		return nil, joinBuildError(err, runtimeCloser(), transportCloser())

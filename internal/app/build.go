@@ -532,13 +532,17 @@ func build(cfg Config) (_ *App, err error) {
 		GroupActiveFanoutMaxSubscribers: cfg.Conversation.GroupActiveFanoutMaxSubscribers,
 		Logger:                          app.logger.Named("conversation.projector"),
 	})
+	conversationFacts := channelLogConversationFacts{
+		cluster:     app.channelLog,
+		metas:       app.store,
+		remote:      app.nodeClient,
+		metaRefresh: app.channelMetaSync,
+		localNodeID: cfg.Node.ID,
+	}
 	app.conversationApp = conversationusecase.New(conversationusecase.Options{
-		States: app.store,
-		Facts: channelLogConversationFacts{
-			cluster: app.channelLog,
-			metas:   app.store,
-			remote:  app.nodeClient,
-		},
+		States:                app.store,
+		Facts:                 conversationFacts,
+		AuthoritativeFacts:    conversationFacts,
 		Now:                   time.Now,
 		ColdThreshold:         cfg.Conversation.ColdThreshold,
 		ActiveScanLimit:       cfg.Conversation.ActiveScanLimit,
@@ -1299,7 +1303,10 @@ func (c ClusterConfig) runtimeSeeds() []raftcluster.SeedConfig {
 	return seeds
 }
 
-const conversationFetchMaxBytes = 1 << 20
+const (
+	conversationFetchMaxBytes      = 1 << 20
+	conversationFactsRouteAttempts = 2
+)
 
 type channelLogConversationFacts struct {
 	cluster interface {
@@ -1311,8 +1318,14 @@ type channelLogConversationFacts struct {
 	}
 	remote interface {
 		LoadLatestConversationMessage(ctx context.Context, nodeID uint64, key channel.ChannelID, maxBytes int) (channel.Message, bool, error)
+		LoadLatestConversationMessageAuthoritative(ctx context.Context, nodeID uint64, key channel.ChannelID, maxBytes int, expectedChannelEpoch, expectedLeaderEpoch uint64) (channel.Message, bool, error)
 		LoadRecentConversationMessages(ctx context.Context, nodeID uint64, key channel.ChannelID, limit, maxBytes int) ([]channel.Message, error)
 	}
+	metaRefresh interface {
+		ActivateByID(ctx context.Context, id channel.ChannelID, source channelruntime.ActivationSource) (channel.Meta, error)
+		InvalidateChannelMeta(id channel.ChannelID)
+	}
+	localNodeID uint64
 }
 
 type batchConversationFactsRemote interface {
@@ -1364,6 +1377,106 @@ func (f channelLogConversationFacts) LoadLatestMessages(ctx context.Context, key
 		}
 	}
 	return out, nil
+}
+
+// LoadLatestMessagesAuthoritative resolves every channel to its current leader
+// before loading its latest message. Conversation mutations use this path so a
+// readable but lagging local replica cannot produce a stale read cursor.
+func (f channelLogConversationFacts) LoadLatestMessagesAuthoritative(ctx context.Context, keys []conversationusecase.ConversationKey) (map[conversationusecase.ConversationKey]channel.Message, error) {
+	out := make(map[conversationusecase.ConversationKey]channel.Message, len(keys))
+	for _, key := range keys {
+		msg, ok, err := f.loadLatestMessageAuthoritative(ctx, channel.ChannelID{ID: key.ChannelID, Type: key.ChannelType})
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out[key] = msg
+		}
+	}
+	return out, nil
+}
+
+func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.Context, id channel.ChannelID) (channel.Message, bool, error) {
+	if f.metaRefresh == nil {
+		return channel.Message{}, false, channel.ErrStaleMeta
+	}
+	var lastErr error
+	for attempt := 0; attempt < conversationFactsRouteAttempts; attempt++ {
+		meta, err := f.metaRefresh.ActivateByID(ctx, id, channelruntime.ActivationSourceFetch)
+		if err != nil {
+			if errors.Is(err, metadb.ErrNotFound) {
+				return channel.Message{}, false, channel.ErrChannelNotFound
+			}
+			lastErr = conversationFactsRouteUnavailable(err)
+			if conversationFactsRouteRetryable(lastErr) {
+				if attempt+1 < conversationFactsRouteAttempts {
+					f.metaRefresh.InvalidateChannelMeta(id)
+				}
+				continue
+			}
+			return channel.Message{}, false, lastErr
+		}
+
+		var (
+			msg     channel.Message
+			ok      bool
+			loadErr error
+		)
+		if meta.Leader == 0 {
+			lastErr = raftcluster.ErrNoLeader
+		} else if uint64(meta.Leader) == f.localNodeID {
+			msg, ok, loadErr = accessnode.LoadLatestConversationMessageAuthoritative(ctx, f.cluster, id, conversationFetchMaxBytes, f.localNodeID, meta.Epoch, meta.LeaderEpoch)
+		} else if f.remote == nil {
+			return channel.Message{}, false, channel.ErrStaleMeta
+		} else {
+			msg, ok, loadErr = f.remote.LoadLatestConversationMessageAuthoritative(
+				ctx,
+				uint64(meta.Leader),
+				id,
+				conversationFetchMaxBytes,
+				meta.Epoch,
+				meta.LeaderEpoch,
+			)
+		}
+		if loadErr == nil && meta.Leader != 0 {
+			return msg, ok, nil
+		}
+		if loadErr != nil {
+			lastErr = normalizeConversationFactsAuthoritativeError(loadErr)
+		}
+		if !conversationFactsRouteRetryable(lastErr) {
+			return channel.Message{}, false, lastErr
+		}
+		if attempt+1 < conversationFactsRouteAttempts {
+			f.metaRefresh.InvalidateChannelMeta(id)
+		}
+	}
+	return channel.Message{}, false, lastErr
+}
+
+func normalizeConversationFactsAuthoritativeError(err error) error {
+	if err == nil ||
+		errors.Is(err, channel.ErrChannelNotFound) ||
+		errors.Is(err, channel.ErrChannelDeleting) ||
+		errors.Is(err, channel.ErrNotReady) ||
+		conversationFactsRouteRetryable(err) {
+		return err
+	}
+	return conversationFactsRouteUnavailable(err)
+}
+
+func conversationFactsRouteUnavailable(err error) error {
+	if errors.Is(err, accessnode.ErrConversationFactsRouteUnavailable) && errors.Is(err, channel.ErrNotReady) {
+		return err
+	}
+	return fmt.Errorf("%w: %w: %v", accessnode.ErrConversationFactsRouteUnavailable, channel.ErrNotReady, err)
+}
+
+func conversationFactsRouteRetryable(err error) bool {
+	return errors.Is(err, channel.ErrNotLeader) ||
+		errors.Is(err, channel.ErrStaleMeta) ||
+		errors.Is(err, accessnode.ErrConversationFactsRouteUnavailable) ||
+		errors.Is(err, raftcluster.ErrNoLeader)
 }
 
 func (f channelLogConversationFacts) LoadRecentMessages(ctx context.Context, key conversationusecase.ConversationKey, limit int) ([]channel.Message, error) {

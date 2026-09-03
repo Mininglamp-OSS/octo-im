@@ -18,6 +18,7 @@ import (
 	testdatausecase "github.com/WuKongIM/WuKongIM/internal/usecase/testdata"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/user"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 	"github.com/stretchr/testify/require"
@@ -1423,6 +1424,23 @@ func TestConversationDeleteMapsLegacyRequestToUsecaseCommand(t *testing.T) {
 	}, conversations.deleteCommands)
 }
 
+func TestConversationDeleteReturnsConflictWhenLatestMessageUnavailable(t *testing.T) {
+	conversations := &recordingConversationUsecase{
+		deleteErr: conversationusecase.ErrLatestMessageUnavailable,
+	}
+	srv := New(Options{Conversations: conversations})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/conversations/delete", bytes.NewBufferString(`{"uid":"u1","channel_id":"g1","channel_type":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.Engine().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.JSONEq(t, `{"msg":"conversation has no latest message","status":409}`, rec.Body.String())
+	require.Len(t, conversations.deleteCommands, 1)
+	require.Zero(t, conversations.deleteCommands[0].MessageSeq)
+}
+
 func TestConversationSetUnreadRejectsInvalidLegacyRequest(t *testing.T) {
 	conversations := &recordingConversationUsecase{}
 	srv := New(Options{Conversations: conversations})
@@ -1436,6 +1454,61 @@ func TestConversationSetUnreadRejectsInvalidLegacyRequest(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.JSONEq(t, `{"msg":"UID cannot be empty","status":400}`, rec.Body.String())
 	require.Empty(t, conversations.setUnreadCommands)
+}
+
+func TestConversationMutationsReturnServiceUnavailableForRetryableClusterErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "not ready", err: channel.ErrNotReady},
+		{name: "stale metadata", err: channel.ErrStaleMeta},
+		{name: "not leader", err: channel.ErrNotLeader},
+		{name: "no leader", err: raftcluster.ErrNoLeader},
+		{name: "wrapped internal failure", err: errors.Join(channel.ErrNotReady, errors.New("dial tcp 10.0.0.2:11110: connection refused"))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conversations := &recordingConversationUsecase{setUnreadErr: tt.err}
+			srv := New(Options{Conversations: conversations})
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/conversations/setUnread", bytes.NewBufferString(`{"uid":"u1","channel_id":"g1","channel_type":2,"unread":3}`))
+			req.Header.Set("Content-Type", "application/json")
+			srv.Engine().ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+			require.JSONEq(t, `{"msg":"retry required","status":503}`, rec.Body.String())
+		})
+	}
+}
+
+func TestConversationMutationsDoNotExposeInternalErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status int
+		body   string
+	}{
+		{name: "channel not found", err: channel.ErrChannelNotFound, status: http.StatusNotFound, body: `{"msg":"channel not found","status":404}`},
+		{name: "channel deleting", err: channel.ErrChannelDeleting, status: http.StatusConflict, body: `{"msg":"channel deleting","status":409}`},
+		{name: "unknown internal failure", err: errors.New("dial tcp 10.0.0.2:11110: connection refused"), status: http.StatusInternalServerError, body: `{"msg":"conversation mutation failed","status":500}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conversations := &recordingConversationUsecase{setUnreadErr: tt.err}
+			srv := New(Options{Conversations: conversations})
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/conversations/setUnread", bytes.NewBufferString(`{"uid":"u1","channel_id":"g1","channel_type":2,"unread":3}`))
+			req.Header.Set("Content-Type", "application/json")
+			srv.Engine().ServeHTTP(rec, req)
+
+			require.Equal(t, tt.status, rec.Code)
+			require.JSONEq(t, tt.body, rec.Body.String())
+			require.NotContains(t, rec.Body.String(), "10.0.0.2")
+		})
+	}
 }
 
 type recordingMessageUsecase struct {

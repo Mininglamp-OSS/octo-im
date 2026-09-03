@@ -23,6 +23,12 @@ type MessageFactsStore interface {
 	LoadRecentMessages(ctx context.Context, key ConversationKey, limit int) ([]channel.Message, error)
 }
 
+// AuthoritativeMessageFactsStore routes latest-message reads to the current
+// channel leader and fails closed when leadership cannot be proven.
+type AuthoritativeMessageFactsStore interface {
+	LoadLatestMessagesAuthoritative(ctx context.Context, keys []ConversationKey) (map[ConversationKey]channel.Message, error)
+}
+
 type ProjectorStore interface {
 	SubmitUserConversationActiveHints(ctx context.Context, hints []metadb.UserConversationActiveHint) error
 	ListChannelSubscribers(ctx context.Context, channelID string, channelType int64, afterUID string, limit int) ([]string, string, bool, error)

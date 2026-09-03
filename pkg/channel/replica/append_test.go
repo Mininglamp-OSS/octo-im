@@ -446,6 +446,7 @@ func TestFenceAndDrainRejectsNewAppends(t *testing.T) {
 	require.Equal(t, fenced.Key, drain.ChannelKey)
 	require.Equal(t, uint64(7), drain.ChannelEpoch)
 	require.Equal(t, uint64(1), drain.WriteFenceVersion)
+	require.Equal(t, uint64(1), r.Status().DrainedFenceVersion)
 
 	_, err = r.Append(context.Background(), []channel.Record{{Payload: []byte("x"), SizeBytes: 1}})
 	require.ErrorIs(t, err, channel.ErrWriteFenced)
@@ -786,16 +787,19 @@ func TestDrainedFailClosedReopensOnlyAfterNewerVersionClear(t *testing.T) {
 		ExpectedLeader:       1,
 	})
 	require.NoError(t, err)
+	require.Equal(t, uint64(1), r.Status().DrainedFenceVersion)
 
 	sameVersionClear := fenced
 	sameVersionClear.WriteFence = channel.WriteFence{Version: 1}
 	require.NoError(t, r.ApplyMeta(sameVersionClear))
+	require.Equal(t, uint64(1), r.Status().DrainedFenceVersion)
 	_, err = r.Append(channel.WithCommitMode(context.Background(), channel.CommitModeLocal), []channel.Record{{Payload: []byte("blocked"), SizeBytes: 7}})
 	require.ErrorIs(t, err, channel.ErrWriteFenced)
 
 	newerClear := fenced
 	newerClear.WriteFence = channel.WriteFence{Version: 2}
 	require.NoError(t, r.ApplyMeta(newerClear))
+	require.Zero(t, r.Status().DrainedFenceVersion)
 	_, err = r.Append(channel.WithCommitMode(context.Background(), channel.CommitModeLocal), []channel.Record{{Payload: []byte("open"), SizeBytes: 4}})
 	require.NoError(t, err)
 }

@@ -77,6 +77,8 @@ func (r *replica) applyFenceAndDrainCommand(cmd machineFenceAndDrainCommand) mac
 		version: req.WriteFenceVersion,
 		active:  true,
 	}
+	r.state.DrainedFenceVersion = req.WriteFenceVersion
+	r.publishStateLocked()
 	drain := channel.DrainResult{
 		ChannelKey:        r.state.ChannelKey,
 		LEO:               r.state.LEO,

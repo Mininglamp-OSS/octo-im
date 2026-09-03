@@ -109,9 +109,10 @@ func TestNewBuildsClusterWithRuntimeHandlerAndTransport(t *testing.T) {
 	}
 
 	fetchResult, err := got.Fetch(context.Background(), channel.FetchRequest{
-		ChannelID: id,
-		Limit:     10,
-		MaxBytes:  1024,
+		ChannelID:     id,
+		Limit:         10,
+		MaxBytes:      1024,
+		RequireLeader: true,
 	})
 	if err != nil {
 		t.Fatalf("Fetch() error = %v", err)
@@ -623,6 +624,7 @@ func buildTestHandler(cfg channel.HandlerBuildConfig) (channel.MetaRollbackServi
 		Runtime:    rt,
 		Store:      engine,
 		MessageIDs: cfg.MessageIDs,
+		Now:        cfg.Now,
 	})
 }
 

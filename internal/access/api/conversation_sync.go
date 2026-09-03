@@ -6,7 +6,10 @@ import (
 
 	runtimechannelid "github.com/WuKongIM/WuKongIM/internal/runtime/channelid"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
+	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
+	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/gin-gonic/gin"
 )
 
@@ -91,7 +94,7 @@ func (s *Server) handleConversationClearUnread(c *gin.Context) {
 		ChannelType: req.ChannelType,
 		MessageSeq:  req.MessageSeq,
 	}); err != nil {
-		writeLegacyJSONError(c, err.Error())
+		s.writeConversationMutationError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
@@ -123,7 +126,7 @@ func (s *Server) handleConversationSetUnread(c *gin.Context) {
 		ChannelType: req.ChannelType,
 		Unread:      req.Unread,
 	}); err != nil {
-		writeLegacyJSONError(c, err.Error())
+		s.writeConversationMutationError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
@@ -155,10 +158,42 @@ func (s *Server) handleConversationDelete(c *gin.Context) {
 		ChannelType: req.ChannelType,
 		MessageSeq:  req.MessageSeq,
 	}); err != nil {
-		writeLegacyJSONError(c, err.Error())
+		s.writeConversationMutationError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
+}
+
+func (s *Server) writeConversationMutationError(c *gin.Context, err error) {
+	status, message := classifyConversationMutationError(err)
+	switch {
+	case status == http.StatusServiceUnavailable:
+		if s != nil && s.logger != nil {
+			s.logger.Warn("conversation mutation temporarily unavailable", wklog.Error(err))
+		}
+	case status >= http.StatusInternalServerError:
+		if s != nil && s.logger != nil {
+			s.logger.Error("conversation mutation failed", wklog.Error(err))
+		}
+	}
+	writeLegacyJSONErrorStatus(c, status, message)
+}
+
+func classifyConversationMutationError(err error) (int, string) {
+	switch {
+	case errors.Is(err, conversationusecase.ErrLatestMessageUnavailable):
+		return http.StatusConflict, "conversation has no latest message"
+	case errors.Is(err, channel.ErrNotReady),
+		errors.Is(err, channel.ErrStaleMeta),
+		errors.Is(err, channel.ErrNotLeader),
+		errors.Is(err, raftcluster.ErrNoLeader):
+		return http.StatusServiceUnavailable, "retry required"
+	default:
+		if status, message, ok := mapSendError(err); ok {
+			return status, message
+		}
+		return http.StatusInternalServerError, "conversation mutation failed"
+	}
 }
 
 func validateClearConversationUnreadRequest(req clearConversationUnreadRequest) error {

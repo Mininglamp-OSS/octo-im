@@ -11,8 +11,10 @@ import (
 	"time"
 	"unsafe"
 
+	accessnode "github.com/WuKongIM/WuKongIM/internal/access/node"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel/runtime"
 	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	channelstore "github.com/WuKongIM/WuKongIM/pkg/db/message"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
@@ -72,6 +74,285 @@ func TestChannelLogConversationFactsLoadLatestMessagesBatchesRemoteLoadsByOwner(
 		{NodeID: 3, Keys: []channel.ChannelID{{ID: "g3", Type: 2}}},
 	}, normalizeConversationFactsBatchCalls(remote.latestBatchCalls))
 	require.Equal(t, 1, metas.batchCalls)
+}
+
+func TestChannelLogConversationFactsLoadLatestMessagesAuthoritativeUsesOwner(t *testing.T) {
+	remote := &recordingConversationFactsRemote{
+		latestByNode: map[uint64]map[channel.ChannelID]channel.Message{
+			3: {
+				{ID: "g1", Type: 2}: {ChannelID: "g1", ChannelType: 2, MessageSeq: 10},
+			},
+		},
+	}
+	metas := &staticConversationFactsMetas{
+		metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{
+			{ID: "g1", Type: 2}: {ChannelID: "g1", ChannelType: 2, ChannelEpoch: 11, LeaderEpoch: 12, Leader: 3},
+		},
+	}
+	facts := channelLogConversationFacts{
+		cluster:     notReadyConversationFactsCluster{},
+		metas:       metas,
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{
+		{ChannelID: "g1", ChannelType: 2},
+	})
+	require.NoError(t, err)
+	require.Equal(t, map[conversationusecase.ConversationKey]channel.Message{
+		{ChannelID: "g1", ChannelType: 2}: {ChannelID: "g1", ChannelType: 2, MessageSeq: 10},
+	}, got)
+	require.Equal(t, []authoritativeConversationFactsCall{{
+		NodeID:               3,
+		Key:                  channel.ChannelID{ID: "g1", Type: 2},
+		ExpectedChannelEpoch: 11,
+		ExpectedLeaderEpoch:  12,
+	}}, remote.authoritativeLatestCalls)
+	require.Equal(t, 1, metas.refreshCalls)
+	require.Equal(t, []channelruntime.ActivationSource{channelruntime.ActivationSourceFetch}, metas.activationSources)
+}
+
+func TestChannelLogConversationFactsAuthoritativeDoesNotBootstrapUnknownChannel(t *testing.T) {
+	id := channel.ChannelID{ID: "missing", Type: 2}
+	metas := &staticConversationFactsMetas{metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{}}
+	remote := &recordingConversationFactsRemote{}
+	facts := channelLogConversationFacts{
+		cluster:     staleConversationFactsCluster{},
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	_, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
+
+	require.ErrorIs(t, err, channel.ErrChannelNotFound)
+	require.Equal(t, []channelruntime.ActivationSource{channelruntime.ActivationSourceFetch}, metas.activationSources)
+	require.Zero(t, metas.invalidateCalls)
+	require.Empty(t, remote.authoritativeLatestCalls)
+}
+
+func TestChannelLogConversationFactsAuthoritativeUsesLocalLeaderWithoutRPC(t *testing.T) {
+	cluster := &readyConversationFactsCluster{
+		status: channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 12, CommittedSeq: 10},
+		fetch:  channel.FetchResult{Messages: []channel.Message{{ChannelID: "g1", ChannelType: 2, MessageSeq: 10}}},
+	}
+	metas := &staticConversationFactsMetas{metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{
+		{ID: "g1", Type: 2}: {ChannelID: "g1", ChannelType: 2, ChannelEpoch: 11, LeaderEpoch: 12, Leader: 1},
+	}}
+	remote := &recordingConversationFactsRemote{}
+	facts := channelLogConversationFacts{
+		cluster:     cluster,
+		metas:       metas,
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: "g1", ChannelType: 2}})
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), got[conversationusecase.ConversationKey{ChannelID: "g1", ChannelType: 2}].MessageSeq)
+	require.Empty(t, remote.authoritativeLatestCalls)
+	require.Len(t, cluster.fetches, 1)
+	require.True(t, cluster.fetches[0].RequireLeader)
+	require.Equal(t, uint64(11), cluster.fetches[0].ExpectedChannelEpoch)
+	require.Equal(t, uint64(12), cluster.fetches[0].ExpectedLeaderEpoch)
+}
+
+func TestChannelLogConversationFactsAuthoritativeFencesStaleLocalLeaderEpoch(t *testing.T) {
+	id := channel.ChannelID{ID: "g1", Type: 2}
+	cluster := &readyConversationFactsCluster{
+		status: channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 13, CommittedSeq: 10},
+	}
+	metas := &staticConversationFactsMetas{metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{
+		id: {ChannelID: id.ID, ChannelType: int64(id.Type), ChannelEpoch: 11, LeaderEpoch: 12, Leader: 1},
+	}}
+	remote := &recordingConversationFactsRemote{}
+	facts := channelLogConversationFacts{
+		cluster:     cluster,
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	_, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
+
+	require.ErrorIs(t, err, channel.ErrStaleMeta)
+	require.Empty(t, cluster.fetches)
+	require.Empty(t, remote.authoritativeLatestCalls)
+	require.Equal(t, 2, metas.refreshCalls)
+	require.Equal(t, 1, metas.invalidateCalls)
+}
+
+func TestChannelLogConversationFactsAuthoritativePreservesDeletedLocalChannelError(t *testing.T) {
+	id := channel.ChannelID{ID: "g1", Type: 2}
+	cluster := &readyConversationFactsCluster{
+		status:   channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 12, CommittedSeq: 10},
+		fetchErr: channel.ErrChannelNotFound,
+	}
+	metas := &staticConversationFactsMetas{metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{
+		id: {ChannelID: id.ID, ChannelType: int64(id.Type), ChannelEpoch: 11, LeaderEpoch: 12, Leader: 1},
+	}}
+	facts := channelLogConversationFacts{
+		cluster:     cluster,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
+
+	require.ErrorIs(t, err, channel.ErrChannelNotFound)
+	require.Empty(t, got)
+}
+
+func TestChannelLogConversationFactsAuthoritativePreservesRemotePermanentChannelErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "deleting", err: channel.ErrChannelDeleting},
+		{name: "deleted", err: channel.ErrChannelNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := channel.ChannelID{ID: "g1", Type: 2}
+			metas := &staticConversationFactsMetas{metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{
+				id: {ChannelID: id.ID, ChannelType: int64(id.Type), ChannelEpoch: 11, LeaderEpoch: 12, Leader: 2},
+			}}
+			remote := &recordingConversationFactsRemote{authoritativeErrByNode: map[uint64]error{2: tt.err}}
+			facts := channelLogConversationFacts{
+				cluster:     staleConversationFactsCluster{},
+				remote:      remote,
+				metaRefresh: metas,
+				localNodeID: 1,
+			}
+
+			got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
+
+			require.ErrorIs(t, err, tt.err)
+			require.Empty(t, got)
+			require.Len(t, remote.authoritativeLatestCalls, 1)
+			require.Zero(t, metas.invalidateCalls)
+		})
+	}
+}
+
+func TestChannelLogConversationFactsAuthoritativeRefreshesAndRetriesStaleLeader(t *testing.T) {
+	id := channel.ChannelID{ID: "g1", Type: 2}
+	metas := &staticConversationFactsMetas{refreshMetas: []channel.Meta{
+		{ID: id, Epoch: 11, LeaderEpoch: 12, Leader: 2},
+		{ID: id, Epoch: 11, LeaderEpoch: 13, Leader: 3},
+	}}
+	remote := &recordingConversationFactsRemote{
+		latestByNode: map[uint64]map[channel.ChannelID]channel.Message{
+			3: {id: {ChannelID: "g1", ChannelType: 2, MessageSeq: 10}},
+		},
+		authoritativeErrByNode: map[uint64]error{2: channel.ErrNotLeader},
+	}
+	facts := channelLogConversationFacts{
+		cluster:     staleConversationFactsCluster{},
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: "g1", ChannelType: 2}})
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), got[conversationusecase.ConversationKey{ChannelID: "g1", ChannelType: 2}].MessageSeq)
+	require.Equal(t, []authoritativeConversationFactsCall{
+		{NodeID: 2, Key: id, ExpectedChannelEpoch: 11, ExpectedLeaderEpoch: 12},
+		{NodeID: 3, Key: id, ExpectedChannelEpoch: 11, ExpectedLeaderEpoch: 13},
+	}, remote.authoritativeLatestCalls)
+	require.Equal(t, 2, metas.refreshCalls)
+	require.Equal(t, 1, metas.invalidateCalls)
+}
+
+func TestChannelLogConversationFactsAuthoritativeReroutesAfterTransportFailure(t *testing.T) {
+	id := channel.ChannelID{ID: "g1", Type: 2}
+	metas := &staticConversationFactsMetas{refreshMetas: []channel.Meta{
+		{ID: id, Epoch: 11, LeaderEpoch: 12, Leader: 2},
+		{ID: id, Epoch: 11, LeaderEpoch: 13, Leader: 3},
+	}}
+	remote := &recordingConversationFactsRemote{
+		latestByNode: map[uint64]map[channel.ChannelID]channel.Message{
+			3: {id: {ChannelID: "g1", ChannelType: 2, MessageSeq: 10}},
+		},
+		authoritativeErrByNode: map[uint64]error{2: accessnode.ErrConversationFactsRouteUnavailable},
+	}
+	facts := channelLogConversationFacts{
+		cluster:     staleConversationFactsCluster{},
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: "g1", ChannelType: 2}})
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), got[conversationusecase.ConversationKey{ChannelID: "g1", ChannelType: 2}].MessageSeq)
+	require.Equal(t, []authoritativeConversationFactsCall{
+		{NodeID: 2, Key: id, ExpectedChannelEpoch: 11, ExpectedLeaderEpoch: 12},
+		{NodeID: 3, Key: id, ExpectedChannelEpoch: 11, ExpectedLeaderEpoch: 13},
+	}, remote.authoritativeLatestCalls)
+	require.Equal(t, 1, metas.invalidateCalls)
+}
+
+func TestChannelLogConversationFactsAuthoritativeReroutesAfterMetadataAuthorityFailure(t *testing.T) {
+	id := channel.ChannelID{ID: "g1", Type: 2}
+	metas := &staticConversationFactsMetas{
+		activationErrs: []error{errors.New("dial metadata authority: connection refused")},
+		refreshMetas: []channel.Meta{
+			{ID: id, Epoch: 11, LeaderEpoch: 12, Leader: 3},
+		},
+	}
+	remote := &recordingConversationFactsRemote{
+		latestByNode: map[uint64]map[channel.ChannelID]channel.Message{
+			3: {id: {ChannelID: "g1", ChannelType: 2, MessageSeq: 10}},
+		},
+	}
+	facts := channelLogConversationFacts{
+		cluster:     staleConversationFactsCluster{},
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), got[conversationusecase.ConversationKey{ChannelID: id.ID, ChannelType: id.Type}].MessageSeq)
+	require.Len(t, metas.activationSources, 2)
+	require.Equal(t, 1, metas.invalidateCalls)
+}
+
+func TestChannelLogConversationFactsAuthoritativeClassifiesMetadataAuthorityFailuresAsUnavailable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "dial failure", err: errors.New("dial tcp: connection refused")},
+		{name: "deadline", err: context.DeadlineExceeded},
+		{name: "canceled", err: context.Canceled},
+		{name: "not ready", err: channel.ErrNotReady},
+		{name: "slot unavailable", err: errors.New("cluster: slot 42 has no leader available")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metas := &staticConversationFactsMetas{activationErrs: []error{tt.err, tt.err}}
+			facts := channelLogConversationFacts{
+				cluster:     staleConversationFactsCluster{},
+				metaRefresh: metas,
+				localNodeID: 1,
+			}
+
+			_, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: "g1", ChannelType: 2}})
+
+			require.ErrorIs(t, err, channel.ErrNotReady)
+			require.ErrorIs(t, err, accessnode.ErrConversationFactsRouteUnavailable)
+			require.Len(t, metas.activationSources, 2)
+			require.Equal(t, 1, metas.invalidateCalls)
+		})
+	}
 }
 
 func TestChannelLogConversationFactsSupportsBatchRecentLoadsByOwner(t *testing.T) {
@@ -345,10 +626,67 @@ func (notReadyConversationFactsCluster) Fetch(context.Context, channel.FetchRequ
 	return channel.FetchResult{}, channel.ErrNotReady
 }
 
+type readyConversationFactsCluster struct {
+	status   channel.ChannelRuntimeStatus
+	fetch    channel.FetchResult
+	fetchErr error
+	fetches  []channel.FetchRequest
+}
+
+func (c *readyConversationFactsCluster) Status(channel.ChannelID) (channel.ChannelRuntimeStatus, error) {
+	return c.status, nil
+}
+
+func (c *readyConversationFactsCluster) Fetch(_ context.Context, req channel.FetchRequest) (channel.FetchResult, error) {
+	c.fetches = append(c.fetches, req)
+	return c.fetch, c.fetchErr
+}
+
 type staticConversationFactsMetas struct {
-	metas       map[channel.ChannelID]metadb.ChannelRuntimeMeta
-	singularErr error
-	batchCalls  int
+	metas             map[channel.ChannelID]metadb.ChannelRuntimeMeta
+	singularErr       error
+	batchCalls        int
+	refreshCalls      int
+	activationSources []channelruntime.ActivationSource
+	activationErrs    []error
+	invalidateCalls   int
+	invalidated       bool
+	refreshMetas      []channel.Meta
+}
+
+func (s *staticConversationFactsMetas) ActivateByID(ctx context.Context, id channel.ChannelID, source channelruntime.ActivationSource) (channel.Meta, error) {
+	callIndex := len(s.activationSources)
+	s.activationSources = append(s.activationSources, source)
+	if callIndex < len(s.activationErrs) && s.activationErrs[callIndex] != nil {
+		return channel.Meta{}, s.activationErrs[callIndex]
+	}
+	return s.RefreshChannelMeta(ctx, id)
+}
+
+func (s *staticConversationFactsMetas) RefreshChannelMeta(_ context.Context, id channel.ChannelID) (channel.Meta, error) {
+	s.refreshCalls++
+	if len(s.refreshMetas) > 0 {
+		index := 0
+		if s.invalidated && len(s.refreshMetas) > 1 {
+			index = 1
+		}
+		return s.refreshMetas[index], nil
+	}
+	meta, ok := s.metas[id]
+	if !ok {
+		return channel.Meta{}, metadb.ErrNotFound
+	}
+	return channel.Meta{
+		ID:          id,
+		Epoch:       meta.ChannelEpoch,
+		LeaderEpoch: meta.LeaderEpoch,
+		Leader:      channel.NodeID(meta.Leader),
+	}, nil
+}
+
+func (s *staticConversationFactsMetas) InvalidateChannelMeta(channel.ChannelID) {
+	s.invalidateCalls++
+	s.invalidated = true
 }
 
 func (s *staticConversationFactsMetas) GetChannelRuntimeMeta(_ context.Context, channelID string, channelType int64) (metadb.ChannelRuntimeMeta, error) {
@@ -379,15 +717,41 @@ type conversationFactsBatchCall struct {
 	Keys   []channel.ChannelID
 }
 
+type authoritativeConversationFactsCall struct {
+	NodeID               uint64
+	Key                  channel.ChannelID
+	ExpectedChannelEpoch uint64
+	ExpectedLeaderEpoch  uint64
+}
+
 type recordingConversationFactsRemote struct {
-	latestByNode        map[uint64]map[channel.ChannelID]channel.Message
-	recentsByNode       map[uint64]map[channel.ChannelID][]channel.Message
-	latestBatchCalls    []conversationFactsBatchCall
-	recentBatchCalls    []conversationFactsBatchCall
-	singularLatestCalls []channel.ChannelID
-	singularRecentCalls []channel.ChannelID
-	singularLatestErr   error
-	singularRecentErr   error
+	latestByNode             map[uint64]map[channel.ChannelID]channel.Message
+	recentsByNode            map[uint64]map[channel.ChannelID][]channel.Message
+	latestBatchCalls         []conversationFactsBatchCall
+	recentBatchCalls         []conversationFactsBatchCall
+	authoritativeLatestCalls []authoritativeConversationFactsCall
+	authoritativeErrByNode   map[uint64]error
+	singularLatestCalls      []channel.ChannelID
+	singularRecentCalls      []channel.ChannelID
+	singularLatestErr        error
+	singularRecentErr        error
+}
+
+func (r *recordingConversationFactsRemote) LoadLatestConversationMessageAuthoritative(_ context.Context, nodeID uint64, key channel.ChannelID, _ int, expectedChannelEpoch, expectedLeaderEpoch uint64) (channel.Message, bool, error) {
+	r.authoritativeLatestCalls = append(r.authoritativeLatestCalls, authoritativeConversationFactsCall{
+		NodeID:               nodeID,
+		Key:                  key,
+		ExpectedChannelEpoch: expectedChannelEpoch,
+		ExpectedLeaderEpoch:  expectedLeaderEpoch,
+	})
+	if err := r.authoritativeErrByNode[nodeID]; err != nil {
+		return channel.Message{}, false, err
+	}
+	if r.singularLatestErr != nil {
+		return channel.Message{}, false, r.singularLatestErr
+	}
+	msg, ok := r.latestByNode[nodeID][key]
+	return msg, ok, nil
 }
 
 func (r *recordingConversationFactsRemote) LoadLatestConversationMessage(_ context.Context, _ uint64, key channel.ChannelID, _ int) (channel.Message, bool, error) {
