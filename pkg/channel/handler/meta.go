@@ -3,6 +3,7 @@ package handler
 import (
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
 	store "github.com/WuKongIM/WuKongIM/pkg/db/message"
@@ -12,6 +13,7 @@ type Config struct {
 	Runtime    channel.HandlerRuntime
 	Store      *store.Engine
 	MessageIDs channel.MessageIDGenerator
+	Now        func() time.Time
 }
 
 type Service interface{ channel.MetaRollbackService }
@@ -31,6 +33,9 @@ type service struct {
 func New(cfg Config) (Service, error) {
 	if cfg.Runtime == nil || cfg.Store == nil || cfg.MessageIDs == nil {
 		return nil, channel.ErrInvalidConfig
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
 	}
 	return &service{
 		cfg:                    cfg,

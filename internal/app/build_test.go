@@ -11,8 +11,10 @@ import (
 	"time"
 	"unsafe"
 
+	accessnode "github.com/WuKongIM/WuKongIM/internal/access/node"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel/runtime"
 	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	channelstore "github.com/WuKongIM/WuKongIM/pkg/db/message"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
@@ -109,6 +111,26 @@ func TestChannelLogConversationFactsLoadLatestMessagesAuthoritativeUsesOwner(t *
 		ExpectedLeaderEpoch:  12,
 	}}, remote.authoritativeLatestCalls)
 	require.Equal(t, 1, metas.refreshCalls)
+	require.Equal(t, []channelruntime.ActivationSource{channelruntime.ActivationSourceFetch}, metas.activationSources)
+}
+
+func TestChannelLogConversationFactsAuthoritativeDoesNotBootstrapUnknownChannel(t *testing.T) {
+	id := channel.ChannelID{ID: "missing", Type: 2}
+	metas := &staticConversationFactsMetas{metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{}}
+	remote := &recordingConversationFactsRemote{}
+	facts := channelLogConversationFacts{
+		cluster:     staleConversationFactsCluster{},
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	_, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
+
+	require.ErrorIs(t, err, channel.ErrChannelNotFound)
+	require.Equal(t, []channelruntime.ActivationSource{channelruntime.ActivationSourceFetch}, metas.activationSources)
+	require.Zero(t, metas.invalidateCalls)
+	require.Empty(t, remote.authoritativeLatestCalls)
 }
 
 func TestChannelLogConversationFactsAuthoritativeUsesLocalLeaderWithoutRPC(t *testing.T) {
@@ -163,6 +185,27 @@ func TestChannelLogConversationFactsAuthoritativeFencesStaleLocalLeaderEpoch(t *
 	require.Equal(t, 1, metas.invalidateCalls)
 }
 
+func TestChannelLogConversationFactsAuthoritativeTreatsDeletedLocalChannelAsEmpty(t *testing.T) {
+	id := channel.ChannelID{ID: "g1", Type: 2}
+	cluster := &readyConversationFactsCluster{
+		status:   channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 12, CommittedSeq: 10},
+		fetchErr: channel.ErrChannelNotFound,
+	}
+	metas := &staticConversationFactsMetas{metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{
+		id: {ChannelID: id.ID, ChannelType: int64(id.Type), ChannelEpoch: 11, LeaderEpoch: 12, Leader: 1},
+	}}
+	facts := channelLogConversationFacts{
+		cluster:     cluster,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
+
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
 func TestChannelLogConversationFactsAuthoritativeRefreshesAndRetriesStaleLeader(t *testing.T) {
 	id := channel.ChannelID{ID: "g1", Type: 2}
 	metas := &staticConversationFactsMetas{refreshMetas: []channel.Meta{
@@ -190,6 +233,35 @@ func TestChannelLogConversationFactsAuthoritativeRefreshesAndRetriesStaleLeader(
 		{NodeID: 3, Key: id, ExpectedChannelEpoch: 11, ExpectedLeaderEpoch: 13},
 	}, remote.authoritativeLatestCalls)
 	require.Equal(t, 2, metas.refreshCalls)
+	require.Equal(t, 1, metas.invalidateCalls)
+}
+
+func TestChannelLogConversationFactsAuthoritativeReroutesAfterTransportFailure(t *testing.T) {
+	id := channel.ChannelID{ID: "g1", Type: 2}
+	metas := &staticConversationFactsMetas{refreshMetas: []channel.Meta{
+		{ID: id, Epoch: 11, LeaderEpoch: 12, Leader: 2},
+		{ID: id, Epoch: 11, LeaderEpoch: 13, Leader: 3},
+	}}
+	remote := &recordingConversationFactsRemote{
+		latestByNode: map[uint64]map[channel.ChannelID]channel.Message{
+			3: {id: {ChannelID: "g1", ChannelType: 2, MessageSeq: 10}},
+		},
+		authoritativeErrByNode: map[uint64]error{2: accessnode.ErrConversationFactsRouteUnavailable},
+	}
+	facts := channelLogConversationFacts{
+		cluster:     staleConversationFactsCluster{},
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: "g1", ChannelType: 2}})
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), got[conversationusecase.ConversationKey{ChannelID: "g1", ChannelType: 2}].MessageSeq)
+	require.Equal(t, []authoritativeConversationFactsCall{
+		{NodeID: 2, Key: id, ExpectedChannelEpoch: 11, ExpectedLeaderEpoch: 12},
+		{NodeID: 3, Key: id, ExpectedChannelEpoch: 11, ExpectedLeaderEpoch: 13},
+	}, remote.authoritativeLatestCalls)
 	require.Equal(t, 1, metas.invalidateCalls)
 }
 
@@ -465,9 +537,10 @@ func (notReadyConversationFactsCluster) Fetch(context.Context, channel.FetchRequ
 }
 
 type readyConversationFactsCluster struct {
-	status  channel.ChannelRuntimeStatus
-	fetch   channel.FetchResult
-	fetches []channel.FetchRequest
+	status   channel.ChannelRuntimeStatus
+	fetch    channel.FetchResult
+	fetchErr error
+	fetches  []channel.FetchRequest
 }
 
 func (c *readyConversationFactsCluster) Status(channel.ChannelID) (channel.ChannelRuntimeStatus, error) {
@@ -476,17 +549,23 @@ func (c *readyConversationFactsCluster) Status(channel.ChannelID) (channel.Chann
 
 func (c *readyConversationFactsCluster) Fetch(_ context.Context, req channel.FetchRequest) (channel.FetchResult, error) {
 	c.fetches = append(c.fetches, req)
-	return c.fetch, nil
+	return c.fetch, c.fetchErr
 }
 
 type staticConversationFactsMetas struct {
-	metas           map[channel.ChannelID]metadb.ChannelRuntimeMeta
-	singularErr     error
-	batchCalls      int
-	refreshCalls    int
-	invalidateCalls int
-	invalidated     bool
-	refreshMetas    []channel.Meta
+	metas             map[channel.ChannelID]metadb.ChannelRuntimeMeta
+	singularErr       error
+	batchCalls        int
+	refreshCalls      int
+	activationSources []channelruntime.ActivationSource
+	invalidateCalls   int
+	invalidated       bool
+	refreshMetas      []channel.Meta
+}
+
+func (s *staticConversationFactsMetas) ActivateByID(ctx context.Context, id channel.ChannelID, source channelruntime.ActivationSource) (channel.Meta, error) {
+	s.activationSources = append(s.activationSources, source)
+	return s.RefreshChannelMeta(ctx, id)
 }
 
 func (s *staticConversationFactsMetas) RefreshChannelMeta(_ context.Context, id channel.ChannelID) (channel.Meta, error) {

@@ -1303,7 +1303,10 @@ func (c ClusterConfig) runtimeSeeds() []raftcluster.SeedConfig {
 	return seeds
 }
 
-const conversationFetchMaxBytes = 1 << 20
+const (
+	conversationFetchMaxBytes      = 1 << 20
+	conversationFactsRouteAttempts = 2
+)
 
 type channelLogConversationFacts struct {
 	cluster interface {
@@ -1319,7 +1322,7 @@ type channelLogConversationFacts struct {
 		LoadRecentConversationMessages(ctx context.Context, nodeID uint64, key channel.ChannelID, limit, maxBytes int) ([]channel.Message, error)
 	}
 	metaRefresh interface {
-		RefreshChannelMeta(ctx context.Context, id channel.ChannelID) (channel.Meta, error)
+		ActivateByID(ctx context.Context, id channel.ChannelID, source channelruntime.ActivationSource) (channel.Meta, error)
 		InvalidateChannelMeta(id channel.ChannelID)
 	}
 	localNodeID uint64
@@ -1398,12 +1401,15 @@ func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.
 		return channel.Message{}, false, channel.ErrStaleMeta
 	}
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		meta, err := f.metaRefresh.RefreshChannelMeta(ctx, id)
+	for attempt := 0; attempt < conversationFactsRouteAttempts; attempt++ {
+		meta, err := f.metaRefresh.ActivateByID(ctx, id, channelruntime.ActivationSourceFetch)
 		if err != nil {
+			if errors.Is(err, metadb.ErrNotFound) {
+				return channel.Message{}, false, channel.ErrChannelNotFound
+			}
 			lastErr = err
 			if conversationFactsRouteRetryable(lastErr) {
-				if attempt == 0 {
+				if attempt+1 < conversationFactsRouteAttempts {
 					f.metaRefresh.InvalidateChannelMeta(id)
 				}
 				continue
@@ -1419,7 +1425,7 @@ func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.
 		if meta.Leader == 0 {
 			lastErr = raftcluster.ErrNoLeader
 		} else if uint64(meta.Leader) == f.localNodeID {
-			msg, ok, loadErr = loadLatestConversationMessageAuthoritative(ctx, f.cluster, id, conversationFetchMaxBytes, f.localNodeID, meta.Epoch, meta.LeaderEpoch)
+			msg, ok, loadErr = accessnode.LoadLatestConversationMessageAuthoritative(ctx, f.cluster, id, conversationFetchMaxBytes, f.localNodeID, meta.Epoch, meta.LeaderEpoch)
 		} else if f.remote == nil {
 			return channel.Message{}, false, channel.ErrStaleMeta
 		} else {
@@ -1441,7 +1447,7 @@ func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.
 		if !conversationFactsRouteRetryable(lastErr) {
 			return channel.Message{}, false, lastErr
 		}
-		if attempt == 0 {
+		if attempt+1 < conversationFactsRouteAttempts {
 			f.metaRefresh.InvalidateChannelMeta(id)
 		}
 	}
@@ -1451,6 +1457,7 @@ func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.
 func conversationFactsRouteRetryable(err error) bool {
 	return errors.Is(err, channel.ErrNotLeader) ||
 		errors.Is(err, channel.ErrStaleMeta) ||
+		errors.Is(err, accessnode.ErrConversationFactsRouteUnavailable) ||
 		errors.Is(err, raftcluster.ErrNoLeader)
 }
 
@@ -1660,49 +1667,6 @@ func loadLatestConversationMessage(ctx context.Context, cluster interface {
 		return channel.Message{}, false, err
 	}
 	if len(fetch.Messages) == 0 {
-		return channel.Message{}, false, nil
-	}
-	return fetch.Messages[0], true, nil
-}
-
-func loadLatestConversationMessageAuthoritative(ctx context.Context, cluster interface {
-	Status(id channel.ChannelID) (channel.ChannelRuntimeStatus, error)
-	Fetch(ctx context.Context, req channel.FetchRequest) (channel.FetchResult, error)
-}, key channel.ChannelID, maxBytes int, localNodeID, expectedChannelEpoch, expectedLeaderEpoch uint64) (channel.Message, bool, error) {
-	if cluster == nil || localNodeID == 0 {
-		return channel.Message{}, false, channel.ErrStaleMeta
-	}
-	status, err := cluster.Status(key)
-	if err != nil {
-		return channel.Message{}, false, err
-	}
-	if status.Leader == 0 {
-		return channel.Message{}, false, raftcluster.ErrNoLeader
-	}
-	if uint64(status.Leader) != localNodeID {
-		return channel.Message{}, false, channel.ErrNotLeader
-	}
-	if expectedLeaderEpoch != 0 && status.LeaderEpoch != expectedLeaderEpoch {
-		return channel.Message{}, false, channel.ErrStaleMeta
-	}
-
-	fromSeq := status.CommittedSeq
-	if fromSeq == 0 {
-		fromSeq = 1
-	}
-	fetch, err := cluster.Fetch(ctx, channel.FetchRequest{
-		ChannelID:            key,
-		FromSeq:              fromSeq,
-		Limit:                1,
-		MaxBytes:             maxBytes,
-		ExpectedChannelEpoch: expectedChannelEpoch,
-		ExpectedLeaderEpoch:  expectedLeaderEpoch,
-		RequireLeader:        true,
-	})
-	if err != nil {
-		return channel.Message{}, false, err
-	}
-	if status.CommittedSeq == 0 || len(fetch.Messages) == 0 {
 		return channel.Message{}, false, nil
 	}
 	return fetch.Messages[0], true, nil

@@ -17,7 +17,12 @@ const (
 	conversationFactsStatusStaleMeta       = "stale_meta"
 )
 
-var errConversationFactsLocalRuntimeStale = errors.New("access/node: local conversation facts runtime stale")
+var (
+	// ErrConversationFactsRouteUnavailable marks peer RPC failures that should
+	// invalidate channel routing and retry once before surfacing as unavailable.
+	ErrConversationFactsRouteUnavailable  = errors.New("access/node: conversation facts route unavailable")
+	errConversationFactsLocalRuntimeStale = errors.New("access/node: local conversation facts runtime stale")
+)
 
 type conversationFactsChannelKey struct {
 	ID   string
@@ -159,7 +164,7 @@ func (a *Adapter) loadLatestConversationFact(ctx context.Context, id channel.Cha
 }
 
 func (a *Adapter) loadLatestConversationFactAuthoritative(ctx context.Context, id channel.ChannelID, maxBytes int, expectedChannelEpoch, expectedLeaderEpoch uint64) (channel.Message, bool, error) {
-	msg, ok, err := loadLatestConversationMessageAuthoritative(
+	msg, ok, err := LoadLatestConversationMessageAuthoritative(
 		ctx,
 		a.channelLog,
 		id,
@@ -174,7 +179,7 @@ func (a *Adapter) loadLatestConversationFactAuthoritative(ctx context.Context, i
 	if _, refreshErr := a.refreshConversationFactsMeta(ctx, id); refreshErr != nil {
 		return channel.Message{}, false, refreshErr
 	}
-	return loadLatestConversationMessageAuthoritative(
+	return LoadLatestConversationMessageAuthoritative(
 		ctx,
 		a.channelLog,
 		id,
@@ -238,7 +243,15 @@ func loadLatestConversationMessageStrict(ctx context.Context, cluster ChannelLog
 	return fetch.Messages[0], true, nil
 }
 
-func loadLatestConversationMessageAuthoritative(ctx context.Context, cluster ChannelLog, id channel.ChannelID, maxBytes int, localNodeID, expectedChannelEpoch, expectedLeaderEpoch uint64) (channel.Message, bool, error) {
+// ConversationFactsLog is the narrow channel-log view required by conversation reads.
+type ConversationFactsLog interface {
+	Status(id channel.ChannelID) (channel.ChannelRuntimeStatus, error)
+	Fetch(ctx context.Context, req channel.FetchRequest) (channel.FetchResult, error)
+}
+
+// LoadLatestConversationMessageAuthoritative returns the latest committed
+// message only when the local replica proves it is still authoritative.
+func LoadLatestConversationMessageAuthoritative(ctx context.Context, cluster ConversationFactsLog, id channel.ChannelID, maxBytes int, localNodeID, expectedChannelEpoch, expectedLeaderEpoch uint64) (channel.Message, bool, error) {
 	if cluster == nil || localNodeID == 0 {
 		return channel.Message{}, false, channel.ErrStaleMeta
 	}
@@ -272,10 +285,13 @@ func loadLatestConversationMessageAuthoritative(ctx context.Context, cluster Cha
 		ExpectedLeaderEpoch:  expectedLeaderEpoch,
 		RequireLeader:        true,
 	})
+	if errors.Is(err, channel.ErrChannelNotFound) {
+		return channel.Message{}, false, nil
+	}
 	if err != nil {
 		return channel.Message{}, false, err
 	}
-	if status.CommittedSeq == 0 || len(fetch.Messages) == 0 {
+	if len(fetch.Messages) == 0 {
 		return channel.Message{}, false, nil
 	}
 	return fetch.Messages[0], true, nil

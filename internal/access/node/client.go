@@ -534,12 +534,14 @@ func normalizeConversationFactsRPCError(err error) error {
 		return channel.ErrNotReady
 	case strings.Contains(msg, raftcluster.ErrNoLeader.Error()):
 		return raftcluster.ErrNoLeader
+	// These fragments are a temporary wire-compatibility contract with peers
+	// that predate the authoritative conversation-facts operation.
 	case strings.Contains(msg, "invalid conversation facts request codec"),
 		strings.Contains(msg, "unknown conversation facts op"),
 		strings.Contains(msg, "unsupported conversation facts op"):
 		return fmt.Errorf("%w: peer does not support authoritative conversation facts", channel.ErrNotReady)
 	default:
-		return err
+		return fmt.Errorf("%w: %w: %v", ErrConversationFactsRouteUnavailable, channel.ErrNotReady, err)
 	}
 }
 

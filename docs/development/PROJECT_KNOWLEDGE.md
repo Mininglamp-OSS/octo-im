@@ -18,7 +18,8 @@
 - `ActiveAt` is a best-effort hint: updates may be batched, throttled, dropped, and merged from cache during `ListUserConversationActive`.
 - Deleting a conversation clears current active visibility through `DeletedToSeq`; a later message with a larger sequence must be allowed to reactivate it.
 - Delete without an explicit message sequence must first resolve the latest Channel Log sequence; if no sequence is available, do not install a zero delete barrier.
-- Conversation read-cursor mutations must resolve the latest message through a leader-required, epoch-fenced read; a readable follower is not authoritative even when it is `CommitReady`.
+- Conversation read-cursor mutations must resolve the latest message through a leader-required, epoch-fenced read; a readable follower, lease-expired leader, write-fenced leader, or drained former leader is not authoritative even when it is `CommitReady`.
+- Read-cursor route resolution must use non-bootstrapping metadata activation; an unknown client-supplied channel ID must not create runtime metadata.
 - A leader-reroute retry must invalidate cached channel metadata before refreshing it; otherwise both attempts can target the same former leader.
 - During mixed-version rollout, a peer that does not understand the authoritative conversation-facts codec must fail closed with a retryable response; never fall back to an unfenced legacy read.
 - Ordinary conversation sync remains best-effort per channel: a transiently not-ready remote channel must not fail the user's whole conversation list.

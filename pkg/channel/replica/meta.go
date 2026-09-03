@@ -34,11 +34,14 @@ func (r *replica) validateMetaLocked(normalized channel.Meta) error {
 func (r *replica) commitMetaLocked(normalized channel.Meta) {
 	if r.drainedFence.active && normalized.WriteFence.Version > r.drainedFence.version {
 		r.drainedFence = drainedFenceState{}
+		r.state.DrainedFenceVersion = 0
 	}
 	r.meta = normalized
 	r.state.ChannelKey = normalized.Key
 	r.state.Epoch = normalized.Epoch
 	r.state.Leader = normalized.Leader
+	r.state.LeaseUntil = normalized.LeaseUntil
+	r.state.WriteFence = normalized.WriteFence
 	if normalized.RetentionThroughSeq > r.state.RetentionThroughSeq {
 		r.state.RetentionThroughSeq = normalized.RetentionThroughSeq
 	}

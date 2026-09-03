@@ -192,6 +192,34 @@ func TestConversationFactsRPCAuthoritativeLatestFencesEpochsAndRequiresLeader(t 
 	}}, log.fetches)
 }
 
+func TestLoadLatestConversationMessageAuthoritativeReturnsFirstConcurrentCommit(t *testing.T) {
+	log := &recordingAuthoritativeConversationFactsLog{
+		status: channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 12},
+		fetch: channel.FetchResult{
+			Messages: []channel.Message{{
+				ChannelID:   "g1",
+				ChannelType: 2,
+				MessageSeq:  1,
+			}},
+		},
+	}
+
+	msg, ok, err := LoadLatestConversationMessageAuthoritative(
+		context.Background(),
+		log,
+		channel.ChannelID{ID: "g1", Type: 2},
+		1024,
+		1,
+		11,
+		12,
+	)
+
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(1), msg.MessageSeq)
+	require.Equal(t, uint64(1), log.fetches[0].FromSeq)
+}
+
 func TestConversationFactsRPCAuthoritativeStaleCallerEpochDoesNotRefreshLocalMeta(t *testing.T) {
 	log := &recordingAuthoritativeConversationFactsLog{
 		status: channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 13, CommittedSeq: 7},
@@ -286,6 +314,23 @@ func TestConversationFactsAuthoritativeClientTreatsLegacyPeerCodecAsNotReady(t *
 		12,
 	)
 
+	require.ErrorIs(t, err, channel.ErrNotReady)
+	require.False(t, ok)
+}
+
+func TestConversationFactsAuthoritativeClientTreatsTransportFailureAsRouteUnavailable(t *testing.T) {
+	client := NewClient(remoteErrorCluster{err: errors.New("dial tcp 10.0.0.2:11110: connect: connection refused")})
+
+	_, ok, err := client.LoadLatestConversationMessageAuthoritative(
+		context.Background(),
+		2,
+		channel.ChannelID{ID: "g1", Type: 2},
+		1024,
+		11,
+		12,
+	)
+
+	require.ErrorIs(t, err, ErrConversationFactsRouteUnavailable)
 	require.ErrorIs(t, err, channel.ErrNotReady)
 	require.False(t, ok)
 }

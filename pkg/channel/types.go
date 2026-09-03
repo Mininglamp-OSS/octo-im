@@ -299,16 +299,23 @@ const (
 )
 
 type ReplicaState struct {
-	ChannelKey     ChannelKey
-	Role           ReplicaRole
-	Epoch          uint64
-	OffsetEpoch    uint64
-	Leader         NodeID
-	LogStartOffset uint64
-	HW             uint64
-	CheckpointHW   uint64
-	CommitReady    bool
-	LEO            uint64
+	ChannelKey  ChannelKey
+	Role        ReplicaRole
+	Epoch       uint64
+	OffsetEpoch uint64
+	Leader      NodeID
+	// LeaseUntil is the locally applied leadership lease deadline.
+	LeaseUntil time.Time
+	// WriteFence is the locally applied authoritative write fence.
+	WriteFence WriteFence
+	// DrainedFenceVersion is non-zero after this replica has produced a stable
+	// migration drain proof and until newer authoritative metadata clears it.
+	DrainedFenceVersion uint64
+	LogStartOffset      uint64
+	HW                  uint64
+	CheckpointHW        uint64
+	CommitReady         bool
+	LEO                 uint64
 	// RetentionThroughSeq is the local logical retention fence applied from metadata.
 	RetentionThroughSeq uint64
 	// MinAvailableSeq is the first message sequence that reads may return.

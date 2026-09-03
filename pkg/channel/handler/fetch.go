@@ -34,8 +34,14 @@ func (s *service) Fetch(_ context.Context, req channel.FetchRequest) (channel.Fe
 		return channel.FetchResult{}, channel.ErrStaleMeta
 	}
 	state := group.Status()
-	if req.RequireLeader && state.Role != channel.ReplicaRoleLeader {
-		return channel.FetchResult{}, channel.ErrNotLeader
+	if req.RequireLeader {
+		if state.Role != channel.ReplicaRoleLeader ||
+			!s.cfg.Now().Before(state.LeaseUntil) ||
+			meta.WriteFence.BlocksAppend() ||
+			state.WriteFence.BlocksAppend() ||
+			state.DrainedFenceVersion != 0 {
+			return channel.FetchResult{}, channel.ErrNotLeader
+		}
 	}
 	if !state.CommitReady {
 		return channel.FetchResult{}, channel.ErrNotReady

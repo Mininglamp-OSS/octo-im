@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"testing"
+	"time"
 
 	core "github.com/WuKongIM/WuKongIM/pkg/channel"
 )
@@ -156,6 +157,85 @@ func TestFetchRequireLeaderRejectsFollower(t *testing.T) {
 	id := core.ChannelID{ID: "c1", Type: 1}
 	svc, rt, _ := newAppendService(t, id)
 	rt.channels[KeyFromChannelID(id)].status.Role = core.ReplicaRoleFollower
+
+	_, err := svc.Fetch(context.Background(), core.FetchRequest{
+		ChannelID:     id,
+		FromSeq:       1,
+		Limit:         1,
+		MaxBytes:      1024,
+		RequireLeader: true,
+	})
+	if err != core.ErrNotLeader {
+		t.Fatalf("expected ErrNotLeader, got %v", err)
+	}
+}
+
+func TestFetchRequireLeaderRejectsExpiredLease(t *testing.T) {
+	id := core.ChannelID{ID: "c1", Type: 1}
+	svc, rt, _ := newAppendService(t, id)
+	rt.channels[KeyFromChannelID(id)].status.LeaseUntil = time.Now().Add(-time.Second)
+
+	_, err := svc.Fetch(context.Background(), core.FetchRequest{
+		ChannelID:     id,
+		FromSeq:       1,
+		Limit:         1,
+		MaxBytes:      1024,
+		RequireLeader: true,
+	})
+	if err != core.ErrNotLeader {
+		t.Fatalf("expected ErrNotLeader, got %v", err)
+	}
+}
+
+func TestFetchRequireLeaderRejectsWriteFence(t *testing.T) {
+	id := core.ChannelID{ID: "c1", Type: 1}
+	svc, rt, _ := newAppendService(t, id)
+	rt.channels[KeyFromChannelID(id)].status.LeaseUntil = time.Now().Add(time.Minute)
+	raw := svc.(*service)
+	key := KeyFromChannelID(id)
+	raw.mu.Lock()
+	meta := raw.metas[key]
+	meta.WriteFence = core.WriteFence{Token: "migration", Version: 1}
+	raw.metas[key] = meta
+	raw.mu.Unlock()
+
+	_, err := svc.Fetch(context.Background(), core.FetchRequest{
+		ChannelID:     id,
+		FromSeq:       1,
+		Limit:         1,
+		MaxBytes:      1024,
+		RequireLeader: true,
+	})
+	if err != core.ErrNotLeader {
+		t.Fatalf("expected ErrNotLeader, got %v", err)
+	}
+}
+
+func TestFetchRequireLeaderRejectsRuntimeWriteFence(t *testing.T) {
+	id := core.ChannelID{ID: "c1", Type: 1}
+	svc, rt, _ := newAppendService(t, id)
+	handle := rt.channels[KeyFromChannelID(id)]
+	handle.status.LeaseUntil = time.Now().Add(time.Minute)
+	handle.status.WriteFence = core.WriteFence{Token: "migration", Version: 1}
+
+	_, err := svc.Fetch(context.Background(), core.FetchRequest{
+		ChannelID:     id,
+		FromSeq:       1,
+		Limit:         1,
+		MaxBytes:      1024,
+		RequireLeader: true,
+	})
+	if err != core.ErrNotLeader {
+		t.Fatalf("expected ErrNotLeader, got %v", err)
+	}
+}
+
+func TestFetchRequireLeaderRejectsDrainedReplica(t *testing.T) {
+	id := core.ChannelID{ID: "c1", Type: 1}
+	svc, rt, _ := newAppendService(t, id)
+	handle := rt.channels[KeyFromChannelID(id)]
+	handle.status.LeaseUntil = time.Now().Add(time.Minute)
+	handle.status.DrainedFenceVersion = 3
 
 	_, err := svc.Fetch(context.Background(), core.FetchRequest{
 		ChannelID:     id,
