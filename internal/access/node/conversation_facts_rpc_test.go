@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
@@ -157,11 +158,12 @@ func TestConversationFactsRPCAuthoritativeLatestRejectsFollower(t *testing.T) {
 func TestConversationFactsRPCAuthoritativeLatestFencesEpochsAndRequiresLeader(t *testing.T) {
 	log := &recordingAuthoritativeConversationFactsLog{
 		status: channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 12, CommittedSeq: 7},
-		fetch: channel.FetchResult{Messages: []channel.Message{{
-			ChannelID:   "g1",
-			ChannelType: 2,
-			MessageSeq:  7,
-		}},
+		fetch: channel.FetchResult{
+			Messages: []channel.Message{{
+				ChannelID:   "g1",
+				ChannelType: 2,
+				MessageSeq:  7,
+			}},
 		},
 	}
 	adapter := New(Options{ChannelLog: log, LocalNodeID: 1})
@@ -190,6 +192,66 @@ func TestConversationFactsRPCAuthoritativeLatestFencesEpochsAndRequiresLeader(t 
 	}}, log.fetches)
 }
 
+func TestConversationFactsRPCAuthoritativeStaleCallerEpochDoesNotRefreshLocalMeta(t *testing.T) {
+	log := &recordingAuthoritativeConversationFactsLog{
+		status: channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 13, CommittedSeq: 7},
+	}
+	refresher := &refreshingConversationFactsMetaRefresher{}
+	adapter := New(Options{ChannelLog: log, ChannelMeta: refresher, LocalNodeID: 1})
+	body := mustEncodeConversationFactsRequest(t, conversationFactsRequest{
+		Op:                   conversationFactsOpLatestAuthoritative,
+		Key:                  newConversationFactsChannelKey(channel.ChannelID{ID: "g1", Type: 2}),
+		MaxBytes:             1024,
+		ExpectedChannelEpoch: 11,
+		ExpectedLeaderEpoch:  12,
+	})
+
+	respBody, err := adapter.handleConversationFactsRPC(context.Background(), body)
+	require.NoError(t, err)
+	resp, err := decodeConversationFactsResponse(respBody)
+	require.NoError(t, err)
+	require.Equal(t, conversationFactsStatusStaleMeta, resp.Status)
+	require.Empty(t, refresher.calls)
+	require.Empty(t, refresher.invalidations)
+	require.Empty(t, log.fetches)
+}
+
+func TestConversationFactsRPCAuthoritativeRefreshesMissingLocalRuntime(t *testing.T) {
+	log := &refreshableConversationFactsLog{
+		status: channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 12, CommittedSeq: 7},
+		fetch: channel.FetchResult{
+			Messages: []channel.Message{{
+				ChannelID:   "g1",
+				ChannelType: 2,
+				MessageSeq:  7,
+			}},
+		},
+	}
+	refresher := &refreshingConversationFactsMetaRefresher{
+		meta: channel.Meta{ID: channel.ChannelID{ID: "g1", Type: 2}, Epoch: 11, LeaderEpoch: 12, Leader: 1},
+		onRefresh: func() {
+			log.markRefreshed()
+		},
+	}
+	adapter := New(Options{ChannelLog: log, ChannelMeta: refresher, LocalNodeID: 1})
+	body := mustEncodeConversationFactsRequest(t, conversationFactsRequest{
+		Op:                   conversationFactsOpLatestAuthoritative,
+		Key:                  newConversationFactsChannelKey(channel.ChannelID{ID: "g1", Type: 2}),
+		MaxBytes:             1024,
+		ExpectedChannelEpoch: 11,
+		ExpectedLeaderEpoch:  12,
+	})
+
+	respBody, err := adapter.handleConversationFactsRPC(context.Background(), body)
+	require.NoError(t, err)
+	resp, err := decodeConversationFactsResponse(respBody)
+	require.NoError(t, err)
+	require.Equal(t, rpcStatusOK, resp.Status)
+	require.Len(t, resp.Messages, 1)
+	require.Equal(t, []channel.ChannelID{{ID: "g1", Type: 2}}, refresher.invalidations)
+	require.Equal(t, []channel.ChannelID{{ID: "g1", Type: 2}}, refresher.calls)
+}
+
 func TestConversationFactsAuthoritativeClientPreservesNotLeaderStatus(t *testing.T) {
 	network := newFakeClusterNetwork(nil, nil)
 	New(Options{
@@ -209,6 +271,41 @@ func TestConversationFactsAuthoritativeClientPreservesNotLeaderStatus(t *testing
 	)
 
 	require.ErrorIs(t, err, channel.ErrNotLeader)
+	require.False(t, ok)
+}
+
+func TestConversationFactsAuthoritativeClientTreatsLegacyPeerCodecAsNotReady(t *testing.T) {
+	client := NewClient(remoteErrorCluster{err: errors.New("nodetransport: remote error: access/node: invalid conversation facts request codec")})
+
+	_, ok, err := client.LoadLatestConversationMessageAuthoritative(
+		context.Background(),
+		2,
+		channel.ChannelID{ID: "g1", Type: 2},
+		1024,
+		11,
+		12,
+	)
+
+	require.ErrorIs(t, err, channel.ErrNotReady)
+	require.False(t, ok)
+}
+
+func TestConversationFactsOrdinaryClientPreservesStaleMetaStatus(t *testing.T) {
+	network := newFakeClusterNetwork(nil, nil)
+	New(Options{
+		Cluster:    network.cluster(2),
+		ChannelLog: &recordingAuthoritativeConversationFactsLog{statusErr: channel.ErrStaleMeta},
+	})
+	client := NewClient(network.cluster(1))
+
+	_, ok, err := client.LoadLatestConversationMessage(
+		context.Background(),
+		2,
+		channel.ChannelID{ID: "g1", Type: 2},
+		1024,
+	)
+
+	require.ErrorIs(t, err, channel.ErrStaleMeta)
 	require.False(t, ok)
 }
 
@@ -247,6 +344,7 @@ func TestConversationFactsRPCRefreshesStaleMetaForBatchRecentLoads(t *testing.T)
 	resp, err := decodeConversationFactsResponse(respBody)
 	require.NoError(t, err)
 	require.Equal(t, []channel.ChannelID{{ID: "g1", Type: 2}}, refresher.calls)
+	require.Equal(t, []channel.ChannelID{{ID: "g1", Type: 2}}, refresher.invalidations)
 	require.Len(t, resp.Entries, 1)
 	require.Len(t, resp.Entries[0].Messages, 1)
 	require.Equal(t, uint64(7), resp.Entries[0].Messages[0].MessageSeq)
@@ -328,10 +426,11 @@ func (l *refreshableConversationFactsLog) markRefreshed() {
 }
 
 type refreshingConversationFactsMetaRefresher struct {
-	meta      channel.Meta
-	err       error
-	calls     []channel.ChannelID
-	onRefresh func()
+	meta          channel.Meta
+	err           error
+	calls         []channel.ChannelID
+	invalidations []channel.ChannelID
+	onRefresh     func()
 }
 
 func (r *refreshingConversationFactsMetaRefresher) RefreshChannelMeta(_ context.Context, id channel.ChannelID) (channel.Meta, error) {
@@ -340,6 +439,10 @@ func (r *refreshingConversationFactsMetaRefresher) RefreshChannelMeta(_ context.
 		r.onRefresh()
 	}
 	return r.meta, r.err
+}
+
+func (r *refreshingConversationFactsMetaRefresher) InvalidateChannelMeta(id channel.ChannelID) {
+	r.invalidations = append(r.invalidations, id)
 }
 
 func mustEncodeConversationFactsRequest(t *testing.T, req conversationFactsRequest) []byte {

@@ -90,3 +90,5 @@ func (r *recordingNodeMetaRefresher) RefreshChannelMeta(context.Context, channel
 	r.calls++
 	return channel.Meta{}, nil
 }
+
+func (r *recordingNodeMetaRefresher) InvalidateChannelMeta(channel.ChannelID) {}

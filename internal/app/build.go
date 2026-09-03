@@ -1320,6 +1320,7 @@ type channelLogConversationFacts struct {
 	}
 	metaRefresh interface {
 		RefreshChannelMeta(ctx context.Context, id channel.ChannelID) (channel.Meta, error)
+		InvalidateChannelMeta(id channel.ChannelID)
 	}
 	localNodeID uint64
 }
@@ -1402,6 +1403,9 @@ func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.
 		if err != nil {
 			lastErr = err
 			if conversationFactsRouteRetryable(lastErr) {
+				if attempt == 0 {
+					f.metaRefresh.InvalidateChannelMeta(id)
+				}
 				continue
 			}
 			return channel.Message{}, false, lastErr
@@ -1436,6 +1440,9 @@ func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.
 		}
 		if !conversationFactsRouteRetryable(lastErr) {
 			return channel.Message{}, false, lastErr
+		}
+		if attempt == 0 {
+			f.metaRefresh.InvalidateChannelMeta(id)
 		}
 	}
 	return channel.Message{}, false, lastErr

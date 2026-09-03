@@ -138,6 +138,31 @@ func TestChannelLogConversationFactsAuthoritativeUsesLocalLeaderWithoutRPC(t *te
 	require.Equal(t, uint64(12), cluster.fetches[0].ExpectedLeaderEpoch)
 }
 
+func TestChannelLogConversationFactsAuthoritativeFencesStaleLocalLeaderEpoch(t *testing.T) {
+	id := channel.ChannelID{ID: "g1", Type: 2}
+	cluster := &readyConversationFactsCluster{
+		status: channel.ChannelRuntimeStatus{Leader: 1, LeaderEpoch: 13, CommittedSeq: 10},
+	}
+	metas := &staticConversationFactsMetas{metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{
+		id: {ChannelID: id.ID, ChannelType: int64(id.Type), ChannelEpoch: 11, LeaderEpoch: 12, Leader: 1},
+	}}
+	remote := &recordingConversationFactsRemote{}
+	facts := channelLogConversationFacts{
+		cluster:     cluster,
+		remote:      remote,
+		metaRefresh: metas,
+		localNodeID: 1,
+	}
+
+	_, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{{ChannelID: id.ID, ChannelType: id.Type}})
+
+	require.ErrorIs(t, err, channel.ErrStaleMeta)
+	require.Empty(t, cluster.fetches)
+	require.Empty(t, remote.authoritativeLatestCalls)
+	require.Equal(t, 2, metas.refreshCalls)
+	require.Equal(t, 1, metas.invalidateCalls)
+}
+
 func TestChannelLogConversationFactsAuthoritativeRefreshesAndRetriesStaleLeader(t *testing.T) {
 	id := channel.ChannelID{ID: "g1", Type: 2}
 	metas := &staticConversationFactsMetas{refreshMetas: []channel.Meta{
@@ -165,6 +190,7 @@ func TestChannelLogConversationFactsAuthoritativeRefreshesAndRetriesStaleLeader(
 		{NodeID: 3, Key: id, ExpectedChannelEpoch: 11, ExpectedLeaderEpoch: 13},
 	}, remote.authoritativeLatestCalls)
 	require.Equal(t, 2, metas.refreshCalls)
+	require.Equal(t, 1, metas.invalidateCalls)
 }
 
 func TestChannelLogConversationFactsSupportsBatchRecentLoadsByOwner(t *testing.T) {
@@ -454,19 +480,21 @@ func (c *readyConversationFactsCluster) Fetch(_ context.Context, req channel.Fet
 }
 
 type staticConversationFactsMetas struct {
-	metas        map[channel.ChannelID]metadb.ChannelRuntimeMeta
-	singularErr  error
-	batchCalls   int
-	refreshCalls int
-	refreshMetas []channel.Meta
+	metas           map[channel.ChannelID]metadb.ChannelRuntimeMeta
+	singularErr     error
+	batchCalls      int
+	refreshCalls    int
+	invalidateCalls int
+	invalidated     bool
+	refreshMetas    []channel.Meta
 }
 
 func (s *staticConversationFactsMetas) RefreshChannelMeta(_ context.Context, id channel.ChannelID) (channel.Meta, error) {
 	s.refreshCalls++
 	if len(s.refreshMetas) > 0 {
-		index := s.refreshCalls - 1
-		if index >= len(s.refreshMetas) {
-			index = len(s.refreshMetas) - 1
+		index := 0
+		if s.invalidated && len(s.refreshMetas) > 1 {
+			index = 1
 		}
 		return s.refreshMetas[index], nil
 	}
@@ -480,6 +508,11 @@ func (s *staticConversationFactsMetas) RefreshChannelMeta(_ context.Context, id 
 		LeaderEpoch: meta.LeaderEpoch,
 		Leader:      channel.NodeID(meta.Leader),
 	}, nil
+}
+
+func (s *staticConversationFactsMetas) InvalidateChannelMeta(channel.ChannelID) {
+	s.invalidateCalls++
+	s.invalidated = true
 }
 
 func (s *staticConversationFactsMetas) GetChannelRuntimeMeta(_ context.Context, channelID string, channelType int64) (metadb.ChannelRuntimeMeta, error) {

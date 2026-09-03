@@ -591,6 +591,8 @@ func (s *stubNodeMetaRefresher) RefreshChannelMeta(context.Context, channel.Chan
 	return s.meta, s.err
 }
 
+func (s *stubNodeMetaRefresher) InvalidateChannelMeta(channel.ChannelID) {}
+
 type remoteErrorCluster struct {
 	err error
 }

@@ -17,6 +17,8 @@ const (
 	conversationFactsStatusStaleMeta       = "stale_meta"
 )
 
+var errConversationFactsLocalRuntimeStale = errors.New("access/node: local conversation facts runtime stale")
+
 type conversationFactsChannelKey struct {
 	ID   string
 	Type uint8
@@ -166,7 +168,7 @@ func (a *Adapter) loadLatestConversationFactAuthoritative(ctx context.Context, i
 		expectedChannelEpoch,
 		expectedLeaderEpoch,
 	)
-	if !errors.Is(err, channel.ErrStaleMeta) {
+	if !errors.Is(err, errConversationFactsLocalRuntimeStale) {
 		return msg, ok, err
 	}
 	if _, refreshErr := a.refreshConversationFactsMeta(ctx, id); refreshErr != nil {
@@ -205,6 +207,7 @@ func (a *Adapter) refreshConversationFactsMeta(ctx context.Context, id channel.C
 	if a == nil || a.channelMeta == nil {
 		return channel.Meta{}, channel.ErrStaleMeta
 	}
+	a.channelMeta.InvalidateChannelMeta(id)
 	return a.channelMeta.RefreshChannelMeta(ctx, id)
 }
 
@@ -241,6 +244,9 @@ func loadLatestConversationMessageAuthoritative(ctx context.Context, cluster Cha
 	}
 	status, err := cluster.Status(id)
 	if err != nil {
+		if errors.Is(err, channel.ErrStaleMeta) {
+			return channel.Message{}, false, fmt.Errorf("%w: %w", errConversationFactsLocalRuntimeStale, err)
+		}
 		return channel.Message{}, false, err
 	}
 	if status.Leader == 0 {

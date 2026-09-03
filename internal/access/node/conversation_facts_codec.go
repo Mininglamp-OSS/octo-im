@@ -35,6 +35,9 @@ func decodeConversationFactsRequest(body []byte) (conversationFactsRequest, erro
 	}
 	isV2 := hasMagic(body, conversationFactsRequestMagicV2[:])
 	offset := len(conversationFactsRequestMagicV1)
+	if isV2 {
+		offset = len(conversationFactsRequestMagicV2)
+	}
 	var req conversationFactsRequest
 	var err error
 	if req.Op, offset, err = readString(body, offset); err != nil {

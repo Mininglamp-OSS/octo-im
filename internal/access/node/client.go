@@ -384,6 +384,9 @@ func (c *Client) LoadLatestConversationMessage(ctx context.Context, nodeID uint6
 	if err != nil {
 		return channel.Message{}, false, err
 	}
+	if err := conversationFactsResponseError(resp.Status); err != nil {
+		return channel.Message{}, false, err
+	}
 	if len(resp.Messages) == 0 {
 		return channel.Message{}, false, nil
 	}
@@ -401,18 +404,8 @@ func (c *Client) LoadLatestConversationMessageAuthoritative(ctx context.Context,
 	if err != nil {
 		return channel.Message{}, false, normalizeConversationFactsRPCError(err)
 	}
-	switch resp.Status {
-	case rpcStatusOK:
-	case rpcStatusNotLeader:
-		return channel.Message{}, false, channel.ErrNotLeader
-	case rpcStatusNoLeader:
-		return channel.Message{}, false, raftcluster.ErrNoLeader
-	case conversationFactsStatusNotReady:
-		return channel.Message{}, false, channel.ErrNotReady
-	case conversationFactsStatusStaleMeta:
-		return channel.Message{}, false, channel.ErrStaleMeta
-	default:
-		return channel.Message{}, false, fmt.Errorf("access/node: unexpected authoritative conversation facts status %q", resp.Status)
+	if err := conversationFactsResponseError(resp.Status); err != nil {
+		return channel.Message{}, false, err
 	}
 	if len(resp.Messages) == 0 {
 		return channel.Message{}, false, nil
@@ -427,6 +420,9 @@ func (c *Client) LoadLatestConversationMessages(ctx context.Context, nodeID uint
 		MaxBytes: maxBytes,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := conversationFactsResponseError(resp.Status); err != nil {
 		return nil, err
 	}
 	out := make(map[channel.ChannelID]channel.Message, len(resp.Entries))
@@ -449,6 +445,9 @@ func (c *Client) LoadRecentConversationMessages(ctx context.Context, nodeID uint
 	if err != nil {
 		return nil, err
 	}
+	if err := conversationFactsResponseError(resp.Status); err != nil {
+		return nil, err
+	}
 	return append([]channel.Message(nil), resp.Messages...), nil
 }
 
@@ -460,6 +459,9 @@ func (c *Client) LoadRecentConversationMessagesBatch(ctx context.Context, nodeID
 		MaxBytes: maxBytes,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := conversationFactsResponseError(resp.Status); err != nil {
 		return nil, err
 	}
 	out := make(map[channel.ChannelID][]channel.Message, len(resp.Entries))
@@ -532,8 +534,29 @@ func normalizeConversationFactsRPCError(err error) error {
 		return channel.ErrNotReady
 	case strings.Contains(msg, raftcluster.ErrNoLeader.Error()):
 		return raftcluster.ErrNoLeader
+	case strings.Contains(msg, "invalid conversation facts request codec"),
+		strings.Contains(msg, "unknown conversation facts op"),
+		strings.Contains(msg, "unsupported conversation facts op"):
+		return fmt.Errorf("%w: peer does not support authoritative conversation facts", channel.ErrNotReady)
 	default:
 		return err
+	}
+}
+
+func conversationFactsResponseError(status string) error {
+	switch status {
+	case rpcStatusOK:
+		return nil
+	case rpcStatusNotLeader:
+		return channel.ErrNotLeader
+	case rpcStatusNoLeader:
+		return raftcluster.ErrNoLeader
+	case conversationFactsStatusNotReady:
+		return channel.ErrNotReady
+	case conversationFactsStatusStaleMeta:
+		return channel.ErrStaleMeta
+	default:
+		return fmt.Errorf("access/node: unexpected conversation facts status %q", status)
 	}
 }
 

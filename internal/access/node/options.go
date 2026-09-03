@@ -53,6 +53,7 @@ type ChannelLog interface {
 
 type ChannelMetaRefresher interface {
 	RefreshChannelMeta(ctx context.Context, id channel.ChannelID) (channel.Meta, error)
+	InvalidateChannelMeta(id channel.ChannelID)
 }
 
 // ChannelLeaderRepairer repairs a channel leader on the authoritative slot leader.
