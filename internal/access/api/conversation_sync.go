@@ -9,6 +9,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
 	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
+	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/gin-gonic/gin"
 )
 
@@ -93,7 +94,7 @@ func (s *Server) handleConversationClearUnread(c *gin.Context) {
 		ChannelType: req.ChannelType,
 		MessageSeq:  req.MessageSeq,
 	}); err != nil {
-		writeConversationMutationError(c, err)
+		s.writeConversationMutationError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
@@ -125,7 +126,7 @@ func (s *Server) handleConversationSetUnread(c *gin.Context) {
 		ChannelType: req.ChannelType,
 		Unread:      req.Unread,
 	}); err != nil {
-		writeConversationMutationError(c, err)
+		s.writeConversationMutationError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
@@ -157,21 +158,31 @@ func (s *Server) handleConversationDelete(c *gin.Context) {
 		ChannelType: req.ChannelType,
 		MessageSeq:  req.MessageSeq,
 	}); err != nil {
-		writeConversationMutationError(c, err)
+		s.writeConversationMutationError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
 }
 
-func writeConversationMutationError(c *gin.Context, err error) {
+func (s *Server) writeConversationMutationError(c *gin.Context, err error) {
 	if errors.Is(err, channel.ErrNotReady) ||
 		errors.Is(err, channel.ErrStaleMeta) ||
 		errors.Is(err, channel.ErrNotLeader) ||
 		errors.Is(err, raftcluster.ErrNoLeader) {
+		if s != nil && s.logger != nil {
+			s.logger.Warn("conversation mutation temporarily unavailable", wklog.Error(err))
+		}
 		writeLegacyJSONErrorStatus(c, http.StatusServiceUnavailable, "retry required")
 		return
 	}
-	writeLegacyJSONError(c, err.Error())
+	if status, message, ok := mapSendError(err); ok {
+		writeLegacyJSONErrorStatus(c, status, message)
+		return
+	}
+	if s != nil && s.logger != nil {
+		s.logger.Error("conversation mutation failed", wklog.Error(err))
+	}
+	writeLegacyJSONErrorStatus(c, http.StatusInternalServerError, "conversation mutation failed")
 }
 
 func validateClearConversationUnreadRequest(req clearConversationUnreadRequest) error {

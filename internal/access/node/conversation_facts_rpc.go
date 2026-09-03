@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel/runtime"
 	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 )
 
@@ -213,7 +214,7 @@ func (a *Adapter) refreshConversationFactsMeta(ctx context.Context, id channel.C
 		return channel.Meta{}, channel.ErrStaleMeta
 	}
 	a.channelMeta.InvalidateChannelMeta(id)
-	return a.channelMeta.RefreshChannelMeta(ctx, id)
+	return a.channelMeta.ActivateByID(ctx, id, channelruntime.ActivationSourceFetch)
 }
 
 func loadLatestConversationMessageStrict(ctx context.Context, cluster ChannelLog, id channel.ChannelID, maxBytes int) (channel.Message, bool, error) {

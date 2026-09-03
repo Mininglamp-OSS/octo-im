@@ -274,6 +274,7 @@ func newAppendBenchmarkEnv(b *testing.B, channelCount int, profile appendBenchma
 					Runtime:    buildCfg.Runtime,
 					Store:      buildCfg.Store.(*channelstore.Engine),
 					MessageIDs: buildCfg.MessageIDs,
+					Now:        buildCfg.Now,
 				})
 			},
 		},

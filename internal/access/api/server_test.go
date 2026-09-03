@@ -1448,6 +1448,7 @@ func TestConversationMutationsReturnServiceUnavailableForRetryableClusterErrors(
 		{name: "stale metadata", err: channel.ErrStaleMeta},
 		{name: "not leader", err: channel.ErrNotLeader},
 		{name: "no leader", err: raftcluster.ErrNoLeader},
+		{name: "wrapped internal failure", err: errors.Join(channel.ErrNotReady, errors.New("dial tcp 10.0.0.2:11110: connection refused"))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1461,6 +1462,34 @@ func TestConversationMutationsReturnServiceUnavailableForRetryableClusterErrors(
 
 			require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 			require.JSONEq(t, `{"msg":"retry required","status":503}`, rec.Body.String())
+		})
+	}
+}
+
+func TestConversationMutationsDoNotExposeInternalErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status int
+		body   string
+	}{
+		{name: "channel not found", err: channel.ErrChannelNotFound, status: http.StatusNotFound, body: `{"msg":"channel not found","status":404}`},
+		{name: "channel deleting", err: channel.ErrChannelDeleting, status: http.StatusConflict, body: `{"msg":"channel deleting","status":409}`},
+		{name: "unknown internal failure", err: errors.New("dial tcp 10.0.0.2:11110: connection refused"), status: http.StatusInternalServerError, body: `{"msg":"conversation mutation failed","status":500}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conversations := &recordingConversationUsecase{setUnreadErr: tt.err}
+			srv := New(Options{Conversations: conversations})
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/conversations/setUnread", bytes.NewBufferString(`{"uid":"u1","channel_id":"g1","channel_type":2,"unread":3}`))
+			req.Header.Set("Content-Type", "application/json")
+			srv.Engine().ServeHTTP(rec, req)
+
+			require.Equal(t, tt.status, rec.Code)
+			require.JSONEq(t, tt.body, rec.Body.String())
+			require.NotContains(t, rec.Body.String(), "10.0.0.2")
 		})
 	}
 }

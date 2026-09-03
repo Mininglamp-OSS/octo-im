@@ -170,6 +170,26 @@ func TestFetchRequireLeaderRejectsFollower(t *testing.T) {
 	}
 }
 
+func TestFetchRequireLeaderAcceptsHealthyLeader(t *testing.T) {
+	id := core.ChannelID{ID: "c1", Type: 1}
+	svc, rt, _ := newAppendService(t, id)
+	now := time.Unix(1700000000, 0)
+	raw := svc.(*service)
+	raw.cfg.Now = func() time.Time { return now }
+	rt.channels[KeyFromChannelID(id)].status.LeaseUntil = now.Add(time.Minute)
+
+	_, err := svc.Fetch(context.Background(), core.FetchRequest{
+		ChannelID:     id,
+		FromSeq:       1,
+		Limit:         1,
+		MaxBytes:      1024,
+		RequireLeader: true,
+	})
+	if err != nil {
+		t.Fatalf("Fetch() error = %v, want nil", err)
+	}
+}
+
 func TestFetchRequireLeaderRejectsExpiredLease(t *testing.T) {
 	id := core.ChannelID{ID: "c1", Type: 1}
 	svc, rt, _ := newAppendService(t, id)

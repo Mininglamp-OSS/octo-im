@@ -35,6 +35,8 @@ func (s *service) Fetch(_ context.Context, req channel.FetchRequest) (channel.Fe
 	}
 	state := group.Status()
 	if req.RequireLeader {
+		// Authoritative reads deliberately fail closed on a zero lease,
+		// matching the replica append gate.
 		if state.Role != channel.ReplicaRoleLeader ||
 			!s.cfg.Now().Before(state.LeaseUntil) ||
 			meta.WriteFence.BlocksAppend() ||

@@ -1407,7 +1407,7 @@ func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.
 			if errors.Is(err, metadb.ErrNotFound) {
 				return channel.Message{}, false, channel.ErrChannelNotFound
 			}
-			lastErr = err
+			lastErr = conversationFactsRouteUnavailable(err)
 			if conversationFactsRouteRetryable(lastErr) {
 				if attempt+1 < conversationFactsRouteAttempts {
 					f.metaRefresh.InvalidateChannelMeta(id)
@@ -1442,7 +1442,7 @@ func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.
 			return msg, ok, nil
 		}
 		if loadErr != nil {
-			lastErr = loadErr
+			lastErr = normalizeConversationFactsAuthoritativeError(loadErr)
 		}
 		if !conversationFactsRouteRetryable(lastErr) {
 			return channel.Message{}, false, lastErr
@@ -1452,6 +1452,24 @@ func (f channelLogConversationFacts) loadLatestMessageAuthoritative(ctx context.
 		}
 	}
 	return channel.Message{}, false, lastErr
+}
+
+func normalizeConversationFactsAuthoritativeError(err error) error {
+	if err == nil ||
+		errors.Is(err, channel.ErrChannelNotFound) ||
+		errors.Is(err, channel.ErrChannelDeleting) ||
+		errors.Is(err, channel.ErrNotReady) ||
+		conversationFactsRouteRetryable(err) {
+		return err
+	}
+	return conversationFactsRouteUnavailable(err)
+}
+
+func conversationFactsRouteUnavailable(err error) error {
+	if errors.Is(err, accessnode.ErrConversationFactsRouteUnavailable) && errors.Is(err, channel.ErrNotReady) {
+		return err
+	}
+	return fmt.Errorf("%w: %w: %v", accessnode.ErrConversationFactsRouteUnavailable, channel.ErrNotReady, err)
 }
 
 func conversationFactsRouteRetryable(err error) bool {

@@ -13,7 +13,8 @@ type Config struct {
 	Runtime    channel.HandlerRuntime
 	Store      *store.Engine
 	MessageIDs channel.MessageIDGenerator
-	Now        func() time.Time
+	// Now supplies the clock used for authoritative leader-lease checks.
+	Now func() time.Time
 }
 
 type Service interface{ channel.MetaRollbackService }

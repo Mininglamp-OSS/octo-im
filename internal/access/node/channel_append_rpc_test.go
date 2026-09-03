@@ -9,6 +9,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/runtime/online"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel/runtime"
 	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
@@ -589,6 +590,10 @@ type stubNodeMetaRefresher struct {
 
 func (s *stubNodeMetaRefresher) RefreshChannelMeta(context.Context, channel.ChannelID) (channel.Meta, error) {
 	return s.meta, s.err
+}
+
+func (s *stubNodeMetaRefresher) ActivateByID(ctx context.Context, id channel.ChannelID, _ channelruntime.ActivationSource) (channel.Meta, error) {
+	return s.RefreshChannelMeta(ctx, id)
 }
 
 func (s *stubNodeMetaRefresher) InvalidateChannelMeta(channel.ChannelID) {}

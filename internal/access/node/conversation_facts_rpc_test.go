@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel/runtime"
 	"github.com/stretchr/testify/require"
 )
 
@@ -278,6 +279,7 @@ func TestConversationFactsRPCAuthoritativeRefreshesMissingLocalRuntime(t *testin
 	require.Len(t, resp.Messages, 1)
 	require.Equal(t, []channel.ChannelID{{ID: "g1", Type: 2}}, refresher.invalidations)
 	require.Equal(t, []channel.ChannelID{{ID: "g1", Type: 2}}, refresher.calls)
+	require.Equal(t, []channelruntime.ActivationSource{channelruntime.ActivationSourceFetch}, refresher.activationSources)
 }
 
 func TestConversationFactsAuthoritativeClientPreservesNotLeaderStatus(t *testing.T) {
@@ -471,11 +473,21 @@ func (l *refreshableConversationFactsLog) markRefreshed() {
 }
 
 type refreshingConversationFactsMetaRefresher struct {
-	meta          channel.Meta
-	err           error
-	calls         []channel.ChannelID
-	invalidations []channel.ChannelID
-	onRefresh     func()
+	meta              channel.Meta
+	err               error
+	calls             []channel.ChannelID
+	invalidations     []channel.ChannelID
+	activationSources []channelruntime.ActivationSource
+	onRefresh         func()
+}
+
+func (r *refreshingConversationFactsMetaRefresher) ActivateByID(_ context.Context, id channel.ChannelID, source channelruntime.ActivationSource) (channel.Meta, error) {
+	r.activationSources = append(r.activationSources, source)
+	r.calls = append(r.calls, id)
+	if r.onRefresh != nil {
+		r.onRefresh()
+	}
+	return r.meta, r.err
 }
 
 func (r *refreshingConversationFactsMetaRefresher) RefreshChannelMeta(_ context.Context, id channel.ChannelID) (channel.Meta, error) {
