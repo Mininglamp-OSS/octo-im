@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/channel"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/stretchr/testify/require"
 )
@@ -133,4 +134,49 @@ func TestSetUnreadDoesNotMoveReadSeqBackward(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Empty(t, repo.upsertedStates)
+}
+
+func TestSetUnreadUsesAuthoritativeLatestMessage(t *testing.T) {
+	base := newConversationSyncRepoStub()
+	base.latest[key("g1", 2)] = testMessage("g1", 2, 5, "u2", 100, "stale")
+	facts := &authoritativeConversationFactsStub{
+		conversationSyncRepoStub: base,
+		latest: map[ConversationKey]channel.Message{
+			key("g1", 2): testMessage("g1", 2, 10, "u2", 101, "leader"),
+		},
+	}
+	app := New(Options{
+		States: base,
+		Facts:  facts,
+	})
+
+	err := app.SetUnread(context.Background(), SetUnreadCommand{
+		UID:         "u1",
+		ChannelID:   "g1",
+		ChannelType: 2,
+		Unread:      3,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []ConversationKey{key("g1", 2)}, facts.loads)
+	require.Empty(t, base.latestLoads)
+	require.Len(t, base.upsertedStates, 1)
+	require.Equal(t, uint64(7), base.upsertedStates[0].ReadSeq)
+}
+
+type authoritativeConversationFactsStub struct {
+	*conversationSyncRepoStub
+	latest map[ConversationKey]channel.Message
+	loads  []ConversationKey
+}
+
+func (s *authoritativeConversationFactsStub) LoadLatestMessagesAuthoritative(_ context.Context, keys []ConversationKey) (map[ConversationKey]channel.Message, error) {
+	s.loads = append(s.loads, keys...)
+	out := make(map[ConversationKey]channel.Message, len(keys))
+	for _, key := range keys {
+		if msg, ok := s.latest[key]; ok {
+			out[key] = msg
+		}
+	}
+	return out, nil
 }

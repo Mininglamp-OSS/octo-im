@@ -64,16 +64,16 @@ func TestConversationFactsRPCRejectsJSONPayload(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestLoadLatestConversationMessageTreatsNotReadyAsEmpty(t *testing.T) {
+func TestLoadLatestConversationMessageReturnsNotReady(t *testing.T) {
 	msg, ok, err := loadLatestConversationMessage(context.Background(), notReadyConversationFactsLog{}, channel.ChannelID{ID: "g1", Type: 2}, 1024)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, channel.ErrNotReady)
 	require.False(t, ok)
 	require.Equal(t, channel.Message{}, msg)
 }
 
-func TestLoadRecentConversationMessagesTreatsNotReadyAsEmpty(t *testing.T) {
+func TestLoadRecentConversationMessagesReturnsNotReady(t *testing.T) {
 	msgs, err := loadRecentConversationMessages(context.Background(), notReadyConversationFactsLog{}, channel.ChannelID{ID: "g1", Type: 2}, 10, 1024)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, channel.ErrNotReady)
 	require.Nil(t, msgs)
 }
 

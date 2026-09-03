@@ -63,7 +63,11 @@ func (a *App) latestConversationSeq(ctx context.Context, key ConversationKey, fa
 	if a.facts == nil {
 		return 0, false, errors.New("message facts store not configured")
 	}
-	latestByKey, err := a.facts.LoadLatestMessages(ctx, []ConversationKey{key})
+	loadLatest := a.facts.LoadLatestMessages
+	if authoritative, ok := a.facts.(authoritativeMessageFactsStore); ok {
+		loadLatest = authoritative.LoadLatestMessagesAuthoritative
+	}
+	latestByKey, err := loadLatest(ctx, []ConversationKey{key})
 	if err != nil {
 		return 0, false, err
 	}

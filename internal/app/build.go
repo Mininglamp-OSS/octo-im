@@ -1366,6 +1366,29 @@ func (f channelLogConversationFacts) LoadLatestMessages(ctx context.Context, key
 	return out, nil
 }
 
+// LoadLatestMessagesAuthoritative resolves every channel to its current leader
+// before loading its latest message. Conversation mutations use this path so a
+// readable but lagging local replica cannot produce a stale read cursor.
+func (f channelLogConversationFacts) LoadLatestMessagesAuthoritative(ctx context.Context, keys []conversationusecase.ConversationKey) (map[conversationusecase.ConversationKey]channel.Message, error) {
+	if len(keys) == 0 {
+		return map[conversationusecase.ConversationKey]channel.Message{}, nil
+	}
+	if remote, ok := f.remote.(batchConversationFactsRemote); ok {
+		return f.loadRemoteLatestMessagesBatch(ctx, remote, keys)
+	}
+	out := make(map[conversationusecase.ConversationKey]channel.Message, len(keys))
+	for _, key := range keys {
+		msg, ok, err := f.loadRemoteLatestMessage(ctx, channel.ChannelID{ID: key.ChannelID, Type: key.ChannelType})
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out[key] = msg
+		}
+	}
+	return out, nil
+}
+
 func (f channelLogConversationFacts) LoadRecentMessages(ctx context.Context, key conversationusecase.ConversationKey, limit int) ([]channel.Message, error) {
 	if limit <= 0 {
 		return nil, nil

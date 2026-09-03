@@ -74,6 +74,38 @@ func TestChannelLogConversationFactsLoadLatestMessagesBatchesRemoteLoadsByOwner(
 	require.Equal(t, 1, metas.batchCalls)
 }
 
+func TestChannelLogConversationFactsLoadLatestMessagesAuthoritativeUsesOwner(t *testing.T) {
+	remote := &recordingConversationFactsRemote{
+		latestByNode: map[uint64]map[channel.ChannelID]channel.Message{
+			3: {
+				{ID: "g1", Type: 2}: {ChannelID: "g1", ChannelType: 2, MessageSeq: 10},
+			},
+		},
+	}
+	metas := &staticConversationFactsMetas{
+		metas: map[channel.ChannelID]metadb.ChannelRuntimeMeta{
+			{ID: "g1", Type: 2}: {ChannelID: "g1", ChannelType: 2, Leader: 3},
+		},
+	}
+	facts := channelLogConversationFacts{
+		cluster: notReadyConversationFactsCluster{},
+		metas:   metas,
+		remote:  remote,
+	}
+
+	got, err := facts.LoadLatestMessagesAuthoritative(context.Background(), []conversationusecase.ConversationKey{
+		{ChannelID: "g1", ChannelType: 2},
+	})
+	require.NoError(t, err)
+	require.Equal(t, map[conversationusecase.ConversationKey]channel.Message{
+		{ChannelID: "g1", ChannelType: 2}: {ChannelID: "g1", ChannelType: 2, MessageSeq: 10},
+	}, got)
+	require.Equal(t, []conversationFactsBatchCall{
+		{NodeID: 3, Keys: []channel.ChannelID{{ID: "g1", Type: 2}}},
+	}, remote.latestBatchCalls)
+	require.Equal(t, 1, metas.batchCalls)
+}
+
 func TestChannelLogConversationFactsSupportsBatchRecentLoadsByOwner(t *testing.T) {
 	remote := &recordingConversationFactsRemote{
 		recentsByNode: map[uint64]map[channel.ChannelID][]channel.Message{
