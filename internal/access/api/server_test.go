@@ -1424,6 +1424,23 @@ func TestConversationDeleteMapsLegacyRequestToUsecaseCommand(t *testing.T) {
 	}, conversations.deleteCommands)
 }
 
+func TestConversationDeleteReturnsConflictWhenLatestMessageUnavailable(t *testing.T) {
+	conversations := &recordingConversationUsecase{
+		deleteErr: conversationusecase.ErrLatestMessageUnavailable,
+	}
+	srv := New(Options{Conversations: conversations})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/conversations/delete", bytes.NewBufferString(`{"uid":"u1","channel_id":"g1","channel_type":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.Engine().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.JSONEq(t, `{"msg":"conversation has no latest message","status":409}`, rec.Body.String())
+	require.Len(t, conversations.deleteCommands, 1)
+	require.Zero(t, conversations.deleteCommands[0].MessageSeq)
+}
+
 func TestConversationSetUnreadRejectsInvalidLegacyRequest(t *testing.T) {
 	conversations := &recordingConversationUsecase{}
 	srv := New(Options{Conversations: conversations})

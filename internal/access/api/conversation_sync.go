@@ -165,24 +165,35 @@ func (s *Server) handleConversationDelete(c *gin.Context) {
 }
 
 func (s *Server) writeConversationMutationError(c *gin.Context, err error) {
-	if errors.Is(err, channel.ErrNotReady) ||
-		errors.Is(err, channel.ErrStaleMeta) ||
-		errors.Is(err, channel.ErrNotLeader) ||
-		errors.Is(err, raftcluster.ErrNoLeader) {
+	status, message := classifyConversationMutationError(err)
+	switch {
+	case status == http.StatusServiceUnavailable:
 		if s != nil && s.logger != nil {
 			s.logger.Warn("conversation mutation temporarily unavailable", wklog.Error(err))
 		}
-		writeLegacyJSONErrorStatus(c, http.StatusServiceUnavailable, "retry required")
-		return
+	case status >= http.StatusInternalServerError:
+		if s != nil && s.logger != nil {
+			s.logger.Error("conversation mutation failed", wklog.Error(err))
+		}
 	}
-	if status, message, ok := mapSendError(err); ok {
-		writeLegacyJSONErrorStatus(c, status, message)
-		return
+	writeLegacyJSONErrorStatus(c, status, message)
+}
+
+func classifyConversationMutationError(err error) (int, string) {
+	switch {
+	case errors.Is(err, conversationusecase.ErrLatestMessageUnavailable):
+		return http.StatusConflict, "conversation has no latest message"
+	case errors.Is(err, channel.ErrNotReady),
+		errors.Is(err, channel.ErrStaleMeta),
+		errors.Is(err, channel.ErrNotLeader),
+		errors.Is(err, raftcluster.ErrNoLeader):
+		return http.StatusServiceUnavailable, "retry required"
+	default:
+		if status, message, ok := mapSendError(err); ok {
+			return status, message
+		}
+		return http.StatusInternalServerError, "conversation mutation failed"
 	}
-	if s != nil && s.logger != nil {
-		s.logger.Error("conversation mutation failed", wklog.Error(err))
-	}
-	writeLegacyJSONErrorStatus(c, http.StatusInternalServerError, "conversation mutation failed")
 }
 
 func validateClearConversationUnreadRequest(req clearConversationUnreadRequest) error {

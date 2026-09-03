@@ -93,7 +93,7 @@ func TestDeleteConversationReturnsErrorWhenLatestMessageSeqMissing(t *testing.T)
 		ChannelType: 2,
 	})
 
-	require.ErrorContains(t, err, "latest message not found")
+	require.ErrorIs(t, err, ErrLatestMessageUnavailable)
 	require.Empty(t, repo.hides)
 	require.Empty(t, repo.removedBarriers)
 }
