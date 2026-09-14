@@ -281,3 +281,19 @@ func TestMembershipBroadcastCommitClampedToDurableLogs(t *testing.T) {
 		require.Equal(t, uint64(8), follower.queue.committedIndex)
 	}
 }
+
+func TestElectionMembershipHigherTermConfigEndsCampaign(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	n.campaign()
+	clearEvents(n)
+	term := n.LastTerm()
+	require.NoError(t, n.Step(types.Event{Type: types.VoteResp, From: 1, Term: term, Reason: types.ReasonOk}))
+	cfg := n.cfg.Clone()
+	cfg.Term++
+	cfg.Version++
+	require.NoError(t, n.switchConfig(cfg))
+	require.Equal(t, types.RoleFollower, n.cfg.Role)
+	require.Empty(t, n.votes)
+	require.NoError(t, n.Step(types.Event{Type: types.VoteResp, From: 2, Term: term, Reason: types.ReasonOk}))
+	require.False(t, n.IsLeader())
+}

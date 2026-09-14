@@ -58,14 +58,14 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	} else if oldCfg.Role == types.RoleLearner || newCfg.Role == types.RoleLearner {
 		newCfg.Role = types.RoleFollower
 	}
-	if isVoter(newCfg, n.opts.NodeId) && oldCfg.Role == types.RoleCandidate && !sameVoters(oldCfg, newCfg) {
+	if isVoter(newCfg, n.opts.NodeId) && oldCfg.Role == types.RoleCandidate && (!sameVoters(oldCfg, newCfg) || oldCfg.Term != newCfg.Term) {
 		newCfg.Role = types.RoleFollower
 		newCfg.Leader = None
 	}
 
 	// A version-only update is not a new election. Preserve collected votes;
 	// role transitions below clear them if the campaign actually ends.
-	if !sameVoters(oldCfg, newCfg) {
+	if !sameVoters(oldCfg, newCfg) || oldCfg.Term != newCfg.Term {
 		n.votes = make(map[uint64]bool)
 	}
 	n.replicaSync = make(map[uint64]*SyncInfo)
