@@ -248,6 +248,7 @@ func TestConversationReadCommittedBoundary(t *testing.T) {
 	}{
 		{"uncommitted suffix", 42, 41, 41, 41},
 		{"nothing committed", 42, 0, 0, 0},
+		{"empty channel", 0, 0, 0, 0},
 		{"commit during read", 42, 41, 42, 42},
 		{"tail below commit", 40, 41, 41, 40},
 	} {
@@ -266,6 +267,10 @@ func TestConversationReadCommittedBoundary(t *testing.T) {
 			}
 			r.local = func(string, uint8) (uint64, uint64, error) { return tc.tail, 0, nil }
 			seq, err := r.readLocal(context.Background(), cfg)
+			if tc.tail > 0 && tc.after == 0 {
+				require.ErrorIs(t, err, ErrConversationReadRetry)
+				return
+			}
 			require.NoError(t, err)
 			require.Equal(t, tc.want, seq)
 		})

@@ -134,6 +134,24 @@ func (s *storage) Apply(key string, logs []types.Log) error {
 	return s.db.UpdateChannelAppliedIndex(id, typ, logs[len(logs)-1].Index)
 }
 
+// AppendLogs already writes the message state. Once Raft confirms commitment,
+// applying it only needs a durable boundary, including on a legacy channel
+// with no marker. Do not deserialize its entire history on the ACK path.
+func (s *storage) ApplyCommittedRange(key string, start, end uint64) error {
+	if start == 0 || end <= start {
+		return fmt.Errorf("invalid committed channel range [%d,%d)", start, end)
+	}
+	last, err := s.LastIndex(key)
+	if err != nil {
+		return err
+	}
+	if end-1 > last {
+		return fmt.Errorf("committed channel range exceeds stored tail")
+	}
+	id, typ := wkutil.ChannelFromlKey(key)
+	return s.db.UpdateChannelAppliedIndex(id, typ, end-1)
+}
+
 func (s *storage) SaveConfig(key string, cfg types.Config) error {
 	if s.s.opts.OnSaveConfig != nil {
 		channelId, channelType := wkutil.ChannelFromlKey(key)

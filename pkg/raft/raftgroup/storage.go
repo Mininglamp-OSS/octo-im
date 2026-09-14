@@ -2,6 +2,15 @@ package raftgroup
 
 import "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 
+// CommittedRangeApplier is optional for stores whose state is already
+// materialized by AppendLogs. ApplyCommittedRange must durably record the
+// committed [start, end) range before returning. It is called only for a Raft
+// ApplyReq, never to infer commitment from a locally stored tail.
+// State machines that need log payloads must use IStorage.Apply instead.
+type CommittedRangeApplier interface {
+	ApplyCommittedRange(key string, start, end uint64) error
+}
+
 type IStorage interface {
 	// AppendLogs 追加日志, 如果termStartIndex不为nil, 则需要保存termStartIndex，最好确保原子性
 	AppendLogs(key string, logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) error

@@ -91,7 +91,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 			if _, ok := pending[k]; ok {
 				continue
 			}
-			old, err := s.opts.DB.LoadMsgBySenderClientMsgNo(id, typ, m.FromUID, m.ClientMsgNo)
+			old, err := s.opts.DB.LoadMsgBySenderClientMsgNo(ctx, id, typ, m.FromUID, m.ClientMsgNo)
 			if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
 				return err
 			}

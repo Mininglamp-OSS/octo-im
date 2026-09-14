@@ -1,6 +1,8 @@
 package wkdb_test
 
 import (
+	"context"
+	"fmt"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/stretchr/testify/require"
@@ -23,7 +25,7 @@ func TestMessageRetryLookupPreservesColumnsAndScope(t *testing.T) {
 	other.MessageID = 12
 	require.NoError(t, d.AppendMessages("b", 2, []wkdb.Message{other}))
 	for _, want := range []wkdb.Message{m, bob, other} {
-		got, err := d.LoadMsgBySenderClientMsgNo(want.ChannelID, 2, want.FromUID, "key")
+		got, err := d.LoadMsgBySenderClientMsgNo(context.Background(), want.ChannelID, 2, want.FromUID, "key")
 		require.NoError(t, err)
 		require.Equal(t, want.MessageID, got.MessageID)
 		require.True(t, got.RedDot)
@@ -36,36 +38,35 @@ func TestMessageRetryLookupPreservesColumnsAndScope(t *testing.T) {
 	}
 	// Stale secondary indexes after truncation must not replay a replaced entry.
 	require.NoError(t, d.TruncateLogTo("a", 2, 1))
-	_, err := d.LoadMsgBySenderClientMsgNo("a", 2, "bob", "key")
+	_, err := d.LoadMsgBySenderClientMsgNo(context.Background(), "a", 2, "bob", "key")
 	require.ErrorIs(t, err, wkdb.ErrNotFound)
 	bob.MessageID = 13
 	bob.ClientMsgNo = "replacement"
 	require.NoError(t, d.AppendMessages("a", 2, []wkdb.Message{bob}))
-	_, err = d.LoadMsgBySenderClientMsgNo("a", 2, "bob", "key")
+	_, err = d.LoadMsgBySenderClientMsgNo(context.Background(), "a", 2, "bob", "key")
 	require.ErrorIs(t, err, wkdb.ErrNotFound)
 }
 
-func TestMessageRetryLookupSeeksOnlyRequestedChannelAndCapsLegacyBucket(t *testing.T) {
+func TestMessageRetryLookupIntersectsSenderAndClientIndexes(t *testing.T) {
 	d := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(t.TempDir()), wkdb.WithShardNum(1)))
 	require.NoError(t, d.Open())
 	defer d.Close()
-	// The old index includes primary keys: exploit their channel prefix even
-	// on a database written before this PR. Pollution on another channel must
-	// not consume the retry lookup's candidate budget.
+	// Legacy stores already contain both indexes. Cross-channel and
+	// cross-sender rows must not prevent a valid lookup or a new sender.
 	messages := make([]wkdb.Message, 1100)
 	for i := range messages {
-		messages[i] = wkdb.Message{RecvPacket: wkproto.RecvPacket{ChannelID: "pollution", ChannelType: 2, MessageSeq: uint32(i + 1), MessageID: int64(i + 1), FromUID: "other", ClientMsgNo: "counter-1", Payload: []byte("x")}}
+		messages[i] = wkdb.Message{RecvPacket: wkproto.RecvPacket{ChannelID: "pollution", ChannelType: 2, MessageSeq: uint32(i + 1), MessageID: int64(i + 1), FromUID: fmt.Sprintf("sender-%04d", i), ClientMsgNo: "counter-1", Payload: []byte("x")}}
 	}
 	require.NoError(t, d.AppendMessages("pollution", 2, messages))
-	_, err := d.LoadMsgBySenderClientMsgNo("target", 2, "alice", "counter-1")
+	_, err := d.LoadMsgBySenderClientMsgNo(context.Background(), "target", 2, "alice", "counter-1")
 	require.ErrorIs(t, err, wkdb.ErrNotFound)
-	_, err = d.LoadMsgBySenderClientMsgNo("pollution", 2, "alice", "counter-1")
-	require.ErrorIs(t, err, wkdb.ErrMessageRetryLookupLimit, "a capped scan must never claim the key is absent")
-	// Existing canonical entries at the front still resolve, including legacy
-	// duplicates. No backfill/version marker is needed for old databases.
-	m, err := d.LoadMsgBySenderClientMsgNo("pollution", 2, "other", "counter-1")
+	_, err = d.LoadMsgBySenderClientMsgNo(context.Background(), "pollution", 2, "alice", "counter-1")
+	require.ErrorIs(t, err, wkdb.ErrNotFound, "other senders cannot deny a new sender")
+	// The last sender remains findable past 1024 same-number entries.
+	// No backfill/version marker is needed for old databases.
+	m, err := d.LoadMsgBySenderClientMsgNo(context.Background(), "pollution", 2, "sender-1099", "counter-1")
 	require.NoError(t, err)
-	require.Equal(t, int64(1), m.MessageID)
+	require.Equal(t, int64(1100), m.MessageID)
 }
 
 func TestMessageRetryTruncateCannotEraseAppliedPrefix(t *testing.T) {

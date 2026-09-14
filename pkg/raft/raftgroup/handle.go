@@ -156,7 +156,14 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 		// 已提交
 		// rg.wait.didCommit(r.Key(), e.EndIndex-1)
 		var lastLogIndex uint64
-		if !rg.opts.NotNeedApplied {
+		if storage, ok := rg.opts.Storage.(CommittedRangeApplier); ok && !rg.opts.NotNeedApplied {
+			if err := storage.ApplyCommittedRange(r.Key(), e.StartIndex, e.EndIndex); err != nil {
+				rg.Error("apply committed range failed", zap.Error(err))
+				rg.AddEvent(r.Key(), types.Event{Type: types.ApplyResp, Reason: types.ReasonError})
+				return
+			}
+			lastLogIndex = e.EndIndex - 1
+		} else if !rg.opts.NotNeedApplied {
 			logs, err := rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, min(e.EndIndex, e.StartIndex+1000), rg.opts.MaxLogSizePerBatch)
 			if err != nil {
 				rg.Error("get logs failed", zap.Error(err))

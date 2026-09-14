@@ -18,23 +18,24 @@ the owner, followed by a final leader/configuration/commit/apply fence. A normal
 append cannot modify that committed prefix. Truncating below the durable applied
 marker is rejected, rather than discarding evidence of acknowledged messages.
 
-Legacy stores need no format migration. The existing retry secondary index is
-ordered by client hash followed by channel and sequence; lookups now seek only
-the requested channel. Sender-scoped admission examines at most 1,024 candidate
-rows and fails with `ErrMessageRetryLookupLimit` if the bucket is larger and no
-match has been found. This is an explicit failure, never a not-found result that
-could create a duplicate. Stale index entries left by historical truncation are
-verified against current rows and count toward this limit. Large same-number
-legacy buckets require index maintenance/a dedicated scope index before they
-can serve a previously unseen sender; repeatedly resending cannot repair this
-limit. This revision chooses bounded lookup, not a new index migration.
+Legacy stores need no format migration. Both existing secondary indexes (sender
+and client message number) include channel/sequence suffixes. Admission seeks
+through their intersection in one Pebble snapshot, loading only common primary
+keys and verifying the complete retry key. A large same-number bucket shared by
+other senders cannot permanently reject valid sends. Stale rows are checked
+against the snapshot's current messages; no fixed candidate-count cap is used.
+The caller's context bounds pathological intersections, and cancellation is
+returned as an error, never as a missing key. DB I/O remains outside the Raft
+owner. One in-flight Pebble operation cannot be interrupted by the context.
 
 Channel apply persists the existing applied-index field. Legacy channels start
 at zero and regain confirmation through replication (or the single-voter quorum
-rule). Recovery reads at most 1,000 logs and the configured `MaxLogSizePerBatch`
-(default 10 MiB) per apply request, advancing the durable marker after each
-successful batch. One log may exceed the byte target. Recovery still takes time
-proportional to history, but never allocates the whole history in one batch.
+rule). Message state is already materialized by `AppendLogs`, so a Raft-confirmed
+apply range durably advances its boundary without reading or re-marshaling any
+historical payloads. It never seeds commitment from the stored tail. Generic
+state machines still read bounded batches and run their payload apply callbacks.
+An active channel with a non-empty tail but no confirmed commit boundary returns
+a retryable conversation-boundary error until confirmation, rather than zero.
 
 The channel proposal RPC is `/rpc/channel/propose/v2`. Its response preserves
 request correlation and canonical identity. Old RPC and generic channel proposal
@@ -56,7 +57,7 @@ exceed a client's three-second ACK budget even when retries are idempotent.
    control-plane leader and slot readiness. Resume writes only after every
    reachable IM peer supports v2 and real cross-node test sends return canonical
    IDs/sequences. Warm representative legacy channels and watch recovery markers,
-   memory, disk latency and lookup-limit errors before opening full traffic.
+   memory and disk latency before opening full traffic.
 4. Rollback also requires quiescing writes and switching the entire IM tier.
    Preserve data and retry records; old binaries lose the new idempotency and
    durable-ACK guarantees. Do not claim a rolling, zero-downtime cutover.

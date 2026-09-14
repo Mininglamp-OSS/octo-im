@@ -27,12 +27,12 @@ type messageBoundaryDB struct {
 	verify  bool
 }
 
-func (d *messageBoundaryDB) LoadMsgBySenderClientMsgNo(id string, typ uint8, sender string, client string) (wkdb.Message, error) {
+func (d *messageBoundaryDB) LoadMsgBySenderClientMsgNo(ctx context.Context, id string, typ uint8, sender string, client string) (wkdb.Message, error) {
 	if d.entered != nil && !d.verify && d.once.CompareAndSwap(false, true) {
 		close(d.entered)
 		<-d.release
 	}
-	return d.DB.LoadMsgBySenderClientMsgNo(id, typ, sender, client)
+	return d.DB.LoadMsgBySenderClientMsgNo(ctx, id, typ, sender, client)
 }
 func (d *messageBoundaryDB) LoadNextRangeMsgsForSize(id string, typ uint8, start, end, limit uint64) ([]wkdb.Message, error) {
 	d.mu.Lock()
@@ -100,7 +100,7 @@ func TestMessageRetryBoundarySlowLookupMustNotBlockOtherChannel(t *testing.T) {
 func TestMessageRetryBoundaryLegacyActivationMustBoundHistoryRead(t *testing.T) {
 	d := &messageBoundaryDB{}
 	s := messageBoundarySetup(t, d)
-	const total = 2000
+	const total = 20000
 	messages := make([]wkdb.Message, total)
 	for i := range messages {
 		messages[i] = wkdb.Message{RecvPacket: wkproto.RecvPacket{ChannelID: "legacy", ChannelType: 2, MessageID: int64(i + 1), MessageSeq: uint32(i + 1), FromUID: "sender", ClientMsgNo: "old", Payload: make([]byte, 256)}, Term: 1}
@@ -117,21 +117,14 @@ func TestMessageRetryBoundaryLegacyActivationMustBoundHistoryRead(t *testing.T) 
 	ranges := append([][3]uint64(nil), d.ranges...)
 	d.mu.Unlock()
 	t.Logf("legacy activation storage reads [start,end,size_limit]: %v", ranges)
-	for _, r := range ranges {
-		require.Greater(t, r[2], uint64(0))
-		require.LessOrEqual(t, r[1]-r[0], uint64(1000))
-	}
+	require.Empty(t, ranges, "apply must not read/deserialize legacy history")
 	d.mu.Lock()
 	appliedSteps := append([]uint64(nil), d.applied...)
 	d.mu.Unlock()
-	require.GreaterOrEqual(t, len(appliedSteps), 3, "recovery must advance its durable marker incrementally")
-	for i, index := range appliedSteps {
-		if i == 0 {
-			require.LessOrEqual(t, index, uint64(1000))
-		} else {
-			require.LessOrEqual(t, index-appliedSteps[i-1], uint64(1000))
-		}
-	}
+	require.NotEmpty(t, appliedSteps)
+	require.LessOrEqual(t, len(appliedSteps), 2, "one recovery marker and optionally one new-message marker")
+	require.Equal(t, uint64(total+1), appliedSteps[len(appliedSteps)-1])
+
 }
 
 func (d *messageBoundaryDB) LoadMsg(id string, typ uint8, seq uint64) (wkdb.Message, error) {

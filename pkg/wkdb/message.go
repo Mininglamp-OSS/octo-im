@@ -2,7 +2,7 @@ package wkdb
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -885,28 +885,28 @@ func (wk *wukongDB) SearchMessages(req MessageSearchReq) ([]Message, error) {
 
 // LoadMsgByClientMsgNo 通过 clientMsgNo 加载指定频道的消息
 func (wk *wukongDB) LoadMsgByClientMsgNo(channelId string, channelType uint8, clientMsgNo string) (Message, error) {
-	return wk.loadMsgByClientMsgNo(channelId, channelType, "", clientMsgNo, false)
+	return wk.loadMsgByClientMsgNo(context.Background(), channelId, channelType, "", clientMsgNo, false)
 }
-
-// ErrMessageRetryLookupLimit requires index maintenance before retrying this
-// oversized legacy bucket. No proposal is admitted after a partial lookup.
-var ErrMessageRetryLookupLimit = errors.New("message retry lookup candidate limit exceeded")
-
-const messageRetryLookupLimit = 1024
 
 // LoadMsgBySenderClientMsgNo scopes a retry key to its sender and channel.
-func (wk *wukongDB) LoadMsgBySenderClientMsgNo(channelId string, channelType uint8, fromUID, clientMsgNo string) (Message, error) {
-	return wk.loadMsgByClientMsgNo(channelId, channelType, fromUID, clientMsgNo, true)
+func (wk *wukongDB) LoadMsgBySenderClientMsgNo(ctx context.Context, channelId string, channelType uint8, fromUID, clientMsgNo string) (Message, error) {
+	return wk.loadMsgByClientMsgNo(ctx, channelId, channelType, fromUID, clientMsgNo, true)
 }
 
-func (wk *wukongDB) loadMsgByClientMsgNo(channelId string, channelType uint8, fromUID, clientMsgNo string, matchSender bool) (Message, error) {
+func (wk *wukongDB) loadMsgByClientMsgNo(ctx context.Context, channelId string, channelType uint8, fromUID, clientMsgNo string, matchSender bool) (Message, error) {
+	if err := ctx.Err(); err != nil {
+		return EmptyMessage, err
+	}
 	wk.metrics.SearchMessagesAdd(1)
 
 	if strings.TrimSpace(clientMsgNo) == "" {
 		return EmptyMessage, fmt.Errorf("clientMsgNo is empty")
 	}
 
-	db := wk.channelDb(channelId, channelType)
+	// All index and primary reads share one snapshot. Concurrent store or
+	// truncation cannot create a false negative between the two indexes.
+	db := wk.channelDb(channelId, channelType).NewSnapshot()
+	defer db.Close()
 
 	// 通过 clientMsgNo 索引查找主键
 	// The primary-key suffix is ordered by channel hash and sequence, so old
@@ -924,18 +924,46 @@ func (wk *wukongDB) loadMsgByClientMsgNo(channelId string, channelType uint8, fr
 	})
 	defer iter.Close()
 
-	// Fail closed on oversized legacy/collision buckets; never mistake a
-	// partial scan for a missing retry key and append a duplicate.
-	scanned := 0
-	for iter.First(); iter.Valid(); iter.Next() {
-		if matchSender && scanned >= messageRetryLookupLimit {
-			return EmptyMessage, ErrMessageRetryLookupLimit
+	// Both indexes already exist in legacy stores and sort by channel/sequence.
+	// Intersect them using seeks: a different sender's large client-number
+	// bucket is skipped without loading its messages. No schema migration or
+	// permanent candidate-count failure is needed. Pathological stale/collision
+	// rows are bounded by the caller's deadline, never treated as "not found".
+	var senderIter *pebble.Iterator
+	if matchSender {
+		senderIter = db.NewIter(&pebble.IterOptions{
+			LowerBound: key.NewMessageSecondIndexFromUidKey(fromUID, lowPrimary),
+			UpperBound: key.NewMessageSecondIndexFromUidKey(fromUID, highPrimary),
+		})
+		defer senderIter.Close()
+		senderIter.First()
+	}
+	iter.First()
+	for iter.Valid() {
+		if err := ctx.Err(); err != nil {
+			return EmptyMessage, err
 		}
-		scanned++
 		primaryBytes, err := key.ParseMessageSecondIndexKey(iter.Key())
 		if err != nil {
-			wk.Error("LoadMsgByClientMsgNo: parseMessageSecondIndexKey failed", zap.Error(err))
-			continue
+			return EmptyMessage, err
+		}
+
+		if senderIter != nil {
+			if !senderIter.Valid() {
+				break
+			}
+			senderPrimary, err := key.ParseMessageSecondIndexKey(senderIter.Key())
+			if err != nil {
+				return EmptyMessage, err
+			}
+			switch bytes.Compare(primaryBytes[:], senderPrimary[:]) {
+			case -1:
+				iter.SeekGE(key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, senderPrimary))
+				continue
+			case 1:
+				senderIter.SeekGE(key.NewMessageSecondIndexFromUidKey(fromUID, primaryBytes))
+				continue
+			}
 		}
 
 		// 通过主键查找消息
@@ -956,10 +984,22 @@ func (wk *wukongDB) loadMsgByClientMsgNo(channelId string, channelType uint8, fr
 
 		// 验证消息确实属于指定的频道且 clientMsgNo 匹配
 		if msg.ChannelID == channelId && msg.ChannelType == channelType && msg.ClientMsgNo == clientMsgNo && (!matchSender || msg.FromUID == fromUID) {
-			return msg, nil
+			return msg, ctx.Err()
+		}
+		iter.Next()
+		if senderIter != nil {
+			senderIter.Next()
 		}
 	}
 
+	if senderIter != nil {
+		if err := senderIter.Error(); err != nil {
+			return EmptyMessage, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return EmptyMessage, err
+	}
 	if err := iter.Error(); err != nil {
 		return EmptyMessage, err
 	}

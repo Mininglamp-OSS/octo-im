@@ -15,20 +15,19 @@ that index. A commit completed during the read may be included.
 
 ## Legacy recovery limitation
 
-The committed-index bound is only as reliable as the old runtime's recovered
-state. This branch initializes a channel's applied index from its durable message
-tail, and initializes the runtime committed index from that applied index.
-Although wkdb exposes a persistent channel applied-index key, the channel apply
-pipeline does not maintain it. Existing records cannot be assumed to contain a
-trustworthy independently persisted commit marker.
+Active channel recovery now loads the persisted applied marker; it no longer
+uses the local message tail as evidence of commitment. Apply maintains that
+marker only after Raft confirms a range. Because channel message state was
+already written by `AppendLogs`, the marker can advance without replaying the
+history payloads. A missing legacy marker starts at zero and replication (or
+the single-voter quorum rule) must establish commitment again. A non-empty
+active channel whose committed bound is still zero returns a retryable error.
 
-Consequently, a dormant-channel read can return a crash-residue uncommitted
-suffix. Creating a runtime does not by itself resolve this: a freshly recovered
-runtime also initially regards that durable suffix as committed. Only subsequent
-replication/election reconciliation can establish the actual history. The active
-read bound prevents new in-flight suffixes from being returned, but does not
-repair this inherited recovery ambiguity. Resolving it requires commit-marker
-maintenance and an explicit migration/recovery policy for existing data.
+Dormant reads still use the designated owner's durable tail without a runtime
+or a commit-marker check. Consequently, a dormant-channel read can return a
+crash-residue uncommitted suffix; maintaining the marker for active channels
+does not change that legacy dormant-read behavior. This remains a separate
+compatibility limitation, not a guarantee of committed dormant history.
 
 Dormant channels remain readable without being created or woken. This preserves
 the v2.2.5 behavior and the above residual risk; it is not a claim of the stronger
