@@ -761,6 +761,10 @@ type RaftState struct {
 type ProposeResp struct {
 	Id    uint64
 	Index uint64
+	// Channel-only metadata, transported by the versioned channel RPC. Id stays
+	// the request correlation ID; generic Raft's binary codec is unchanged.
+	CanonicalID uint64 `json:",omitempty"`
+	Duplicate   bool   `json:",omitempty"`
 }
 
 type ProposeRespSet []*ProposeResp

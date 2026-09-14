@@ -27,9 +27,12 @@ func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, channelId 
 	rg := s.getRaftGroup(channelKey)
 
 	// ========== 如果当前节点存在频道的raft，则直接提按 ==========
-	raft := rg.GetRaft(channelKey)
-	if raft != nil && raft.IsLeader() {
-		return rg.ProposeBatchUntilAppliedTimeout(ctx, channelKey, reqs)
+	state, err := rg.ReadLeaderState(ctx, channelKey)
+	if err != nil {
+		return nil, err
+	}
+	if state.Exists && state.Ready && state.LeaderID == s.opts.NodeId {
+		return s.proposeMessages(ctx, channelId, channelType, reqs)
 	}
 
 	// ========== 如果不存在，则先从频道的槽领导获取频道的分布式配置，然后根据配置执行对应逻辑 ==========
@@ -45,11 +48,11 @@ func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, channelId 
 		if err != nil {
 			return nil, err
 		}
-		return rg.ProposeBatchUntilAppliedTimeout(ctx, channelKey, reqs)
+		return s.proposeMessages(ctx, channelId, channelType, reqs)
 	}
 
 	// 向频道的领导节点请求提案
-	return s.opts.RPC.RequestChannelProposeBatchUntilApplied(clusterConfig.LeaderId, channelId, channelType, reqs)
+	return s.opts.RPC.RequestChannelProposeBatchUntilApplied(ctx, clusterConfig.LeaderId, channelId, channelType, reqs)
 
 }
 
@@ -58,9 +61,12 @@ func (s *Server) ProposeBatchUntilAppliedTimeoutForLocal(ctx context.Context, ch
 	rg := s.getRaftGroup(channelKey)
 
 	// ========== 如果当前节点存在频道的raft，则直接提按 ==========
-	raft := rg.GetRaft(channelKey)
-	if raft != nil && raft.IsLeader() {
-		return rg.ProposeBatchUntilAppliedTimeout(ctx, channelKey, reqs)
+	state, err := rg.ReadLeaderState(ctx, channelKey)
+	if err != nil {
+		return nil, err
+	}
+	if state.Exists && state.Ready && state.LeaderID == s.opts.NodeId {
+		return s.proposeMessages(ctx, channelId, channelType, reqs)
 	}
 
 	// ========== 如果不存在，则先从频道的槽领导获取频道的分布式配置，然后根据配置执行对应逻辑 ==========
@@ -78,7 +84,7 @@ func (s *Server) ProposeBatchUntilAppliedTimeoutForLocal(ctx context.Context, ch
 	if err != nil {
 		return nil, err
 	}
-	return rg.ProposeBatchUntilAppliedTimeout(ctx, channelKey, reqs)
+	return s.proposeMessages(ctx, channelId, channelType, reqs)
 
 }
 

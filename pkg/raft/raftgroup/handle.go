@@ -41,6 +41,8 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
+	// Capture mutable Raft state on its owner before launching storage work.
+	lastIndex := r.LastLogIndex()
 	err := rg.goPool.Submit(func() {
 		// 获取裁断日志下标
 		var (
@@ -48,7 +50,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		)
 		if e.Reason != types.ReasonOnlySync {
 			var treason types.Reason
-			trunctIndex, treason = rg.getTrunctLogIndex(r, e)
+			trunctIndex, treason = rg.getTrunctLogIndex(r.Key(), lastIndex, e)
 			if treason != types.ReasonOk {
 				rg.AddEvent(r.Key(), types.Event{
 					To:     e.From,
@@ -205,8 +207,8 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 }
 
 // 根据副本的同步数据，来获取副本的需要裁剪的日志下标，如果不需要裁剪，则返回0
-func (rg *RaftGroup) getTrunctLogIndex(r IRaft, e types.Event) (uint64, types.Reason) {
-	leaderLastLogTerm, err := rg.opts.Storage.LeaderLastLogTerm(r.Key())
+func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Event) (uint64, types.Reason) {
+	leaderLastLogTerm, err := rg.opts.Storage.LeaderLastLogTerm(key)
 	if err != nil {
 		rg.Error("get leader last log term failed", zap.Error(err))
 		return 0, types.ReasonError
@@ -220,8 +222,8 @@ func (rg *RaftGroup) getTrunctLogIndex(r IRaft, e types.Event) (uint64, types.Re
 	if e.LastLogTerm == leaderLastLogTerm {
 		if e.Index > 0 {
 			replicaLastLogIndex := e.Index - 1 // 副本日志下标等于同步下标-1
-			if replicaLastLogIndex > r.LastLogIndex() {
-				return r.LastLogIndex(), types.ReasonOk
+			if replicaLastLogIndex > lastIndex {
+				return lastIndex, types.ReasonOk
 			}
 		}
 		return 0, types.ReasonOk
@@ -229,13 +231,13 @@ func (rg *RaftGroup) getTrunctLogIndex(r IRaft, e types.Event) (uint64, types.Re
 
 	// 如果副本的最新日志任期小于当前领导的最新日志任期，则需要裁剪
 	if e.LastLogTerm < leaderLastLogTerm {
-		term, err := rg.opts.Storage.LeaderTermGreaterEqThan(r.Key(), e.LastLogTerm+1)
+		term, err := rg.opts.Storage.LeaderTermGreaterEqThan(key, e.LastLogTerm+1)
 		if err != nil {
 			rg.Error("LeaderTermGreaterEqThan: get leader last term failed", zap.Error(err))
 			return 0, types.ReasonError
 		}
 		// 获取副本的最新日志任期+1的开始日志下标
-		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(r.Key(), term)
+		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(key, term)
 		if err != nil {
 			rg.Error("get term start index failed", zap.Error(err))
 			return 0, types.ReasonError
@@ -245,7 +247,7 @@ func (rg *RaftGroup) getTrunctLogIndex(r IRaft, e types.Event) (uint64, types.Re
 		}
 		return termStartIndex, types.ReasonOk
 	} else {
-		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(r.Key(), leaderLastLogTerm)
+		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(key, leaderLastLogTerm)
 		if err != nil {
 			rg.Error("get term start index failed", zap.Error(err))
 			return 0, types.ReasonError

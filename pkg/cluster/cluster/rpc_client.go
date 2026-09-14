@@ -2,7 +2,9 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -23,7 +25,7 @@ func newRpcClient(s *Server) *rpcClient {
 }
 
 // RequestChannelProposeBatchUntilApplied 向指定节点请求频道提案
-func (r *rpcClient) RequestChannelProposeBatchUntilApplied(nodeId uint64, channelId string, channelType uint8, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+func (r *rpcClient) RequestChannelProposeBatchUntilApplied(ctx context.Context, nodeId uint64, channelId string, channelType uint8, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
 
 	req := &channelProposeReq{
 		channelId:   channelId,
@@ -34,16 +36,29 @@ func (r *rpcClient) RequestChannelProposeBatchUntilApplied(nodeId uint64, channe
 	if err != nil {
 		return nil, err
 	}
-	body, err := r.request(nodeId, "/rpc/channel/propose", data)
+	resp, err := r.s.RequestWithContext(ctx, nodeId, "/rpc/channel/propose/v2", data)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil || resp.Status != proto.StatusOK {
+		return nil, fmt.Errorf("channel proposal requires retry")
+	}
+	body := resp.Body
 	if err != nil {
 		return nil, err
 	}
 
-	resps := types.ProposeRespSet{}
-	if err := resps.Unmarshal(body); err != nil {
+	var response channelProposeResponse
+	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, err
 	}
-	return resps, nil
+	if response.Version != 2 {
+		return nil, fmt.Errorf("unsupported channel proposal response")
+	}
+	if err := channel.ValidateMessageResults(reqs, response.Results); err != nil {
+		return nil, err
+	}
+	return response.Results, nil
 }
 
 // RequestSlotProposeBatchUntilApplied 向指定节点请求槽提案

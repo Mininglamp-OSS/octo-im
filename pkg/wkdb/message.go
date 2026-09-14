@@ -876,6 +876,15 @@ func (wk *wukongDB) SearchMessages(req MessageSearchReq) ([]Message, error) {
 
 // LoadMsgByClientMsgNo 通过 clientMsgNo 加载指定频道的消息
 func (wk *wukongDB) LoadMsgByClientMsgNo(channelId string, channelType uint8, clientMsgNo string) (Message, error) {
+	return wk.loadMsgByClientMsgNo(channelId, channelType, "", clientMsgNo, false)
+}
+
+// LoadMsgBySenderClientMsgNo scopes a retry key to its sender and channel.
+func (wk *wukongDB) LoadMsgBySenderClientMsgNo(channelId string, channelType uint8, fromUID, clientMsgNo string) (Message, error) {
+	return wk.loadMsgByClientMsgNo(channelId, channelType, fromUID, clientMsgNo, true)
+}
+
+func (wk *wukongDB) loadMsgByClientMsgNo(channelId string, channelType uint8, fromUID, clientMsgNo string, matchSender bool) (Message, error) {
 	wk.metrics.SearchMessagesAdd(1)
 
 	if strings.TrimSpace(clientMsgNo) == "" {
@@ -907,23 +916,26 @@ func (wk *wukongDB) LoadMsgByClientMsgNo(channelId string, channelType uint8, cl
 			LowerBound: key.NewMessageColumnKeyWithPrimary(primaryBytes, key.MinColumnKey),
 			UpperBound: key.NewMessageColumnKeyWithPrimary(primaryBytes, key.MaxColumnKey),
 		})
-		defer msgIter.Close()
 
 		var msg Message
 		err = wk.iteratorChannelMessages(msgIter, 0, func(m Message) bool {
 			msg = m
 			return false
 		})
+		msgIter.Close()
 		if err != nil {
 			return EmptyMessage, err
 		}
 
 		// 验证消息确实属于指定的频道且 clientMsgNo 匹配
-		if msg.ChannelID == channelId && msg.ChannelType == channelType && msg.ClientMsgNo == clientMsgNo {
+		if msg.ChannelID == channelId && msg.ChannelType == channelType && msg.ClientMsgNo == clientMsgNo && (!matchSender || msg.FromUID == fromUID) {
 			return msg, nil
 		}
 	}
 
+	if err := iter.Error(); err != nil {
+		return EmptyMessage, err
+	}
 	return EmptyMessage, ErrNotFound
 }
 

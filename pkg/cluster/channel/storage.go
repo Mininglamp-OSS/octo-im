@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"fmt"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -24,10 +25,17 @@ func (s *storage) GetState(channelId string, channelType uint8) (types.RaftState
 		return types.RaftState{}, err
 	}
 
+	applied, err := s.db.GetChannelAppliedIndex(channelId, channelType)
+	if err != nil {
+		return types.RaftState{}, err
+	}
+	if applied > uint64(lastMsg.MessageSeq) {
+		return types.RaftState{}, fmt.Errorf("channel applied index exceeds log tail")
+	}
 	return types.RaftState{
 		LastLogIndex: uint64(lastMsg.MessageSeq),
 		LastTerm:     uint32(lastMsg.Term),
-		AppliedIndex: uint64(lastMsg.MessageSeq),
+		AppliedIndex: applied,
 	}, nil
 }
 
@@ -114,7 +122,11 @@ func (s *storage) GetLogs(key string, startLogIndex uint64, endLogIndex uint64, 
 }
 
 func (s *storage) Apply(key string, logs []types.Log) error {
-	return nil
+	if len(logs) == 0 {
+		return nil
+	}
+	id, typ := wkutil.ChannelFromlKey(key)
+	return s.db.UpdateChannelAppliedIndex(id, typ, logs[len(logs)-1].Index)
 }
 
 func (s *storage) SaveConfig(key string, cfg types.Config) error {

@@ -165,9 +165,8 @@ func TestConversationReadSingleNode(t *testing.T) {
 	require.NoError(t, s.db.AppendMessages(cfg.ChannelId, cfg.ChannelType, []wkdb.Message{{Term: 1, RecvPacket: wkproto.RecvPacket{
 		ChannelID: cfg.ChannelId, ChannelType: cfg.ChannelType, MessageID: 42, MessageSeq: 42, Payload: []byte("message"),
 	}}}))
-	// Legacy recovery has no maintained durable commit marker. Pin that
-	// limitation explicitly: waking this pre-existing tail is not proof that
-	// its history reached quorum (see docs/conversation-boundary-reads.md).
+	// Legacy data starts without an applied marker. This single-voter channel
+	// confirms its stored tail on activation through the normal quorum rule.
 	persistedApplied, err := s.db.GetChannelAppliedIndex(cfg.ChannelId, cfg.ChannelType)
 	require.NoError(t, err)
 	require.Zero(t, persistedApplied)
@@ -177,7 +176,7 @@ func TestConversationReadSingleNode(t *testing.T) {
 				require.NoError(t, s.channelServer.WakeLeaderIfNeed(cfg))
 				state, err := s.channelServer.ReadLeaderState(ctx, cfg.ChannelId, cfg.ChannelType)
 				require.NoError(t, err)
-				require.Equal(t, uint64(42), state.CommittedIndex, "legacy recovery seeds committed from the stored tail")
+				require.Equal(t, uint64(42), state.CommittedIndex, "single voter confirms its stored tail on activation")
 			}
 			seq, err := s.GetChannelLastMessageSeq(ctx, cfg.ChannelId, cfg.ChannelType)
 			require.NoError(t, err)
