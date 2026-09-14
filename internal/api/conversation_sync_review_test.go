@@ -103,6 +103,7 @@ func TestRecentReadLegacyFallbackRequires404AndCompleteCoverage(t *testing.T) {
 				legacyCalls.Add(1)
 				var req recentReadRequest
 				require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+				require.True(t, req.PeerRead, "fallback must remain a leaf on upgraded peers")
 				require.Equal(t, "alice", req.UID)
 				require.Len(t, req.Channels, 2)
 				require.Equal(t, 15, req.MsgCount)

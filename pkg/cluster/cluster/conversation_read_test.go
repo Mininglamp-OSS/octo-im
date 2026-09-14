@@ -296,3 +296,23 @@ func TestConversationReaderFenceDoesNotReadPayloadOrTail(t *testing.T) {
 	cfg.MigrateFrom, cfg.MigrateTo = 4, 5
 	require.ErrorIs(t, r.validateLocal(context.Background(), cfg), ErrConversationReadRetry)
 }
+
+func TestConversationReaderCompletedFenceWinsDeadlineRace(t *testing.T) {
+	for _, valid := range []bool{true, false} {
+		cfg := boundaryConfig()
+		r := boundaryReader(t, &cfg)
+		r.nodeID = cfg.LeaderId
+		r.state = func(ctx context.Context, _ string, _ uint8) (raftgroup.ReadState, error) {
+			<-ctx.Done()
+			return raftgroup.ReadState{Exists: true, Ready: valid, LeaderID: cfg.LeaderId, Term: cfg.Term, ConfigVersion: cfg.ConfVersion}, nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		err := r.validateLocal(ctx, cfg)
+		cancel()
+		if valid {
+			require.NoError(t, err)
+		} else {
+			require.ErrorIs(t, err, ErrConversationReadRetry)
+		}
+	}
+}

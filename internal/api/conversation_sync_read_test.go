@@ -142,8 +142,7 @@ func TestRecentReadRejectsIncompleteOrLegacyPeer(t *testing.T) {
 			result, err := reader.getRecentMessagesForCluster(context.Background(), "alice", 10, []*channelRecentMessageReq{{ChannelId: "a", ChannelType: 2}, {ChannelId: "b", ChannelType: 2}}, true)
 			require.Error(t, err)
 			require.Nil(t, result)
-			require.GreaterOrEqual(t, requests.Load(), int32(2))
-			require.LessOrEqual(t, requests.Load(), int32(8))
+			require.Equal(t, int32(1), requests.Load(), "a malformed or incomplete peer response cannot heal through retries")
 		})
 	}
 }

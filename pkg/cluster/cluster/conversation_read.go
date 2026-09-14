@@ -352,5 +352,7 @@ func (r conversationReader) validateLocal(ctx context.Context, expected wkdb.Cha
 	if !conversationStateReady(state, cfg) {
 		return ErrConversationReadRetry
 	}
-	return ctx.Err()
+	// Successful metadata and state checks complete the fence, even when
+	// the deadline expires just as the final state read finishes.
+	return nil
 }
