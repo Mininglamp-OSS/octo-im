@@ -16,6 +16,7 @@ import (
 
 var ErrMessageConflict = errors.New("client_msg_no already used for different message content")
 var errMessageLeaderChanged = errors.New("channel leader changed; retry message")
+var errMessageNotReady = errors.New("channel leader is preparing durable state")
 
 type messageRetryKey struct{ sender, client string }
 
@@ -42,75 +43,92 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 	var version uint64
 	var maxIndex uint64
 	resps := make(types.ProposeRespSet, len(reqs))
-	err := rg.Do(ctx, key, func(r raftgroup.IRaft) error {
-		ch, ok := r.(*Channel)
-		if !ok || !ch.LeaderReadReady() {
-			return errMessageLeaderChanged
-		}
-		owner, term, version = ch, ch.Config().Term, ch.Config().Version
-		pending := make(map[messageRetryKey]wkdb.Message)
-		for _, log := range ch.BufferedLogs() {
-			var m wkdb.Message
-			if err := m.Unmarshal(log.Data); err != nil {
-				return err
+	admit := func() error {
+		return rg.Do(ctx, key, func(r raftgroup.IRaft) error {
+			ch, ok := r.(*Channel)
+			if !ok || !ch.IsLeader() {
+				return errMessageLeaderChanged
 			}
-			m.MessageSeq = uint32(log.Index)
-			if m.ClientMsgNo != "" {
-				pending[messageRetryKey{m.FromUID, m.ClientMsgNo}] = m
+			if !ch.LeaderReadReady() {
+				return errMessageNotReady
 			}
-		}
-		next := ch.LastLogIndex()
-		logs := make([]types.Log, 0, len(reqs))
-		for i, m := range messages {
-			canonical := m
-			duplicate := false
-			k := messageRetryKey{m.FromUID, m.ClientMsgNo}
-			if m.ClientMsgNo != "" {
-				old, found := pending[k]
-				if !found {
-					var err error
-					old, err = s.opts.DB.LoadMsgBySenderClientMsgNo(id, typ, m.FromUID, m.ClientMsgNo)
-					if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
-						return err
-					}
-					found = err == nil
+			owner, term, version = ch, ch.Config().Term, ch.Config().Version
+			pending := make(map[messageRetryKey]wkdb.Message)
+			for _, log := range ch.BufferedLogs() {
+				var m wkdb.Message
+				if err := m.Unmarshal(log.Data); err != nil {
+					return err
 				}
-				if found {
-					if old.MessageSeq == 0 || uint64(old.MessageSeq) > next {
-						return errors.New("retry entry outside channel log")
-					}
-					if !sameMessageContent(old, m) {
-						return ErrMessageConflict
-					}
-					canonical, duplicate = old, true
-				}
-			}
-			if !duplicate {
-				next++
-				if next > math.MaxUint32 {
-					return errors.New("channel message sequence exhausted")
-				}
-				canonical.MessageSeq = uint32(next)
-				logs = append(logs, types.Log{Id: reqs[i].Id, Term: term, Index: next, Data: reqs[i].Data})
+				m.MessageSeq = uint32(log.Index)
 				if m.ClientMsgNo != "" {
-					pending[k] = canonical
+					pending[messageRetryKey{m.FromUID, m.ClientMsgNo}] = m
 				}
 			}
-			resps[i] = &types.ProposeResp{Id: reqs[i].Id, Index: uint64(canonical.MessageSeq), CanonicalID: uint64(canonical.MessageID), Duplicate: duplicate}
-			maxIndex = max(maxIndex, uint64(canonical.MessageSeq))
-		}
-		// A conflicting input rejects the entire batch before assigning any index.
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if len(logs) > 0 {
-			if err := ch.Step(types.Event{Type: types.Propose, Logs: logs}); err != nil {
+			next := ch.LastLogIndex()
+			logs := make([]types.Log, 0, len(reqs))
+			for i, m := range messages {
+				canonical := m
+				duplicate := false
+				k := messageRetryKey{m.FromUID, m.ClientMsgNo}
+				if m.ClientMsgNo != "" {
+					old, found := pending[k]
+					if !found {
+						var err error
+						old, err = s.opts.DB.LoadMsgBySenderClientMsgNo(id, typ, m.FromUID, m.ClientMsgNo)
+						if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
+							return err
+						}
+						found = err == nil
+					}
+					if found {
+						if old.MessageSeq == 0 || uint64(old.MessageSeq) > next {
+							return errors.New("retry entry outside channel log")
+						}
+						if !sameMessageContent(old, m) {
+							return ErrMessageConflict
+						}
+						canonical, duplicate = old, true
+					}
+				}
+				if !duplicate {
+					next++
+					if next > math.MaxUint32 {
+						return errors.New("channel message sequence exhausted")
+					}
+					canonical.MessageSeq = uint32(next)
+					logs = append(logs, types.Log{Id: reqs[i].Id, Term: term, Index: next, Data: reqs[i].Data})
+					if m.ClientMsgNo != "" {
+						pending[k] = canonical
+					}
+				}
+				resps[i] = &types.ProposeResp{Id: reqs[i].Id, Index: uint64(canonical.MessageSeq), CanonicalID: uint64(canonical.MessageID), Duplicate: duplicate}
+				maxIndex = max(maxIndex, uint64(canonical.MessageSeq))
+			}
+			// A conflicting input rejects the entire batch before assigning any index.
+			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if len(logs) > 0 {
+				if err := ch.Step(types.Event{Type: types.Propose, Logs: logs}); err != nil {
+					return err
+				}
+			}
+			ch.ResumeReplication()
+			return nil
+		})
+	}
+	var err error
+	for {
+		err = admit()
+		if !errors.Is(err, errMessageNotReady) {
+			break
 		}
-		ch.ResumeReplication()
-		return nil
-	})
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -120,10 +138,20 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 		done := false
 		err = rg.Do(ctx, key, func(r raftgroup.IRaft) error {
 			ch, ok := r.(*Channel)
-			if !ok || ch != owner || !ch.LeaderReadReady() || ch.Config().Term != term || ch.Config().Version != version {
+			if !ok || ch != owner || !ch.IsLeader() || ch.Config().Term != term {
 				return errMessageLeaderChanged
 			}
 			ch.KeepAlive()
+			// Initial durable-state persistence and a membership update can temporarily
+			// fence the same leader. No new index is allocated while waiting. Observe
+			// the new configuration before checking its committed/applied boundary.
+			if !ch.LeaderReadReady() {
+				return nil
+			}
+			if ch.Config().Version != version {
+				version = ch.Config().Version
+				return nil
+			}
 			if ch.CommittedIndex() < maxIndex || ch.AppliedIndex() < maxIndex {
 				return nil
 			}
@@ -134,7 +162,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 					return err
 				}
 				if uint64(stored.MessageID) != resp.CanonicalID || !sameMessageContent(stored, messages[i]) {
-					return errMessageLeaderChanged
+					return fmt.Errorf("canonical message changed at index %d", resp.Index)
 				}
 			}
 			done = true

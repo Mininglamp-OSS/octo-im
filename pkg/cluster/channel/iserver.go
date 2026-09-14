@@ -31,7 +31,7 @@ func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, channelId 
 	if err != nil {
 		return nil, err
 	}
-	if state.Exists && state.Ready && state.LeaderID == s.opts.NodeId {
+	if state.Exists && state.LeaderID == s.opts.NodeId {
 		return s.proposeMessages(ctx, channelId, channelType, reqs)
 	}
 
@@ -65,7 +65,7 @@ func (s *Server) ProposeBatchUntilAppliedTimeoutForLocal(ctx context.Context, ch
 	if err != nil {
 		return nil, err
 	}
-	if state.Exists && state.Ready && state.LeaderID == s.opts.NodeId {
+	if state.Exists && state.LeaderID == s.opts.NodeId {
 		return s.proposeMessages(ctx, channelId, channelType, reqs)
 	}
 
