@@ -1291,6 +1291,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request parameters."
+          },
+          "503": {
+            "description": "Temporary routing or leader-read failure; retry the complete request. No partial success is returned."
           }
         }
       }
@@ -1726,6 +1732,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request parameters."
+          },
+          "503": {
+            "description": "Temporary routing or leader-read failure; retry the complete request. No partial success is returned."
           }
         }
       }
@@ -1830,6 +1842,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request parameters."
+          },
+          "503": {
+            "description": "Temporary routing or leader-read failure; retry the complete request. No partial success is returned."
           }
         }
       }

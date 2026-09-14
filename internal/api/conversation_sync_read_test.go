@@ -343,16 +343,10 @@ func TestRecentReadRejectsStorageOmission(t *testing.T) {
 }
 
 func TestRecentReadDeduplicatesCursorRanges(t *testing.T) {
-	for _, last := range []bool{false, true} {
-		reqs := []*channelRecentMessageReq{{ChannelId: "g", ChannelType: 2, LastMsgSeq: 10}, {ChannelId: "g", ChannelType: 2, LastMsgSeq: 20}}
-		got, err := normalizeRecentChannels(reqs, last)
-		require.NoError(t, err)
-		require.Len(t, got, 1)
-		if last {
-			require.Equal(t, uint64(20), got[0].LastMsgSeq)
-		} else {
-			require.Equal(t, uint64(10), got[0].LastMsgSeq)
-		}
-		require.Equal(t, uint64(10), reqs[0].LastMsgSeq, "normalization must not mutate callers")
-	}
+	reqs := []*channelRecentMessageReq{{ChannelId: "g", ChannelType: 2, LastMsgSeq: 10}, {ChannelId: "g", ChannelType: 2, LastMsgSeq: 20}}
+	got, err := normalizeRecentChannels(reqs)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(10), got[0].LastMsgSeq)
+	require.Equal(t, uint64(10), reqs[0].LastMsgSeq, "normalization must not mutate callers")
 }

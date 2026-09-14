@@ -5,7 +5,10 @@ fans out to the actual leaders, returning the original plain-array schema.
 A valid never-created channel returns an empty entry. Repeated channel inputs
 are coalesced; empty channel IDs or channel type zero return HTTP 400. The same
 normalization is used by sync/syncByChannels/message-sync orchestration; duplicate
-forward cursors select the oldest start, reverse cursors the newest upper bound.
+cursors select the smallest lower bound in both directions (zero is unbounded).
+Ordering is applied after the DB read; it does not turn the cursor into an upper
+bound. Server-built conversation read/deleted barriers remain applied before
+these requests are constructed.
 
 One end-to-end deadline covers routing, network calls and paced retries (25 ms
 initial delay, exponential backoff capped at 250 ms plus up to 25% jitter, at

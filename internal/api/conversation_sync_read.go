@@ -46,7 +46,7 @@ func recentReadTimeout() time.Duration {
 // disappear from a successful batch; each retry resolves all routes afresh.
 func (s *request) getRecentMessagesForCluster(parent context.Context, uid string, count int, channels []*channelRecentMessageReq, last bool) ([]*channelRecentMessage, error) {
 	var err error
-	channels, err = normalizeRecentChannels(channels, last)
+	channels, err = normalizeRecentChannels(channels)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +270,7 @@ func (s *conversation) serveRecentMessages(c *wkhttp.Context, versioned bool) {
 		return
 	}
 	var err error
-	req.Channels, err = normalizeRecentChannels(req.Channels, wkutil.IntToBool(req.OrderByLast))
+	req.Channels, err = normalizeRecentChannels(req.Channels)
 	if err != nil {
 		c.ResponseError(errInvalidRecentChannel)
 		return
@@ -317,9 +317,9 @@ func (s *conversation) serveRecentMessages(c *wkhttp.Context, versioned bool) {
 var errInvalidRecentChannel = errors.New("invalid channel_id or channel_type")
 
 // Collapse repeated store/cache/input entries without losing the wider cursor
-// range. Forward reads start at the oldest cursor; reverse reads at the newest
-// (zero is the unbounded reverse cursor). Keep the first occurrence's order.
-func normalizeRecentChannels(channels []*channelRecentMessageReq, last bool) ([]*channelRecentMessageReq, error) {
+// range. LastMsgSeq is a lower bound in both query directions; use the
+// minimum (including the unbounded zero). Keep the first occurrence's order.
+func normalizeRecentChannels(channels []*channelRecentMessageReq) ([]*channelRecentMessageReq, error) {
 	result := make([]*channelRecentMessageReq, 0, len(channels))
 	seen := make(map[string]*channelRecentMessageReq, len(channels))
 	for _, ch := range channels {
@@ -328,13 +328,7 @@ func normalizeRecentChannels(channels []*channelRecentMessageReq, last bool) ([]
 		}
 		key := makeChannelKey(ch.ChannelId, ch.ChannelType)
 		if old, ok := seen[key]; ok {
-			if !last {
-				old.LastMsgSeq = min(old.LastMsgSeq, ch.LastMsgSeq)
-			} else if old.LastMsgSeq == 0 || ch.LastMsgSeq == 0 {
-				old.LastMsgSeq = 0
-			} else {
-				old.LastMsgSeq = max(old.LastMsgSeq, ch.LastMsgSeq)
-			}
+			old.LastMsgSeq = min(old.LastMsgSeq, ch.LastMsgSeq)
 			continue
 		}
 		copy := *ch
