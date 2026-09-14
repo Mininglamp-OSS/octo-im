@@ -322,3 +322,13 @@ func (r *rpcServer) handleConversationRead(c *wkserver.Context, configOnly bool)
 	}
 	c.Write(data)
 }
+
+// LoadChannelReadConfig uses the same applied metadata barrier as conversation boundary reads.
+func (s *Server) LoadChannelReadConfig(ctx context.Context, id string, typ uint8) (wkdb.ChannelClusterConfig, error) {
+	return s.loadConversationConfig(ctx, id, typ)
+}
+
+func (s *Server) ValidateLocalChannelRead(ctx context.Context, expected wkdb.ChannelClusterConfig) error {
+	_, err := s.conversationReader().readLocal(ctx, expected)
+	return err
+}

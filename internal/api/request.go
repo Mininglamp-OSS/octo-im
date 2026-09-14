@@ -1,14 +1,11 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
@@ -177,108 +174,6 @@ func runParallel[K comparable, V any](
 }
 
 // ==================== 集群消息同步 ====================
-
-func (s *request) getRecentMessagesForCluster(uid string, msgCount int, channels []*channelRecentMessageReq, orderByLast bool) ([]*channelRecentMessage, error) {
-	if len(channels) == 0 {
-		return nil, nil
-	}
-
-	var (
-		channelRecentMessages     []*channelRecentMessage
-		err                       error
-		channelRecentMessagesLock sync.Mutex
-	)
-
-	// 按照频道所在节点进行分组
-	peerChannelRecentMessageReqsMap := make(map[uint64][]*channelRecentMessageReq)
-	for _, channelRecentMsgReq := range channels {
-		leaderInfo, err := service.Cluster.LeaderOfChannel(channelRecentMsgReq.ChannelId, channelRecentMsgReq.ChannelType)
-		if err != nil {
-			continue
-		}
-		peerChannelRecentMessageReqsMap[leaderInfo.Id] = append(peerChannelRecentMessageReqsMap[leaderInfo.Id], channelRecentMsgReq)
-	}
-
-	// 请求远程的消息列表
-	if len(peerChannelRecentMessageReqsMap) > 0 {
-		var reqErr error
-		wg := &sync.WaitGroup{}
-		for nodeId, peerChannelRecentMessageReqs := range peerChannelRecentMessageReqsMap {
-			if nodeId == options.G.Cluster.NodeId {
-				continue
-			}
-			wg.Add(1)
-			go func(pID uint64, reqs []*channelRecentMessageReq) {
-				defer wg.Done()
-				results, err := s.requestSyncMessage(pID, reqs, uid, msgCount, orderByLast)
-				if err != nil {
-					s.Error("请求同步消息失败！", zap.Error(err), zap.Uint64("nodeId", pID))
-					reqErr = err
-					return
-				}
-				channelRecentMessagesLock.Lock()
-				channelRecentMessages = append(channelRecentMessages, results...)
-				channelRecentMessagesLock.Unlock()
-			}(nodeId, peerChannelRecentMessageReqs)
-		}
-		wg.Wait()
-		if reqErr != nil {
-			s.Error("请求同步消息失败！!", zap.Error(err))
-			return nil, reqErr
-		}
-	}
-
-	// 请求本地的最近消息列表
-	localChannels := peerChannelRecentMessageReqsMap[options.G.Cluster.NodeId]
-	if len(localChannels) > 0 {
-		results, err := s.getRecentMessages(uid, msgCount, localChannels, orderByLast)
-		if err != nil {
-			return nil, err
-		}
-		channelRecentMessages = append(channelRecentMessages, results...)
-	}
-
-	return channelRecentMessages, nil
-}
-
-func (s *request) requestSyncMessage(nodeID uint64, reqs []*channelRecentMessageReq, uid string, msgCount int, orderByLast bool) ([]*channelRecentMessage, error) {
-	nodeInfo := service.Cluster.NodeInfoById(nodeID)
-	if nodeInfo == nil {
-		s.Error("节点不存在！", zap.Uint64("nodeID", nodeID))
-		return nil, errors.New("节点不存在！")
-	}
-
-	reqURL := fmt.Sprintf("%s/%s", nodeInfo.ApiServerAddr, "conversation/syncMessages")
-	request := rest.Request{
-		Method:  rest.Method("POST"),
-		BaseURL: reqURL,
-		Body: []byte(wkutil.ToJSON(map[string]interface{}{
-			"uid":           uid,
-			"msg_count":     msgCount,
-			"channels":      reqs,
-			"order_by_last": wkutil.BoolToInt(orderByLast),
-		})),
-	}
-
-	s.Debug("同步会话消息!", zap.String("apiURL", reqURL), zap.String("uid", uid), zap.Any("channels", reqs))
-
-	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-
-	resp, err := rest.SendWithContext(timeoutCtx, request)
-	if err != nil {
-		return nil, err
-	}
-	if err := handlerIMError(resp); err != nil {
-		return nil, err
-	}
-
-	var results []*channelRecentMessage
-	if err := wkutil.ReadJSONByByte([]byte(resp.Body), &results); err != nil {
-		return nil, err
-	}
-	return results, nil
-}
 
 // ==================== 本地消息查询 ====================
 
