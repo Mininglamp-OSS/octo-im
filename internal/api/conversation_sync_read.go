@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand/v2"
 	"net/http"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
@@ -56,30 +58,29 @@ func (s *request) getRecentMessagesForCluster(parent context.Context, uid string
 	seen := make(map[string]bool)
 	var lastErr error
 	delay := 25 * time.Millisecond
-	for {
+	for attempt := 0; attempt < 64; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		deadline, _ := ctx.Deadline()
-		remaining := time.Until(deadline)
-		attemptBudget := remaining
-		if remaining > 100*time.Millisecond {
-			attemptBudget = remaining / 2
-		}
-		attemptCtx, done := context.WithTimeout(ctx, attemptBudget)
-		result, err := s.recentMessagesAttempt(attemptCtx, uid, count, channels, last, seen)
-		done()
+		// A healthy slow batch can use the entire remaining deadline. Retry
+		// failures that return early; slicing the budget makes large reads
+		// impossible even when they would finish within the request deadline.
+		result, err := s.recentMessagesAttempt(ctx, uid, count, channels, last, seen)
 		if err == nil {
 			return result, ctx.Err()
 		}
 		lastErr = err
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return nil, err
+		}
 		select {
 		case <-ctx.Done():
 			return nil, errors.Join(ctx.Err(), lastErr)
-		case <-time.After(delay):
+		case <-time.After(delay + time.Duration(rand.Int64N(int64(delay/4)+1))):
 		}
 		delay = min(delay*2, 250*time.Millisecond)
 	}
+	return nil, lastErr
 }
 
 func (s *request) recentMessagesAttempt(ctx context.Context, uid string, count int, channels []*channelRecentMessageReq, last bool, seen map[string]bool) ([]*channelRecentMessage, error) {
@@ -93,7 +94,7 @@ func (s *request) recentMessagesAttempt(ctx context.Context, uid string, count i
 		cfg, err := service.Cluster.LoadChannelReadConfig(ctx, ch.ChannelId, ch.ChannelType)
 		key := makeChannelKey(ch.ChannelId, ch.ChannelType)
 		if errors.Is(err, wkdb.ErrNotFound) && !seen[key] {
-			result = append(result, &channelRecentMessage{ChannelId: ch.ChannelId, ChannelType: ch.ChannelType})
+			result = append(result, &channelRecentMessage{ChannelId: ch.ChannelId, ChannelType: ch.ChannelType, Messages: types.MessageRespSlice{}})
 			continue
 		}
 		if err != nil {
@@ -224,6 +225,25 @@ func (s *request) requestSyncMessage(ctx context.Context, nodeID uint64, channel
 	resp, err := rest.SendWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages/v2", Body: data})
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		// Old peers have no v2 route. Only route absence permits downgrade;
+		// a v2 failure or malformed response must not bypass its read fences.
+		resp, err = rest.SendWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages", Body: data})
+		if err != nil {
+			return nil, err
+		}
+		if err := handlerIMError(resp); err != nil {
+			return nil, err
+		}
+		var legacy []*channelRecentMessage
+		if err := json.Unmarshal([]byte(resp.Body), &legacy); err != nil {
+			return nil, err
+		}
+		if err := validateRecentBatch(channels, legacy); err != nil {
+			return nil, err
+		}
+		return legacy, ctx.Err()
 	}
 	if err := handlerIMError(resp); err != nil {
 		return nil, err
