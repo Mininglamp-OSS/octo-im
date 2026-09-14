@@ -12,7 +12,7 @@ func (n *Node) BecomeCandidate() {
 	if n.cfg.Role == types.RoleLeader {
 		n.Panic("invalid transition [leader -> candidate]")
 	}
-	n.cfg.Term++
+	n.setTerm(n.cfg.Term + 1)
 	n.stepFunc = n.stepCandidate
 	n.reset()
 	n.tickFnc = n.tickCandidate
@@ -23,11 +23,13 @@ func (n *Node) BecomeCandidate() {
 }
 
 func (n *Node) BecomeFollower(term uint32, leaderId uint64) {
-	n.cfg.Term = term
+	if term < n.cfg.Term {
+		return
+	}
+	n.setTerm(term)
 	n.stepFunc = n.stepFollower
 	n.reset()
 	n.tickFnc = n.tickFollower
-	n.voteFor = None
 	n.cfg.Leader = leaderId
 	n.cfg.Role = types.RoleFollower
 
@@ -40,7 +42,10 @@ func (n *Node) BecomeFollower(term uint32, leaderId uint64) {
 }
 
 func (n *Node) BecomeLeader(term uint32) {
-	n.cfg.Term = term
+	if term < n.cfg.Term {
+		return
+	}
+	n.setTerm(term)
 	n.stepFunc = n.stepLeader
 	n.reset()
 	n.tickFnc = n.tickLeader
@@ -56,11 +61,13 @@ func (n *Node) BecomeLeader(term uint32) {
 }
 
 func (n *Node) BecomeLearner(term uint32, leaderId uint64) {
-	n.cfg.Term = term
+	if term < n.cfg.Term {
+		return
+	}
+	n.setTerm(term)
 	n.stepFunc = n.stepLearner
 	n.reset()
 	n.tickFnc = n.tickLearner
-	n.voteFor = None
 	n.cfg.Leader = leaderId
 	n.cfg.Role = types.RoleLearner
 
