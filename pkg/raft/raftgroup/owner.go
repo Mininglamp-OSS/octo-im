@@ -11,7 +11,7 @@ type ownerRequest struct {
 
 // Do runs a short operation on the Raft owner, serialized with Step and Tick.
 // The callback must not call blocking RaftGroup methods or retain mutable Raft
-// state. Once accepted, Do waits for completion even if ctx expires, so callers
+// state or perform disk/network I/O. Once accepted, Do waits for completion even if ctx expires, so callers
 // can safely use callback results without a callback outliving their stack.
 func (rg *RaftGroup) Do(ctx context.Context, key string, fn func(IRaft) error) error {
 	if err := ctx.Err(); err != nil {

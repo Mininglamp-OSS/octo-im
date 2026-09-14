@@ -2,6 +2,7 @@ package wkdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -492,6 +493,14 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 
 	}
 
+	applied, err := wk.GetChannelAppliedIndex(channelId, channelType)
+	if err != nil {
+		return err
+	}
+	if messageSeq < applied {
+		return fmt.Errorf("cannot truncate applied channel log: target=%d applied=%d", messageSeq, applied)
+	}
+
 	// 获取最新的消息seq
 	lastMsgSeq, _, err := wk.GetChannelLastMessageSeq(channelId, channelType)
 	if err != nil {
@@ -879,6 +888,12 @@ func (wk *wukongDB) LoadMsgByClientMsgNo(channelId string, channelType uint8, cl
 	return wk.loadMsgByClientMsgNo(channelId, channelType, "", clientMsgNo, false)
 }
 
+// ErrMessageRetryLookupLimit requires index maintenance before retrying this
+// oversized legacy bucket. No proposal is admitted after a partial lookup.
+var ErrMessageRetryLookupLimit = errors.New("message retry lookup candidate limit exceeded")
+
+const messageRetryLookupLimit = 1024
+
 // LoadMsgBySenderClientMsgNo scopes a retry key to its sender and channel.
 func (wk *wukongDB) LoadMsgBySenderClientMsgNo(channelId string, channelType uint8, fromUID, clientMsgNo string) (Message, error) {
 	return wk.loadMsgByClientMsgNo(channelId, channelType, fromUID, clientMsgNo, true)
@@ -894,8 +909,14 @@ func (wk *wukongDB) loadMsgByClientMsgNo(channelId string, channelType uint8, fr
 	db := wk.channelDb(channelId, channelType)
 
 	// 通过 clientMsgNo 索引查找主键
-	lowKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, minMessagePrimaryKey)
-	highKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, maxMessagePrimaryKey)
+	// The primary-key suffix is ordered by channel hash and sequence, so old
+	// databases already support a channel-scoped seek without any migration.
+	var lowPrimary, highPrimary [16]byte
+	wk.endian.PutUint64(lowPrimary[:8], key.ChannelToNum(channelId, channelType))
+	copy(highPrimary[:8], lowPrimary[:8])
+	wk.endian.PutUint64(highPrimary[8:], math.MaxUint64)
+	lowKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, lowPrimary)
+	highKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, highPrimary)
 
 	iter := db.NewIter(&pebble.IterOptions{
 		LowerBound: lowKey,
@@ -903,8 +924,14 @@ func (wk *wukongDB) loadMsgByClientMsgNo(channelId string, channelType uint8, fr
 	})
 	defer iter.Close()
 
-	// 遍历索引查找匹配的消息
+	// Fail closed on oversized legacy/collision buckets; never mistake a
+	// partial scan for a missing retry key and append a duplicate.
+	scanned := 0
 	for iter.First(); iter.Valid(); iter.Next() {
+		if matchSender && scanned >= messageRetryLookupLimit {
+			return EmptyMessage, ErrMessageRetryLookupLimit
+		}
+		scanned++
 		primaryBytes, err := key.ParseMessageSecondIndexKey(iter.Key())
 		if err != nil {
 			wk.Error("LoadMsgByClientMsgNo: parseMessageSecondIndexKey failed", zap.Error(err))

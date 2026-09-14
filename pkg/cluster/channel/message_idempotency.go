@@ -16,12 +16,16 @@ import (
 
 var ErrMessageConflict = errors.New("client_msg_no already used for different message content")
 var errMessageLeaderChanged = errors.New("channel leader changed; retry message")
+var errMessageSnapshotChanged = errors.New("channel log changed during lookup")
 var errMessageNotReady = errors.New("channel leader is preparing durable state")
 
 type messageRetryKey struct{ sender, client string }
 
-// proposeMessages serializes lookup and index allocation with the channel's
-// Step/Tick. Stored messages are Raft log entries, not proof of commitment.
+// proposeMessages snapshots buffered entries on the owner, reads the database
+// off-owner, then revalidates the snapshot before allocating indices. Store
+// completion may remove buffered entries while we read: the snapshot already
+// includes them. Appends/replacements/truncations invalidate the snapshot.
+// Stored messages are Raft log entries, not proof of commitment.
 func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
 	if len(reqs) == 0 {
 		return nil, nil
@@ -44,7 +48,9 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 	var maxIndex uint64
 	resps := make(types.ProposeRespSet, len(reqs))
 	admit := func() error {
-		return rg.Do(ctx, key, func(r raftgroup.IRaft) error {
+		var revision uint64
+		pending := make(map[messageRetryKey]wkdb.Message)
+		err := rg.Do(ctx, key, func(r raftgroup.IRaft) error {
 			ch, ok := r.(*Channel)
 			if !ok || !ch.IsLeader() {
 				return errMessageLeaderChanged
@@ -53,7 +59,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				return errMessageNotReady
 			}
 			owner, term, version = ch, ch.Config().Term, ch.Config().Version
-			pending := make(map[messageRetryKey]wkdb.Message)
+			revision = ch.LogRevision()
 			for _, log := range ch.BufferedLogs() {
 				var m wkdb.Message
 				if err := m.Unmarshal(log.Data); err != nil {
@@ -61,9 +67,50 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				}
 				m.MessageSeq = uint32(log.Index)
 				if m.ClientMsgNo != "" {
+					m.Payload = bytes.Clone(m.Payload) // snapshot must not retain Raft-owned bytes
 					pending[messageRetryKey{m.FromUID, m.ClientMsgNo}] = m
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		// No database operation is allowed in a RaftGroup.Do callback.
+		stored := make(map[messageRetryKey]wkdb.Message)
+		lookedUp := make(map[messageRetryKey]bool)
+		for _, m := range messages {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			k := messageRetryKey{m.FromUID, m.ClientMsgNo}
+			if m.ClientMsgNo == "" || lookedUp[k] {
+				continue
+			}
+			lookedUp[k] = true
+			if _, ok := pending[k]; ok {
+				continue
+			}
+			old, err := s.opts.DB.LoadMsgBySenderClientMsgNo(id, typ, m.FromUID, m.ClientMsgNo)
+			if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
+				return err
+			}
+			if err == nil {
+				stored[k] = old
+			}
+		}
+		return rg.Do(ctx, key, func(r raftgroup.IRaft) error {
+			ch, ok := r.(*Channel)
+			if !ok || ch != owner || !ch.IsLeader() || ch.Config().Term != term {
+				return errMessageLeaderChanged
+			}
+			if !ch.LeaderReadReady() {
+				return errMessageNotReady
+			}
+			if ch.Config().Version != version || ch.LogRevision() != revision {
+				return errMessageSnapshotChanged
+			}
+			maxIndex = 0
 			next := ch.LastLogIndex()
 			logs := make([]types.Log, 0, len(reqs))
 			for i, m := range messages {
@@ -73,12 +120,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				if m.ClientMsgNo != "" {
 					old, found := pending[k]
 					if !found {
-						var err error
-						old, err = s.opts.DB.LoadMsgBySenderClientMsgNo(id, typ, m.FromUID, m.ClientMsgNo)
-						if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
-							return err
-						}
-						found = err == nil
+						old, found = stored[k]
 					}
 					if found {
 						if old.MessageSeq == 0 || uint64(old.MessageSeq) > next {
@@ -120,7 +162,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 	var err error
 	for {
 		err = admit()
-		if !errors.Is(err, errMessageNotReady) {
+		if !errors.Is(err, errMessageNotReady) && !errors.Is(err, errMessageSnapshotChanged) {
 			break
 		}
 		select {
@@ -155,16 +197,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 			if ch.CommittedIndex() < maxIndex || ch.AppliedIndex() < maxIndex {
 				return nil
 			}
-			// Detect replacement/truncation of a previously found index before ACK.
-			for i, resp := range resps {
-				stored, err := s.opts.DB.LoadMsg(id, typ, resp.Index)
-				if err != nil {
-					return err
-				}
-				if uint64(stored.MessageID) != resp.CanonicalID || !sameMessageContent(stored, messages[i]) {
-					return fmt.Errorf("canonical message changed at index %d", resp.Index)
-				}
-			}
+
 			done = true
 			return nil
 		})
@@ -172,7 +205,37 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 			return nil, err
 		}
 		if done {
-			return resps, nil
+			// The committed/applied prefix is immutable. Verify the canonical
+			// payload off-owner, then certify that this same leader/config is
+			// still serving that prefix. A new append does not invalidate it.
+			for i, resp := range resps {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				stored, err := s.opts.DB.LoadMsg(id, typ, resp.Index)
+				if err != nil {
+					return nil, err
+				}
+				if uint64(stored.MessageID) != resp.CanonicalID || !sameMessageContent(stored, messages[i]) {
+					return nil, fmt.Errorf("canonical message changed at index %d", resp.Index)
+				}
+			}
+			err = rg.Do(ctx, key, func(r raftgroup.IRaft) error {
+				ch, ok := r.(*Channel)
+				if !ok || ch != owner || !ch.IsLeader() || ch.Config().Term != term {
+					return errMessageLeaderChanged
+				}
+				if !ch.LeaderReadReady() || ch.Config().Version != version || ch.CommittedIndex() < maxIndex || ch.AppliedIndex() < maxIndex {
+					return errMessageNotReady
+				}
+				return nil
+			})
+			if err == nil {
+				return resps, nil
+			}
+			if !errors.Is(err, errMessageNotReady) {
+				return nil, err
+			}
 		}
 		select {
 		case <-ctx.Done():

@@ -157,7 +157,7 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 		// rg.wait.didCommit(r.Key(), e.EndIndex-1)
 		var lastLogIndex uint64
 		if !rg.opts.NotNeedApplied {
-			logs, err := rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, e.EndIndex, 0)
+			logs, err := rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, min(e.EndIndex, e.StartIndex+1000), rg.opts.MaxLogSizePerBatch)
 			if err != nil {
 				rg.Error("get logs failed", zap.Error(err))
 				rg.AddEvent(r.Key(), types.Event{

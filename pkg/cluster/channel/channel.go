@@ -61,19 +61,14 @@ func createChannel(cfg wkdb.ChannelClusterConfig, s *Server, rg *raftgroup.RaftG
 }
 
 func (ch *Channel) switchConfig(cfg rafttype.Config) error {
-
-	err := ch.rg.AddEventWait(ch.channelKey, rafttype.Event{
-		Type:   rafttype.ConfChange,
-		Config: cfg,
-	})
-	if err != nil {
-		return err
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return ch.rg.Do(ctx, ch.channelKey, func(r raftgroup.IRaft) error {
 		if r != ch {
 			return raftgroup.ErrRaftNotExist
+		}
+		if err := ch.Step(rafttype.Event{Type: rafttype.ConfChange, Config: cfg}); err != nil {
+			return err
 		}
 		if len(ch.Config().Replicas) == 1 {
 			ch.ResumeReplication()

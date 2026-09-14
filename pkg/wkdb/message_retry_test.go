@@ -44,3 +44,46 @@ func TestMessageRetryLookupPreservesColumnsAndScope(t *testing.T) {
 	_, err = d.LoadMsgBySenderClientMsgNo("a", 2, "bob", "key")
 	require.ErrorIs(t, err, wkdb.ErrNotFound)
 }
+
+func TestMessageRetryLookupSeeksOnlyRequestedChannelAndCapsLegacyBucket(t *testing.T) {
+	d := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(t.TempDir()), wkdb.WithShardNum(1)))
+	require.NoError(t, d.Open())
+	defer d.Close()
+	// The old index includes primary keys: exploit their channel prefix even
+	// on a database written before this PR. Pollution on another channel must
+	// not consume the retry lookup's candidate budget.
+	messages := make([]wkdb.Message, 1100)
+	for i := range messages {
+		messages[i] = wkdb.Message{RecvPacket: wkproto.RecvPacket{ChannelID: "pollution", ChannelType: 2, MessageSeq: uint32(i + 1), MessageID: int64(i + 1), FromUID: "other", ClientMsgNo: "counter-1", Payload: []byte("x")}}
+	}
+	require.NoError(t, d.AppendMessages("pollution", 2, messages))
+	_, err := d.LoadMsgBySenderClientMsgNo("target", 2, "alice", "counter-1")
+	require.ErrorIs(t, err, wkdb.ErrNotFound)
+	_, err = d.LoadMsgBySenderClientMsgNo("pollution", 2, "alice", "counter-1")
+	require.ErrorIs(t, err, wkdb.ErrMessageRetryLookupLimit, "a capped scan must never claim the key is absent")
+	// Existing canonical entries at the front still resolve, including legacy
+	// duplicates. No backfill/version marker is needed for old databases.
+	m, err := d.LoadMsgBySenderClientMsgNo("pollution", 2, "other", "counter-1")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), m.MessageID)
+}
+
+func TestMessageRetryTruncateCannotEraseAppliedPrefix(t *testing.T) {
+	d := newTestDB(t)
+	require.NoError(t, d.Open())
+	defer d.Close()
+	messages := make([]wkdb.Message, 3)
+	for i := range messages {
+		messages[i] = wkdb.Message{RecvPacket: wkproto.RecvPacket{ChannelID: "committed", ChannelType: 2, MessageSeq: uint32(i + 1), MessageID: int64(i + 1), FromUID: "sender", ClientMsgNo: "key"}}
+	}
+	require.NoError(t, d.AppendMessages("committed", 2, messages))
+	require.NoError(t, d.UpdateChannelAppliedIndex("committed", 2, 2))
+	require.Error(t, d.TruncateLogTo("committed", 2, 1))
+	tail, _, err := d.GetChannelLastMessageSeq("committed", 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), tail)
+	require.NoError(t, d.TruncateLogTo("committed", 2, 2))
+	applied, err := d.GetChannelAppliedIndex("committed", 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), applied)
+}

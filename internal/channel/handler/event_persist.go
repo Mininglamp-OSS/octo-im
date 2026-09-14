@@ -51,12 +51,20 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, persists)
 		} else {
 			for _, e := range events {
-				if !e.Frame.(*wkproto.SendPacket).NoPersist && e.ReasonCode == wkproto.ReasonSuccess {
+				if packet, ok := e.Frame.(*wkproto.SendPacket); ok && packet != nil && !packet.NoPersist && e.ReasonCode == wkproto.ReasonSuccess {
 					e.ReasonCode = reasonCode
 				}
 			}
 		}
 
+	}
+
+	if options.G.Logger.TraceOn {
+		for _, e := range events {
+			h.Trace("message persistence result", "persist", zap.Int64("messageId", e.MessageId),
+				zap.Uint64("messageSeq", e.MessageSeq), zap.String("channelId", ctx.ChannelId),
+				zap.Uint8("channelType", ctx.ChannelType), zap.String("reason", e.ReasonCode.String()))
+		}
 	}
 
 	// ========== webhook ==========
@@ -211,7 +219,7 @@ func applyPersistResults(events []*eventbus.Event, messages []wkdb.Message, resu
 	}
 	eligible := make([]*eventbus.Event, 0, len(messages))
 	for _, e := range events {
-		if !e.Frame.(*wkproto.SendPacket).NoPersist && e.ReasonCode == wkproto.ReasonSuccess {
+		if packet, ok := e.Frame.(*wkproto.SendPacket); ok && packet != nil && !packet.NoPersist && e.ReasonCode == wkproto.ReasonSuccess {
 			eligible = append(eligible, e)
 		}
 	}

@@ -44,9 +44,6 @@ func (r *rpcClient) RequestChannelProposeBatchUntilApplied(ctx context.Context, 
 		return nil, fmt.Errorf("channel proposal requires retry")
 	}
 	body := resp.Body
-	if err != nil {
-		return nil, err
-	}
 
 	var response channelProposeResponse
 	if err := json.Unmarshal(body, &response); err != nil {

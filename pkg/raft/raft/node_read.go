@@ -22,3 +22,7 @@ func (n *Node) ResumeReplication() {
 	n.updateLeaderCommittedIndex()
 	n.sendNotifySync(All)
 }
+
+// LogRevision fences off-owner lookups against replacement as well as appends.
+// Call only on the owner loop. Store/apply progress does not change log content.
+func (n *Node) LogRevision() uint64 { return n.queue.revision }
