@@ -293,9 +293,7 @@ func (n *Node) stepFollower(e types.Event) error {
 		}
 
 	case types.ConfigResp: // 配置返回
-		// 切换配置
-		e.Config.Term = n.cfg.Term
-		n.switchConfig(e.Config)
+		return n.switchRemoteConfig(e.Config)
 
 	}
 	return nil
@@ -396,9 +394,7 @@ func (n *Node) stepLearner(e types.Event) error {
 		}
 
 	case types.ConfigResp: // 配置返回
-		// 切换配置
-		e.Config.Term = n.cfg.Term
-		n.switchConfig(e.Config)
+		return n.switchRemoteConfig(e.Config)
 
 	}
 	return nil
