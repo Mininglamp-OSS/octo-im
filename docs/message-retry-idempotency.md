@@ -8,7 +8,8 @@ content fails. Existing duplicate history is not rewritten.
 Lookup, buffered-log inspection, batch coalescing and sequence allocation run
 on the channel Raft owner. A database hit alone never produces a success ACK:
 the original entry must be committed and durably applied, with its identity
-rechecked before returning. Leadership/config changes abort a pending attempt.
+rechecked before returning. Leadership changes abort a pending attempt. Same-leader readiness/configuration
+transitions wait and recheck the committed boundary without appending again.
 Channel apply now persists the existing applied-index field. Legacy stores
 without that marker start conservatively at zero and regain confirmation via
 replication (or the normal single-voter quorum rule), not by trusting the tail.

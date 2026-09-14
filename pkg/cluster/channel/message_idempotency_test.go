@@ -52,6 +52,7 @@ type retryHookDB struct {
 	appendRelease chan struct{}
 	once          sync.Once
 	failApply     atomic.Bool
+	beforeApply   func()
 }
 
 func (d *retryHookDB) AppendMessages(id string, typ uint8, m []wkdb.Message) error {
@@ -61,6 +62,9 @@ func (d *retryHookDB) AppendMessages(id string, typ uint8, m []wkdb.Message) err
 	return d.DB.AppendMessages(id, typ, m)
 }
 func (d *retryHookDB) UpdateChannelAppliedIndex(id string, typ uint8, idx uint64) error {
+	if d.beforeApply != nil {
+		d.beforeApply()
+	}
 	if d.failApply.Load() {
 		return errors.New("injected apply failure")
 	}
@@ -342,4 +346,34 @@ func TestMessageRetryLeadershipChangeWhilePending(t *testing.T) {
 	cfg := types.Config{Leader: 2, Term: 2, Version: 2, Role: types.RoleFollower, Replicas: []uint64{1, 2, 3}}
 	require.NoError(t, s.Channel("retry", 2).switchConfig(cfg))
 	require.ErrorIs(t, <-done, errMessageLeaderChanged)
+}
+
+func TestMessageRetrySameLeaderConfigDuringApply(t *testing.T) {
+	db := &retryHookDB{DB: retryDB(t)}
+	s := retryServer(t, 1, db, []uint64{1}, retryNetwork())
+	var once sync.Once
+	db.beforeApply = func() {
+		once.Do(func() {
+			err := s.Channel("retry", 2).switchConfig(types.Config{Leader: 1, Role: types.RoleLeader, Term: 1, Version: 2, Replicas: []uint64{1}})
+			if err != nil {
+				panic(err)
+			}
+		})
+	}
+	r := retryPropose(t, s, retryMessage(1, "a", "membership"))
+	require.Equal(t, uint64(1), r[0].Index)
+	require.Equal(t, uint64(1), retryTail(t, db))
+}
+
+func TestMessageRetryProtocolFlags(t *testing.T) {
+	db := retryDB(t)
+	s := retryServer(t, 1, db, []uint64{1}, retryNetwork())
+	for i, mutate := range []func(*wkdb.Message){func(m *wkdb.Message) { m.RedDot = true }, func(m *wkdb.Message) { m.SyncOnce = true }, func(m *wkdb.Message) { m.Topic = "topic"; m.Setting.Set(wkproto.SettingTopic) }} {
+		m := retryMessage(int64(10+i), "a", fmt.Sprint(i))
+		mutate(&m)
+		first := retryPropose(t, s, m)
+		m.MessageID += 100
+		second := retryPropose(t, s, m)
+		require.Equal(t, first[0].CanonicalID, second[0].CanonicalID)
+	}
 }
