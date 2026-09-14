@@ -450,7 +450,7 @@ func (m *message) sync(c *wkhttp.Context) {
 		channelRecentMessages, err := m.s.requset.getRecentMessagesForCluster(c.Request.Context(), req.UID, req.Limit, channelRecentMessageReqs, false)
 		if err != nil {
 			m.Error("获取最近消息失败！", zap.Error(err), zap.String("uid", req.UID))
-			respondConversationReadRetry(c)
+			respondRecentReadError(c, err)
 			return
 		}
 		for _, channelRecentMessage := range channelRecentMessages {

@@ -48,15 +48,49 @@ func recentReadTimeout() time.Duration {
 	return 5 * time.Second
 }
 
-// Scale the configured budget by work size instead of imposing the same
-// deadline on one conversation and an unpaged history. The parent deadline
-// always remains the upper bound. Saturation prevents duration overflow.
+// Shared process-wide limits use separate pools for metadata and peer HTTP.
+// A peer HTTP call must not hold a metadata permit while its receiver fences.
+var recentMetadataSlots = make(chan struct{}, recentReadWorkers)
+var recentPeerSlots = make(chan struct{}, recentReadWorkers)
+
+func withRecentReadSlot(ctx context.Context, slots chan struct{}, task func() error) error {
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return task()
+}
+
+func recentReadMaxChannels() int {
+	if options.G != nil && options.G.Cluster.RecentReadMaxChannels > 0 {
+		return options.G.Cluster.RecentReadMaxChannels
+	}
+	return 10000
+}
+
+func checkRecentReadChannelCount(count int) error {
+	if count > recentReadMaxChannels() {
+		return fmt.Errorf("%w: limit %d; use smaller channel batches or conversation paging", errRecentReadTooLarge, recentReadMaxChannels())
+	}
+	return nil
+}
+
+// Scale within an operator-controlled ceiling. Oversized inputs are rejected
+// before routing, never silently truncated. A shorter parent deadline wins.
 func recentReadBudget(channels int) time.Duration {
 	windows := max(1, (max(channels, 1)-1)/recentReadBudgetChannels+1)
+	limit := options.G.Cluster.RecentReadMaxTimeout
+	if limit <= 0 {
+		limit = time.Minute
+	}
 	base := recentReadTimeout()
-	const maxDuration = time.Duration(1<<63 - 1)
-	if base > maxDuration/time.Duration(windows) {
-		return maxDuration
+	if base > limit/time.Duration(windows) {
+		return limit
 	}
 	return base * time.Duration(windows)
 }
@@ -78,7 +112,7 @@ func runRecentReadTasks(ctx context.Context, count int, task func(context.Contex
 			if err := workerCtx.Err(); err != nil {
 				return err
 			}
-			return task(workerCtx, i)
+			return withRecentReadSlot(workerCtx, recentMetadataSlots, func() error { return task(workerCtx, i) })
 		})
 	}
 	return group.Wait()
@@ -112,7 +146,7 @@ func (s *request) getRecentMessagesForCluster(parent context.Context, uid string
 			return result, nil
 		}
 		lastErr = err
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, errRecentReadProtocol) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, errRecentReadProtocol) || errors.Is(err, errRecentReadDisappeared) {
 			return nil, err
 		}
 		select {
@@ -138,8 +172,11 @@ func (s *request) recentMessagesAttempt(ctx context.Context, uid string, count i
 		}
 		cfg, err := service.Cluster.LoadChannelReadConfig(ctx, ch.ChannelId, ch.ChannelType)
 		key := makeChannelKey(ch.ChannelId, ch.ChannelType)
-		if errors.Is(err, wkdb.ErrNotFound) && !seen[key] {
+		if errors.Is(err, wkdb.ErrNotFound) {
 			missing[i] = true
+			if seen[key] {
+				return errRecentReadDisappeared
+			}
 			return nil
 		}
 		if err != nil {
@@ -154,10 +191,18 @@ func (s *request) recentMessagesAttempt(ctx context.Context, uid string, count i
 	})
 	// Retain observations even when another task fails, so a retry cannot
 	// turn a previously existing channel into an authoritative empty entry.
+	disappeared := false
 	for i, ch := range channels {
 		if found[i] {
 			seen[makeChannelKey(ch.ChannelId, ch.ChannelType)] = true
 		}
+		if missing[i] && seen[makeChannelKey(ch.ChannelId, ch.ChannelType)] {
+			disappeared = true
+		}
+	}
+	// A sibling's transient error must not mask an observed terminal deletion.
+	if disappeared {
+		return nil, errRecentReadDisappeared
 	}
 	if err != nil {
 		return nil, err
@@ -186,7 +231,11 @@ func (s *request) recentMessagesAttempt(ctx context.Context, uid string, count i
 			if node == options.G.Cluster.NodeId {
 				batches[i], err = s.localRecentMessagesWithConfigs(workerCtx, uid, count, groups[node], last, configsByNode[node])
 			} else {
-				batches[i], err = s.requestSyncMessage(workerCtx, node, groups[node], uid, count, last)
+				err = withRecentReadSlot(workerCtx, recentPeerSlots, func() error {
+					var peerErr error
+					batches[i], peerErr = s.requestSyncMessage(workerCtx, node, groups[node], uid, count, last)
+					return peerErr
+				})
 			}
 			if err != nil {
 				return err
@@ -345,7 +394,7 @@ func (s *conversation) serveRecentMessages(c *wkhttp.Context, versioned bool) {
 	var err error
 	req.Channels, err = normalizeRecentChannels(req.Channels)
 	if err != nil {
-		c.ResponseError(errInvalidRecentChannel)
+		c.ResponseError(err)
 		return
 	}
 	budget := recentReadBudget(len(req.Channels))
@@ -391,6 +440,9 @@ var errInvalidRecentChannel = errors.New("invalid channel_id or channel_type")
 // range. LastMsgSeq is a lower bound in both query directions; use the
 // minimum (including the unbounded zero). Keep the first occurrence's order.
 func normalizeRecentChannels(channels []*channelRecentMessageReq) ([]*channelRecentMessageReq, error) {
+	if err := checkRecentReadChannelCount(len(channels)); err != nil {
+		return nil, err
+	}
 	result := make([]*channelRecentMessageReq, 0, len(channels))
 	seen := make(map[string]*channelRecentMessageReq, len(channels))
 	for _, ch := range channels {
@@ -417,4 +469,15 @@ func recentPeerError(resp *rest.Response) error {
 		return fmt.Errorf("%w: %v", errRecentReadProtocol, err)
 	}
 	return err
+}
+
+var errRecentReadTooLarge = errors.New("too many recent-message channels")
+var errRecentReadDisappeared = errors.New("previously observed channel disappeared; refresh conversations")
+
+func respondRecentReadError(c *wkhttp.Context, err error) {
+	if errors.Is(err, errRecentReadTooLarge) {
+		c.ResponseError(err)
+		return
+	}
+	respondConversationReadRetry(c)
 }

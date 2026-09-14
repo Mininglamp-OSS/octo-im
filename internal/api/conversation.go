@@ -513,7 +513,7 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 		channelRecentMessages, err = s.s.requset.getRecentMessagesForCluster(c.Request.Context(), req.UID, int(req.MsgCount), channelRecentMessageReqs, true)
 		if err != nil {
 			s.Error("获取最近消息失败！", zap.Error(err), zap.String("uid", req.UID))
-			respondConversationReadRetry(c)
+			respondRecentReadError(c, err)
 			return
 		}
 
@@ -708,6 +708,11 @@ func (s *conversation) syncConversationByChannels(c *wkhttp.Context) {
 		return
 	}
 
+	if err := checkRecentReadChannelCount(len(req.Channels)); err != nil {
+		respondRecentReadError(c, err)
+		return
+	}
+
 	seenChannels := make(map[string]bool, len(req.Channels))
 	unique := req.Channels[:0]
 	for _, ch := range req.Channels {
@@ -800,7 +805,7 @@ func (s *conversation) syncConversationByChannels(c *wkhttp.Context) {
 	channelRecentMessages, err := s.s.requset.getRecentMessagesForCluster(c.Request.Context(), req.UID, msgCount, channelRecentMessageReqs, true)
 	if err != nil {
 		s.Error("获取最近消息失败！", zap.Error(err), zap.String("uid", req.UID))
-		respondConversationReadRetry(c)
+		respondRecentReadError(c, err)
 		return
 	}
 

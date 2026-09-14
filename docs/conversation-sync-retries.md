@@ -10,20 +10,36 @@ Ordering is applied after the DB read; it does not turn the cursor into an upper
 bound. Server-built conversation read/deleted barriers remain applied before
 these requests are constructed.
 
-Routing and each pre/post-read fence use at most 16 concurrent workers, and peer
-fan-out is also bounded to 16. One end-to-end deadline covers routing, network
-calls and paced retries. Its budget is `cluster.reqTimeout * ceil(channels/64)`
-after deduplication (at least one unit), so unpaged histories are not forced into
-the same budget as one channel. A shorter caller deadline always wins; the
-internal peer's budget is also clamped to this size-based server allowance.
+Admission rejects more than `cluster.recentReadMaxChannels` channels (default
+10,000) with HTTP 400 before route work; raw duplicate entries count toward this
+limit. No prefix is silently returned. Send smaller channel batches or use
+`/conversation/sync` paging. Server-built batches obey the same limit;
+`/message/sync` has no channel paging, so an over-limit history requires an
+operator limit adjustment or another supported batched synchronization flow.
+
+Routing and pre/post-read fences share a process-wide pool of 16 permits across
+requests. Outbound peer HTTP calls share a separate process-wide pool of 16;
+separate pools let inbound peer fences progress while outbound calls are waiting.
+Permit waits are cancellable. Each request also starts at most 16 workers per
+phase. One end-to-end deadline covers permit waits, routing, network calls and
+paced retries. Its budget is
+`min(cluster.reqTimeout * ceil(channels/64), cluster.recentReadMaxTimeout)` after
+deduplication (at least one unit); the timeout ceiling defaults to 60 seconds.
+Nonpositive limit settings use the defaults. A shorter caller deadline always
+wins, and the peer's advertised budget cannot extend the server allowance.
 Retries use a 25 ms initial delay, exponential backoff capped at 250 ms plus up to 25% jitter, at
 most 64 attempts. Each attempt may use the full remaining budget. Only early
 failures retry; a timeout/cancellation before completion ends the request.
 Once every worker and both fences have returned success and coverage validates,
 a deadline racing with final assembly does not discard that complete result.
+A Raft state snapshot already delivered by the real event loop wins a concurrent
+cancellation; a pending state read still fails immediately on cancellation.
 Malformed/wrong-version/incomplete peer responses and fixed HTTP 4xx failures
 (except 429) fail immediately; elections, transport errors and 5xx retain paced
-retry. Every retry resolves routes; a channel observed to exist cannot disappear into an empty result on retry.
+retry. Every retry resolves routes. If a previously observed channel is subsequently
+reported missing, the request fails immediately without consuming the remaining
+retry budget; callers should refresh their conversation list. It cannot become
+an empty entry within the same request.
 Both routing and serving require a normal configuration with a voting leader.
 Local serving fences leader/configuration state before and after payload reads,
 without performing extra discarded message-sequence reads.
@@ -42,7 +58,7 @@ this PR does not claim that Octo clients already receive retryable 503s.
 Peers use `/conversation/syncMessages/v2`, an endpoint that only serves locally
 led channels, with `{version: 2, channels: [...]}` responses and a positive `budget_ms` integer in
 requests. The older nanosecond `budget` field is still accepted during transition;
-`budget_ms` takes precedence and is capped by the size-based server budget. v2
+`budget_ms` takes precedence and is capped by the size-based budget and operator ceiling. v2
 rejects missing metadata because its caller already resolved an existing route.
 Both routes are registered on the existing public API listener; “peer” describes
 intended use, not authentication or network isolation. Public v1 remains routable.
