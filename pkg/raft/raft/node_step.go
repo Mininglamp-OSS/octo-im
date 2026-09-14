@@ -91,8 +91,11 @@ func (n *Node) Step(e types.Event) error {
 	case types.ApplyResp: // 应用返回
 		if e.Reason == types.ReasonOk {
 			n.queue.appliedTo(e.Index)
+			n.applyFailures = 0
+			n.applyRetryTicks = 0
 		} else {
 			n.queue.applying = false
+			n.backoffApply()
 		}
 	default:
 		if n.stepFunc != nil {

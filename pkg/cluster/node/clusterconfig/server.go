@@ -20,13 +20,17 @@ import (
 )
 
 type Server struct {
-	opts              *Options
-	raft              *raft.Raft             // raft算法
-	config            *Config                // 分布式配置对象
-	storage           *PebbleShardLogStorage // 配置日志存储
-	cfgGenId          *snowflake.Node        // 配置ID生成器
-	membershipPending bool                   // accessed only by the apply worker; retained across failed applications
-	listeners         []IEvent               // 事件监听器
+	opts     *Options
+	raft     *raft.Raft             // raft算法
+	config   *Config                // 分布式配置对象
+	storage  *PebbleShardLogStorage // 配置日志存储
+	cfgGenId *snowflake.Node        // 配置ID生成器
+	// Apply-worker-only progress. On restart the persisted snapshot and
+	// initRaft reconstruct membership; these flags cover in-process retries.
+	membershipPending   bool
+	configSavePending   bool
+	configNotifyPending bool
+	listeners           []IEvent // 事件监听器
 	wklog.Log
 }
 

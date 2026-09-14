@@ -2,6 +2,7 @@ package clusterconfig
 
 import (
 	"encoding/binary"
+	"fmt"
 	"slices"
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -36,20 +37,23 @@ func (s *Server) applyLog(log types.Log) error {
 		before := s.configToRaftConfig(s.config).Clone()
 		err = s.handleCmd(cmd)
 		if err != nil {
-			s.Panic("handle cmd failed", zap.Error(err))
+			s.Error("handle cmd failed", zap.Error(err))
 			return err
 		}
 		after := s.configToRaftConfig(s.config)
 		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
 		s.config.cfg.Term = log.Term
 		s.config.cfg.Version = log.Index
+		s.configSavePending = true
+		s.configNotifyPending = true
 	}
 
-	// fmt.Println("apply log", log.Index, log.Term, cmd.CmdType.String())
-	err := s.config.saveConfig()
-	if err != nil {
-		s.Error("save config err", zap.Error(err))
-		return err
+	if s.configSavePending {
+		if err := s.config.saveConfig(); err != nil {
+			s.Error("save config err", zap.Error(err))
+			return err
+		}
+		s.configSavePending = false
 	}
 	// Membership becomes visible to Raft only after its version and saved
 	// application config are updated. Learners must not promote on VoteReq.
@@ -60,8 +64,10 @@ func (s *Server) applyLog(log types.Log) error {
 		}
 		s.membershipPending = false
 	}
-	// 配置发送变化
-	s.NotifyConfigChangeEvent()
+	if s.configNotifyPending {
+		s.NotifyConfigChangeEvent()
+		s.configNotifyPending = false
+	}
 	return nil
 }
 
@@ -155,6 +161,9 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 }
 
 func (s *Server) handleNodeJoining(cmd *CMD) error {
+	if len(cmd.Data) != 8 {
+		return fmt.Errorf("invalid node joining payload length: %d", len(cmd.Data))
+	}
 	nodeId := binary.BigEndian.Uint64(cmd.Data)
 	s.config.updateNodeJoining(nodeId)
 	return nil
