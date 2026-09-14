@@ -60,7 +60,9 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	}
 	if isVoter(newCfg, n.opts.NodeId) && oldCfg.Role == types.RoleCandidate && (!sameVoters(oldCfg, newCfg) || oldCfg.Term != newCfg.Term) {
 		newCfg.Role = types.RoleFollower
-		newCfg.Leader = None
+		if newCfg.Leader == n.opts.NodeId || !isVoter(newCfg, newCfg.Leader) {
+			newCfg.Leader = None
+		}
 	}
 
 	// A version-only update is not a new election. Preserve collected votes;

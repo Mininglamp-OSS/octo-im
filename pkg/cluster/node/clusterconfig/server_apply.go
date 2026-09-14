@@ -21,26 +21,32 @@ func (s *Server) applyLogs(logs []types.Log) error {
 }
 
 func (s *Server) applyLog(log types.Log) error {
-	cmd := &CMD{}
-	err := cmd.Unmarshal(log.Data)
-	if err != nil {
-		s.Error("unmarshal cmd err", zap.Error(err), zap.Uint64("index", log.Index), zap.ByteString("data", log.Data))
-		return err
-	}
+	// A batch may be retried after saveConfig or membership delivery fails.
+	// The full application config already includes earlier logs in that batch;
+	// do not repeat side effects (e.g. OfflineCount), but retry persistence and
+	// pending Raft delivery before allowing the applied marker to advance.
+	if log.Index > s.config.version() {
+		cmd := &CMD{}
+		err := cmd.Unmarshal(log.Data)
+		if err != nil {
+			s.Error("unmarshal cmd err", zap.Error(err), zap.Uint64("index", log.Index), zap.ByteString("data", log.Data))
+			return err
+		}
 
-	before := s.configToRaftConfig(s.config).Clone()
-	err = s.handleCmd(cmd)
-	if err != nil {
-		s.Panic("handle cmd failed", zap.Error(err))
-		return err
+		before := s.configToRaftConfig(s.config).Clone()
+		err = s.handleCmd(cmd)
+		if err != nil {
+			s.Panic("handle cmd failed", zap.Error(err))
+			return err
+		}
+		after := s.configToRaftConfig(s.config)
+		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
+		s.config.cfg.Term = log.Term
+		s.config.cfg.Version = log.Index
 	}
-	after := s.configToRaftConfig(s.config)
-	s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
-	s.config.cfg.Term = log.Term
-	s.config.cfg.Version = log.Index
 
 	// fmt.Println("apply log", log.Index, log.Term, cmd.CmdType.String())
-	err = s.config.saveConfig()
+	err := s.config.saveConfig()
 	if err != nil {
 		s.Error("save config err", zap.Error(err))
 		return err

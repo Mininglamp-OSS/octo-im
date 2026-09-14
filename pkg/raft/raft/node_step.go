@@ -7,6 +7,20 @@ import (
 )
 
 func (n *Node) Step(e types.Event) error {
+	// Election membership discovery does not carry a term or cast a vote.
+	// Process it separately so a still-local learner cannot raise our term.
+	if (e.Type == types.ConfigReq || e.Type == types.ConfigResp) && e.Reason == types.ReasonOnlySync {
+		return n.stepElectionMembership(e)
+	}
+	if (e.Type == types.VoteReq || e.Type == types.VoteResp) && n.opts.ElectionOn &&
+		e.ConfigVersion > n.cfg.Version && (n.isVoter(e.From) || n.isLearner(e.From)) {
+		if n.membershipRequests == nil {
+			n.membershipRequests = make(map[uint64]uint64)
+		}
+		n.membershipRequests[e.From] = e.ConfigVersion
+		n.events = append(n.events, types.Event{Type: types.ConfigReq, From: n.opts.NodeId, To: e.From,
+			Reason: types.ReasonOnlySync, ConfigVersion: e.ConfigVersion})
+	}
 	// Non-voters cannot disrupt an election by supplying a higher term.
 	if (e.Type == types.VoteReq || e.Type == types.VoteResp) &&
 		(!n.isVoter(n.opts.NodeId) || !n.isVoter(e.From)) {

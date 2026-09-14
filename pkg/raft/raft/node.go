@@ -35,8 +35,9 @@ type Node struct {
 	cfg                types.Config // 分布式配置
 	voteFor            uint64       // 本任期的投票，不随角色重置
 	persistedHardState types.HardState
-	electionState      // 选举状态
-	syncState          // 同步状态
+	membershipRequests map[uint64]uint64 // peer -> newer applied config version requested
+	electionState                        // 选举状态
+	syncState                            // 同步状态
 	// 最新的任期对应的开始日志下标
 	lastTermStartIndex types.TermStartIndexInfo
 	onlySync           bool // 是否只同步,不做截断判断

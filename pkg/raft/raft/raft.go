@@ -418,7 +418,7 @@ func (r *Raft) handleApplyReq(e types.Event) {
 		}
 		err = r.opts.Storage.Apply(logs)
 		if err != nil {
-			r.Panic("apply logs failed", zap.Error(err))
+			r.Error("apply logs failed", zap.Error(err))
 			r.stepC <- stepReq{event: types.Event{
 				Type:   types.ApplyResp,
 				Reason: types.ReasonError,
