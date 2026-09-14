@@ -32,7 +32,12 @@ func (s *storage) GetState(channelId string, channelType uint8) (types.RaftState
 	if applied > uint64(lastMsg.MessageSeq) {
 		return types.RaftState{}, fmt.Errorf("channel applied index exceeds log tail")
 	}
+	state, err := s.db.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return types.RaftState{}, err
+	}
 	return types.RaftState{
+		HardState:    state,
 		LastLogIndex: uint64(lastMsg.MessageSeq),
 		LastTerm:     uint32(lastMsg.Term),
 		AppliedIndex: applied,

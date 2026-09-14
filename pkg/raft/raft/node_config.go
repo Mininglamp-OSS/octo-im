@@ -8,6 +8,24 @@ import (
 	"go.uber.org/zap"
 )
 
+// switchRemoteConfig derives the local role from membership. ConfigResp also
+// carries the sender's role, which older leaders populate with RoleLeader.
+func (n *Node) switchRemoteConfig(cfg types.Config) error {
+	switch {
+	case wkutil.ArrayContainsUint64(cfg.Replicas, n.opts.NodeId):
+		cfg.Role = types.RoleFollower
+		if cfg.Leader == n.opts.NodeId {
+			cfg.Role = types.RoleLeader
+		}
+	case wkutil.ArrayContainsUint64(cfg.Learners, n.opts.NodeId):
+		cfg.Role = types.RoleLearner
+	default:
+		return errors.New("local node is not a member of config response")
+	}
+	cfg.Term = n.cfg.Term
+	return n.switchConfig(cfg)
+}
+
 func (n *Node) switchConfig(newCfg types.Config) error {
 
 	oldCfg := n.cfg
@@ -30,6 +48,7 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	n.resetRandomizedElectionTimeout()
 
 	// 比较角色是否发生变化
+	n.setTerm(newCfg.Term)
 	n.roleChangeIfNeed(oldCfg, newCfg)
 
 	n.cfg = newCfg

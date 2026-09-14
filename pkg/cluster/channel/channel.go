@@ -50,6 +50,7 @@ func createChannel(cfg wkdb.ChannelClusterConfig, s *Server, rg *raftgroup.RaftG
 		state,
 		raft.NewOptions(
 			raft.WithKey(channelKey),
+			raft.WithSaveHardState(func(state types.HardState) error { return s.storage.db.SaveRaftHardState(channelKey, state) }),
 			raft.WithAutoSuspend(true),
 			raft.WithAutoDestory(true),
 			raft.WithNodeId(s.opts.NodeId),
