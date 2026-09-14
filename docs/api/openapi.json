@@ -1733,8 +1733,10 @@
     "/conversation/syncMessages": {
       "post": {
         "summary": "Sync Recent Messages",
-        "description": "Synchronize recent messages for conversations",
-        "tags": ["Conversation"],
+        "description": "Synchronize recent messages for conversations Public endpoint: resolves each channel leader across the cluster. Valid unused channels return empty entries; duplicate channels are coalesced. Temporary read failures return HTTP 503.",
+        "tags": [
+          "Conversation"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -1758,6 +1760,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid channel ID or channel type."
+          },
+          "503": {
+            "description": "Temporary routing or leader-read failure; retry the complete request. No partial success is returned."
           }
         }
       }

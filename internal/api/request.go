@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -179,7 +181,7 @@ func runParallel[K comparable, V any](
 
 // getRecentMessages 获取本节点频道最近消息
 // orderByLast: true 按照最新的消息排序 false 按照最旧的消息排序
-func (s *request) getRecentMessages(uid string, msgCount int, channels []*channelRecentMessageReq, orderByLast bool) ([]*channelRecentMessage, error) {
+func (s *request) getRecentMessages(ctx context.Context, uid string, msgCount int, channels []*channelRecentMessageReq, orderByLast bool) ([]*channelRecentMessage, error) {
 	if len(channels) == 0 {
 		return []*channelRecentMessage{}, nil
 	}
@@ -187,7 +189,7 @@ func (s *request) getRecentMessages(uid string, msgCount int, channels []*channe
 	// 按数据库分片分组并行处理
 	shardGroups := s.groupChannelsByDbShard(channels)
 	return runParallel(shardGroups, func(chs []*channelRecentMessageReq) ([]*channelRecentMessage, error) {
-		return s.processBatchChannels(uid, msgCount, chs, orderByLast)
+		return s.processBatchChannels(ctx, uid, msgCount, chs, orderByLast)
 	})
 }
 
@@ -202,7 +204,7 @@ func (s *request) groupChannelsByDbShard(channels []*channelRecentMessageReq) ma
 }
 
 // processBatchChannels 批量处理频道消息查询（统一使用批量模式）
-func (s *request) processBatchChannels(uid string, msgCount int, channels []*channelRecentMessageReq, orderByLast bool) ([]*channelRecentMessage, error) {
+func (s *request) processBatchChannels(ctx context.Context, uid string, msgCount int, channels []*channelRecentMessageReq, orderByLast bool) ([]*channelRecentMessage, error) {
 	if len(channels) == 0 {
 		return nil, nil
 	}
@@ -216,6 +218,9 @@ func (s *request) processBatchChannels(uid string, msgCount int, channels []*cha
 		})
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// 批量获取用户最后消息序号
 	userLastMsgSeqMap, err := service.Store.GetUserLastMsgSeqBatch(uid, wkdbChannels)
 	if err != nil {
@@ -224,7 +229,7 @@ func (s *request) processBatchChannels(uid string, msgCount int, channels []*cha
 	}
 
 	// 批量加载消息
-	msgMap, err := s.loadMessagesBatch(channels, msgCount, orderByLast)
+	msgMap, err := s.loadMessagesBatch(ctx, channels, msgCount, orderByLast)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +259,7 @@ func (s *request) processBatchChannels(uid string, msgCount int, channels []*cha
 }
 
 // loadMessagesBatch 批量加载频道消息（使用批量查询接口）
-func (s *request) loadMessagesBatch(channels []*channelRecentMessageReq, msgCount int, orderByLast bool) (map[string]types.MessageRespSlice, error) {
+func (s *request) loadMessagesBatch(ctx context.Context, channels []*channelRecentMessageReq, msgCount int, orderByLast bool) (map[string]types.MessageRespSlice, error) {
 	// 构建批量查询请求
 	batchRequests := make([]wkdb.BatchMsgRequest, 0, len(channels))
 	for _, channel := range channels {
@@ -271,6 +276,9 @@ func (s *request) loadMessagesBatch(channels []*channelRecentMessageReq, msgCoun
 		})
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// 批量查询消息
 	batchResponses, err := service.Store.LoadMsgsBatch(batchRequests)
 	if err != nil {
@@ -278,6 +286,23 @@ func (s *request) loadMessagesBatch(channels []*channelRecentMessageReq, msgCoun
 		return nil, err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	expected := make(map[string]bool, len(batchRequests))
+	for _, req := range batchRequests {
+		expected[makeChannelKey(req.ChannelId, req.ChannelType)] = true
+	}
+	for _, resp := range batchResponses {
+		k := makeChannelKey(resp.ChannelId, resp.ChannelType)
+		if !expected[k] {
+			return nil, errors.New("unexpected or duplicate storage channel response")
+		}
+		delete(expected, k)
+	}
+	if len(expected) != 0 {
+		return nil, errors.New("incomplete storage channel response")
+	}
 	// 构建结果映射
 	msgMap := make(map[string]types.MessageRespSlice, len(batchResponses))
 	for _, resp := range batchResponses {

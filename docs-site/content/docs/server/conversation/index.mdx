@@ -124,3 +124,12 @@ POST /conversations/delete
   <Card title="看消息查询" href="/server/message/search" />
   <Card title="看连接管理" href="/server/connection" />
 </Cards>
+
+
+### 最近消息同步的集群与错误语义
+
+`POST /conversation/syncMessages` 是公开接口，可请求任意 IM API 节点；服务端会解析频道的当前 leader 并跨节点查询，成功响应仍为频道数组。合法但尚未创建的频道返回空消息项，重复频道合并处理，空频道 ID 或 `channel_type: 0` 返回 HTTP 400。
+
+暂时无法确认路由或读取角色时，服务端在总超时内退避重试；耗尽后返回 HTTP 503，客户端应重试整批请求。成功响应覆盖所有请求频道，不能把失败频道当作空结果。代理层应保留可重试状态码。
+
+`/conversation/syncMessages/v2` 是 IM 节点之间使用的内部接口，使用版本化响应及毫秒单位的 `budget_ms`，不应由公开客户端直接调用。升级时需让 IM 节点一起切换到支持 v2 的版本；混跑旧节点期间跨节点同步可能失败。

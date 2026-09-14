@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
 )
 
@@ -133,10 +133,7 @@ func (r conversationReader) attempt(ctx context.Context, id string, typ uint8, a
 }
 
 func validConversationConfig(cfg wkdb.ChannelClusterConfig, id string, typ uint8) bool {
-	return cfg.ChannelId == id && cfg.ChannelType == typ && cfg.LeaderId != 0 && cfg.Term != 0 &&
-		cfg.Status == wkdb.ChannelClusterStatusNormal &&
-		wkutil.ArrayContainsUint64(cfg.Replicas, cfg.LeaderId) &&
-		!wkutil.ArrayContainsUint64(cfg.Learners, cfg.LeaderId)
+	return icluster.ValidChannelReadConfig(cfg, id, typ)
 }
 
 func (r conversationReader) readLocal(ctx context.Context, expected wkdb.ChannelClusterConfig) (uint64, error) {
@@ -329,6 +326,31 @@ func (s *Server) LoadChannelReadConfig(ctx context.Context, id string, typ uint8
 }
 
 func (s *Server) ValidateLocalChannelRead(ctx context.Context, expected wkdb.ChannelClusterConfig) error {
-	_, err := s.conversationReader().readLocal(ctx, expected)
-	return err
+	return s.conversationReader().validateLocal(ctx, expected)
+}
+
+// validateLocal fences a payload read without fetching and discarding a tail
+// sequence. Call before and after I/O with the same expected configuration.
+func (r conversationReader) validateLocal(ctx context.Context, expected wkdb.ChannelClusterConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !validConversationConfig(expected, expected.ChannelId, expected.ChannelType) || expected.LeaderId != r.nodeID {
+		return ErrConversationReadRetry
+	}
+	cfg, err := r.load(ctx, expected.ChannelId, expected.ChannelType)
+	if err != nil {
+		return err
+	}
+	if !cfg.Equal(expected) {
+		return ErrConversationReadRetry
+	}
+	state, err := r.state(ctx, expected.ChannelId, expected.ChannelType)
+	if err != nil {
+		return err
+	}
+	if !conversationStateReady(state, cfg) {
+		return ErrConversationReadRetry
+	}
+	return ctx.Err()
 }

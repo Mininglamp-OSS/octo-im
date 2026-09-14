@@ -83,6 +83,20 @@ func TestConversationReadRPC(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, uint64(42), seq)
 	})
+	t.Run("public read config and local fence", func(t *testing.T) {
+		loaded, err := leader.LoadChannelReadConfig(ctx, id, 2)
+		require.NoError(t, err)
+		require.Equal(t, cfg.ChannelId, loaded.ChannelId)
+		require.Equal(t, cfg.LeaderId, loaded.LeaderId)
+		require.Equal(t, cfg.ConfVersion, loaded.ConfVersion)
+		require.NoError(t, leader.ValidateLocalChannelRead(ctx, loaded))
+		require.ErrorIs(t, owner.ValidateLocalChannelRead(ctx, loaded), ErrConversationReadRetry)
+		stale := loaded
+		stale.ConfVersion++
+		require.ErrorIs(t, leader.ValidateLocalChannelRead(ctx, stale), ErrConversationReadRetry)
+		_, err = leader.LoadChannelReadConfig(ctx, "never-created", 2)
+		require.ErrorIs(t, err, wkdb.ErrNotFound)
+	})
 	t.Run("stale epoch", func(t *testing.T) {
 		stale := cfg
 		stale.Term++
@@ -136,6 +150,9 @@ func TestConversationReadRPC(t *testing.T) {
 			state, err := leader.channelServer.ReadLeaderState(ctx, id, 2)
 			return err == nil && !state.Ready && state.Term == 2
 		}, time.Second, time.Millisecond)
+		expected, err := leader.LoadChannelReadConfig(ctx, id, 2)
+		require.NoError(t, err)
+		require.ErrorIs(t, leader.ValidateLocalChannelRead(ctx, expected), ErrConversationReadRetry)
 		seq, err := owner.GetChannelLastMessageSeq(ctx, id, 2)
 		require.ErrorIs(t, err, ErrConversationReadRetry)
 		require.Zero(t, seq)

@@ -285,3 +285,14 @@ func TestConversationReaderRetainsFailureCause(t *testing.T) {
 	require.ErrorContains(t, err, "attempt 2")
 	require.ErrorContains(t, err, cfg.ChannelId)
 }
+
+func TestConversationReaderFenceDoesNotReadPayloadOrTail(t *testing.T) {
+	cfg := boundaryConfig()
+	r := boundaryReader(t, &cfg)
+	r.nodeID = cfg.LeaderId
+	require.NoError(t, r.validateLocal(context.Background(), cfg)) // local callback is fatal
+	r.state = func(context.Context, string, uint8) (raftgroup.ReadState, error) { return raftgroup.ReadState{}, nil }
+	require.NoError(t, r.validateLocal(context.Background(), cfg))
+	cfg.MigrateFrom, cfg.MigrateTo = 4, 5
+	require.ErrorIs(t, r.validateLocal(context.Background(), cfg), ErrConversationReadRetry)
+}

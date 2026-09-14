@@ -4,16 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/sendgrid/rest"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -24,7 +25,8 @@ type recentReadRequest struct {
 	Channels    []*channelRecentMessageReq `json:"channels"`
 	MsgCount    int                        `json:"msg_count"`
 	OrderByLast int                        `json:"order_by_last"`
-	Budget      time.Duration              `json:"budget"`
+	Budget      time.Duration              `json:"budget,omitempty"` // legacy nanoseconds, accepted during transition
+	BudgetMS    int64                      `json:"budget_ms,omitempty"`
 }
 type recentReadResponse struct {
 	Version  int                     `json:"version"`
@@ -38,9 +40,14 @@ func recentReadTimeout() time.Duration {
 	return 5 * time.Second
 }
 
-// One end-to-end budget, at most two attempts. A failed channel must never
+// One end-to-end budget with paced retries. A failed channel must never
 // disappear from a successful batch; each retry resolves all routes afresh.
 func (s *request) getRecentMessagesForCluster(parent context.Context, uid string, count int, channels []*channelRecentMessageReq, last bool) ([]*channelRecentMessage, error) {
+	var err error
+	channels, err = normalizeRecentChannels(channels, last)
+	if err != nil {
+		return nil, err
+	}
 	if len(channels) == 0 {
 		return []*channelRecentMessage{}, nil
 	}
@@ -48,31 +55,36 @@ func (s *request) getRecentMessagesForCluster(parent context.Context, uid string
 	defer cancel()
 	seen := make(map[string]bool)
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	delay := 25 * time.Millisecond
+	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		deadline, _ := ctx.Deadline()
-		attemptCtx, done := context.WithTimeout(ctx, time.Until(deadline)/time.Duration(2-attempt))
+		remaining := time.Until(deadline)
+		attemptBudget := remaining
+		if remaining > 100*time.Millisecond {
+			attemptBudget = remaining / 2
+		}
+		attemptCtx, done := context.WithTimeout(ctx, attemptBudget)
 		result, err := s.recentMessagesAttempt(attemptCtx, uid, count, channels, last, seen)
 		done()
 		if err == nil {
 			return result, ctx.Err()
 		}
 		lastErr = err
-		if attempt == 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(10 * time.Millisecond):
-			}
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(ctx.Err(), lastErr)
+		case <-time.After(delay):
 		}
+		delay = min(delay*2, 250*time.Millisecond)
 	}
-	return nil, fmt.Errorf("recent message read requires retry: %w", lastErr)
 }
 
 func (s *request) recentMessagesAttempt(ctx context.Context, uid string, count int, channels []*channelRecentMessageReq, last bool, seen map[string]bool) ([]*channelRecentMessage, error) {
 	groups := make(map[uint64][]*channelRecentMessageReq)
+	configsByNode := make(map[uint64][]wkdb.ChannelClusterConfig)
 	result := make([]*channelRecentMessage, 0, len(channels))
 	for _, ch := range channels {
 		if ch == nil || ch.ChannelId == "" || ch.ChannelType == 0 {
@@ -88,10 +100,11 @@ func (s *request) recentMessagesAttempt(ctx context.Context, uid string, count i
 			return nil, err
 		}
 		seen[key] = true
-		if cfg.ChannelId != ch.ChannelId || cfg.ChannelType != ch.ChannelType || cfg.LeaderId == 0 {
+		if !icluster.ValidChannelReadConfig(cfg, ch.ChannelId, ch.ChannelType) {
 			return nil, errors.New("invalid channel route")
 		}
 		groups[cfg.LeaderId] = append(groups[cfg.LeaderId], ch)
+		configsByNode[cfg.LeaderId] = append(configsByNode[cfg.LeaderId], cfg)
 	}
 	// Each worker owns its result slot. No shared reqErr or append races.
 	peers := make([]uint64, 0, len(groups))
@@ -105,7 +118,7 @@ func (s *request) recentMessagesAttempt(ctx context.Context, uid string, count i
 		group.Go(func() error {
 			var err error
 			if node == options.G.Cluster.NodeId {
-				batches[i], err = s.localRecentMessages(workerCtx, uid, count, groups[node], last)
+				batches[i], err = s.localRecentMessagesWithConfigs(workerCtx, uid, count, groups[node], last, configsByNode[node])
 			} else {
 				batches[i], err = s.requestSyncMessage(workerCtx, node, groups[node], uid, count, last)
 			}
@@ -156,22 +169,31 @@ func validateRecentBatch(want []*channelRecentMessageReq, got []*channelRecentMe
 func (s *request) localRecentMessages(ctx context.Context, uid string, count int, channels []*channelRecentMessageReq, last bool) ([]*channelRecentMessage, error) {
 	configs := make([]wkdb.ChannelClusterConfig, 0, len(channels))
 	for _, ch := range channels {
-		if ch == nil {
-			return nil, errors.New("nil channel request")
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if ch == nil || ch.ChannelId == "" || ch.ChannelType == 0 {
+			return nil, errInvalidRecentChannel
 		}
 		cfg, err := service.Cluster.LoadChannelReadConfig(ctx, ch.ChannelId, ch.ChannelType)
 		if err != nil {
 			return nil, err
 		}
-		if cfg.LeaderId != options.G.Cluster.NodeId {
+		configs = append(configs, cfg)
+	}
+	return s.localRecentMessagesWithConfigs(ctx, uid, count, channels, last, configs)
+}
+
+func (s *request) localRecentMessagesWithConfigs(ctx context.Context, uid string, count int, channels []*channelRecentMessageReq, last bool, configs []wkdb.ChannelClusterConfig) ([]*channelRecentMessage, error) {
+	for i, cfg := range configs {
+		if !icluster.ValidChannelReadConfig(cfg, channels[i].ChannelId, channels[i].ChannelType) || cfg.LeaderId != options.G.Cluster.NodeId {
 			return nil, errors.New("recent message route changed")
 		}
 		if err := service.Cluster.ValidateLocalChannelRead(ctx, cfg); err != nil {
 			return nil, err
 		}
-		configs = append(configs, cfg)
 	}
-	result, err := s.getRecentMessages(uid, count, channels, last)
+	result, err := s.getRecentMessages(ctx, uid, count, channels, last)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +217,7 @@ func (s *request) requestSyncMessage(ctx context.Context, nodeID uint64, channel
 	if budget <= 0 {
 		return nil, context.DeadlineExceeded
 	}
-	data, err := json.Marshal(recentReadRequest{UID: uid, Channels: channels, MsgCount: count, OrderByLast: wkutil.BoolToInt(last), Budget: budget})
+	data, err := json.Marshal(recentReadRequest{UID: uid, Channels: channels, MsgCount: count, OrderByLast: wkutil.BoolToInt(last), BudgetMS: max(1, budget.Milliseconds())})
 	if err != nil {
 		return nil, err
 	}
@@ -227,8 +249,17 @@ func (s *conversation) serveRecentMessages(c *wkhttp.Context, versioned bool) {
 		c.ResponseError(errors.New("invalid recent message request"))
 		return
 	}
+	var err error
+	req.Channels, err = normalizeRecentChannels(req.Channels, wkutil.IntToBool(req.OrderByLast))
+	if err != nil {
+		c.ResponseError(errInvalidRecentChannel)
+		return
+	}
 	budget := recentReadTimeout()
 	if versioned {
+		if req.BudgetMS > 0 {
+			req.Budget = time.Duration(min(req.BudgetMS, budget.Milliseconds())) * time.Millisecond
+		}
 		if req.Budget <= 0 {
 			respondConversationReadRetry(c)
 			return
@@ -242,11 +273,17 @@ func (s *conversation) serveRecentMessages(c *wkhttp.Context, versioned bool) {
 	if req.MsgCount <= 0 {
 		req.MsgCount = 15
 	}
-	result, err := s.s.requset.localRecentMessages(ctx, req.UID, req.MsgCount, req.Channels, wkutil.IntToBool(req.OrderByLast))
+	var result []*channelRecentMessage
+	if versioned {
+		result, err = s.s.requset.localRecentMessages(ctx, req.UID, req.MsgCount, req.Channels, wkutil.IntToBool(req.OrderByLast))
+	} else {
+		result, err = s.s.requset.getRecentMessagesForCluster(ctx, req.UID, req.MsgCount, req.Channels, wkutil.IntToBool(req.OrderByLast))
+	}
 	if err == nil {
 		err = validateRecentBatch(req.Channels, result)
 	}
 	if err != nil {
+		s.Warn("recent message read failed", zap.Error(err), zap.Bool("internal", versioned), zap.Int("channels", len(req.Channels)))
 		respondConversationReadRetry(c)
 		return
 	}
@@ -255,4 +292,34 @@ func (s *conversation) serveRecentMessages(c *wkhttp.Context, versioned bool) {
 	} else {
 		c.JSON(http.StatusOK, result)
 	}
+}
+
+var errInvalidRecentChannel = errors.New("invalid channel_id or channel_type")
+
+// Collapse repeated store/cache/input entries without losing the wider cursor
+// range. Forward reads start at the oldest cursor; reverse reads at the newest
+// (zero is the unbounded reverse cursor). Keep the first occurrence's order.
+func normalizeRecentChannels(channels []*channelRecentMessageReq, last bool) ([]*channelRecentMessageReq, error) {
+	result := make([]*channelRecentMessageReq, 0, len(channels))
+	seen := make(map[string]*channelRecentMessageReq, len(channels))
+	for _, ch := range channels {
+		if ch == nil || ch.ChannelId == "" || ch.ChannelType == 0 {
+			return nil, errInvalidRecentChannel
+		}
+		key := makeChannelKey(ch.ChannelId, ch.ChannelType)
+		if old, ok := seen[key]; ok {
+			if !last {
+				old.LastMsgSeq = min(old.LastMsgSeq, ch.LastMsgSeq)
+			} else if old.LastMsgSeq == 0 || ch.LastMsgSeq == 0 {
+				old.LastMsgSeq = 0
+			} else {
+				old.LastMsgSeq = max(old.LastMsgSeq, ch.LastMsgSeq)
+			}
+			continue
+		}
+		copy := *ch
+		seen[key] = &copy
+		result = append(result, &copy)
+	}
+	return result, nil
 }

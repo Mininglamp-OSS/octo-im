@@ -70,7 +70,7 @@ func successfulRecentPeer(t *testing.T) *httptest.Server {
 			return
 		}
 		var req recentReadRequest
-		if json.NewDecoder(r.Body).Decode(&req) != nil || req.Budget <= 0 {
+		if json.NewDecoder(r.Body).Decode(&req) != nil || req.BudgetMS <= 0 && req.Budget <= 0 {
 			w.WriteHeader(400)
 			return
 		}
@@ -142,7 +142,8 @@ func TestRecentReadRejectsIncompleteOrLegacyPeer(t *testing.T) {
 			result, err := reader.getRecentMessagesForCluster(context.Background(), "alice", 10, []*channelRecentMessageReq{{ChannelId: "a", ChannelType: 2}, {ChannelId: "b", ChannelType: 2}}, true)
 			require.Error(t, err)
 			require.Nil(t, result)
-			require.Equal(t, int32(2), requests.Load())
+			require.GreaterOrEqual(t, requests.Load(), int32(2))
+			require.LessOrEqual(t, requests.Load(), int32(8))
 		})
 	}
 }
@@ -192,6 +193,7 @@ func TestRecentReadNoPartialSuccessAndBoundedCancellation(t *testing.T) {
 type recentReadDB struct {
 	wkdb.DB
 	afterLoad func()
+	partial   bool
 }
 
 func (*recentReadDB) GetChannelShardIndex(string, uint8) uint32 { return 0 }
@@ -199,6 +201,9 @@ func (*recentReadDB) GetUserLastMsgSeqBatch(string, []wkdb.Channel) (map[string]
 	return map[string]uint64{}, nil
 }
 func (d *recentReadDB) LoadMsgsBatch(reqs []wkdb.BatchMsgRequest) ([]wkdb.BatchMsgResponse, error) {
+	if d.partial {
+		return nil, nil
+	}
 	if d.afterLoad != nil {
 		d.afterLoad()
 	}
@@ -260,5 +265,94 @@ func TestRecentReadServingRoleAndHTTPFailure(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRecentReadPublicEndpointRoutesAndKeepsEmptyChannels(t *testing.T) {
+	peer := successfulRecentPeer(t)
+	reader := setupRecentRead(t, &recentReadCluster{nodes: map[uint64]*clustertypes.Node{2: {Id: 2, ApiServerAddr: peer.URL}}, load: func(ctx context.Context, id string, typ uint8) (wkdb.ChannelClusterConfig, error) {
+		if id == "unused" {
+			return wkdb.EmptyChannelClusterConfig, wkdb.ErrNotFound
+		}
+		return readCfg(id, typ, 2), nil
+	}})
+	router := wkhttp.New()
+	newConversation(&Server{requset: reader}).route(router)
+	req := httptest.NewRequest(http.MethodPost, "/conversation/syncMessages", strings.NewReader(`{"uid":"alice","channels":[{"channel_id":"remote","channel_type":2},{"channel_id":"unused","channel_type":2},{"channel_id":"remote","channel_type":2}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var result []*channelRecentMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &result))
+	require.Len(t, result, 2)
+	byID := map[string]*channelRecentMessage{}
+	for _, ch := range result {
+		byID[ch.ChannelId] = ch
+	}
+	require.Empty(t, byID["unused"].Messages)
+	require.Equal(t, uint64(18), byID["remote"].Messages[0].MessageSeq)
+}
+
+func TestRecentReadInvalidChannelsAreBadRequests(t *testing.T) {
+	reader := setupRecentRead(t, &recentReadCluster{load: func(context.Context, string, uint8) (wkdb.ChannelClusterConfig, error) {
+		t.Fatal("invalid request reached routing")
+		return wkdb.EmptyChannelClusterConfig, nil
+	}})
+	router := wkhttp.New()
+	newConversation(&Server{requset: reader}).route(router)
+	for _, path := range []string{"/conversation/syncMessages", "/conversation/syncMessages/v2", "/conversation/syncByChannels"} {
+		for _, ch := range []string{`{"channel_id":"g","channel_type":0}`, `{"channel_id":"","channel_type":2}`} {
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"uid":"alice","channels":[`+ch+`],"budget_ms":500}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestRecentReadPacesRetriesUntilElectionCompletes(t *testing.T) {
+	peer := successfulRecentPeer(t)
+	start := time.Now()
+	calls := 0
+	reader := setupRecentRead(t, &recentReadCluster{nodes: map[uint64]*clustertypes.Node{2: {Id: 2, ApiServerAddr: peer.URL}}, load: func(ctx context.Context, id string, typ uint8) (wkdb.ChannelClusterConfig, error) {
+		calls++
+		cfg := readCfg(id, typ, 2)
+		if time.Since(start) < 160*time.Millisecond {
+			cfg.Term = 0
+		}
+		return cfg, nil
+	}})
+	result, err := reader.getRecentMessagesForCluster(context.Background(), "alice", 15, []*channelRecentMessageReq{{ChannelId: "g", ChannelType: 2}}, true)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	require.GreaterOrEqual(t, calls, 4)
+	require.LessOrEqual(t, calls, 6)
+	require.GreaterOrEqual(t, time.Since(start), 160*time.Millisecond)
+}
+
+func TestRecentReadRejectsStorageOmission(t *testing.T) {
+	reader := setupRecentRead(t, &recentReadCluster{load: func(ctx context.Context, id string, typ uint8) (wkdb.ChannelClusterConfig, error) {
+		return readCfg(id, typ, 1), nil
+	}})
+	service.Store = store.New(store.NewOptions(store.WithDB(&recentReadDB{partial: true})))
+	result, err := reader.localRecentMessages(context.Background(), "alice", 15, []*channelRecentMessageReq{{ChannelId: "g", ChannelType: 2}}, true)
+	require.ErrorContains(t, err, "incomplete storage")
+	require.Nil(t, result)
+}
+
+func TestRecentReadDeduplicatesCursorRanges(t *testing.T) {
+	for _, last := range []bool{false, true} {
+		reqs := []*channelRecentMessageReq{{ChannelId: "g", ChannelType: 2, LastMsgSeq: 10}, {ChannelId: "g", ChannelType: 2, LastMsgSeq: 20}}
+		got, err := normalizeRecentChannels(reqs, last)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		if last {
+			require.Equal(t, uint64(20), got[0].LastMsgSeq)
+		} else {
+			require.Equal(t, uint64(10), got[0].LastMsgSeq)
+		}
+		require.Equal(t, uint64(10), reqs[0].LastMsgSeq, "normalization must not mutate callers")
 	}
 }

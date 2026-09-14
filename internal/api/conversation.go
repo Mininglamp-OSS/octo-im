@@ -708,6 +708,22 @@ func (s *conversation) syncConversationByChannels(c *wkhttp.Context) {
 		return
 	}
 
+	seenChannels := make(map[string]bool, len(req.Channels))
+	unique := req.Channels[:0]
+	for _, ch := range req.Channels {
+		if ch.ChannelId == "" || ch.ChannelType == 0 {
+			c.ResponseError(errInvalidRecentChannel)
+			return
+		}
+		key := makeChannelKey(ch.ChannelId, ch.ChannelType)
+		if seenChannels[key] {
+			continue
+		}
+		seenChannels[key] = true
+		unique = append(unique, ch)
+	}
+	req.Channels = unique
+
 	// 集群路由
 	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson)
 	if err != nil {
