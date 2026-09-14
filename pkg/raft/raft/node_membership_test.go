@@ -189,3 +189,95 @@ func TestSingleVoterPromotionRequiresStoredTail(t *testing.T) {
 		require.True(t, n.replicaSync[4].roleSwitching)
 	}
 }
+
+func TestElectionMembershipVersionSkewDoesNotRejectVotes(t *testing.T) {
+	for _, version := range []uint64{0, 2, 100} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			n := newTestNode(1, []uint64{1, 2, 3})
+			n.cfg.Version = 7
+			require.NoError(t, n.Step(types.Event{Type: types.VoteReq, From: 2, Term: 3, ConfigVersion: version, Logs: []types.Log{{Term: 1}}}))
+			resp, ok := findEvent(n.Ready(), types.VoteResp)
+			require.True(t, ok)
+			require.Equal(t, types.ReasonOk, resp.Reason)
+			// A differing version must not bypass one-vote-per-term.
+			require.NoError(t, n.Step(types.Event{Type: types.VoteReq, From: 3, Term: 3, ConfigVersion: version, Logs: []types.Log{{Term: 1}}}))
+			resp, ok = findEvent(n.Ready(), types.VoteResp)
+			require.True(t, ok)
+			require.Equal(t, types.ReasonError, resp.Reason)
+		})
+	}
+}
+
+func TestElectionMembershipVersionUpdatePreservesCampaign(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	n.campaign()
+	clearEvents(n)
+	term := n.LastTerm()
+	require.NoError(t, n.Step(types.Event{Type: types.VoteResp, From: 1, Term: term, Reason: types.ReasonOk}))
+	cfg := n.cfg.Clone()
+	cfg.Version++
+	cfg.Role = types.RoleUnknown
+	require.NoError(t, n.switchConfig(cfg))
+	require.Equal(t, types.RoleCandidate, n.cfg.Role)
+	require.Len(t, n.votes, 1)
+	require.NoError(t, n.Step(types.Event{Type: types.VoteResp, From: 2, Term: term, ConfigVersion: 0, Reason: types.ReasonOk}))
+	require.True(t, n.IsLeader())
+}
+
+func TestElectionMembershipLearnerOverlapEndsCampaign(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	n.campaign()
+	cfg := n.cfg.Clone()
+	cfg.Learners = []uint64{3} // voter eligibility changed, even at the same version
+	require.NoError(t, n.switchConfig(cfg))
+	require.Equal(t, types.RoleFollower, n.cfg.Role)
+	require.Empty(t, n.votes)
+}
+
+func TestMembershipExplicitRemoteLeaderOverridesRole(t *testing.T) {
+	for _, role := range []types.Role{types.RoleLeader, types.RoleUnknown} {
+		n := newTestNode(1, []uint64{1, 2, 3})
+		makeLeader(n, 2)
+		cfg := n.cfg.Clone()
+		cfg.Leader, cfg.Role = 2, role
+		require.NoError(t, n.switchConfig(cfg))
+		require.Equal(t, types.RoleFollower, n.cfg.Role)
+		require.Equal(t, uint64(2), n.LeaderId())
+		require.False(t, n.IsLeader())
+	}
+}
+
+func TestLearnerPromotionGapRequiresDurableCommittedPrefix(t *testing.T) {
+	for _, orphan := range []bool{false, true} {
+		n := newTestNode(1, []uint64{1, 2, 3})
+		makeLeader(n, 2)
+		n.cfg.Learners = []uint64{4}
+		if !orphan {
+			n.cfg.MigrateFrom, n.cfg.MigrateTo = 2, 4
+		}
+		n.queue.lastLogIndex, n.queue.storedIndex, n.queue.committedIndex = 100, 100, 90
+		n.opts.LearnerToFollowerMinLogGap = 20
+		n.replicaSync[4] = &SyncInfo{}
+		n.roleSwitchIfNeed(types.Event{From: 4, Index: 95, StoredIndex: 90})
+		require.False(t, n.replicaSync[4].roleSwitching)
+		n.roleSwitchIfNeed(types.Event{From: 4, Index: 95, StoredIndex: 91})
+		require.True(t, n.replicaSync[4].roleSwitching)
+	}
+}
+
+func TestMembershipBroadcastCommitClampedToDurableLogs(t *testing.T) {
+	leader := newTestNode(1, []uint64{1, 2, 3})
+	makeLeader(leader, 2)
+	leader.cfg.Version = 7
+	leader.queue.committedIndex = 10
+	leader.sendPing(All)
+	for _, ping := range findEventsOfType(leader.Ready(), types.Ping) {
+		require.Equal(t, uint64(10), ping.CommittedIndex)
+		require.Equal(t, uint64(7), ping.ConfigVersion)
+		follower := newTestNode(ping.To, []uint64{1, 2, 3})
+		makeFollower(follower, 2, 1)
+		follower.queue.lastLogIndex, follower.queue.storedIndex = 10, 8
+		require.NoError(t, follower.Step(ping))
+		require.Equal(t, uint64(8), follower.queue.committedIndex)
+	}
+}

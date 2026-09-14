@@ -8,6 +8,9 @@ import (
 	"go.uber.org/zap"
 )
 
+// ErrConfigVersionStale means Raft already holds a newer configuration.
+var ErrConfigVersionStale = errors.New("config version is lower than current version")
+
 // switchRemoteConfig derives the local role from membership. ConfigResp also
 // carries the sender's role, which older leaders populate with RoleLeader.
 func (n *Node) switchRemoteConfig(cfg types.Config) error {
@@ -31,7 +34,7 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	oldCfg := n.cfg
 	if n.cfg.Version > newCfg.Version {
 		n.Error("config version is lower than current version", zap.Uint64("newVersion", newCfg.Version), zap.Uint64("currentVersion", oldCfg.Version))
-		return errors.New("config version is lower than current version")
+		return ErrConfigVersionStale
 	}
 
 	if newCfg.Term != 0 && newCfg.Term < oldCfg.Term {
@@ -55,14 +58,24 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	} else if oldCfg.Role == types.RoleLearner || newCfg.Role == types.RoleLearner {
 		newCfg.Role = types.RoleFollower
 	}
-	if isVoter(newCfg, n.opts.NodeId) && oldCfg.Role == types.RoleCandidate && (!sameVoters(oldCfg, newCfg) || oldCfg.Version != newCfg.Version) {
+	if isVoter(newCfg, n.opts.NodeId) && oldCfg.Role == types.RoleCandidate && !sameVoters(oldCfg, newCfg) {
 		newCfg.Role = types.RoleFollower
 		newCfg.Leader = None
 	}
 
-	n.votes = make(map[uint64]bool)
+	// A version-only update is not a new election. Preserve collected votes;
+	// role transitions below clear them if the campaign actually ends.
+	if !sameVoters(oldCfg, newCfg) {
+		n.votes = make(map[uint64]bool)
+	}
 	n.replicaSync = make(map[uint64]*SyncInfo)
 	n.resetRandomizedElectionTimeout()
+
+	// An explicit remote leader cannot coexist with a local leader role.
+	if newCfg.Leader != None && newCfg.Leader != n.opts.NodeId &&
+		(newCfg.Role == types.RoleLeader || newCfg.Role == types.RoleUnknown && oldCfg.Role == types.RoleLeader) {
+		newCfg.Role = types.RoleFollower
+	}
 
 	// 比较角色是否发生变化
 	n.setTerm(newCfg.Term)
@@ -71,7 +84,9 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	// Preserve the locally selected role. An unspecified role in a membership
 	// update must not erase the role just established by roleChangeIfNeed.
 	newCfg.Role = n.cfg.Role
-	newCfg.Leader = n.cfg.Leader
+	if newCfg.Leader == None {
+		newCfg.Leader = n.cfg.Leader
+	}
 	n.cfg = newCfg
 
 	return nil

@@ -2,6 +2,7 @@ package clusterconfig
 
 import (
 	"encoding/binary"
+	"slices"
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -27,11 +28,14 @@ func (s *Server) applyLog(log types.Log) error {
 		return err
 	}
 
+	before := s.configToRaftConfig(s.config).Clone()
 	err = s.handleCmd(cmd)
 	if err != nil {
 		s.Panic("handle cmd failed", zap.Error(err))
 		return err
 	}
+	after := s.configToRaftConfig(s.config)
+	s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
 	s.config.cfg.Term = log.Term
 	s.config.cfg.Version = log.Index
 
@@ -43,9 +47,12 @@ func (s *Server) applyLog(log types.Log) error {
 	}
 	// Membership becomes visible to Raft only after its version and saved
 	// application config are updated. Learners must not promote on VoteReq.
-	switch cmd.CmdType {
-	case CMDTypeConfigChange, CMDTypeNodeJoin, CMDTypeNodeJoining, CMDTypeNodeJoined:
-		s.switchConfig(s.config)
+	if s.membershipPending {
+		if err := s.switchConfig(s.config); err != nil {
+			s.Error("apply raft membership failed", zap.Error(err), zap.Uint64("index", log.Index))
+			return err
+		}
+		s.membershipPending = false
 	}
 	// 配置发送变化
 	s.NotifyConfigChangeEvent()
@@ -175,4 +182,17 @@ func (s *Server) handleSlotStatusChange(cmd *CMD) error {
 	}
 	s.config.updateSlotStatus(slotId, status)
 	return nil
+}
+
+// Ignore application-only versions/metadata; compare all Raft membership fields
+// so new command types cannot silently bypass membership delivery.
+func sameRaftMembership(a, b types.Config) bool {
+	sameSet := func(x, y []uint64) bool {
+		x, y = slices.Clone(x), slices.Clone(y)
+		slices.Sort(x)
+		slices.Sort(y)
+		return slices.Equal(slices.Compact(x), slices.Compact(y))
+	}
+	return sameSet(a.Replicas, b.Replicas) && sameSet(a.Learners, b.Learners) &&
+		a.MigrateFrom == b.MigrateFrom && a.MigrateTo == b.MigrateTo
 }

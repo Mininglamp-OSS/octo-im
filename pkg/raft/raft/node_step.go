@@ -392,7 +392,7 @@ func (n *Node) stepLearner(e types.Event) error {
 // 统计投票
 func (n *Node) poll(e types.Event) {
 	if n.cfg.Role != types.RoleCandidate || !n.isVoter(n.opts.NodeId) ||
-		!n.isVoter(e.From) || e.Term != n.cfg.Term || e.ConfigVersion != n.cfg.Version {
+		!n.isVoter(e.From) || e.Term != n.cfg.Term {
 		return
 	}
 	if _, received := n.votes[e.From]; received {
@@ -429,9 +429,12 @@ func (n *Node) quorum() int {
 	return len(voters)/2 + 1
 }
 
+// ConfigVersion is a replication hint, not an election epoch: clusterconfig
+// restores the last applied application index, including non-membership logs.
+// Membership, term, one vote per term and log freshness fence elections.
 // 是否可以投票
 func (n *Node) canVote(e types.Event) bool {
-	if !n.isVoter(n.opts.NodeId) || !n.isVoter(e.From) || n.cfg.Role == types.RoleLearner || e.ConfigVersion != n.cfg.Version {
+	if !n.isVoter(n.opts.NodeId) || !n.isVoter(e.From) || n.cfg.Role == types.RoleLearner {
 		return false
 	}
 
