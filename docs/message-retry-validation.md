@@ -7,11 +7,15 @@ A slow lookup or final verification does not delay another channel's owner read.
 Tests also change leadership while each disk read is blocked and confirm no
 stale success ACK. Concurrent store completion reuses the committed identity.
 
-A 2,000-message legacy channel now recovers through multiple apply batches of at
-most 1,000 messages, with nonzero byte limits and incremental durable markers.
-A polluted client-number bucket is confined to its channel and capped; hitting
-the cap fails closed. The applied prefix cannot be truncated. Both PR42's
-HardState and PR46's applied-index restore are retained after the base merge.
+A 20,000-message legacy-channel regression now asserts that applying the
+Raft-confirmed prefix performs no history payload reads and at most two durable
+marker updates (recovery plus the new send). Generic state machines retain
+bounded payload apply batches. Sender/client-number lookup intersects both
+existing indexes in one snapshot, so the 1,100-sender same-number fixture can
+find its last sender or confirm a new sender is absent without a candidate cap.
+The caller deadline bounds pathological stale-index scans. The applied prefix
+cannot be truncated. Both PR42's HardState and PR46's applied-index restore are
+retained after the base merge.
 
 Configuration installation intentionally retains two ordered owner operations.
 The intervening Ready persists a newly selected term before replication resumes.
