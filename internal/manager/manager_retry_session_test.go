@@ -143,3 +143,32 @@ func TestRetryRejectsReusedLegacyConnectionID(t *testing.T) {
 	require.Empty(t, users.events)
 	require.Zero(t, r.RetryMessageCount())
 }
+
+func TestRetryQueueKeepsSameMessageForReusedConnectionSessions(t *testing.T) {
+	oldOptions, oldUser := options.G, eventbus.User
+	t.Cleanup(func() {
+		options.G, eventbus.User = oldOptions, oldUser
+	})
+	options.G = options.New()
+	r := newRetryManagerForSessionTest()
+	oldMsg := &types.RetryMessage{
+		Uid: "u", FromNode: 2, ConnId: 7, Uptime: 101, OwnerBootID: "boot", SessionID: "old-session",
+		MessageId: 9, RecvPacket: &wkproto.RecvPacket{Payload: []byte("old")},
+	}
+	newMsg := &types.RetryMessage{
+		Uid: "u", FromNode: 2, ConnId: 7, Uptime: 102, OwnerBootID: "boot", SessionID: "new-session",
+		MessageId: 9, RecvPacket: &wkproto.RecvPacket{Payload: []byte("new")},
+	}
+
+	r.AddRetry(oldMsg)
+	r.AddRetry(newMsg)
+	require.Equal(t, 2, r.RetryMessageCount())
+
+	legacyNewConn := &eventbus.Conn{Uid: "u", NodeId: 2, ConnId: 7, Uptime: 102}
+	eventbus.RegisterUser(&retrySessionUsers{conn: legacyNewConn})
+	r.retryQueues[9%len(r.retryQueues)].processInFlightQueue(oldMsg.Pri)
+	require.Equal(t, 1, r.RetryMessageCount(), "the old session timeout must not remove the replacement session retry")
+	require.Same(t, newMsg, r.RetryMessage(legacyNewConn, 9))
+	require.NoError(t, r.RemoveRetry(legacyNewConn, 9))
+	require.Zero(t, r.RetryMessageCount())
+}

@@ -326,6 +326,12 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 	}
 	completedAt := time.Now()
 	for uid, r := range states {
+		// Every accepted recovery result is a commit for this UID. Advance the
+		// generation before mutating the logical view so an older snapshot that
+		// was read concurrently cannot commit after this one and resurrect an
+		// evicted session.
+		r.generation++
+		r.until = time.Time{}
 		current := byUID[uid]
 		if complete {
 			for _, old := range eventbus.User.ConnsByUid(uid) {

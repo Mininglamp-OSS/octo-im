@@ -19,7 +19,7 @@ func (h *Handler) recvack(event *eventbus.Event) {
 	conn := event.Conn
 	var currMsg *types.RetryMessage
 	if persist {
-		currMsg = service.RetryManager.RetryMessage(conn.NodeId, conn.ConnId, recvackPacket.MessageID)
+		currMsg = service.RetryManager.RetryMessage(conn, recvackPacket.MessageID)
 		if currMsg != nil && !retryAckMatchesSession(currMsg, conn) {
 			h.Warn("ignore recvack from a different physical session",
 				zap.String("uid", conn.Uid),
@@ -49,7 +49,7 @@ func (h *Handler) recvack(event *eventbus.Event) {
 	}
 	if persist { // 只有需要持久化的消息才会重试
 		// r.Debug("remove retry", zap.String("uid", req.uid), zap.Int64("connId", msg.ConnId), zap.Int64("messageID", recvackPacket.MessageID))
-		err := service.RetryManager.RemoveRetry(conn.NodeId, conn.ConnId, recvackPacket.MessageID)
+		err := service.RetryManager.RemoveRetry(conn, recvackPacket.MessageID)
 		if err != nil {
 			h.Warn("removeRetry error", zap.Error(err), zap.String("uid", conn.Uid), zap.String("deviceId", conn.DeviceId), zap.Int64("connId", conn.ConnId), zap.Uint64("nodeId", conn.NodeId), zap.Int64("messageID", recvackPacket.MessageID))
 		}

@@ -227,6 +227,45 @@ func TestAuthenticationDuringRecoveryCannotBeEvictedByOlderSnapshot(t *testing.T
 	require.True(t, got[0].SameSession(newConn) || got[1].SameSession(newConn))
 }
 
+func TestOlderConcurrentRecoveryCannotResurrectEvictedSession(t *testing.T) {
+	owner, leader, cluster, users, raw, conn := fixture(t)
+	require.NoError(t, leader.Recover(context.Background(), []string{conn.Uid}))
+	require.Len(t, users.ConnsByUid(conn.Uid), 1)
+	leader.mu.Lock()
+	leader.ready[conn.Uid].until = time.Time{}
+	leader.mu.Unlock()
+
+	firstRead := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var hookMu sync.Mutex
+	requestCount := 0
+	cluster.afterRead = func() {
+		hookMu.Lock()
+		requestCount++
+		current := requestCount
+		hookMu.Unlock()
+		if current == 1 {
+			close(firstRead)
+			<-releaseFirst
+		}
+	}
+
+	olderResult := make(chan error, 1)
+	go func() {
+		olderResult <- leader.recoverBatch(context.Background(), []string{conn.Uid})
+	}()
+	<-firstRead
+
+	owner.Close(raw)
+	newerErr := leader.recoverBatch(context.Background(), []string{conn.Uid})
+	close(releaseFirst)
+	olderErr := <-olderResult
+
+	require.NoError(t, newerErr)
+	require.ErrorIs(t, olderErr, ErrNotReady)
+	require.Empty(t, users.ConnsByUid(conn.Uid))
+}
+
 func TestPreparedSessionCannotBeEvictedBeforeOwnerAuthentication(t *testing.T) {
 	owner, leader, _, users, _, oldConn := fixture(t)
 	require.NoError(t, leader.Recover(context.Background(), []string{oldConn.Uid}))

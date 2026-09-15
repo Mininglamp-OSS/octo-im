@@ -60,16 +60,16 @@ func (r *RetryManager) AddRetry(msg *types.RetryMessage) {
 	r.retryQueues[index].startInFlightTimeout(msg)
 }
 
-func (r *RetryManager) RemoveRetry(fromNode uint64, connId int64, messageId int64) error {
+func (r *RetryManager) RemoveRetry(conn *eventbus.Conn, messageId int64) error {
 	index := messageId % int64(len(r.retryQueues))
-	return r.retryQueues[index].finishMessage(fromNode, connId, messageId)
+	return r.retryQueues[index].finishMessage(conn, messageId)
 }
 
 // 获取重试消息
-func (r *RetryManager) RetryMessage(fromNode uint64, connId int64, messageId int64) *types.RetryMessage {
+func (r *RetryManager) RetryMessage(conn *eventbus.Conn, messageId int64) *types.RetryMessage {
 	index := messageId % int64(len(r.retryQueues))
 
-	return r.retryQueues[index].getInFlightMessage(fromNode, connId, messageId)
+	return r.retryQueues[index].getInFlightMessage(conn, messageId)
 }
 
 func (r *RetryManager) retry(msg *types.RetryMessage) {

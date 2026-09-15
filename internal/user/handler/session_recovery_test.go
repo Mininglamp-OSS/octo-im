@@ -309,10 +309,10 @@ type recvackRetryManager struct {
 	removed bool
 }
 
-func (m *recvackRetryManager) RetryMessage(uint64, int64, int64) *types.RetryMessage {
+func (m *recvackRetryManager) RetryMessage(*eventbus.Conn, int64) *types.RetryMessage {
 	return m.msg
 }
-func (m *recvackRetryManager) RemoveRetry(uint64, int64, int64) error {
+func (m *recvackRetryManager) RemoveRetry(*eventbus.Conn, int64) error {
 	m.removed = true
 	return nil
 }
