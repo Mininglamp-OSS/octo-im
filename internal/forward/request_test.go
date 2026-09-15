@@ -164,7 +164,7 @@ func TestDecodeUsesRelativeBudgetAndClampsFutureValues(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestFailClassifiesAmbiguityAndSkipsPostCommitEvents(t *testing.T) {
+func TestFailLeavesAmbiguousOutcomeUnansweredAndSkipsPostCommitEvents(t *testing.T) {
 	oldOptions, oldUser := options.G, eventbus.User
 	t.Cleanup(func() { options.G, eventbus.User = oldOptions, oldUser })
 	options.G = options.New()
@@ -176,15 +176,19 @@ func TestFailClassifiesAmbiguityAndSkipsPostCommitEvents(t *testing.T) {
 
 	Fail([]*eventbus.Event{unkeyed}, ErrOutcomeUnknown)
 
-	require.Len(t, u.events, 1)
-	require.Equal(t, wkproto.ReasonSystemError, u.events[0].Frame.(*wkproto.SendackPacket).ReasonCode)
-	require.Equal(t, 1, u.advances)
+	require.Empty(t, u.events)
+	require.Zero(t, u.advances)
 
 	u.events = nil
 	keyed := &eventbus.Event{Type: eventbus.EventOnSend, Conn: conn, Frame: &wkproto.SendPacket{ClientSeq: 8, ClientMsgNo: "stable"}}
 	Fail([]*eventbus.Event{keyed}, ErrOutcomeUnknown)
+	require.Empty(t, u.events)
+	require.Zero(t, u.advances)
+
+	Fail([]*eventbus.Event{unkeyed}, ErrUnavailable)
 	require.Len(t, u.events, 1)
-	require.Equal(t, wkproto.ReasonSystemError, u.events[0].Frame.(*wkproto.SendackPacket).ReasonCode)
+	require.Equal(t, wkproto.ReasonNodeNotMatch, u.events[0].Frame.(*wkproto.SendackPacket).ReasonCode)
+	require.Equal(t, 1, u.advances)
 
 	u.events = nil
 	Fail([]*eventbus.Event{{Type: eventbus.EventChannelDistribute, Conn: conn, Frame: &wkproto.SendPacket{ClientSeq: 7}}}, ErrUnavailable)

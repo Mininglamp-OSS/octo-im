@@ -26,6 +26,7 @@ func TestPersistCanonicalRetryResults(t *testing.T) {
 	require.True(t, events[3].PersistedDuplicate)
 	require.Empty(t, newlyPersistedMessages(events, messages))
 	require.False(t, shouldRunPersistSideEffects(events[0]))
+	require.True(t, shouldDistributePersistResult(events[0]))
 	require.True(t, events[0].Clone().PersistedDuplicate)
 	require.Equal(t, int64(11), events[1].MessageId)
 	require.Equal(t, int64(12), events[2].MessageId)
@@ -34,8 +35,9 @@ func TestPersistCanonicalRetryResults(t *testing.T) {
 		require.Equal(t, int64(5), m.MessageID)
 		require.Equal(t, uint32(7), m.MessageSeq)
 	}
-	// The duplicate still receives the canonical success ACK, but side effects
-	// are suppressed because the logical message was already committed.
+	// The duplicate still receives the canonical success ACK and is distributed
+	// again in case the first process committed but crashed before dispatch.
+	// External plugin and webhook side effects remain suppressed.
 	require.Equal(t, wkproto.ReasonSuccess, events[0].ReasonCode)
 }
 func TestPersistRejectsIncompleteCanonicalResponse(t *testing.T) {

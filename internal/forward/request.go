@@ -186,6 +186,12 @@ func request(path string, body []byte, events []*eventbus.Event, target func() u
 // Fail only answers pre-persistence SEND events. A post-commit distribution
 // failure must not contradict the success ACK already sent to the producer.
 func Fail(events []*eventbus.Event, cause error) {
+	if errors.Is(cause, ErrOutcomeUnknown) {
+		// The peer may already have admitted the batch and may still send the
+		// canonical success ACK. Let the client timeout rather than contradict a
+		// possible success with a locally generated terminal failure.
+		return
+	}
 	for _, e := range events {
 		packet, ok := e.Frame.(*wkproto.SendPacket)
 		if !ok || packet == nil || e.Conn == nil ||
@@ -193,13 +199,9 @@ func Fail(events []*eventbus.Event, cause error) {
 			options.G.IsSystemDevice(e.Conn.DeviceId) {
 			continue
 		}
-		reasonCode := wkproto.ReasonNodeNotMatch
-		if errors.Is(cause, ErrOutcomeUnknown) {
-			reasonCode = wkproto.ReasonSystemError
-		}
 		eventbus.User.ConnWrite(e.ReqId, e.Conn, &wkproto.SendackPacket{
 			Framer: packet.Framer, ClientSeq: packet.ClientSeq, ClientMsgNo: packet.ClientMsgNo,
-			ReasonCode: reasonCode,
+			ReasonCode: wkproto.ReasonNodeNotMatch,
 		})
 		eventbus.User.Advance(e.Conn.Uid)
 	}

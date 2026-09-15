@@ -84,7 +84,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 	// ========== 分发 ==========
 	for _, e := range events {
-		if !shouldRunPersistSideEffects(e) {
+		if !shouldDistributePersistResult(e) {
 			continue
 		}
 		cloneEvent := e.Clone()
@@ -99,6 +99,14 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 func shouldRunPersistSideEffects(event *eventbus.Event) bool {
 	return event.ReasonCode == wkproto.ReasonSuccess && !event.PersistedDuplicate
+}
+
+func shouldDistributePersistResult(event *eventbus.Event) bool {
+	// Duplicate proves persistence, not that the earlier process reached the
+	// in-memory distribution stage. Redistribute the canonical message so a
+	// commit followed by a crash cannot strand it; recipients deduplicate by
+	// the canonical message identity.
+	return event.ReasonCode == wkproto.ReasonSuccess
 }
 
 func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, msgs []wkdb.Message) {

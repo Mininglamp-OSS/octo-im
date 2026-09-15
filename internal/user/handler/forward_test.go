@@ -105,7 +105,7 @@ func TestForwardReuseRequiresTheCompleteAuthenticatedDescriptor(t *testing.T) {
 	require.False(t, sameForwardedConn(cached, incoming))
 }
 
-func TestAmbiguousUnkeyedSendGetsNonRetryableAck(t *testing.T) {
+func TestAmbiguousUnkeyedSendWaitsForPeerOrClientTimeout(t *testing.T) {
 	oldOptions, oldCluster, oldUser := options.G, service.Cluster, eventbus.User
 	t.Cleanup(func() { options.G, service.Cluster, eventbus.User = oldOptions, oldCluster, oldUser })
 	options.G = options.New()
@@ -118,9 +118,7 @@ func TestAmbiguousUnkeyedSendGetsNonRetryableAck(t *testing.T) {
 
 	h.OnEvent(&eventbus.UserContext{Uid: "u", EventType: eventbus.EventOnSend, Events: []*eventbus.Event{e}})
 
-	require.Len(t, u.events, 1)
-	ack := u.events[0].Frame.(*wkproto.SendackPacket)
-	require.Equal(t, wkproto.ReasonSystemError, ack.ReasonCode)
+	require.Empty(t, u.events)
 }
 
 func TestWriteFrameBatchesRemoteEventsByDestination(t *testing.T) {
