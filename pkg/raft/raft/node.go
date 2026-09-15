@@ -35,8 +35,11 @@ type Node struct {
 	cfg                types.Config // 分布式配置
 	voteFor            uint64       // 本任期的投票，不随角色重置
 	persistedHardState types.HardState
-	electionState      // 选举状态
-	syncState          // 同步状态
+	membershipRequests map[uint64]uint64 // peer -> newer applied config version requested
+	applyFailures      int
+	applyRetryTicks    int // only Tick advances retries; role changes do not reset it
+	electionState          // 选举状态
+	syncState              // 同步状态
 	// 最新的任期对应的开始日志下标
 	lastTermStartIndex types.TermStartIndexInfo
 	onlySync           bool // 是否只同步,不做截断判断
@@ -134,7 +137,7 @@ func (n *Node) HasReady() bool {
 	if n.queue.hasNextStoreLogs() {
 		return true
 	}
-	if n.queue.hasNextApplyLogs() {
+	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
 		return true
 	}
 	return len(n.events) > 0
@@ -177,7 +180,7 @@ func (n *Node) Ready() []types.Event {
 		}
 	}
 
-	if n.queue.hasNextApplyLogs() {
+	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
 		start, end := n.queue.nextApplyLogs()
 		if start > 0 {
 			n.sendApplyReq(start, end)

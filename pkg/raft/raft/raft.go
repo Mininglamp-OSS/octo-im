@@ -418,7 +418,7 @@ func (r *Raft) handleApplyReq(e types.Event) {
 		}
 		err = r.opts.Storage.Apply(logs)
 		if err != nil {
-			r.Panic("apply logs failed", zap.Error(err))
+			r.Error("apply logs failed", zap.Error(err))
 			r.stepC <- stepReq{event: types.Event{
 				Type:   types.ApplyResp,
 				Reason: types.ReasonError,
@@ -591,6 +591,9 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 
 // 学习者转换
 func (r *Raft) learnTo(learnerId uint64) (types.Config, error) {
+	if !wkutil.ArrayContainsUint64(r.node.Config().Learners, learnerId) {
+		return types.Config{}, errors.New("promotion target is not a learner")
+	}
 	cfg := r.node.Config().Clone()
 
 	// orphan learner: 前次迁移已完成（MigrateFrom/MigrateTo 都为 0），
