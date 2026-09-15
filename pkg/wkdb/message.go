@@ -2,6 +2,7 @@ package wkdb
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -492,6 +493,14 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 
 	}
 
+	applied, err := wk.GetChannelAppliedIndex(channelId, channelType)
+	if err != nil {
+		return err
+	}
+	if messageSeq < applied {
+		return fmt.Errorf("cannot truncate applied channel log: target=%d applied=%d", messageSeq, applied)
+	}
+
 	// 获取最新的消息seq
 	lastMsgSeq, _, err := wk.GetChannelLastMessageSeq(channelId, channelType)
 	if err != nil {
@@ -876,17 +885,38 @@ func (wk *wukongDB) SearchMessages(req MessageSearchReq) ([]Message, error) {
 
 // LoadMsgByClientMsgNo 通过 clientMsgNo 加载指定频道的消息
 func (wk *wukongDB) LoadMsgByClientMsgNo(channelId string, channelType uint8, clientMsgNo string) (Message, error) {
+	return wk.loadMsgByClientMsgNo(context.Background(), channelId, channelType, "", clientMsgNo, false)
+}
+
+// LoadMsgBySenderClientMsgNo scopes a retry key to its sender and channel.
+func (wk *wukongDB) LoadMsgBySenderClientMsgNo(ctx context.Context, channelId string, channelType uint8, fromUID, clientMsgNo string) (Message, error) {
+	return wk.loadMsgByClientMsgNo(ctx, channelId, channelType, fromUID, clientMsgNo, true)
+}
+
+func (wk *wukongDB) loadMsgByClientMsgNo(ctx context.Context, channelId string, channelType uint8, fromUID, clientMsgNo string, matchSender bool) (Message, error) {
+	if err := ctx.Err(); err != nil {
+		return EmptyMessage, err
+	}
 	wk.metrics.SearchMessagesAdd(1)
 
 	if strings.TrimSpace(clientMsgNo) == "" {
 		return EmptyMessage, fmt.Errorf("clientMsgNo is empty")
 	}
 
-	db := wk.channelDb(channelId, channelType)
+	// All index and primary reads share one snapshot. Concurrent store or
+	// truncation cannot create a false negative between the two indexes.
+	db := wk.channelDb(channelId, channelType).NewSnapshot()
+	defer db.Close()
 
 	// 通过 clientMsgNo 索引查找主键
-	lowKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, minMessagePrimaryKey)
-	highKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, maxMessagePrimaryKey)
+	// The primary-key suffix is ordered by channel hash and sequence, so old
+	// databases already support a channel-scoped seek without any migration.
+	var lowPrimary, highPrimary [16]byte
+	wk.endian.PutUint64(lowPrimary[:8], key.ChannelToNum(channelId, channelType))
+	copy(highPrimary[:8], lowPrimary[:8])
+	wk.endian.PutUint64(highPrimary[8:], math.MaxUint64)
+	lowKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, lowPrimary)
+	highKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, highPrimary)
 
 	iter := db.NewIter(&pebble.IterOptions{
 		LowerBound: lowKey,
@@ -894,12 +924,46 @@ func (wk *wukongDB) LoadMsgByClientMsgNo(channelId string, channelType uint8, cl
 	})
 	defer iter.Close()
 
-	// 遍历索引查找匹配的消息
-	for iter.First(); iter.Valid(); iter.Next() {
+	// Both indexes already exist in legacy stores and sort by channel/sequence.
+	// Intersect them using seeks: a different sender's large client-number
+	// bucket is skipped without loading its messages. No schema migration or
+	// permanent candidate-count failure is needed. Pathological stale/collision
+	// rows are bounded by the caller's deadline, never treated as "not found".
+	var senderIter *pebble.Iterator
+	if matchSender {
+		senderIter = db.NewIter(&pebble.IterOptions{
+			LowerBound: key.NewMessageSecondIndexFromUidKey(fromUID, lowPrimary),
+			UpperBound: key.NewMessageSecondIndexFromUidKey(fromUID, highPrimary),
+		})
+		defer senderIter.Close()
+		senderIter.First()
+	}
+	iter.First()
+	for iter.Valid() {
+		if err := ctx.Err(); err != nil {
+			return EmptyMessage, err
+		}
 		primaryBytes, err := key.ParseMessageSecondIndexKey(iter.Key())
 		if err != nil {
-			wk.Error("LoadMsgByClientMsgNo: parseMessageSecondIndexKey failed", zap.Error(err))
-			continue
+			return EmptyMessage, err
+		}
+
+		if senderIter != nil {
+			if !senderIter.Valid() {
+				break
+			}
+			senderPrimary, err := key.ParseMessageSecondIndexKey(senderIter.Key())
+			if err != nil {
+				return EmptyMessage, err
+			}
+			switch bytes.Compare(primaryBytes[:], senderPrimary[:]) {
+			case -1:
+				iter.SeekGE(key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, senderPrimary))
+				continue
+			case 1:
+				senderIter.SeekGE(key.NewMessageSecondIndexFromUidKey(fromUID, primaryBytes))
+				continue
+			}
 		}
 
 		// 通过主键查找消息
@@ -907,23 +971,38 @@ func (wk *wukongDB) LoadMsgByClientMsgNo(channelId string, channelType uint8, cl
 			LowerBound: key.NewMessageColumnKeyWithPrimary(primaryBytes, key.MinColumnKey),
 			UpperBound: key.NewMessageColumnKeyWithPrimary(primaryBytes, key.MaxColumnKey),
 		})
-		defer msgIter.Close()
 
 		var msg Message
 		err = wk.iteratorChannelMessages(msgIter, 0, func(m Message) bool {
 			msg = m
 			return false
 		})
+		msgIter.Close()
 		if err != nil {
 			return EmptyMessage, err
 		}
 
 		// 验证消息确实属于指定的频道且 clientMsgNo 匹配
-		if msg.ChannelID == channelId && msg.ChannelType == channelType && msg.ClientMsgNo == clientMsgNo {
-			return msg, nil
+		if msg.ChannelID == channelId && msg.ChannelType == channelType && msg.ClientMsgNo == clientMsgNo && (!matchSender || msg.FromUID == fromUID) {
+			return msg, ctx.Err()
+		}
+		iter.Next()
+		if senderIter != nil {
+			senderIter.Next()
 		}
 	}
 
+	if senderIter != nil {
+		if err := senderIter.Error(); err != nil {
+			return EmptyMessage, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return EmptyMessage, err
+	}
+	if err := iter.Error(); err != nil {
+		return EmptyMessage, err
+	}
 	return EmptyMessage, ErrNotFound
 }
 
@@ -1210,23 +1289,14 @@ func (wk *wukongDB) iteratorChannelMessagesDirection(iter *pebble.Iterator, limi
 
 	if reverse {
 		if !iter.Last() {
-			return nil
+			return iter.Error()
 		}
 	} else {
 		if !iter.First() {
-			return nil
+			return iter.Error()
 		}
 	}
 	for iter.Valid() {
-		if reverse {
-			if !iter.Prev() {
-				break
-			}
-		} else {
-			if !iter.Next() {
-				break
-			}
-		}
 		messageSeq, coulmnName, err := key.ParseMessageColumnKey(iter.Key())
 		if err != nil {
 			return err
@@ -1285,6 +1355,15 @@ func (wk *wukongDB) iteratorChannelMessagesDirection(iter *pebble.Iterator, limi
 
 		}
 		hasData = true
+		if reverse {
+			if !iter.Prev() {
+				break
+			}
+		} else {
+			if !iter.Next() {
+				break
+			}
+		}
 	}
 	if lastNeedAppend && hasData {
 		if iterFnc != nil {
@@ -1293,7 +1372,7 @@ func (wk *wukongDB) iteratorChannelMessagesDirection(iter *pebble.Iterator, limi
 		}
 	}
 
-	return nil
+	return iter.Error()
 
 }
 

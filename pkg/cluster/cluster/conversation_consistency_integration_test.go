@@ -7,7 +7,6 @@ import (
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/stretchr/testify/require"
 	"net"
@@ -181,6 +180,8 @@ func TestConversationUncommittedTail(t *testing.T) {
 	cfg.Replicas = []uint64{1, 2, 3}
 	require.NoError(t, s.db.SaveChannelClusterConfig(cfg))
 	require.NoError(t, s.db.AppendMessages(cfg.ChannelId, cfg.ChannelType, []wkdb.Message{consistencyMessage(41)}))
+	// Seed a genuinely committed prefix; local storage alone is not commitment.
+	require.NoError(t, s.db.UpdateChannelAppliedIndex(cfg.ChannelId, cfg.ChannelType, 41))
 	require.NoError(t, s.channelServer.WakeLeaderIfNeed(cfg))
 	before, err := s.channelServer.ReadLeaderState(ctx, cfg.ChannelId, cfg.ChannelType)
 	require.NoError(t, err)
@@ -189,7 +190,10 @@ func TestConversationUncommittedTail(t *testing.T) {
 	data, err := msg.Marshal()
 	require.NoError(t, err)
 	// Run the actual Raft append/store pipeline, with no follower ACKs for index 42.
-	s.channelServer.AddEvent(wkutil.ChannelToKey(cfg.ChannelId, cfg.ChannelType), rafttypes.Event{Type: rafttypes.Propose, Logs: []rafttypes.Log{{Id: 42, Index: 42, Term: 1, Data: data}}})
+	writeCtx, writeCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	_, writeErr := s.channelServer.ProposeBatchUntilAppliedTimeoutForLocal(writeCtx, cfg.ChannelId, cfg.ChannelType, rafttypes.ProposeReqSet{{Id: 42, Data: data}})
+	writeCancel()
+	require.ErrorIs(t, writeErr, context.DeadlineExceeded)
 	require.Eventually(t, func() bool {
 		tail, _, err := s.db.GetChannelLastMessageSeq(cfg.ChannelId, cfg.ChannelType)
 		return err == nil && tail == 42

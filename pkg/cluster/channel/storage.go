@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"fmt"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -24,6 +25,13 @@ func (s *storage) GetState(channelId string, channelType uint8) (types.RaftState
 		return types.RaftState{}, err
 	}
 
+	applied, err := s.db.GetChannelAppliedIndex(channelId, channelType)
+	if err != nil {
+		return types.RaftState{}, err
+	}
+	if applied > uint64(lastMsg.MessageSeq) {
+		return types.RaftState{}, fmt.Errorf("channel applied index exceeds log tail")
+	}
 	state, err := s.db.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
 	if err != nil {
 		return types.RaftState{}, err
@@ -32,7 +40,7 @@ func (s *storage) GetState(channelId string, channelType uint8) (types.RaftState
 		HardState:    state,
 		LastLogIndex: uint64(lastMsg.MessageSeq),
 		LastTerm:     uint32(lastMsg.Term),
-		AppliedIndex: uint64(lastMsg.MessageSeq),
+		AppliedIndex: applied,
 	}, nil
 }
 
@@ -119,7 +127,29 @@ func (s *storage) GetLogs(key string, startLogIndex uint64, endLogIndex uint64, 
 }
 
 func (s *storage) Apply(key string, logs []types.Log) error {
-	return nil
+	if len(logs) == 0 {
+		return nil
+	}
+	id, typ := wkutil.ChannelFromlKey(key)
+	return s.db.UpdateChannelAppliedIndex(id, typ, logs[len(logs)-1].Index)
+}
+
+// AppendLogs already writes the message state. Once Raft confirms commitment,
+// applying it only needs a durable boundary, including on a legacy channel
+// with no marker. Do not deserialize its entire history on the ACK path.
+func (s *storage) ApplyCommittedRange(key string, start, end uint64) error {
+	if start == 0 || end <= start {
+		return fmt.Errorf("invalid committed channel range [%d,%d)", start, end)
+	}
+	last, err := s.LastIndex(key)
+	if err != nil {
+		return err
+	}
+	if end-1 > last {
+		return fmt.Errorf("committed channel range exceeds stored tail")
+	}
+	id, typ := wkutil.ChannelFromlKey(key)
+	return s.db.UpdateChannelAppliedIndex(id, typ, end-1)
 }
 
 func (s *storage) SaveConfig(key string, cfg types.Config) error {

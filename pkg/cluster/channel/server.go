@@ -46,7 +46,7 @@ func NewServer(opts *Options) *Server {
 		rg := raftgroup.New(
 			raftgroup.NewOptions(
 				raftgroup.WithLogPrefix("channel"),
-				raftgroup.WithNotNeedApplied(true),
+				raftgroup.WithNotNeedApplied(false),
 				raftgroup.WithTransport(opts.Transport),
 				raftgroup.WithStorage(s.storage),
 				raftgroup.WithEvent(s)),
@@ -177,6 +177,11 @@ func (s *Server) wakeFollowerIfNeedAsync(channelId string, channelType uint8) {
 }
 
 func (s *Server) AddEvent(channelKey string, e rafttype.Event) {
+	// Legacy generic proposals bypass message idempotency and cannot carry the
+	// canonical result. Require the versioned channel RPC for forwarded writes.
+	if e.Type == rafttype.SendPropose || e.Type == rafttype.Propose {
+		return
+	}
 
 	// 添加事件到对应的频道
 	channelId, channelType := wkutil.ChannelFromlKey(channelKey)
