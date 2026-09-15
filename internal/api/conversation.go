@@ -40,6 +40,8 @@ func (s *conversation) route(r *wkhttp.WKHttp) {
 	r.POST("/conversation/sync", s.syncUserConversation)            // 同步会话
 	r.POST("/conversation/syncMessages", s.syncRecentMessages)      // 同步会话最近消息
 
+	r.POST("/conversation/syncMessages/v2", s.syncRecentMessagesV2)
+
 	r.POST("/conversation/channels", s.conversationChannels)             // 获取最近会话的频道集合
 	r.POST("/conversation/syncByChannels", s.syncConversationByChannels) // 通过频道集合同步会话数据
 }
@@ -508,10 +510,10 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 		var channelRecentMessages []*channelRecentMessage
 
 		// 获取用户最近会话的最近消息
-		channelRecentMessages, err = s.s.requset.getRecentMessagesForCluster(req.UID, int(req.MsgCount), channelRecentMessageReqs, true)
+		channelRecentMessages, err = s.s.requset.getRecentMessagesForCluster(c.Request.Context(), req.UID, int(req.MsgCount), channelRecentMessageReqs, true)
 		if err != nil {
 			s.Error("获取最近消息失败！", zap.Error(err), zap.String("uid", req.UID))
-			c.ResponseError(errors.New("获取最近消息失败！"))
+			respondRecentReadError(c, err)
 			return
 		}
 
@@ -603,31 +605,6 @@ func (s *conversation) getChannelLastMsgSeqMap(lastMsgSeqs string) map[string]ui
 		channelLastMsgMap[fmt.Sprintf("%s-%d", channelID, channelTypeI)] = lastMsgSeq
 	}
 	return channelLastMsgMap
-}
-
-func (s *conversation) syncRecentMessages(c *wkhttp.Context) {
-	var req struct {
-		UID         string                     `json:"uid"`
-		Channels    []*channelRecentMessageReq `json:"channels"`
-		MsgCount    int                        `json:"msg_count"`
-		OrderByLast int                        `json:"order_by_last"`
-	}
-	if err := c.BindJSON(&req); err != nil {
-		s.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
-		return
-	}
-	msgCount := req.MsgCount
-	if msgCount <= 0 {
-		msgCount = 15
-	}
-	channelRecentMessages, err := s.s.requset.getRecentMessages(req.UID, msgCount, req.Channels, wkutil.IntToBool(req.OrderByLast))
-	if err != nil {
-		s.Error("获取最近消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("获取最近消息失败！"))
-		return
-	}
-	c.JSON(http.StatusOK, channelRecentMessages)
 }
 
 func (s *conversation) conversationChannels(c *wkhttp.Context) {
@@ -731,6 +708,27 @@ func (s *conversation) syncConversationByChannels(c *wkhttp.Context) {
 		return
 	}
 
+	if err := checkRecentReadChannelCount(len(req.Channels)); err != nil {
+		respondRecentReadError(c, err)
+		return
+	}
+
+	seenChannels := make(map[string]bool, len(req.Channels))
+	unique := req.Channels[:0]
+	for _, ch := range req.Channels {
+		if ch.ChannelId == "" || ch.ChannelType == 0 {
+			c.ResponseError(errInvalidRecentChannel)
+			return
+		}
+		key := makeChannelKey(ch.ChannelId, ch.ChannelType)
+		if seenChannels[key] {
+			continue
+		}
+		seenChannels[key] = true
+		unique = append(unique, ch)
+	}
+	req.Channels = unique
+
 	// 集群路由
 	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson)
 	if err != nil {
@@ -804,10 +802,10 @@ func (s *conversation) syncConversationByChannels(c *wkhttp.Context) {
 	}
 
 	// 批量获取最近消息
-	channelRecentMessages, err := s.s.requset.getRecentMessagesForCluster(req.UID, msgCount, channelRecentMessageReqs, true)
+	channelRecentMessages, err := s.s.requset.getRecentMessagesForCluster(c.Request.Context(), req.UID, msgCount, channelRecentMessageReqs, true)
 	if err != nil {
 		s.Error("获取最近消息失败！", zap.Error(err), zap.String("uid", req.UID))
-		c.ResponseError(errors.New("获取最近消息失败！"))
+		respondRecentReadError(c, err)
 		return
 	}
 

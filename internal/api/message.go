@@ -447,10 +447,10 @@ func (m *message) sync(c *wkhttp.Context) {
 	// 获取每个session的消息
 	messageResps := make([]*types.MessageResp, 0)
 	if len(channelRecentMessageReqs) > 0 {
-		channelRecentMessages, err := m.s.requset.getRecentMessagesForCluster(req.UID, req.Limit, channelRecentMessageReqs, false)
+		channelRecentMessages, err := m.s.requset.getRecentMessagesForCluster(c.Request.Context(), req.UID, req.Limit, channelRecentMessageReqs, false)
 		if err != nil {
 			m.Error("获取最近消息失败！", zap.Error(err), zap.String("uid", req.UID))
-			c.ResponseError(errors.New("获取最近消息失败！"))
+			respondRecentReadError(c, err)
 			return
 		}
 		for _, channelRecentMessage := range channelRecentMessages {

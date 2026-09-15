@@ -63,6 +63,11 @@ type IClusterSlot interface {
 }
 
 type IClusterChannel interface {
+	// LoadChannelReadConfig resolves metadata from the current slot leader without creating a channel.
+	LoadChannelReadConfig(ctx context.Context, channelID string, channelType uint8) (wkdb.ChannelClusterConfig, error)
+	// ValidateLocalChannelRead rejects a stale route or a fenced local channel leader.
+	ValidateLocalChannelRead(ctx context.Context, expected wkdb.ChannelClusterConfig) error
+
 	// GetChannelLastMessageSeq reads a conversation boundary from the channel leader.
 	// It never creates a channel or falls back to a local follower.
 	GetChannelLastMessageSeq(ctx context.Context, channelID string, channelType uint8) (uint64, error)
