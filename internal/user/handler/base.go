@@ -2,6 +2,9 @@ package handler
 
 import (
 	"context"
+	"sync"
+	"time"
+
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
@@ -9,11 +12,33 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
-	"time"
 )
+
+const (
+	verificationBatchBudget = 250 * time.Millisecond
+	verificationFailureTTL  = time.Second
+	verificationFailureCap  = 4096
+)
+
+type verificationSessionKey struct {
+	uid         string
+	nodeID      uint64
+	connID      int64
+	ownerBootID string
+	sessionID   string
+}
+
+type verificationResult struct {
+	conn   *eventbus.Conn
+	failed bool
+}
 
 type Handler struct {
 	wklog.Log
+	verificationFailures struct {
+		sync.Mutex
+		entries map[verificationSessionKey]time.Time
+	}
 }
 
 func NewHandler() *Handler {
@@ -84,6 +109,10 @@ func (h *Handler) OnEvent(ctx *eventbus.UserContext) {
 
 func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*eventbus.Event {
 	verifiedEvents := make([]*eventbus.Event, 0, len(events))
+	results := make(map[verificationSessionKey]verificationResult)
+	batchCtx, cancelBatch := context.WithTimeout(context.Background(), verificationBatchBudget)
+	defer cancelBatch()
+	budgetWarned := false
 	for _, event := range events {
 		if event == nil || event.Conn == nil || event.Frame == nil {
 			h.Warn("skip malformed on-send event", zap.String("uid", uid))
@@ -95,37 +124,110 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 			verifiedEvents = append(verifiedEvents, event)
 			continue
 		}
-		verifyCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		verified, err := service.Presence.Verify(verifyCtx, event.Conn)
-		cancel()
+		key := verificationKey(event.Conn)
+		if result, ok := results[key]; ok {
+			if result.failed {
+				verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event)
+				continue
+			}
+			event.Conn = result.conn
+			verifiedEvents = append(verifiedEvents, event)
+			continue
+		}
+		if h.verificationFailedRecently(key, time.Now()) {
+			results[key] = verificationResult{failed: true}
+			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event)
+			continue
+		}
+		if err := batchCtx.Err(); err != nil {
+			if !budgetWarned {
+				h.Warn("physical session verification budget exhausted", zap.Error(err), zap.String("uid", uid))
+				budgetWarned = true
+			}
+			results[key] = verificationResult{failed: true}
+			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event)
+			continue
+		}
+		verified, err := service.Presence.Verify(batchCtx, event.Conn)
 		if err != nil {
+			results[key] = verificationResult{failed: true}
+			h.rememberVerificationFailure(key, time.Now())
 			h.Warn("physical session verification failed",
 				zap.Error(err),
 				zap.String("uid", event.Conn.Uid),
 				zap.Uint64("nodeId", event.Conn.NodeId),
 				zap.Int64("connId", event.Conn.ConnId))
-			switch packet := event.Frame.(type) {
-			case *wkproto.SendPacket:
-				eventbus.User.ConnWrite(event.ReqId, event.Conn, &wkproto.SendackPacket{
-					Framer:      packet.Framer,
-					MessageID:   event.MessageId,
-					ClientSeq:   packet.ClientSeq,
-					ClientMsgNo: packet.ClientMsgNo,
-					ReasonCode:  wkproto.ReasonNodeNotMatch,
-				})
-				eventbus.User.Advance(event.Conn.Uid)
-			case *wkproto.PingPacket, *wkproto.RecvackPacket:
-				// These frames are idempotent. Let the physical write/session fence
-				// protect PONG delivery, and let recvack validate the retry's session.
-				verifiedEvents = append(verifiedEvents, event)
-			}
+			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event)
 			continue
 		}
+		results[key] = verificationResult{conn: verified}
+		h.clearVerificationFailure(key)
 		event.Conn = verified
 		eventbus.User.UpdateConn(verified)
 		verifiedEvents = append(verifiedEvents, event)
 	}
 	return verifiedEvents
+}
+
+func verificationKey(conn *eventbus.Conn) verificationSessionKey {
+	return verificationSessionKey{
+		uid: conn.Uid, nodeID: conn.NodeId, connID: conn.ConnId,
+		ownerBootID: conn.OwnerBootID, sessionID: conn.SessionID,
+	}
+}
+
+func (h *Handler) handleUnverifiedOnSend(verifiedEvents []*eventbus.Event, event *eventbus.Event) []*eventbus.Event {
+	switch packet := event.Frame.(type) {
+	case *wkproto.SendPacket:
+		eventbus.User.ConnWrite(event.ReqId, event.Conn, &wkproto.SendackPacket{
+			Framer:      packet.Framer,
+			MessageID:   event.MessageId,
+			ClientSeq:   packet.ClientSeq,
+			ClientMsgNo: packet.ClientMsgNo,
+			ReasonCode:  wkproto.ReasonNodeNotMatch,
+		})
+		eventbus.User.Advance(event.Conn.Uid)
+	case *wkproto.PingPacket, *wkproto.RecvackPacket:
+		// These frames are idempotent. Let the physical write/session fence
+		// protect PONG delivery, and let recvack validate the retry's session.
+		verifiedEvents = append(verifiedEvents, event)
+	}
+	return verifiedEvents
+}
+
+func (h *Handler) verificationFailedRecently(key verificationSessionKey, now time.Time) bool {
+	h.verificationFailures.Lock()
+	defer h.verificationFailures.Unlock()
+	until, ok := h.verificationFailures.entries[key]
+	if !ok {
+		return false
+	}
+	if !now.Before(until) {
+		delete(h.verificationFailures.entries, key)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) rememberVerificationFailure(key verificationSessionKey, now time.Time) {
+	h.verificationFailures.Lock()
+	defer h.verificationFailures.Unlock()
+	if h.verificationFailures.entries == nil {
+		h.verificationFailures.entries = make(map[verificationSessionKey]time.Time)
+	}
+	if len(h.verificationFailures.entries) >= verificationFailureCap {
+		for cached := range h.verificationFailures.entries {
+			delete(h.verificationFailures.entries, cached)
+			break
+		}
+	}
+	h.verificationFailures.entries[key] = now.Add(verificationFailureTTL)
+}
+
+func (h *Handler) clearVerificationFailure(key verificationSessionKey) {
+	h.verificationFailures.Lock()
+	delete(h.verificationFailures.entries, key)
+	h.verificationFailures.Unlock()
 }
 
 // 统计输入

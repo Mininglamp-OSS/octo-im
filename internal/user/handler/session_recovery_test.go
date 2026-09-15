@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -19,10 +20,14 @@ import (
 
 type verificationPresence struct {
 	service.IPresence
-	verify func(*eventbus.Conn) (*eventbus.Conn, error)
+	verify        func(*eventbus.Conn) (*eventbus.Conn, error)
+	verifyContext func(context.Context, *eventbus.Conn) (*eventbus.Conn, error)
 }
 
-func (p *verificationPresence) Verify(_ context.Context, conn *eventbus.Conn) (*eventbus.Conn, error) {
+func (p *verificationPresence) Verify(ctx context.Context, conn *eventbus.Conn) (*eventbus.Conn, error) {
+	if p.verifyContext != nil {
+		return p.verifyContext(ctx, conn)
+	}
 	return p.verify(conn)
 }
 
@@ -59,7 +64,9 @@ func TestVerifyOnSendRejectsOnlyTheInvalidEvent(t *testing.T) {
 	bad := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 2, Auth: true, OwnerBootID: "boot", SessionID: "bad"}
 	users := &handlerUsers{known: good}
 	eventbus.RegisterUser(users)
+	verifyCalls := 0
 	service.Presence = &verificationPresence{verify: func(*eventbus.Conn) (*eventbus.Conn, error) {
+		verifyCalls++
 		return nil, errors.New("stale session")
 	}}
 	h := NewHandler()
@@ -91,6 +98,66 @@ func TestVerifyOnSendRejectsOnlyTheInvalidEvent(t *testing.T) {
 	require.True(t, ack.NoPersist)
 	require.Equal(t, wkproto.ReasonNodeNotMatch, ack.ReasonCode)
 	require.Equal(t, 1, users.advance)
+	require.Equal(t, 1, verifyCalls)
+}
+
+func TestVerifyOnSendCachesFailuresAcrossBatchesBySession(t *testing.T) {
+	oldOptions, oldPresence, oldUser := options.G, service.Presence, eventbus.User
+	t.Cleanup(func() { options.G, service.Presence, eventbus.User = oldOptions, oldPresence, oldUser })
+	options.G = options.New()
+	users := &handlerUsers{}
+	eventbus.RegisterUser(users)
+	verifyCalls := 0
+	service.Presence = &verificationPresence{verify: func(*eventbus.Conn) (*eventbus.Conn, error) {
+		verifyCalls++
+		return nil, errors.New("owner unavailable")
+	}}
+	h := NewHandler()
+	event := func(seq uint64, session string) *eventbus.Event {
+		return &eventbus.Event{
+			Type:  eventbus.EventOnSend,
+			Conn:  &eventbus.Conn{Uid: "u", NodeId: 2, ConnId: 7, OwnerBootID: "boot", SessionID: session},
+			Frame: &wkproto.SendPacket{ClientSeq: seq},
+		}
+	}
+
+	h.verifyOnSendEvents("u", []*eventbus.Event{event(1, "session")})
+	h.verifyOnSendEvents("u", []*eventbus.Event{event(2, "session")})
+	h.verifyOnSendEvents("u", []*eventbus.Event{event(3, "replacement")})
+
+	require.Equal(t, 2, verifyCalls)
+	require.Len(t, users.events, 3)
+}
+
+func TestVerifyOnSendHasOneBatchDeadlineForDistinctSessions(t *testing.T) {
+	oldOptions, oldPresence, oldUser := options.G, service.Presence, eventbus.User
+	t.Cleanup(func() { options.G, service.Presence, eventbus.User = oldOptions, oldPresence, oldUser })
+	options.G = options.New()
+	users := &handlerUsers{}
+	eventbus.RegisterUser(users)
+	verifyCalls := 0
+	service.Presence = &verificationPresence{verifyContext: func(ctx context.Context, _ *eventbus.Conn) (*eventbus.Conn, error) {
+		verifyCalls++
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	h := NewHandler()
+	events := make([]*eventbus.Event, 0, 32)
+	for i := 0; i < 32; i++ {
+		events = append(events, &eventbus.Event{
+			Type:  eventbus.EventOnSend,
+			Conn:  &eventbus.Conn{Uid: "u", NodeId: 2, ConnId: int64(i + 1), OwnerBootID: "boot", SessionID: fmt.Sprintf("session-%d", i)},
+			Frame: &wkproto.SendPacket{ClientSeq: uint64(i + 1)},
+		})
+	}
+
+	start := time.Now()
+	verified := h.verifyOnSendEvents("u", events)
+
+	require.Empty(t, verified)
+	require.Equal(t, 1, verifyCalls)
+	require.Len(t, users.events, len(events))
+	require.Less(t, time.Since(start), 500*time.Millisecond)
 }
 
 type recvackRetryManager struct {
