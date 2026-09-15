@@ -16,20 +16,28 @@ import (
 func (h *Handler) recvack(event *eventbus.Event) {
 	recvackPacket := event.Frame.(*wkproto.RecvackPacket)
 	persist := !recvackPacket.NoPersist // 是否需要持久化
+	conn := event.Conn
+	var currMsg *types.RetryMessage
+	if persist {
+		currMsg = service.RetryManager.RetryMessage(conn, recvackPacket.MessageID)
+		if currMsg != nil && !retryAckMatchesSession(currMsg, conn) {
+			h.Warn("ignore recvack from a different physical session",
+				zap.String("uid", conn.Uid),
+				zap.Uint64("nodeId", conn.NodeId),
+				zap.Int64("connId", conn.ConnId),
+				zap.Int64("messageId", recvackPacket.MessageID))
+			return
+		}
+	}
 	// 记录消息路径
 	event.Track.Record(track.PositionUserRecvack)
 
 	trace.GlobalTrace.Metrics.App().RecvackPacketCountAdd(1)
 	trace.GlobalTrace.Metrics.App().RecvackPacketBytesAdd(recvackPacket.GetFrameSize())
 
-	conn := event.Conn
 	isCmd := recvackPacket.SyncOnce                           // 是命令消息
 	isMaster := conn.DeviceLevel == wkproto.DeviceLevelMaster // 是master设备，只有master设备才能擦除指令消息
 
-	var currMsg *types.RetryMessage
-	if persist {
-		currMsg = service.RetryManager.RetryMessage(conn.NodeId, conn.ConnId, recvackPacket.MessageID)
-	}
 	if isCmd && persist && isMaster {
 		if currMsg != nil {
 			// 更新最近会话的已读位置
@@ -41,7 +49,7 @@ func (h *Handler) recvack(event *eventbus.Event) {
 	}
 	if persist { // 只有需要持久化的消息才会重试
 		// r.Debug("remove retry", zap.String("uid", req.uid), zap.Int64("connId", msg.ConnId), zap.Int64("messageID", recvackPacket.MessageID))
-		err := service.RetryManager.RemoveRetry(conn.NodeId, conn.ConnId, recvackPacket.MessageID)
+		err := service.RetryManager.RemoveRetry(conn, recvackPacket.MessageID)
 		if err != nil {
 			h.Warn("removeRetry error", zap.Error(err), zap.String("uid", conn.Uid), zap.String("deviceId", conn.DeviceId), zap.Int64("connId", conn.ConnId), zap.Uint64("nodeId", conn.NodeId), zap.Int64("messageID", recvackPacket.MessageID))
 		}
@@ -77,4 +85,19 @@ func (h *Handler) recvack(event *eventbus.Event) {
 		}
 	}
 
+}
+
+func retryAckMatchesSession(msg *types.RetryMessage, conn *eventbus.Conn) bool {
+	if msg == nil || conn == nil || msg.Uid != conn.Uid || msg.FromNode != conn.NodeId || msg.ConnId != conn.ConnId {
+		return false
+	}
+	msgHasIdentity := msg.OwnerBootID != "" && msg.SessionID != ""
+	msgIsLegacy := msg.OwnerBootID == "" && msg.SessionID == ""
+	if !msgHasIdentity && !msgIsLegacy || !conn.HasSessionIdentity() && !conn.IsLegacySession() {
+		return false
+	}
+	if msgHasIdentity && conn.HasSessionIdentity() {
+		return msg.OwnerBootID == conn.OwnerBootID && msg.SessionID == conn.SessionID
+	}
+	return msg.Uptime != 0 && msg.Uptime == conn.Uptime
 }

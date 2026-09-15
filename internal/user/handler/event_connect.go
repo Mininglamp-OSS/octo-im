@@ -29,6 +29,12 @@ func (h *Handler) connect(ctx *eventbus.UserContext) {
 			if conn.LastActive <= 0 {
 				conn.LastActive = fasttime.UnixTimestamp()
 			}
+			// Fence snapshots before publishing the newly authenticated logical
+			// session. Otherwise a snapshot captured just before authentication
+			// could remove this live session as absent during its commit phase.
+			if service.Presence != nil {
+				service.Presence.Invalidate(uid)
+			}
 			ctx.AddConn(conn)
 
 			// -------------------- user online --------------------

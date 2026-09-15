@@ -164,7 +164,7 @@ func (p *poller) connsByUid(uid string) []*eventbus.Conn {
 	if h == nil {
 		return nil
 	}
-	return h.conns.conns
+	return h.conns.allConns()
 }
 func (p *poller) authedConnsByUid(uid string) []*eventbus.Conn {
 	h := p.handler(uid)
@@ -221,17 +221,31 @@ func (p *poller) allConn() []*eventbus.Conn {
 	tmpHandlers := make([]*userHandler, 0)
 	p.waitlist.readHandlers(&tmpHandlers)
 	for _, h := range tmpHandlers {
-		conns = append(conns, h.conns.conns...)
+		conns = append(conns, h.conns.allConns()...)
 	}
 	return conns
 }
 
 func (p *poller) updateConn(conn *eventbus.Conn) {
+	p.Lock()
+	defer p.Unlock()
 	h := p.handler(conn.Uid)
 	if h == nil {
-		return
+		h = newUserHandler(conn.Uid, p)
+		p.waitlist.push(h)
 	}
 	h.conns.addOrUpdateConn(conn)
+}
+
+func (p *poller) updateConnRecovered(conn *eventbus.Conn) {
+	p.Lock()
+	defer p.Unlock()
+	h := p.handler(conn.Uid)
+	if h == nil {
+		h = newUserHandler(conn.Uid, p)
+		p.waitlist.push(h)
+	}
+	h.conns.addOrUpdateRecoveredConn(conn)
 }
 
 func (p *poller) allUserCount() int {
