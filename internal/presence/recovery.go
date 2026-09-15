@@ -131,36 +131,49 @@ func (m *Manager) Recover(parent context.Context, uids []string) error {
 	if len(missing) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
-	defer cancel()
-	if err := m.lockRecovery(ctx); err != nil {
+	if err := m.lockRecovery(parent); err != nil {
 		return err
 	}
 	defer func() { <-m.gate }()
 	// Another recovery may have completed while this call waited for capacity.
 	missing = m.filterMissing(missing)
-	var recoveryErrors []error
-	for offset := 0; offset < len(missing); offset += 128 {
-		batch := missing[offset:min(offset+128, len(missing))]
-		var err error
-		for attempt := 0; attempt < 3; attempt++ {
-			err = m.recoverBatch(ctx, batch)
-			if err == nil {
-				break
-			}
-			timer := time.NewTimer(time.Duration(attempt+1) * 50 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
+	if len(missing) == 0 {
+		return nil
+	}
+	batchCount := (len(missing) + 127) / 128
+	recoveryErrors := make([]error, batchCount)
+	group := errgroup.Group{}
+	group.SetLimit(4)
+	for batchIndex, offset := 0, 0; offset < len(missing); batchIndex, offset = batchIndex+1, offset+128 {
+		batchIndex := batchIndex
+		batch := append([]string(nil), missing[offset:min(offset+128, len(missing))]...)
+		group.Go(func() error {
+			recoveryErrors[batchIndex] = m.recoverBatchWithRetry(parent, batch)
+			return nil
+		})
+	}
+	_ = group.Wait()
+	return errors.Join(recoveryErrors...)
+}
+
+func (m *Manager) recoverBatchWithRetry(parent context.Context, batch []string) error {
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = m.recoverBatch(ctx, batch)
+		if err == nil {
+			return nil
 		}
-		if err != nil {
-			recoveryErrors = append(recoveryErrors, err)
+		timer := time.NewTimer(time.Duration(attempt+1) * 50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
 		}
 	}
-	return errors.Join(recoveryErrors...)
+	return err
 }
 
 func (m *Manager) filterMissing(uids []string) []string {

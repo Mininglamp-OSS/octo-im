@@ -173,7 +173,7 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 			}
 			// Do not hold known-live delivery behind cold recovery RPCs.
 			flushOnline()
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 			err := service.Presence.Recover(ctx, unknownUids)
 			cancel()
 			if err != nil {
@@ -186,8 +186,7 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 				continue
 			}
 			isOnline, masterIsOnline := h.deviceOnlineStatus(uid)
-			presenceKnown := service.Presence == nil || service.Presence.IsReady(uid)
-			if !masterIsOnline && presenceKnown && channelType != wkproto.ChannelTypeAgent { // agent不需要触发离线的webhook
+			if !masterIsOnline && channelType != wkproto.ChannelTypeAgent { // agent不需要触发离线的webhook
 				if offlineUids == nil {
 					offlineUids = make([]string, 0, len(node.Uids))
 				}

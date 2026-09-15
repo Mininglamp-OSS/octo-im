@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -80,6 +81,7 @@ type testCluster struct {
 	leader      uint64
 	version     uint64
 	request     func() error
+	requestCtx  func(context.Context) error
 	requestNode func(uint64) error
 	afterRead   func()
 	mutate      func(*snapshotResponse)
@@ -101,6 +103,11 @@ func (c *testCluster) RequestWithContext(ctx context.Context, node uint64, path 
 	}
 	if c.request != nil {
 		if err := c.request(); err != nil {
+			return nil, err
+		}
+	}
+	if c.requestCtx != nil {
+		if err := c.requestCtx(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -329,4 +336,23 @@ func TestVerifyRejectsForeignSnapshotBoot(t *testing.T) {
 	cluster.mutate = func(response *snapshotResponse) { response.Boot = "foreign-boot" }
 	_, err := leader.Verify(context.Background(), conn)
 	require.ErrorIs(t, err, ErrNotReady)
+}
+
+func TestRecoveryProcessesUIDBatchesConcurrently(t *testing.T) {
+	_, leader, cluster, _, _, _ := fixture(t)
+	cluster.requestCtx = func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+			return nil
+		}
+	}
+	uids := make([]string, 257)
+	for i := range uids {
+		uids[i] = fmt.Sprintf("u-%d", i)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 220*time.Millisecond)
+	defer cancel()
+	require.NoError(t, leader.Recover(ctx, uids))
 }

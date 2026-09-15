@@ -16,20 +16,28 @@ import (
 func (h *Handler) recvack(event *eventbus.Event) {
 	recvackPacket := event.Frame.(*wkproto.RecvackPacket)
 	persist := !recvackPacket.NoPersist // 是否需要持久化
+	conn := event.Conn
+	var currMsg *types.RetryMessage
+	if persist {
+		currMsg = service.RetryManager.RetryMessage(conn.NodeId, conn.ConnId, recvackPacket.MessageID)
+		if currMsg != nil && !retryAckMatchesSession(currMsg, conn) {
+			h.Warn("ignore recvack from a different physical session",
+				zap.String("uid", conn.Uid),
+				zap.Uint64("nodeId", conn.NodeId),
+				zap.Int64("connId", conn.ConnId),
+				zap.Int64("messageId", recvackPacket.MessageID))
+			return
+		}
+	}
 	// 记录消息路径
 	event.Track.Record(track.PositionUserRecvack)
 
 	trace.GlobalTrace.Metrics.App().RecvackPacketCountAdd(1)
 	trace.GlobalTrace.Metrics.App().RecvackPacketBytesAdd(recvackPacket.GetFrameSize())
 
-	conn := event.Conn
 	isCmd := recvackPacket.SyncOnce                           // 是命令消息
 	isMaster := conn.DeviceLevel == wkproto.DeviceLevelMaster // 是master设备，只有master设备才能擦除指令消息
 
-	var currMsg *types.RetryMessage
-	if persist {
-		currMsg = service.RetryManager.RetryMessage(conn.NodeId, conn.ConnId, recvackPacket.MessageID)
-	}
 	if isCmd && persist && isMaster {
 		if currMsg != nil {
 			// 更新最近会话的已读位置
@@ -77,4 +85,11 @@ func (h *Handler) recvack(event *eventbus.Event) {
 		}
 	}
 
+}
+
+func retryAckMatchesSession(msg *types.RetryMessage, conn *eventbus.Conn) bool {
+	return msg != nil && conn != nil &&
+		msg.Uid == conn.Uid && msg.FromNode == conn.NodeId && msg.ConnId == conn.ConnId &&
+		msg.OwnerBootID != "" && msg.SessionID != "" &&
+		msg.OwnerBootID == conn.OwnerBootID && msg.SessionID == conn.SessionID
 }

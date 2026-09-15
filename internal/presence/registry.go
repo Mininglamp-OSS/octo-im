@@ -67,7 +67,6 @@ func (m *Manager) Prepare(raw wknet.Conn, conn *eventbus.Conn) {
 		sessionID = entry.conn.SessionID
 	}
 	m.unindexLocked(entry.conn)
-	conn.OwnerBootID = m.boot
 	if sessionID == "" {
 		sessionID = wkutil.GenUUID()
 	}

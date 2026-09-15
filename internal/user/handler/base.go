@@ -104,7 +104,8 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 				zap.String("uid", event.Conn.Uid),
 				zap.Uint64("nodeId", event.Conn.NodeId),
 				zap.Int64("connId", event.Conn.ConnId))
-			if packet, ok := event.Frame.(*wkproto.SendPacket); ok {
+			switch packet := event.Frame.(type) {
+			case *wkproto.SendPacket:
 				eventbus.User.ConnWrite(event.ReqId, event.Conn, &wkproto.SendackPacket{
 					Framer:      packet.Framer,
 					MessageID:   event.MessageId,
@@ -113,6 +114,10 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 					ReasonCode:  wkproto.ReasonNodeNotMatch,
 				})
 				eventbus.User.Advance(event.Conn.Uid)
+			case *wkproto.PingPacket, *wkproto.RecvackPacket:
+				// These frames are idempotent. Let the physical write/session fence
+				// protect PONG delivery, and let recvack validate the retry's session.
+				verifiedEvents = append(verifiedEvents, event)
 			}
 			continue
 		}

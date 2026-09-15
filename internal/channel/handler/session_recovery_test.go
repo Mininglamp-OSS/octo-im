@@ -72,9 +72,11 @@ func TestDistributionKeepsKnownOnlineDeliveryWhenRecoveryFails(t *testing.T) {
 		Frame: &wkproto.SendPacket{},
 	}})
 
-	require.Len(t, pusher.events, 1)
+	require.Len(t, pusher.events, 2)
 	require.Equal(t, eventbus.EventPushOnline, pusher.events[0].Type)
 	require.Equal(t, "known", pusher.events[0].ToUid)
+	require.Equal(t, eventbus.EventPushOffline, pusher.events[1].Type)
+	require.Equal(t, []string{"unknown"}, pusher.events[1].OfflineUsers)
 	require.Equal(t, []string{"unknown"}, recovery.uids)
 	require.Equal(t, 1, recovery.deliveredBefore)
 }

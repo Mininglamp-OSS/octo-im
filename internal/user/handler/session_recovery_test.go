@@ -10,6 +10,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/presence"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -70,13 +71,17 @@ func TestVerifyOnSendRejectsOnlyTheInvalidEvent(t *testing.T) {
 		{Type: eventbus.EventOnSend, Conn: bad, Frame: &wkproto.SendPacket{Framer: wkproto.Framer{NoPersist: true}, ClientSeq: 4, ClientMsgNo: "bad"}, MessageId: 88},
 		{Type: eventbus.EventOnSend, Conn: good, Frame: &wkproto.PingPacket{}},
 		{Type: eventbus.EventOnSend, Conn: good, Frame: &wkproto.RecvackPacket{MessageID: 9}},
+		{Type: eventbus.EventOnSend, Conn: bad, Frame: &wkproto.PingPacket{}},
+		{Type: eventbus.EventOnSend, Conn: bad, Frame: &wkproto.RecvackPacket{MessageID: 10}},
 		{Type: eventbus.EventOnSend, Conn: nil, Frame: &wkproto.PingPacket{}},
 	}
 
 	h.OnEvent(&eventbus.UserContext{Uid: "u", EventType: eventbus.EventOnSend, Events: events})
-	require.Len(t, executed, 2)
+	require.Len(t, executed, 4)
 	require.IsType(t, &wkproto.PingPacket{}, executed[0].Frame)
 	require.IsType(t, &wkproto.RecvackPacket{}, executed[1].Frame)
+	require.IsType(t, &wkproto.PingPacket{}, executed[2].Frame)
+	require.IsType(t, &wkproto.RecvackPacket{}, executed[3].Frame)
 	require.Len(t, users.events, 1)
 	ack, ok := users.events[0].Frame.(*wkproto.SendackPacket)
 	require.True(t, ok)
@@ -86,6 +91,34 @@ func TestVerifyOnSendRejectsOnlyTheInvalidEvent(t *testing.T) {
 	require.True(t, ack.NoPersist)
 	require.Equal(t, wkproto.ReasonNodeNotMatch, ack.ReasonCode)
 	require.Equal(t, 1, users.advance)
+}
+
+type recvackRetryManager struct {
+	service.RetryMgr
+	msg     *types.RetryMessage
+	removed bool
+}
+
+func (m *recvackRetryManager) RetryMessage(uint64, int64, int64) *types.RetryMessage {
+	return m.msg
+}
+func (m *recvackRetryManager) RemoveRetry(uint64, int64, int64) error {
+	m.removed = true
+	return nil
+}
+
+func TestRecvackCannotClearRetryFromReusedSession(t *testing.T) {
+	oldRetry := service.RetryManager
+	t.Cleanup(func() { service.RetryManager = oldRetry })
+	retry := &recvackRetryManager{msg: &types.RetryMessage{
+		Uid: "u", FromNode: 1, ConnId: 7, OwnerBootID: "old-boot", SessionID: "old-session",
+	}}
+	service.RetryManager = retry
+	conn := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, OwnerBootID: "new-boot", SessionID: "new-session"}
+
+	NewHandler().recvack(&eventbus.Event{Conn: conn, Frame: &wkproto.RecvackPacket{MessageID: 9}})
+
+	require.False(t, retry.removed)
 }
 
 type handlerSocket struct {
