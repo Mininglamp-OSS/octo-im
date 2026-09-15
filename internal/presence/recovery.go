@@ -240,6 +240,7 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 	}
 	nodes := service.Cluster.Nodes()
 	var owners []uint64
+	var membershipIncomplete bool
 	foundLocal := false
 	for _, node := range nodes {
 		if node.Id == m.node {
@@ -247,6 +248,10 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 		}
 		if node.Online || node.Id == m.node {
 			owners = append(owners, node.Id)
+		} else {
+			// An offline membership record is not proof that the node has no live
+			// client sockets. Excluding it makes this snapshot incomplete.
+			membershipIncomplete = true
 		}
 	}
 	if !foundLocal {
@@ -271,7 +276,7 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 		})
 	}
 	_ = group.Wait()
-	complete := !authorityIncomplete
+	complete := !authorityIncomplete && !membershipIncomplete
 	var ownerErrors []error
 	for _, err := range readErrors {
 		if err != nil {

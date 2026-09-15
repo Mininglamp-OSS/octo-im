@@ -356,3 +356,21 @@ func TestRecoveryProcessesUIDBatchesConcurrently(t *testing.T) {
 	defer cancel()
 	require.NoError(t, leader.Recover(ctx, uids))
 }
+
+func TestOfflineMarkedOwnerCannotCauseLiveSessionEviction(t *testing.T) {
+	_, leader, cluster, users, _, conn := fixture(t)
+	require.NoError(t, leader.Recover(context.Background(), []string{conn.Uid}))
+	require.Len(t, users.ConnsByUid(conn.Uid), 1)
+	cluster.nodes = []*types.Node{{Id: 1, Online: false}, {Id: 2, Online: true}}
+	leader.mu.Lock()
+	leader.ready[conn.Uid].until = time.Time{}
+	leader.mu.Unlock()
+
+	err := leader.Recover(context.Background(), []string{conn.Uid})
+
+	require.ErrorIs(t, err, ErrNotReady)
+	got := users.ConnsByUid(conn.Uid)
+	require.Len(t, got, 1)
+	require.True(t, got[0].SameSession(conn))
+	require.Empty(t, users.events, "an incomplete membership view must not emit a false offline event")
+}
