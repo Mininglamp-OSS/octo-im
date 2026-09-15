@@ -269,6 +269,8 @@ func (s *Server) Start() error {
 	}
 
 	s.ingress.SetRoutes()
+	s.userHandler.SetForwardRoutes()
+	s.channelHandler.SetForwardRoutes()
 
 	// 重试管理
 	if err = s.retryManager.Start(); err != nil {

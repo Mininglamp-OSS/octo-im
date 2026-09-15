@@ -188,10 +188,11 @@ func (c *Client) Request(p string, body []byte) (*proto.Response, error) {
 }
 
 func (c *Client) RequestWithContext(ctx context.Context, p string, body []byte) (*proto.Response, error) {
-	if c.conn() == nil {
+	conn := c.conn()
+	if conn == nil {
 		return nil, errors.New("conn is nil")
 	}
-	if c.conn().status.Load() != authed {
+	if conn.status.Load() != authed {
 		c.Error("connect not authed", zap.String("addr", c.opts.Addr), zap.String("path", p))
 		return nil, errors.New("connect not authed")
 	}
@@ -208,6 +209,7 @@ func (c *Client) RequestWithContext(ctx context.Context, p string, body []byte) 
 	}
 
 	c.Requesting.Inc()
+	defer c.Requesting.Dec()
 
 	msgData, err := c.proto.Encode(data, proto.MsgTypeRequest)
 	if err != nil {
@@ -215,7 +217,8 @@ func (c *Client) RequestWithContext(ctx context.Context, p string, body []byte) 
 	}
 	start := time.Now()
 	ch := c.w.Register(r.Id)
-	err = c.conn().asyncWrite(msgData)
+	defer c.w.Trigger(r.Id, nil)
+	err = conn.asyncWrite(msgData)
 	if err != nil {
 		return nil, err
 	}
@@ -225,15 +228,12 @@ func (c *Client) RequestWithContext(ctx context.Context, p string, body []byte) 
 	}
 	select {
 	case x := <-ch:
-		c.Requesting.Dec()
 		if x == nil {
 			return nil, errors.New("unknown error")
 		}
 		return x.(*proto.Response), nil
 	case <-ctx.Done():
 		c.Error("request timeout", zap.String("path", p), zap.Uint64("requestId", r.Id), zap.String("addr", c.opts.Addr), zap.Error(ctx.Err()))
-		c.Requesting.Dec()
-		c.w.Trigger(r.Id, nil)
 		return nil, ctx.Err()
 	}
 }

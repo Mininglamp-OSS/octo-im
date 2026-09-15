@@ -15,7 +15,7 @@ import (
 )
 
 var ErrMessageConflict = errors.New("client_msg_no already used for different message content")
-var errMessageLeaderChanged = errors.New("channel leader changed; retry message")
+var errMessageLeaderChanged = fmt.Errorf("%w: channel leader changed", ErrSendUnavailable)
 var errMessageSnapshotChanged = errors.New("channel log changed during lookup")
 var errMessageNotReady = errors.New("channel leader is preparing durable state")
 

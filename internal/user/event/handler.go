@@ -11,7 +11,6 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/fasttime"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
-	"go.uber.org/zap"
 )
 
 type userHandler struct {
@@ -76,8 +75,8 @@ func (u *userHandler) hasEvent() bool {
 }
 
 func (u *userHandler) events() []*eventbus.Event {
-	u.pending.RLock()
-	defer u.pending.RUnlock()
+	u.pending.Lock()
+	defer u.pending.Unlock()
 	events := u.pending.eventQueue.SliceWithSize(u.processingIndex+1, u.pending.eventQueue.LastIndex()+1, options.G.Poller.UserEventMaxSizePerBatch)
 	if len(events) == 0 {
 		return nil
@@ -99,10 +98,6 @@ func (u *userHandler) advanceEvents(events []*eventbus.Event) {
 	}()
 
 	slotLeaderId := u.leaderId()
-	if slotLeaderId == 0 {
-		u.Error("advanceEvents: slotLeaderId is 0", zap.String("uid", u.Uid))
-		return
-	}
 
 	// 统计在线用户数
 	if !u.stat && options.G.IsLocalNode(slotLeaderId) {

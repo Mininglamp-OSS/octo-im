@@ -6,14 +6,18 @@ import (
 	"errors"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
+	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
+
+const channelProposalUnavailable proto.Status = 3
 
 type rpcServer struct {
 	s *Server
@@ -73,7 +77,11 @@ func (r *rpcServer) handleChannelPropose(c *wkserver.Context) {
 	resps, err := r.s.channelServer.ProposeBatchUntilAppliedTimeoutForLocal(timeoutCtx, req.channelId, req.channelType, req.reqs)
 	if err != nil {
 		r.Error("channel propose failed", zap.Error(err), zap.String("channelId", req.channelId), zap.Uint8("channelType", req.channelType), zap.Uint64("nodeId", r.s.opts.ConfigOptions.NodeId))
-		c.WriteErr(err)
+		if channel.IsRetryableSendError(err) {
+			c.WriteErrorAndStatus(err, channelProposalUnavailable)
+		} else {
+			c.WriteErr(err)
+		}
 		return
 	}
 	data, err := json.Marshal(channelProposeResponse{Version: 2, Results: resps})

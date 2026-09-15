@@ -11,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
@@ -36,6 +37,9 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		if err != nil {
 			h.Error("store message failed", zap.Error(err), zap.Int("events", len(persists)), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
 			reasonCode = wkproto.ReasonSystemError
+			if channel.IsRetryableSendError(err) {
+				reasonCode = wkproto.ReasonNodeNotMatch
+			}
 		}
 
 		if err == nil {
@@ -73,6 +77,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 			sendPacket := e.Frame.(*wkproto.SendPacket)
 			if e.ReasonCode == wkproto.ReasonSuccess && !sendPacket.NoPersist {
 				cloneEvent := e.Clone()
+				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 				cloneEvent.Type = eventbus.EventChannelWebhook
 				eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 			}
@@ -85,6 +90,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 			continue
 		}
 		cloneEvent := e.Clone()
+		cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 		cloneEvent.Type = eventbus.EventChannelDistribute
 		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 	}

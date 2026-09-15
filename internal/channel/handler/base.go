@@ -5,6 +5,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/common"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/forward"
 	"github.com/WuKongIM/WuKongIM/internal/ingress"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
@@ -54,12 +55,7 @@ func (h *Handler) OnEvent(ctx *eventbus.ChannelContext) {
 		// 执行本地事件 ,频道永远在自己的槽领导节点上执行逻辑。
 		eventbus.ExecuteChannelEvent(ctx)
 	} else {
-		if ctx.SlotLeaderId != 0 {
-			// 转发到leader节点
-			h.forwardsToNode(ctx.SlotLeaderId, ctx.ChannelId, ctx.ChannelType, ctx.Events)
-		} else {
-			h.Error("channel: OnEvent: leaderId is 0", zap.String("channelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-		}
+		h.forwardsToNode(ctx.SlotLeaderId, ctx.ChannelId, ctx.ChannelType, ctx.Events)
 	}
 }
 
@@ -85,16 +81,23 @@ func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType ui
 	data, err := req.encode()
 	if err != nil {
 		h.Error("forwardToLeader: encode failed", zap.Error(err))
+		forward.Fail(events)
 		return
 	}
-	msg := &proto.Message{
-		MsgType: uint32(msgForwardChannelEvent),
-		Content: data,
+	target := func() uint64 {
+		if len(events) > 0 && h.notForwardToLeader(events[0].Type) {
+			return nodeId
+		}
+		leader, err := service.Cluster.SlotLeaderIdOfChannel(channelId, channelType)
+		if err != nil {
+			return 0
+		}
+		return leader
 	}
-	err = h.sendToNode(nodeId, msg)
+	err = forward.Request(forward.ChannelPath, data, events, target, options.G.Cluster.NodeId, h.acceptForward)
 	if err != nil {
-		h.Error("channel: forwardToLeader: send failed", zap.Error(err), zap.Uint64("nodeId", nodeId), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
-		return
+		h.Error("channel forwarding failed", zap.Error(err), zap.String("channelId", channelId))
+		forward.Fail(events)
 	}
 }
 
