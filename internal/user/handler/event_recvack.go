@@ -91,9 +91,13 @@ func retryAckMatchesSession(msg *types.RetryMessage, conn *eventbus.Conn) bool {
 	if msg == nil || conn == nil || msg.Uid != conn.Uid || msg.FromNode != conn.NodeId || msg.ConnId != conn.ConnId {
 		return false
 	}
-	if msg.OwnerBootID == "" && msg.SessionID == "" && conn.IsLegacySession() {
-		return msg.Uptime != 0 && msg.Uptime == conn.Uptime
+	msgHasIdentity := msg.OwnerBootID != "" && msg.SessionID != ""
+	msgIsLegacy := msg.OwnerBootID == "" && msg.SessionID == ""
+	if !msgHasIdentity && !msgIsLegacy || !conn.HasSessionIdentity() && !conn.IsLegacySession() {
+		return false
 	}
-	return msg.OwnerBootID != "" && msg.SessionID != "" &&
-		msg.OwnerBootID == conn.OwnerBootID && msg.SessionID == conn.SessionID
+	if msgHasIdentity && conn.HasSessionIdentity() {
+		return msg.OwnerBootID == conn.OwnerBootID && msg.SessionID == conn.SessionID
+	}
+	return msg.Uptime != 0 && msg.Uptime == conn.Uptime
 }

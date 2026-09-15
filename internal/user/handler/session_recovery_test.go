@@ -341,7 +341,7 @@ func TestLegacyRecvackClearsMatchingSocketBirthOnly(t *testing.T) {
 	options.G = options.New()
 	trace.SetGlobalTrace(trace.New(context.Background(), trace.NewOptions()))
 	retry := &recvackRetryManager{msg: &types.RetryMessage{
-		Uid: "u", FromNode: 1, ConnId: 7, Uptime: 101,
+		Uid: "u", FromNode: 1, ConnId: 7, Uptime: 101, OwnerBootID: "boot", SessionID: "session",
 	}}
 	service.RetryManager = retry
 	h := NewHandler()
@@ -354,6 +354,17 @@ func TestLegacyRecvackClearsMatchingSocketBirthOnly(t *testing.T) {
 
 	h.recvack(&eventbus.Event{
 		Conn:  &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, Uptime: 101},
+		Frame: &wkproto.RecvackPacket{MessageID: 9},
+	})
+	require.True(t, retry.removed)
+
+	retry.removed = false
+	retry.msg.OwnerBootID = ""
+	retry.msg.SessionID = ""
+	h.recvack(&eventbus.Event{
+		Conn: &eventbus.Conn{
+			Uid: "u", NodeId: 1, ConnId: 7, Uptime: 101, OwnerBootID: "boot", SessionID: "session",
+		},
 		Frame: &wkproto.RecvackPacket{MessageID: 9},
 	})
 	require.True(t, retry.removed)
