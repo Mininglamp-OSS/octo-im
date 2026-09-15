@@ -15,11 +15,16 @@ import (
 
 type forwardChannelCluster struct {
 	icluster.ICluster
-	leader uint64
+	leader    uint64
+	sendCalls int
 }
 
 func (c *forwardChannelCluster) SlotLeaderIdOfChannel(string, uint8) (uint64, error) {
 	return c.leader, nil
+}
+func (c *forwardChannelCluster) Send(uint64, *proto.Message) error {
+	c.sendCalls++
+	return nil
 }
 
 type forwardChannel struct {
@@ -80,4 +85,22 @@ func TestChannelForwardAdmissionRejectsWrongFrameAndMixedBatch(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, forward.StatusInvalid, h.acceptForward(data))
 	}
+}
+
+func TestChannelForwardConcurrencyGatePreservesDistributionInTransportQueue(t *testing.T) {
+	oldOptions, oldCluster := options.G, service.Cluster
+	t.Cleanup(func() { options.G, service.Cluster = oldOptions, oldCluster })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 1
+	c := &forwardChannelCluster{leader: 2}
+	service.Cluster = c
+	h := NewHandler()
+	h.forwardGate = forward.NewGate(4)
+	require.True(t, h.forwardGate.TryAcquire())
+	defer h.forwardGate.Release()
+	e := &eventbus.Event{Type: eventbus.EventChannelDistribute, Frame: &wkproto.SendPacket{}}
+
+	h.forwardsToNode(2, "room", 2, []*eventbus.Event{e})
+
+	require.Equal(t, 1, c.sendCalls)
 }

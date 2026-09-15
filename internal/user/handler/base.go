@@ -138,10 +138,22 @@ func (h *Handler) forwardsToNode(nodeId uint64, uid string, events []*eventbus.E
 		forward.Fail(events, err)
 		return
 	}
+	legacy := func(targetNode uint64) error {
+		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardUserEvent), Content: data})
+	}
 	if !h.forwardGate.TryAcquire() {
-		err = forward.ErrUnavailable
-		h.Error("user forwarding concurrency limit reached", zap.Error(err), zap.String("uid", uid))
-		forward.Fail(events, err)
+		if forward.OnlyRetryableSends(events) {
+			err = forward.ErrUnavailable
+		} else {
+			// Fixed-destination lifecycle/write events cannot ask a client to
+			// retry. Before any v1 attempt, preserve them in the reconnect-aware
+			// transport queue instead of dropping the dequeued batch.
+			err = legacy(nodeId)
+		}
+		if err != nil {
+			h.Error("user forwarding concurrency limit reached", zap.Error(err), zap.String("uid", uid))
+			forward.Fail(events, err)
+		}
 		return
 	}
 	defer h.forwardGate.Release()
@@ -149,9 +161,7 @@ func (h *Handler) forwardsToNode(nodeId uint64, uid string, events []*eventbus.E
 	if !h.notForwardToLeader(events[0].Type) {
 		target = func() uint64 { return h.userLeaderNodeId(uid) }
 	}
-	err = forward.RequestCompatible(forward.UserPath, data, events, target, options.G.Cluster.NodeId, h.acceptForward, &h.forwardCapabilities, func(targetNode uint64) error {
-		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardUserEvent), Content: data})
-	})
+	err = forward.RequestCompatible(forward.UserPath, data, events, target, options.G.Cluster.NodeId, h.acceptForward, &h.forwardCapabilities, legacy)
 	if err != nil {
 		h.Error("user forwarding failed", zap.Error(err), zap.String("uid", uid))
 		forward.Fail(events, err)

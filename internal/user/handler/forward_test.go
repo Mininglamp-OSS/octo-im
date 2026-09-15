@@ -145,6 +145,25 @@ func TestForwardConcurrencyGateFailsFastBeforeNetworkWait(t *testing.T) {
 	require.Equal(t, wkproto.ReasonNodeNotMatch, u.events[0].Frame.(*wkproto.SendackPacket).ReasonCode)
 }
 
+func TestForwardConcurrencyGatePreservesNonSendInTransportQueue(t *testing.T) {
+	oldOptions, oldCluster := options.G, service.Cluster
+	t.Cleanup(func() { options.G, service.Cluster = oldOptions, oldCluster })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 1
+	c := &forwardCluster{leader: 2}
+	service.Cluster = c
+	h := NewHandler()
+	h.forwardGate = forward.NewGate(4)
+	require.True(t, h.forwardGate.TryAcquire())
+	defer h.forwardGate.Release()
+	e := &eventbus.Event{Type: eventbus.EventConnWriteFrame, Conn: &eventbus.Conn{Uid: "u", NodeId: 2}, Frame: &wkproto.PongPacket{}}
+
+	h.forwardsToNode(2, "u", []*eventbus.Event{e})
+
+	require.Zero(t, c.calls)
+	require.Equal(t, 1, c.sendCalls)
+}
+
 func TestWriteFrameBatchesRemoteEventsByDestination(t *testing.T) {
 	oldOptions, oldCluster := options.G, service.Cluster
 	t.Cleanup(func() { options.G, service.Cluster = oldOptions, oldCluster })

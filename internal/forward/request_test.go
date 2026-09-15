@@ -65,6 +65,23 @@ func TestGateRejectsWithoutBlockingWhenForwardCapacityIsBusy(t *testing.T) {
 	require.Less(t, time.Since(start), 100*time.Millisecond)
 }
 
+func TestOnlyRetryableSendsRequiresEveryEventToHaveClientSendPacket(t *testing.T) {
+	oldOptions := options.G
+	t.Cleanup(func() { options.G = oldOptions })
+	options.G = options.New()
+	conn := &eventbus.Conn{DeviceId: "client"}
+	send := &eventbus.Event{Type: eventbus.EventOnSend, Conn: conn, Frame: &wkproto.SendPacket{}}
+	channelSend := &eventbus.Event{Type: eventbus.EventChannelOnSend, Conn: conn, Frame: &wkproto.SendPacket{}}
+	ping := &eventbus.Event{Type: eventbus.EventOnSend, Conn: conn, Frame: &wkproto.PingPacket{}}
+	systemSend := &eventbus.Event{Type: eventbus.EventOnSend, Conn: &eventbus.Conn{DeviceId: options.G.SystemDeviceId}, Frame: &wkproto.SendPacket{}}
+
+	require.True(t, OnlyRetryableSends([]*eventbus.Event{send, channelSend}))
+	require.False(t, OnlyRetryableSends(nil))
+	require.False(t, OnlyRetryableSends([]*eventbus.Event{send, ping}))
+	require.False(t, OnlyRetryableSends([]*eventbus.Event{systemSend}))
+	require.False(t, OnlyRetryableSends([]*eventbus.Event{nil}))
+}
+
 func TestAmbiguousResponseCannotContradictPeerSuccess(t *testing.T) {
 	oldOptions, oldCluster, oldUser := options.G, service.Cluster, eventbus.User
 	t.Cleanup(func() { options.G, service.Cluster, eventbus.User = oldOptions, oldCluster, oldUser })

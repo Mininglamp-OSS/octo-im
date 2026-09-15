@@ -71,6 +71,23 @@ func (g *Gate) Release() {
 	}
 }
 
+// OnlyRetryableSends reports whether every event can receive a retryable SENDACK.
+func OnlyRetryableSends(events []*eventbus.Event) bool {
+	if len(events) == 0 {
+		return false
+	}
+	for _, event := range events {
+		if event == nil || event.Conn == nil || options.G.IsSystemDevice(event.Conn.DeviceId) ||
+			(event.Type != eventbus.EventOnSend && event.Type != eventbus.EventChannelOnSend) {
+			return false
+		}
+		if packet, ok := event.Frame.(*wkproto.SendPacket); !ok || packet == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // CapabilityCache probes a peer before the first side-effecting v1 request.
 // A failed read-only probe can safely select the legacy transport during a
 // rolling upgrade without guessing after an admission response is lost.
