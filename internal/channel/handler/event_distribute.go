@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"context"
 	"errors"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/ingress"
@@ -132,6 +134,16 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 		}
 		if len(node.Uids) > 0 {
 			localHasEvent = true
+		}
+		if service.Presence != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err := service.Presence.Recover(ctx, node.Uids)
+			cancel()
+			if err != nil {
+				h.Warn("recipient authority recovery incomplete", zap.Error(err))
+				// Unknown presence must not be reported as offline.
+				continue
+			}
 		}
 		for _, uid := range node.Uids {
 			if options.G.IsSystemUid(uid) {

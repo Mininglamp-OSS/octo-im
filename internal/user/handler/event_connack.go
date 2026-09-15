@@ -25,6 +25,9 @@ func (h *Handler) connack(ctx *eventbus.UserContext) {
 		if connack.ReasonCode == wkproto.ReasonSuccess {
 			// 设置连接最大空闲时间
 			if options.G.IsLocalNode(conn.NodeId) {
+				if service.Presence != nil && !service.Presence.Authenticate(conn) {
+					continue
+				}
 				realConn := service.ConnManager.GetConn(conn.ConnId)
 				if realConn != nil {
 					realConn.SetMaxIdle(options.G.ConnIdleTime)

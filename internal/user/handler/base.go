@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
@@ -8,6 +9,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
+	"time"
 )
 
 type Handler struct {
@@ -62,7 +64,34 @@ func (h *Handler) OnEvent(ctx *eventbus.UserContext) {
 	// 如果本节点的事件则执行，非本节点事件转发到leader节点
 	if options.G.IsLocalNode(slotLeaderId) ||
 		h.notForwardToLeader(ctx.EventType) {
-		// 执行本地事件
+		// A forwarded descriptor is only a claim until its physical owner verifies it.
+		if ctx.EventType == eventbus.EventOnSend && service.Presence != nil {
+			for _, e := range ctx.Events {
+				if e.Conn == nil {
+					return
+				}
+				known := eventbus.User.ConnById(ctx.Uid, e.Conn.NodeId, e.Conn.ConnId)
+				if known != nil && known.Auth && known.SameSession(e.Conn) {
+					e.Conn = known
+					continue
+				}
+				verifyCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+				verified, err := service.Presence.Verify(verifyCtx, e.Conn)
+				cancel()
+				if err != nil {
+					h.Warn("physical session verification failed", zap.Error(err))
+					for _, pending := range ctx.Events {
+						if packet, ok := pending.Frame.(*wkproto.SendPacket); ok && pending.Conn != nil {
+							eventbus.User.ConnWrite(pending.ReqId, pending.Conn, &wkproto.SendackPacket{ClientSeq: packet.ClientSeq, ClientMsgNo: packet.ClientMsgNo, ReasonCode: wkproto.ReasonNodeNotMatch})
+							eventbus.User.Advance(pending.Conn.Uid)
+						}
+					}
+					return
+				}
+				e.Conn = verified
+				eventbus.User.UpdateConn(verified)
+			}
+		}
 		eventbus.ExecuteUserEvent(ctx)
 	} else {
 		if slotLeaderId != 0 {
@@ -192,7 +221,7 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 		// 替换成本地的连接
 		if e.Conn != nil {
 			conn := eventbus.User.ConnById(e.Conn.Uid, e.Conn.NodeId, e.Conn.ConnId)
-			if conn != nil {
+			if e.Type != eventbus.EventConnack && conn != nil && conn.SameSession(e.Conn) {
 				e.Conn = conn
 			}
 

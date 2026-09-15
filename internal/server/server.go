@@ -20,6 +20,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/manager"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/plugin"
+	"github.com/WuKongIM/WuKongIM/internal/presence"
 	pusherevent "github.com/WuKongIM/WuKongIM/internal/pusher/event"
 	pusherhandler "github.com/WuKongIM/WuKongIM/internal/pusher/handler"
 	"github.com/WuKongIM/WuKongIM/internal/service"
@@ -103,6 +104,7 @@ func New(opts *options.Options) *Server {
 	}
 
 	s.ingress = ingress.New()
+	service.Presence = presence.New(opts.Cluster.NodeId)
 
 	// user event pool
 	s.userHandler = userhandler.NewHandler()
@@ -286,11 +288,13 @@ func (s *Server) Start() error {
 
 	}
 
+	service.Presence.SetRoutes()
 	err = s.clusterServer.Start()
 	if err != nil {
 		return err
 	}
 
+	go service.Presence.Run(s.ctx)
 	s.engine.OnConnect(s.onConnect)
 	s.engine.OnData(s.onData)
 	s.engine.OnClose(s.onClose)
@@ -582,6 +586,7 @@ func (s *Server) onConnect(conn wknet.Conn) error {
 	s.trace.Metrics.App().ConnCountAdd(1)
 
 	service.ConnManager.AddConn(conn)
+	service.Presence.Track(conn)
 
 	return nil
 }
@@ -600,6 +605,7 @@ func (s *Server) onConnect(conn wknet.Conn) error {
 // }
 
 func (s *Server) onClose(conn wknet.Conn) {
+	service.Presence.Close(conn)
 
 	s.trace.Metrics.App().ConnCountAdd(-1)
 	connCtxObj := conn.Context()

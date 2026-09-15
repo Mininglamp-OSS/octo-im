@@ -227,9 +227,12 @@ func (p *poller) allConn() []*eventbus.Conn {
 }
 
 func (p *poller) updateConn(conn *eventbus.Conn) {
+	p.Lock()
+	defer p.Unlock()
 	h := p.handler(conn.Uid)
 	if h == nil {
-		return
+		h = newUserHandler(conn.Uid, p)
+		p.waitlist.push(h)
 	}
 	h.conns.addOrUpdateConn(conn)
 }

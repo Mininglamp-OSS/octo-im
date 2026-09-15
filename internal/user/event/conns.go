@@ -44,7 +44,7 @@ func (c *conns) remove(cn *eventbus.Conn) {
 	c.Lock()
 	defer c.Unlock()
 	for i, conn := range c.conns {
-		if conn.ConnId == cn.ConnId && conn.NodeId == cn.NodeId {
+		if conn.SameSession(cn) {
 			c.conns = append(c.conns[:i], c.conns[i+1:]...)
 			return
 		}
@@ -106,7 +106,7 @@ func (c *conns) len() int {
 func (c *conns) allConns() []*eventbus.Conn {
 	c.RLock()
 	defer c.RUnlock()
-	return c.conns
+	return append([]*eventbus.Conn(nil), c.conns...)
 }
 
 func (c *conns) authedConns() []*eventbus.Conn {

@@ -174,7 +174,7 @@ func CheckConnValidAndGetRealConn(conn *eventbus.Conn) (wknet.Conn, error) {
 	if ctxByFd != nil {
 		eventConn, ok := ctxByFd.(*eventbus.Conn)
 		if ok && eventConn != nil {
-			if eventConn.ConnId != conn.ConnId {
+			if !eventConn.SameSession(conn) {
 				return nil, fmt.Errorf("connId not match, connId: %d, realConnId: %d", conn.ConnId, eventConn.ConnId)
 			}
 		}
