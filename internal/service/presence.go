@@ -13,9 +13,12 @@ type IPresence interface {
 	Track(wknet.Conn)
 	Prepare(wknet.Conn, *eventbus.Conn)
 	Authenticate(*eventbus.Conn) bool
+	RejectedCount() uint64
+	LocalSession(*eventbus.Conn) *eventbus.Conn
 	Close(wknet.Conn)
 	Forget(*eventbus.Conn)
 	Recover(context.Context, []string) error
+	IsReady(string) bool
 	Verify(context.Context, *eventbus.Conn) (*eventbus.Conn, error)
 	SetRoutes()
 	Run(context.Context)

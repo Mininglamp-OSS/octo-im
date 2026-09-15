@@ -127,6 +127,27 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 	// 本地分发 （分发本节点上的用户）
 	var offlineUids []string // 需要推离线的用户
 	var pubshEvents []*eventbus.Event
+	appendOnline := func(uid string, capacity int) {
+		for _, event := range events {
+			if pubshEvents == nil {
+				pubshEvents = make([]*eventbus.Event, 0, len(events)*capacity)
+			}
+			cloneMsg := event.Clone()
+			cloneMsg.ToUid = uid
+			cloneMsg.ChannelId = channelId
+			cloneMsg.ChannelType = channelType
+			cloneMsg.Type = eventbus.EventPushOnline
+			pubshEvents = append(pubshEvents, cloneMsg)
+		}
+	}
+	flushOnline := func() {
+		if len(pubshEvents) == 0 {
+			return
+		}
+		id := eventbus.Pusher.AddEvents(pubshEvents)
+		eventbus.Pusher.Advance(id)
+		pubshEvents = nil
+	}
 	localHasEvent := false
 	for _, node := range tag.Nodes {
 		if node.LeaderId != options.G.Cluster.NodeId {
@@ -135,14 +156,29 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 		if len(node.Uids) > 0 {
 			localHasEvent = true
 		}
+		delivered := make(map[string]bool, len(node.Uids))
 		if service.Presence != nil {
+			unknownUids := make([]string, 0, len(node.Uids))
+			for _, uid := range node.Uids {
+				if options.G.IsSystemUid(uid) {
+					continue
+				}
+				isOnline, _ := h.deviceOnlineStatus(uid)
+				if isOnline {
+					appendOnline(uid, len(node.Uids))
+					delivered[uid] = true
+				} else {
+					unknownUids = append(unknownUids, uid)
+				}
+			}
+			// Do not hold known-live delivery behind cold recovery RPCs.
+			flushOnline()
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			err := service.Presence.Recover(ctx, node.Uids)
+			err := service.Presence.Recover(ctx, unknownUids)
 			cancel()
 			if err != nil {
-				h.Warn("recipient authority recovery incomplete", zap.Error(err))
-				// Unknown presence must not be reported as offline.
-				continue
+				h.Warn("recipient authority recovery incomplete; delivering to known sessions",
+					zap.Error(err), zap.Int("recipientCount", len(node.Uids)))
 			}
 		}
 		for _, uid := range node.Uids {
@@ -150,29 +186,17 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 				continue
 			}
 			isOnline, masterIsOnline := h.deviceOnlineStatus(uid)
-			if !masterIsOnline && channelType != wkproto.ChannelTypeAgent { // agent不需要触发离线的webhook
+			presenceKnown := service.Presence == nil || service.Presence.IsReady(uid)
+			if !masterIsOnline && presenceKnown && channelType != wkproto.ChannelTypeAgent { // agent不需要触发离线的webhook
 				if offlineUids == nil {
 					offlineUids = make([]string, 0, len(node.Uids))
 				}
 				offlineUids = append(offlineUids, uid)
 			}
-			if !isOnline {
+			if !isOnline || delivered[uid] {
 				continue
 			}
-
-			for _, event := range events {
-
-				if pubshEvents == nil {
-					pubshEvents = make([]*eventbus.Event, 0, len(events)*len(node.Uids))
-				}
-				cloneMsg := event.Clone()
-				cloneMsg.ToUid = uid
-				cloneMsg.ChannelId = channelId
-				cloneMsg.ChannelType = channelType
-				cloneMsg.Type = eventbus.EventPushOnline
-				pubshEvents = append(pubshEvents, cloneMsg)
-
-			}
+			appendOnline(uid, len(node.Uids))
 		}
 	}
 
@@ -183,10 +207,7 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 		}
 	}
 
-	if len(pubshEvents) > 0 {
-		id := eventbus.Pusher.AddEvents(pubshEvents)
-		eventbus.Pusher.Advance(id)
-	}
+	flushOnline()
 	if len(offlineUids) > 0 {
 		offlineEvents := make([]*eventbus.Event, 0, len(events))
 		for _, event := range events {

@@ -157,3 +157,22 @@ func (c *Conn) String() string {
 func (c *Conn) SameSession(other *Conn) bool {
 	return other != nil && c.Equal(other) && c.OwnerBootID == other.OwnerBootID && c.SessionID == other.SessionID
 }
+
+// HasSessionIdentity reports whether the descriptor carries the complete
+// owner/session fence introduced by presence recovery.
+func (c *Conn) HasSessionIdentity() bool {
+	return c != nil && c.OwnerBootID != "" && c.SessionID != ""
+}
+
+// IsLegacySession reports an identity-less descriptor produced by a node that
+// predates presence recovery. A partially populated identity is never legacy.
+func (c *Conn) IsLegacySession() bool {
+	return c != nil && c.OwnerBootID == "" && c.SessionID == ""
+}
+
+// LegacyMatches provides the strongest comparison available after an old
+// node has decoded and re-encoded a descriptor without the appended identity.
+func (c *Conn) LegacyMatches(other *Conn) bool {
+	return other != nil && c.Equal(other) && c.DeviceId == other.DeviceId &&
+		c.DeviceFlag == other.DeviceFlag && c.Uptime == other.Uptime
+}

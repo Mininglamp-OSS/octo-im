@@ -53,10 +53,12 @@ func (h *Handler) closeConn(ctx *eventbus.UserContext) {
 func (h *Handler) removeConn(ctx *eventbus.UserContext) {
 
 	for _, event := range ctx.Events {
-		if service.Presence != nil {
-			service.Presence.Forget(event.Conn)
+		if !event.PresenceReconciled {
+			if service.Presence != nil {
+				service.Presence.Forget(event.Conn)
+			}
+			eventbus.User.DirectRemoveConn(event.Conn)
 		}
-		eventbus.User.DirectRemoveConn(event.Conn)
 		if event.Conn.Auth {
 			h.notifyUserOfflineIfNeed(event.Conn)
 		}

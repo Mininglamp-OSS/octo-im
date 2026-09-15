@@ -174,8 +174,12 @@ func CheckConnValidAndGetRealConn(conn *eventbus.Conn) (wknet.Conn, error) {
 	if ctxByFd != nil {
 		eventConn, ok := ctxByFd.(*eventbus.Conn)
 		if ok && eventConn != nil {
-			if !eventConn.SameSession(conn) {
-				return nil, fmt.Errorf("connId not match, connId: %d, realConnId: %d", conn.ConnId, eventConn.ConnId)
+			matches := eventConn.SameSession(conn)
+			if conn.IsLegacySession() {
+				matches = eventConn.LegacyMatches(conn)
+			}
+			if !matches {
+				return nil, fmt.Errorf("session identity does not match, uid: %s, connId: %d", conn.Uid, conn.ConnId)
 			}
 		}
 	}

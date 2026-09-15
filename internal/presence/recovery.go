@@ -3,6 +3,7 @@ package presence
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 const snapshotPath = "/wk/presence/snapshot/v1"
 const touchPath = "/wk/presence/touch/v1"
+const maxPresenceRequestBody = 64 << 10
 
 type snapshotResponse struct {
 	Boot     string
@@ -24,7 +26,7 @@ type snapshotResponse struct {
 func (m *Manager) SetRoutes() {
 	service.Cluster.Route(snapshotPath, func(c *wkserver.Context) {
 		var uids []string
-		if json.Unmarshal(c.Body(), &uids) != nil {
+		if len(c.Body()) > maxPresenceRequestBody || json.Unmarshal(c.Body(), &uids) != nil {
 			c.WriteErr(ErrNotReady)
 			return
 		}
@@ -42,7 +44,7 @@ func (m *Manager) SetRoutes() {
 	})
 	service.Cluster.Route(touchPath, func(c *wkserver.Context) {
 		var uids []string
-		if json.Unmarshal(c.Body(), &uids) != nil || len(uids) > 128 {
+		if len(c.Body()) > maxPresenceRequestBody || json.Unmarshal(c.Body(), &uids) != nil || len(uids) > 128 {
 			c.WriteErr(ErrNotReady)
 			return
 		}
@@ -116,21 +118,30 @@ func (m *Manager) Verify(ctx context.Context, expected *eventbus.Conn) (*eventbu
 	}
 	for _, conn := range conns {
 		if conn.SameSession(expected) {
-			return conn, nil
+			// The snapshot proves only boot/session liveness. Keep the caller's
+			// descriptor so connection crypto never has to cross the snapshot route.
+			return expected, nil
 		}
 	}
 	return nil, ErrNotReady
 }
 
 func (m *Manager) Recover(parent context.Context, uids []string) error {
+	missing := m.filterMissing(uids)
+	if len(missing) == 0 {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 	defer cancel()
 	if err := m.lockRecovery(ctx); err != nil {
 		return err
 	}
 	defer func() { <-m.gate }()
-	for offset := 0; offset < len(uids); offset += 128 {
-		batch := uids[offset:min(offset+128, len(uids))]
+	// Another recovery may have completed while this call waited for capacity.
+	missing = m.filterMissing(missing)
+	var recoveryErrors []error
+	for offset := 0; offset < len(missing); offset += 128 {
+		batch := missing[offset:min(offset+128, len(missing))]
 		var err error
 		for attempt := 0; attempt < 3; attempt++ {
 			err = m.recoverBatch(ctx, batch)
@@ -146,10 +157,25 @@ func (m *Manager) Recover(parent context.Context, uids []string) error {
 			}
 		}
 		if err != nil {
-			return err
+			recoveryErrors = append(recoveryErrors, err)
 		}
 	}
-	return nil
+	return errors.Join(recoveryErrors...)
+}
+
+func (m *Manager) filterMissing(uids []string) []string {
+	seen := make(map[string]bool, len(uids))
+	missing := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		if uid == "" || seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		if !m.IsReady(uid) {
+			missing = append(missing, uid)
+		}
+	}
+	return missing
 }
 
 func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
@@ -160,24 +186,29 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 	states := map[string]*readiness{}
 	generations := map[string]uint64{}
 	var missing []string
-	m.mu.Lock()
-	if len(m.ready)+len(uids) > 32768 {
-		m.ready = make(map[string]*readiness)
+	now := time.Now()
+	logical := make(map[string]bool, len(uids))
+	for _, uid := range uids {
+		logical[uid] = len(eventbus.User.ConnsByUid(uid)) > 0
 	}
+	var authorityIncomplete bool
+	m.mu.Lock()
+	m.ensureReadyCapacityLocked(len(uids), now)
 	for _, uid := range uids {
 		if uid == "" {
 			continue
 		}
 		if service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid)) != m.node {
-			m.mu.Unlock()
-			return ErrNotReady
+			authorityIncomplete = true
+			continue
 		}
 		r := m.ready[uid]
 		if r == nil {
-			r = &readiness{}
+			r = &readiness{lastUsed: now}
 			m.ready[uid] = r
 		}
-		if r.version == version && time.Now().Before(r.until) && len(eventbus.User.ConnsByUid(uid)) > 0 {
+		if r.version == version && now.Before(r.until) && (!r.online || logical[uid]) {
+			r.lastUsed = now
 			continue
 		}
 		if states[uid] != nil {
@@ -189,6 +220,9 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 	}
 	m.mu.Unlock()
 	if len(missing) == 0 {
+		if authorityIncomplete {
+			return ErrNotReady
+		}
 		return nil
 	}
 	nodes := service.Cluster.Nodes()
@@ -206,23 +240,31 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 		return ErrNotReady
 	}
 	results := make([][]*eventbus.Conn, len(owners))
-	group, readCtx := errgroup.WithContext(ctx)
+	readErrors := make([]error, len(owners))
+	group := errgroup.Group{}
 	group.SetLimit(4)
 	for i, node := range owners {
 		i, node := i, node
 		group.Go(func() error {
-			requestCtx, cancel := context.WithTimeout(readCtx, time.Second)
+			requestCtx, cancel := context.WithTimeout(ctx, time.Second)
 			defer cancel()
 			conns, err := m.read(requestCtx, node, missing)
 			if err != nil {
-				return err
+				readErrors[i] = err
+				return nil
 			}
 			results[i] = conns
 			return nil
 		})
 	}
-	if err := group.Wait(); err != nil {
-		return fmt.Errorf("%w: %v", ErrNotReady, err)
+	_ = group.Wait()
+	complete := !authorityIncomplete
+	var ownerErrors []error
+	for _, err := range readErrors {
+		if err != nil {
+			complete = false
+			ownerErrors = append(ownerErrors, err)
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -240,31 +282,42 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 			byUID[conn.Uid] = append(byUID[conn.Uid], conn)
 		}
 	}
+	completedAt := time.Now()
 	for uid, r := range states {
 		current := byUID[uid]
-		for _, old := range eventbus.User.ConnsByUid(uid) {
-			if !old.Auth {
-				continue
-			}
-			found := false
-			for _, conn := range current {
-				if old.SameSession(conn) {
-					found = true
-					break
+		if complete {
+			for _, old := range eventbus.User.ConnsByUid(uid) {
+				if !old.Auth {
+					continue
 				}
-			}
-			if !found {
-				eventbus.User.DirectRemoveConn(old)
+				found := false
+				for _, conn := range current {
+					if old.SameSession(conn) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					eventbus.User.RemoveConnRecovered(old)
+				}
 			}
 		}
 		for _, conn := range current {
 			eventbus.User.UpdateConn(conn)
 		}
-		r.version = version
-		r.until = time.Time{}
-		if len(current) > 0 {
-			r.until = time.Now().Add(5 * time.Second)
+		if complete {
+			r.version = version
+			r.online = len(current) > 0
+			r.lastUsed = completedAt
+			if r.online {
+				r.until = completedAt.Add(5 * time.Second)
+			} else {
+				r.until = completedAt.Add(time.Second)
+			}
 		}
+	}
+	if !complete {
+		return fmt.Errorf("%w: %v", ErrNotReady, errors.Join(ownerErrors...))
 	}
 	return nil
 }

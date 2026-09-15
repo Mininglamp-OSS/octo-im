@@ -80,9 +80,9 @@ type Event struct {
 	Type         EventType
 	Conn         *Conn
 	Frame        wkproto.Frame
-	MessageId  int64
-	MessageSeq uint64
-	ReasonCode wkproto.ReasonCode
+	MessageId    int64
+	MessageSeq   uint64
+	ReasonCode   wkproto.ReasonCode
 	TagKey       string // tag的key
 	ToUid        string // 发送事件的目标用户
 	SourceNodeId uint64 // 事件发起源节点
@@ -94,25 +94,29 @@ type Event struct {
 	ChannelId    string   // 频道ID
 	ChannelType  uint8    // 频道类型
 	ReqId        string   // 请求ID(非必填)(jsonrpc)
+	// PresenceReconciled marks a local recovery eviction whose logical removal
+	// already happened; the user handler only needs to emit the offline signal.
+	PresenceReconciled bool
 }
 
 func (e *Event) Clone() *Event {
 	return &Event{
-		Type:         e.Type,
-		Conn:         e.Conn,
-		Frame:        e.Frame,
-		MessageId:  e.MessageId,
-		MessageSeq: e.MessageSeq,
-		ReasonCode: e.ReasonCode,
-		TagKey:       e.TagKey,
-		ToUid:        e.ToUid,
-		SourceNodeId: e.SourceNodeId,
-		Track:        e.Track.Clone(),
-		Index:        e.Index,
-		OfflineUsers: e.OfflineUsers,
-		ChannelId:    e.ChannelId,
-		ChannelType:  e.ChannelType,
-		ReqId:        e.ReqId,
+		Type:               e.Type,
+		Conn:               e.Conn,
+		Frame:              e.Frame,
+		MessageId:          e.MessageId,
+		MessageSeq:         e.MessageSeq,
+		ReasonCode:         e.ReasonCode,
+		TagKey:             e.TagKey,
+		ToUid:              e.ToUid,
+		SourceNodeId:       e.SourceNodeId,
+		Track:              e.Track.Clone(),
+		Index:              e.Index,
+		OfflineUsers:       e.OfflineUsers,
+		ChannelId:          e.ChannelId,
+		ChannelType:        e.ChannelType,
+		ReqId:              e.ReqId,
+		PresenceReconciled: e.PresenceReconciled,
 	}
 }
 
@@ -126,12 +130,12 @@ func (e *Event) Size() uint64 {
 	if e.hasFrame() == 1 {
 		size += 4 + uint64(e.Frame.GetFrameSize())
 	}
-	size += 8 // message id
-	size += 8 // message seq
-	size += 1 // reason code
-	size += uint64(2 + len(e.TagKey))   // tag key
-	size += uint64(2 + len(e.ToUid))    // to uid
-	size += 8                           // source node id
+	size += 8                         // message id
+	size += 8                         // message seq
+	size += 1                         // reason code
+	size += uint64(2 + len(e.TagKey)) // tag key
+	size += uint64(2 + len(e.ToUid))  // to uid
+	size += 8                         // source node id
 
 	if e.hasTrack() == 1 {
 		size += e.Track.Size()

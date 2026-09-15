@@ -164,6 +164,20 @@ func (u *userPlus) RemoveConn(conn *Conn) {
 	})
 }
 
+// RemoveConnRecovered removes a stale logical session immediately, then
+// schedules the normal offline notification without invalidating the fresh
+// recovery snapshot that proved the session absent.
+func (u *userPlus) RemoveConnRecovered(conn *Conn) {
+	u.user.RemoveConn(conn)
+	u.user.AddEvent(conn.Uid, &Event{
+		Type:               EventConnRemove,
+		Conn:               conn,
+		SourceNodeId:       options.G.Cluster.NodeId,
+		PresenceReconciled: true,
+	})
+	u.user.Advance(conn.Uid)
+}
+
 // RemoveLeaderConn 移除leader节点中的连接
 func (u *userPlus) RemoveLeaderConn(conn *Conn) {
 	u.user.AddEvent(conn.Uid, &Event{

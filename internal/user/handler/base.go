@@ -66,30 +66,9 @@ func (h *Handler) OnEvent(ctx *eventbus.UserContext) {
 		h.notForwardToLeader(ctx.EventType) {
 		// A forwarded descriptor is only a claim until its physical owner verifies it.
 		if ctx.EventType == eventbus.EventOnSend && service.Presence != nil {
-			for _, e := range ctx.Events {
-				if e.Conn == nil {
-					return
-				}
-				known := eventbus.User.ConnById(ctx.Uid, e.Conn.NodeId, e.Conn.ConnId)
-				if known != nil && known.Auth && known.SameSession(e.Conn) {
-					e.Conn = known
-					continue
-				}
-				verifyCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-				verified, err := service.Presence.Verify(verifyCtx, e.Conn)
-				cancel()
-				if err != nil {
-					h.Warn("physical session verification failed", zap.Error(err))
-					for _, pending := range ctx.Events {
-						if packet, ok := pending.Frame.(*wkproto.SendPacket); ok && pending.Conn != nil {
-							eventbus.User.ConnWrite(pending.ReqId, pending.Conn, &wkproto.SendackPacket{ClientSeq: packet.ClientSeq, ClientMsgNo: packet.ClientMsgNo, ReasonCode: wkproto.ReasonNodeNotMatch})
-							eventbus.User.Advance(pending.Conn.Uid)
-						}
-					}
-					return
-				}
-				e.Conn = verified
-				eventbus.User.UpdateConn(verified)
+			ctx.Events = h.verifyOnSendEvents(ctx.Uid, ctx.Events)
+			if len(ctx.Events) == 0 {
+				return
 			}
 		}
 		eventbus.ExecuteUserEvent(ctx)
@@ -103,11 +82,52 @@ func (h *Handler) OnEvent(ctx *eventbus.UserContext) {
 	}
 }
 
+func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*eventbus.Event {
+	verifiedEvents := make([]*eventbus.Event, 0, len(events))
+	for _, event := range events {
+		if event == nil || event.Conn == nil || event.Frame == nil {
+			h.Warn("skip malformed on-send event", zap.String("uid", uid))
+			continue
+		}
+		known := eventbus.User.ConnById(uid, event.Conn.NodeId, event.Conn.ConnId)
+		if known != nil && known.Auth && known.SameSession(event.Conn) {
+			event.Conn = known
+			verifiedEvents = append(verifiedEvents, event)
+			continue
+		}
+		verifyCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		verified, err := service.Presence.Verify(verifyCtx, event.Conn)
+		cancel()
+		if err != nil {
+			h.Warn("physical session verification failed",
+				zap.Error(err),
+				zap.String("uid", event.Conn.Uid),
+				zap.Uint64("nodeId", event.Conn.NodeId),
+				zap.Int64("connId", event.Conn.ConnId))
+			if packet, ok := event.Frame.(*wkproto.SendPacket); ok {
+				eventbus.User.ConnWrite(event.ReqId, event.Conn, &wkproto.SendackPacket{
+					Framer:      packet.Framer,
+					MessageID:   event.MessageId,
+					ClientSeq:   packet.ClientSeq,
+					ClientMsgNo: packet.ClientMsgNo,
+					ReasonCode:  wkproto.ReasonNodeNotMatch,
+				})
+				eventbus.User.Advance(event.Conn.Uid)
+			}
+			continue
+		}
+		event.Conn = verified
+		eventbus.User.UpdateConn(verified)
+		verifiedEvents = append(verifiedEvents, event)
+	}
+	return verifiedEvents
+}
+
 // 统计输入
 func (h *Handler) totalIn(ctx *eventbus.UserContext) {
 	// 统计
 	for _, event := range ctx.Events {
-		if event.Type == eventbus.EventOnSend {
+		if event != nil && event.Type == eventbus.EventOnSend && event.Frame != nil && event.Conn != nil {
 			frameType := event.Frame.GetFrameType()
 			// 统计
 			conn := event.Conn

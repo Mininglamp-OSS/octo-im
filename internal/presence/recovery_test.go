@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -29,8 +30,9 @@ func (c *testSocket) Context() interface{}     { return c.ctx }
 
 type testUsers struct {
 	eventbus.IUser
-	mu    sync.Mutex
-	conns []*eventbus.Conn
+	mu     sync.Mutex
+	conns  []*eventbus.Conn
+	events []*eventbus.Event
 }
 
 func (u *testUsers) ConnsByUid(uid string) []*eventbus.Conn {
@@ -65,28 +67,45 @@ func (u *testUsers) RemoveConn(conn *eventbus.Conn) {
 		}
 	}
 }
+func (u *testUsers) AddEvent(_ string, event *eventbus.Event) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.events = append(u.events, event)
+}
+func (u *testUsers) Advance(string) {}
 
 type testCluster struct {
 	icluster.ICluster
-	owner     *Manager
-	leader    uint64
-	version   uint64
-	request   func() error
-	afterRead func()
+	owner       *Manager
+	leader      uint64
+	version     uint64
+	request     func() error
+	requestNode func(uint64) error
+	afterRead   func()
+	mutate      func(*snapshotResponse)
+	nodes       []*types.Node
 }
 
 func (c *testCluster) GetSlotId(string) uint32    { return 19 }
 func (c *testCluster) SlotLeaderId(uint32) uint64 { return c.leader }
 func (c *testCluster) NodeVersion() uint64        { return c.version }
 func (c *testCluster) Nodes() []*types.Node {
+	if c.nodes != nil {
+		return c.nodes
+	}
 	return []*types.Node{{Id: 1, Online: true}, {Id: 2, Online: true}}
 }
-func (c *testCluster) RequestWithContext(ctx context.Context, _ uint64, path string, body []byte) (*proto.Response, error) {
+func (c *testCluster) RequestWithContext(ctx context.Context, node uint64, path string, body []byte) (*proto.Response, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if c.request != nil {
 		if err := c.request(); err != nil {
+			return nil, err
+		}
+	}
+	if c.requestNode != nil {
+		if err := c.requestNode(node); err != nil {
 			return nil, err
 		}
 	}
@@ -101,13 +120,18 @@ func (c *testCluster) RequestWithContext(ctx context.Context, _ uint64, path str
 	if c.afterRead != nil {
 		c.afterRead()
 	}
+	if c.mutate != nil {
+		c.mutate(&response)
+	}
 	data, _ := json.Marshal(response)
 	return &proto.Response{Status: proto.StatusOK, Body: data}, nil
 }
 
 func fixture(t *testing.T) (*Manager, *Manager, *testCluster, *testUsers, *testSocket, *eventbus.Conn) {
-	oldCluster, oldUser := service.Cluster, eventbus.User
-	t.Cleanup(func() { service.Cluster, eventbus.User = oldCluster, oldUser })
+	oldOptions, oldCluster, oldUser := options.G, service.Cluster, eventbus.User
+	t.Cleanup(func() { options.G, service.Cluster, eventbus.User = oldOptions, oldCluster, oldUser })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 2
 	owner, leader := New(1), New(2)
 	cluster := &testCluster{owner: owner, leader: 2, version: 1}
 	service.Cluster = cluster
@@ -153,6 +177,60 @@ func TestRecoveryFailsClosedWhenAnOwnerCannotBeRead(t *testing.T) {
 	cluster.request = nil
 	require.NoError(t, leader.Recover(context.Background(), []string{"u"}))
 	require.Len(t, users.ConnsByUid("u"), 1)
+}
+
+func TestPartialRecoveryPublishesKnownLiveSessionsWithoutClaimingReady(t *testing.T) {
+	_, leader, cluster, users, _, conn := fixture(t)
+	cluster.nodes = []*types.Node{{Id: 1, Online: true}, {Id: 2, Online: true}, {Id: 3, Online: true}}
+	cluster.requestNode = func(node uint64) error {
+		if node == 3 {
+			return errors.New("third owner unavailable")
+		}
+		return nil
+	}
+	err := leader.Recover(context.Background(), []string{conn.Uid})
+	require.Error(t, err)
+	got := users.ConnsByUid(conn.Uid)
+	require.Len(t, got, 1)
+	require.True(t, got[0].SameSession(conn))
+	require.False(t, leader.IsReady(conn.Uid))
+}
+
+func TestWarmRecoveryBypassesSaturatedColdGate(t *testing.T) {
+	_, leader, _, _, _, conn := fixture(t)
+	require.NoError(t, leader.Recover(context.Background(), []string{conn.Uid}))
+	for i := 0; i < cap(leader.gate); i++ {
+		leader.gate <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for len(leader.gate) > 0 {
+			<-leader.gate
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	require.NoError(t, leader.Recover(ctx, []string{conn.Uid}))
+}
+
+func TestCompleteNegativeSnapshotIsCachedBriefly(t *testing.T) {
+	owner, leader, _, users, raw, conn := fixture(t)
+	owner.Close(raw)
+	require.NoError(t, leader.Recover(context.Background(), []string{conn.Uid}))
+	require.Empty(t, users.ConnsByUid(conn.Uid))
+	require.True(t, leader.IsReady(conn.Uid))
+}
+
+func TestRecoveryEvictionSchedulesOfflineNotification(t *testing.T) {
+	owner, leader, _, users, raw, conn := fixture(t)
+	require.NoError(t, leader.Recover(context.Background(), []string{conn.Uid}))
+	owner.Close(raw)
+	leader.mu.Lock()
+	leader.ready[conn.Uid].until = time.Time{}
+	leader.mu.Unlock()
+	require.NoError(t, leader.Recover(context.Background(), []string{conn.Uid}))
+	require.Empty(t, users.ConnsByUid(conn.Uid))
+	require.Len(t, users.events, 1)
+	require.True(t, users.events[0].PresenceReconciled)
 }
 
 func TestSessionIdentityFencesIDReuseAndOwnerRestart(t *testing.T) {
@@ -215,4 +293,40 @@ func TestRegistryReindexesReplacedSocketsAndPendingIdentities(t *testing.T) {
 	require.Len(t, owner.physical, 1)
 	owner.Close(replacement)
 	require.Empty(t, owner.byUID)
+}
+
+func TestPrepareKeepsOneSessionIdentityPerSocket(t *testing.T) {
+	owner, _, _, _, raw, first := fixture(t)
+	second := &eventbus.Conn{Uid: first.Uid, NodeId: first.NodeId, ConnId: first.ConnId, DeviceId: first.DeviceId, DeviceFlag: first.DeviceFlag, Uptime: first.Uptime}
+	owner.Prepare(raw, second)
+	require.Equal(t, first.OwnerBootID, second.OwnerBootID)
+	require.Equal(t, first.SessionID, second.SessionID)
+}
+
+func TestSnapshotOmitsCryptoAndVerifyKeepsCallerDescriptor(t *testing.T) {
+	owner, leader, _, _, _, conn := fixture(t)
+	conn.AesIV = []byte("0123456789abcdef")
+	conn.AesKey = []byte("abcdef0123456789")
+	require.True(t, owner.Authenticate(conn))
+
+	snapshot, err := owner.snapshot([]string{conn.Uid})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Sessions, 1)
+	redacted := &eventbus.Conn{}
+	require.NoError(t, redacted.Decode(snapshot.Sessions[0]))
+	require.Empty(t, redacted.AesIV)
+	require.Empty(t, redacted.AesKey)
+
+	verified, err := leader.Verify(context.Background(), conn)
+	require.NoError(t, err)
+	require.Same(t, conn, verified)
+	require.Equal(t, []byte("0123456789abcdef"), verified.AesIV)
+	require.Equal(t, []byte("abcdef0123456789"), verified.AesKey)
+}
+
+func TestVerifyRejectsForeignSnapshotBoot(t *testing.T) {
+	_, leader, cluster, _, _, conn := fixture(t)
+	cluster.mutate = func(response *snapshotResponse) { response.Boot = "foreign-boot" }
+	_, err := leader.Verify(context.Background(), conn)
+	require.ErrorIs(t, err, ErrNotReady)
 }
