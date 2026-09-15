@@ -114,9 +114,9 @@ func Decode(data []byte) (body []byte, deadline int64, hops uint8, err error) {
 	return data[9:], deadline, hops, nil
 }
 
-// Request re-resolves authority on every attempt. No background goroutines or
-// additional queue are created; the caller's bounded event worker owns waiting.
-// Ambiguous responses may be retried only for explicitly replayable batches.
+// Request re-resolves authority after explicit retry responses. No background
+// goroutines or additional queue are created; the caller's bounded event worker
+// owns waiting. A transport error is outcome-ambiguous and is never replayed.
 func Request(path string, body []byte, events []*eventbus.Event, target func() uint64, local uint64, accept func([]byte) proto.Status) error {
 	return request(path, body, events, target, local, accept, nil, nil)
 }
@@ -134,8 +134,6 @@ func request(path string, body []byte, events []*eventbus.Event, target func() u
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	replayable := Replayable(events)
-	ambiguous := false
 	zeroTargets := 0
 	for attempt := 0; attempt < 6; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -149,19 +147,13 @@ func request(path string, body []byte, events []*eventbus.Event, target func() u
 		} else if node != 0 {
 			zeroTargets = 0
 			if capabilities != nil && legacy != nil && !capabilities.Supports(node) {
-				if ambiguous {
-					return fmt.Errorf("%w: v1 result lost before peer changed", ErrOutcomeUnknown)
-				}
 				return legacy(node)
 			}
 			attemptCtx, done := context.WithTimeout(ctx, 750*time.Millisecond)
 			resp, requestErr := service.Cluster.RequestWithContext(attemptCtx, node, path, data)
 			done()
 			if requestErr != nil || resp == nil {
-				ambiguous = true
-				if !replayable {
-					return fmt.Errorf("%w: request outcome unknown", ErrOutcomeUnknown)
-				}
+				return fmt.Errorf("%w: request outcome unknown", ErrOutcomeUnknown)
 			} else {
 				status = resp.Status
 			}
@@ -191,24 +183,6 @@ func request(path string, body []byte, events []*eventbus.Event, target func() u
 	return ErrUnavailable
 }
 
-func Replayable(events []*eventbus.Event) bool {
-	if len(events) == 0 {
-		return false
-	}
-	for _, e := range events {
-		switch packet := e.Frame.(type) {
-		case *wkproto.SendPacket:
-			if packet.NoPersist || packet.ClientMsgNo == "" {
-				return false
-			}
-		case *wkproto.SendackPacket, *wkproto.PingPacket, *wkproto.PongPacket:
-		default:
-			return false
-		}
-	}
-	return true
-}
-
 // Fail only answers pre-persistence SEND events. A post-commit distribution
 // failure must not contradict the success ACK already sent to the producer.
 func Fail(events []*eventbus.Event, cause error) {
@@ -220,7 +194,7 @@ func Fail(events []*eventbus.Event, cause error) {
 			continue
 		}
 		reasonCode := wkproto.ReasonNodeNotMatch
-		if errors.Is(cause, ErrOutcomeUnknown) && !Replayable([]*eventbus.Event{e}) {
+		if errors.Is(cause, ErrOutcomeUnknown) {
 			reasonCode = wkproto.ReasonSystemError
 		}
 		eventbus.User.ConnWrite(e.ReqId, e.Conn, &wkproto.SendackPacket{

@@ -34,7 +34,7 @@ func (c *requestCluster) RequestWithContext(ctx context.Context, node uint64, pa
 	return c.request(ctx, node, path, body)
 }
 
-func TestRequestReResolvesAfterAmbiguousSend(t *testing.T) {
+func TestRequestDoesNotReplayAfterAmbiguousSend(t *testing.T) {
 	old := service.Cluster
 	t.Cleanup(func() { service.Cluster = old })
 	leader := uint64(2)
@@ -50,9 +50,27 @@ func TestRequestReResolvesAfterAmbiguousSend(t *testing.T) {
 		return &proto.Response{Status: proto.StatusOK}, nil
 	}}
 	events := []*eventbus.Event{{Frame: &wkproto.SendPacket{ClientMsgNo: "stable"}}}
-	require.NoError(t, Request(UserPath, []byte("immutable encrypted packet"), events, func() uint64 { return leader }, 1, nil))
+	require.ErrorIs(t, Request(UserPath, []byte("immutable encrypted packet"), events, func() uint64 { return leader }, 1, nil), ErrOutcomeUnknown)
+	require.Equal(t, []uint64{2}, nodes)
+	require.Len(t, bodies, 1)
+}
+
+func TestRequestReResolvesAfterExplicitRetry(t *testing.T) {
+	old := service.Cluster
+	t.Cleanup(func() { service.Cluster = old })
+	leader := uint64(2)
+	var nodes []uint64
+	service.Cluster = &requestCluster{request: func(_ context.Context, node uint64, _ string, _ []byte) (*proto.Response, error) {
+		nodes = append(nodes, node)
+		if len(nodes) == 1 {
+			leader = 3
+			return &proto.Response{Status: StatusRetry}, nil
+		}
+		return &proto.Response{Status: proto.StatusOK}, nil
+	}}
+	events := []*eventbus.Event{{Frame: &wkproto.SendPacket{ClientMsgNo: "stable"}}}
+	require.NoError(t, Request(UserPath, nil, events, func() uint64 { return leader }, 1, nil))
 	require.Equal(t, []uint64{2, 3}, nodes)
-	require.Equal(t, bodies[0], bodies[1])
 }
 
 func TestRequestDoesNotReplayUnkeyedOrTransientSend(t *testing.T) {
@@ -161,6 +179,12 @@ func TestFailClassifiesAmbiguityAndSkipsPostCommitEvents(t *testing.T) {
 	require.Len(t, u.events, 1)
 	require.Equal(t, wkproto.ReasonSystemError, u.events[0].Frame.(*wkproto.SendackPacket).ReasonCode)
 	require.Equal(t, 1, u.advances)
+
+	u.events = nil
+	keyed := &eventbus.Event{Type: eventbus.EventOnSend, Conn: conn, Frame: &wkproto.SendPacket{ClientSeq: 8, ClientMsgNo: "stable"}}
+	Fail([]*eventbus.Event{keyed}, ErrOutcomeUnknown)
+	require.Len(t, u.events, 1)
+	require.Equal(t, wkproto.ReasonSystemError, u.events[0].Frame.(*wkproto.SendackPacket).ReasonCode)
 
 	u.events = nil
 	Fail([]*eventbus.Event{{Type: eventbus.EventChannelDistribute, Conn: conn, Frame: &wkproto.SendPacket{ClientSeq: 7}}}, ErrUnavailable)
