@@ -141,19 +141,20 @@ func (h *Handler) forwardsToNode(nodeId uint64, uid string, events []*eventbus.E
 	legacy := func(targetNode uint64) error {
 		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardUserEvent), Content: data})
 	}
-	if !h.forwardGate.TryAcquire() {
-		if forward.OnlyRetryableSends(events) {
-			err = forward.ErrUnavailable
-		} else {
-			// Fixed-destination lifecycle/write events cannot ask a client to
-			// retry. Before any v1 attempt, preserve them in the reconnect-aware
-			// transport queue instead of dropping the dequeued batch.
-			err = legacy(nodeId)
-		}
-		if err != nil {
-			h.Error("user forwarding concurrency limit reached", zap.Error(err), zap.String("uid", uid))
+	if !forward.OnlyRetryableSends(events) {
+		// Events without a retryable client ACK must not enter the v1 ambiguity
+		// window. Keep the base transport's reconnect retention for their entire
+		// path, regardless of current gate capacity.
+		if err = legacy(nodeId); err != nil {
+			h.Error("user forwarding through retained transport failed", zap.Error(err), zap.String("uid", uid))
 			forward.Fail(events, err)
 		}
+		return
+	}
+	if !h.forwardGate.TryAcquire() {
+		err = forward.ErrUnavailable
+		h.Error("user forwarding concurrency limit reached", zap.Error(err), zap.String("uid", uid))
+		forward.Fail(events, err)
 		return
 	}
 	defer h.forwardGate.Release()

@@ -145,7 +145,7 @@ func TestForwardConcurrencyGateFailsFastBeforeNetworkWait(t *testing.T) {
 	require.Equal(t, wkproto.ReasonNodeNotMatch, u.events[0].Frame.(*wkproto.SendackPacket).ReasonCode)
 }
 
-func TestForwardConcurrencyGatePreservesNonSendInTransportQueue(t *testing.T) {
+func TestNonSendForwardUsesTransportWithoutV1Attempt(t *testing.T) {
 	oldOptions, oldCluster := options.G, service.Cluster
 	t.Cleanup(func() { options.G, service.Cluster = oldOptions, oldCluster })
 	options.G = options.New()
@@ -154,8 +154,6 @@ func TestForwardConcurrencyGatePreservesNonSendInTransportQueue(t *testing.T) {
 	service.Cluster = c
 	h := NewHandler()
 	h.forwardGate = forward.NewGate(4)
-	require.True(t, h.forwardGate.TryAcquire())
-	defer h.forwardGate.Release()
 	e := &eventbus.Event{Type: eventbus.EventConnWriteFrame, Conn: &eventbus.Conn{Uid: "u", NodeId: 2}, Frame: &wkproto.PongPacket{}}
 
 	h.forwardsToNode(2, "u", []*eventbus.Event{e})

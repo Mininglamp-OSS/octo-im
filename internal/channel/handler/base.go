@@ -94,18 +94,19 @@ func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType ui
 	legacy := func(targetNode uint64) error {
 		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardChannelEvent), Content: data})
 	}
-	if !h.forwardGate.TryAcquire() {
-		if forward.OnlyRetryableSends(events) {
-			err = forward.ErrUnavailable
-		} else {
-			// Post-persistence distribution/webhook events have no client-side
-			// retry path. Preserve them in the reconnect-aware transport queue.
-			err = legacy(nodeId)
-		}
-		if err != nil {
-			h.Error("channel forwarding concurrency limit reached", zap.Error(err), zap.String("channelId", channelId))
+	if !forward.OnlyRetryableSends(events) {
+		// Distribution and webhook work has no client-side retry path. Keep it
+		// out of the v1 ambiguity window and retain it in the base transport.
+		if err = legacy(nodeId); err != nil {
+			h.Error("channel forwarding through retained transport failed", zap.Error(err), zap.String("channelId", channelId))
 			forward.Fail(events, err)
 		}
+		return
+	}
+	if !h.forwardGate.TryAcquire() {
+		err = forward.ErrUnavailable
+		h.Error("channel forwarding concurrency limit reached", zap.Error(err), zap.String("channelId", channelId))
+		forward.Fail(events, err)
 		return
 	}
 	defer h.forwardGate.Release()

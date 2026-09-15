@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -17,6 +18,7 @@ type forwardChannelCluster struct {
 	icluster.ICluster
 	leader    uint64
 	sendCalls int
+	requests  int
 }
 
 func (c *forwardChannelCluster) SlotLeaderIdOfChannel(string, uint8) (uint64, error) {
@@ -25,6 +27,10 @@ func (c *forwardChannelCluster) SlotLeaderIdOfChannel(string, uint8) (uint64, er
 func (c *forwardChannelCluster) Send(uint64, *proto.Message) error {
 	c.sendCalls++
 	return nil
+}
+func (c *forwardChannelCluster) RequestWithContext(context.Context, uint64, string, []byte) (*proto.Response, error) {
+	c.requests++
+	return &proto.Response{Status: proto.StatusOK}, nil
 }
 
 type forwardChannel struct {
@@ -87,7 +93,7 @@ func TestChannelForwardAdmissionRejectsWrongFrameAndMixedBatch(t *testing.T) {
 	}
 }
 
-func TestChannelForwardConcurrencyGatePreservesDistributionInTransportQueue(t *testing.T) {
+func TestChannelDistributionUsesTransportWithoutV1Attempt(t *testing.T) {
 	oldOptions, oldCluster := options.G, service.Cluster
 	t.Cleanup(func() { options.G, service.Cluster = oldOptions, oldCluster })
 	options.G = options.New()
@@ -96,11 +102,10 @@ func TestChannelForwardConcurrencyGatePreservesDistributionInTransportQueue(t *t
 	service.Cluster = c
 	h := NewHandler()
 	h.forwardGate = forward.NewGate(4)
-	require.True(t, h.forwardGate.TryAcquire())
-	defer h.forwardGate.Release()
-	e := &eventbus.Event{Type: eventbus.EventChannelDistribute, Frame: &wkproto.SendPacket{}}
+	e := &eventbus.Event{Type: eventbus.EventChannelDistribute, Conn: &eventbus.Conn{Uid: "sender", NodeId: 1}, Frame: &wkproto.SendPacket{}}
 
 	h.forwardsToNode(2, "room", 2, []*eventbus.Event{e})
 
+	require.Zero(t, c.requests)
 	require.Equal(t, 1, c.sendCalls)
 }
