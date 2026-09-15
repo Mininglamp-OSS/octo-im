@@ -37,9 +37,16 @@ func (rg *RaftGroup) ReadLeaderState(ctx context.Context, key string) (ReadState
 	}
 	select {
 	case state := <-req.result:
-		return state, ctx.Err()
+		return state, nil
 	case <-ctx.Done():
-		return ReadState{}, ctx.Err()
+		// Prefer an already-delivered snapshot when cancellation races the
+		// reply. Never wait for unfinished work after the deadline.
+		select {
+		case state := <-req.result:
+			return state, nil
+		default:
+			return ReadState{}, ctx.Err()
+		}
 	case <-rg.stopper.ShouldStop():
 		return ReadState{}, errors.New("raft group stopped")
 	}

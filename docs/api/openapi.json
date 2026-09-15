@@ -1291,6 +1291,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request parameters or channel count exceeds cluster.recentReadMaxChannels (default 10000); use supported paging or smaller batches."
+          },
+          "503": {
+            "description": "Temporary routing or leader-read failure; retry the complete request. No partial success is returned."
           }
         }
       }
@@ -1726,6 +1732,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request parameters or channel count exceeds cluster.recentReadMaxChannels (default 10000); use supported paging or smaller batches."
+          },
+          "503": {
+            "description": "Temporary routing or leader-read failure; retry the complete request. No partial success is returned."
           }
         }
       }
@@ -1733,8 +1745,10 @@
     "/conversation/syncMessages": {
       "post": {
         "summary": "Sync Recent Messages",
-        "description": "Synchronize recent messages for conversations",
-        "tags": ["Conversation"],
+        "description": "Synchronize recent messages for conversations Public endpoint: resolves each channel leader across the cluster. Valid unused channels return empty entries; duplicate channels are coalesced. Temporary read failures return HTTP 503.",
+        "tags": [
+          "Conversation"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -1758,6 +1772,77 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid channel ID or channel type, or raw channel count exceeds cluster.recentReadMaxChannels (default 10000); send smaller batches."
+          },
+          "503": {
+            "description": "Temporary routing or leader-read failure; retry the complete request. No partial success is returned."
+          }
+        }
+      }
+    },
+    "/conversation/syncMessages/v2": {
+      "post": {
+        "summary": "Sync Recent Messages on the Local Leader",
+        "description": "Peer read route on the same public API listener as v1; no additional authentication boundary. Serves locally led channels only, with complete coverage and role/configuration fences. Positive budget_ms is required for new clients (legacy positive budget in nanoseconds remains accepted). The advertised budget is capped by the scaled server budget and cluster.recentReadMaxTimeout, default 60 seconds. Raw channel count is capped by cluster.recentReadMaxChannels, default 10000.",
+        "tags": [
+          "Conversation"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/SyncRecentMessagesRequest"
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "budget_ms"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Complete local channel results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version",
+                    "channels"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer",
+                      "enum": [
+                        2
+                      ]
+                    },
+                    "channels": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChannelRecentMessagesResponse"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or raw channel count exceeds cluster.recentReadMaxChannels (default 10000); send smaller batches."
+          },
+          "503": {
+            "description": "Missing budget, routing, local leader or read failure. No partial success is returned."
           }
         }
       }
@@ -1822,6 +1907,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request parameters or channel count exceeds cluster.recentReadMaxChannels (default 10000); use supported paging or smaller batches."
+          },
+          "503": {
+            "description": "Temporary routing or leader-read failure; retry the complete request. No partial success is returned."
           }
         }
       }
@@ -4182,7 +4273,10 @@
       },
       "SyncRecentMessagesRequest": {
         "type": "object",
-        "required": ["uid", "channels"],
+        "required": [
+          "uid",
+          "channels"
+        ],
         "properties": {
           "uid": {
             "type": "string",
@@ -4194,7 +4288,7 @@
             "items": {
               "$ref": "#/components/schemas/ChannelRecentMessageRequest"
             },
-            "description": "List of channels to sync messages for"
+            "description": "Raw channel entries, including duplicates, must not exceed cluster.recentReadMaxChannels (default 10000). Split larger inputs into batches."
           },
           "msg_count": {
             "type": "integer",
@@ -4205,8 +4299,29 @@
           "order_by_last": {
             "type": "integer",
             "description": "Whether to order by last message (1=yes, 0=no)",
-            "enum": [0, 1],
+            "enum": [
+              0,
+              1
+            ],
             "default": 0
+          },
+          "budget_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Remaining request budget in milliseconds; required for v2. Capped by the server allowance. Takes precedence over legacy budget."
+          },
+          "budget": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "deprecated": true,
+            "description": "Legacy remaining budget in nanoseconds; use budget_ms."
+          },
+          "peer_read": {
+            "type": "boolean",
+            "default": false,
+            "description": "Keep a v1 peer fallback local instead of routing again; requires a positive budget. v2 always serves locally."
           }
         }
       },
@@ -4214,6 +4329,12 @@
         "type": "object",
         "required": ["channel_id", "channel_type"],
         "properties": {
+          "last_msg_seq": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Message sequence lower bound; zero is unbounded. Duplicate channels use the smallest lower bound in either ordering direction."
+          },
           "channel_id": {
             "type": "string",
             "description": "Channel ID",
