@@ -19,8 +19,14 @@ const touchPath = "/wk/presence/touch/v1"
 const maxPresenceRequestBody = 64 << 10
 
 type snapshotResponse struct {
-	Boot     string
-	Sessions [][]byte
+	Boot             string
+	Sessions         [][]byte
+	PreparedSessions [][]byte
+}
+
+type snapshotState struct {
+	sessions []*eventbus.Conn
+	prepared []*eventbus.Conn
 }
 
 func (m *Manager) SetRoutes() {
@@ -60,63 +66,76 @@ func (m *Manager) SetRoutes() {
 	})
 }
 
-func (m *Manager) read(ctx context.Context, node uint64, uids []string) ([]*eventbus.Conn, error) {
+func (m *Manager) read(ctx context.Context, node uint64, uids []string) (snapshotState, error) {
 	var response snapshotResponse
 	if node == m.node {
 		var err error
 		response, err = m.snapshot(uids)
 		if err != nil {
-			return nil, err
+			return snapshotState{}, err
 		}
 	} else {
 		body, _ := json.Marshal(uids)
 		resp, err := service.Cluster.RequestWithContext(ctx, node, snapshotPath, body)
 		if err != nil {
-			return nil, err
+			return snapshotState{}, err
 		}
 		if resp == nil || resp.Status != proto.StatusOK {
-			return nil, ErrNotReady
+			return snapshotState{}, ErrNotReady
 		}
 		if err = json.Unmarshal(resp.Body, &response); err != nil {
-			return nil, err
+			return snapshotState{}, err
 		}
 	}
 	if response.Boot == "" {
-		return nil, ErrNotReady
+		return snapshotState{}, ErrNotReady
 	}
 	requested := map[string]bool{}
 	for _, uid := range uids {
 		requested[uid] = true
 	}
-	var conns []*eventbus.Conn
+	state := snapshotState{}
 	seen := map[string]bool{}
-	for _, data := range response.Sessions {
-		conn := &eventbus.Conn{}
-		if err := conn.Decode(data); err != nil {
-			return nil, err
+	decode := func(encoded [][]byte, authenticated bool) ([]*eventbus.Conn, error) {
+		conns := make([]*eventbus.Conn, 0, len(encoded))
+		for _, data := range encoded {
+			conn := &eventbus.Conn{}
+			if err := conn.Decode(data); err != nil {
+				return nil, err
+			}
+			if conn.Auth != authenticated || !requested[conn.Uid] || conn.NodeId != node || conn.OwnerBootID != response.Boot || conn.SessionID == "" {
+				return nil, ErrNotReady
+			}
+			if seen[conn.SessionID] {
+				return nil, ErrNotReady
+			}
+			seen[conn.SessionID] = true
+			conn.LastActive = uint64(time.Now().Unix())
+			conns = append(conns, conn)
 		}
-		if !conn.Auth || !requested[conn.Uid] || conn.NodeId != node || conn.OwnerBootID != response.Boot || conn.SessionID == "" {
-			return nil, ErrNotReady
-		}
-		if seen[conn.SessionID] {
-			return nil, ErrNotReady
-		}
-		seen[conn.SessionID] = true
-		conn.LastActive = uint64(time.Now().Unix())
-		conns = append(conns, conn)
+		return conns, nil
 	}
-	return conns, nil
+	var err error
+	state.sessions, err = decode(response.Sessions, true)
+	if err != nil {
+		return snapshotState{}, err
+	}
+	state.prepared, err = decode(response.PreparedSessions, false)
+	if err != nil {
+		return snapshotState{}, err
+	}
+	return state, nil
 }
 
 func (m *Manager) Verify(ctx context.Context, expected *eventbus.Conn) (*eventbus.Conn, error) {
 	if expected == nil || expected.SessionID == "" || expected.OwnerBootID == "" {
 		return nil, ErrNotReady
 	}
-	conns, err := m.read(ctx, expected.NodeId, []string{expected.Uid})
+	state, err := m.read(ctx, expected.NodeId, []string{expected.Uid})
 	if err != nil {
 		return nil, err
 	}
-	for _, conn := range conns {
+	for _, conn := range state.sessions {
 		if conn.SameSession(expected) {
 			// The snapshot proves only boot/session liveness. Keep the caller's
 			// descriptor so connection crypto never has to cross the snapshot route.
@@ -257,7 +276,7 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 	if !foundLocal {
 		return ErrNotReady
 	}
-	results := make([][]*eventbus.Conn, len(owners))
+	results := make([]snapshotState, len(owners))
 	readErrors := make([]error, len(owners))
 	group := errgroup.Group{}
 	group.SetLimit(4)
@@ -266,12 +285,12 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 		group.Go(func() error {
 			requestCtx, cancel := context.WithTimeout(ctx, time.Second)
 			defer cancel()
-			conns, err := m.read(requestCtx, node, missing)
+			state, err := m.read(requestCtx, node, missing)
 			if err != nil {
 				readErrors[i] = err
 				return nil
 			}
-			results[i] = conns
+			results[i] = state
 			return nil
 		})
 	}
@@ -296,9 +315,13 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 		}
 	}
 	byUID := make(map[string][]*eventbus.Conn)
-	for _, conns := range results {
-		for _, conn := range conns {
+	preparedByUID := make(map[string][]*eventbus.Conn)
+	for _, result := range results {
+		for _, conn := range result.sessions {
 			byUID[conn.Uid] = append(byUID[conn.Uid], conn)
+		}
+		for _, conn := range result.prepared {
+			preparedByUID[conn.Uid] = append(preparedByUID[conn.Uid], conn)
 		}
 	}
 	completedAt := time.Now()
@@ -314,6 +337,14 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 					if old.SameSession(conn) {
 						found = true
 						break
+					}
+				}
+				if !found {
+					for _, conn := range preparedByUID[uid] {
+						if old.SameSession(conn) {
+							found = true
+							break
+						}
 					}
 				}
 				if !found {

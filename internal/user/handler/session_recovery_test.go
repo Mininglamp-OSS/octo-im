@@ -14,6 +14,8 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
+	serverproto "github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/stretchr/testify/require"
 )
@@ -158,6 +160,73 @@ func TestVerifyOnSendHasOneBatchDeadlineForDistinctSessions(t *testing.T) {
 	require.Equal(t, 1, verifyCalls)
 	require.Len(t, users.events, len(events))
 	require.Less(t, time.Since(start), 500*time.Millisecond)
+}
+
+func TestVerifyOnSendRestoresCryptoForRecoveredSession(t *testing.T) {
+	oldOptions, oldPresence, oldUser := options.G, service.Presence, eventbus.User
+	t.Cleanup(func() { options.G, service.Presence, eventbus.User = oldOptions, oldPresence, oldUser })
+	options.G = options.New()
+	known := &eventbus.Conn{Uid: "u", NodeId: 2, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "session"}
+	claim := &eventbus.Conn{
+		Uid: "u", NodeId: 2, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "session",
+		AesKey: []byte("0123456789abcdef"), AesIV: []byte("abcdef0123456789"),
+	}
+	users := &handlerUsers{known: known}
+	eventbus.RegisterUser(users)
+	presence := &verificationPresence{verify: func(*eventbus.Conn) (*eventbus.Conn, error) {
+		t.Fatal("matching recovered session must not require a snapshot RPC")
+		return nil, nil
+	}}
+	service.Presence = presence
+	packet := &wkproto.SendPacket{ClientSeq: 1, ClientMsgNo: "m", ChannelID: "c", ChannelType: 2}
+	var err error
+	packet.Payload, err = wkutil.AesEncryptPkcs7Base64([]byte("plain"), claim.AesKey, claim.AesIV)
+	require.NoError(t, err)
+	signature, err := wkutil.AesEncryptPkcs7Base64([]byte(packet.VerityString()), claim.AesKey, claim.AesIV)
+	require.NoError(t, err)
+	packet.MsgKey = wkutil.MD5Bytes(signature)
+
+	events := NewHandler().verifyOnSendEvents("u", []*eventbus.Event{{Type: eventbus.EventOnSend, Conn: claim, Frame: packet}})
+
+	require.Len(t, events, 1)
+	require.Equal(t, claim.AesIV, events[0].Conn.AesIV)
+	require.Equal(t, claim.AesKey, events[0].Conn.AesKey)
+	require.Empty(t, users.updated)
+	plain, err := NewHandler().decryptPayload(packet, events[0].Conn)
+	require.NoError(t, err)
+	require.Equal(t, []byte("plain"), plain)
+}
+
+func TestLegacyForwardKeepsCryptoOnRecoveredSessionEvent(t *testing.T) {
+	oldOptions, oldPresence, oldCluster, oldUser := options.G, service.Presence, service.Cluster, eventbus.User
+	t.Cleanup(func() {
+		options.G, service.Presence, service.Cluster, eventbus.User = oldOptions, oldPresence, oldCluster, oldUser
+	})
+	options.G = options.New()
+	options.G.Cluster.NodeId = 1
+	service.Cluster = &handlerCluster{}
+	service.Presence = &verificationPresence{}
+	known := &eventbus.Conn{Uid: "u", NodeId: 2, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "session"}
+	claim := &eventbus.Conn{
+		Uid: "u", NodeId: 2, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "session",
+		AesKey: []byte("0123456789abcdef"), AesIV: []byte("abcdef0123456789"),
+	}
+	users := &handlerUsers{known: known}
+	eventbus.RegisterUser(users)
+	request := &forwardUserEventReq{
+		fromNode: 2,
+		uid:      "u",
+		events:   eventbus.EventBatch{{Type: eventbus.EventOnSend, Conn: claim, Frame: &wkproto.SendPacket{ClientSeq: 1}}},
+	}
+	data, err := request.encode()
+	require.NoError(t, err)
+
+	NewHandler().onForwardUserEvent(&serverproto.Message{MsgType: uint32(msgForwardUserEvent), Content: data})
+
+	require.Len(t, users.events, 1)
+	require.Equal(t, claim.AesIV, users.events[0].Conn.AesIV)
+	require.Equal(t, claim.AesKey, users.events[0].Conn.AesKey)
+	require.Empty(t, users.updated)
 }
 
 type recvackRetryManager struct {

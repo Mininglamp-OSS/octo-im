@@ -214,17 +214,29 @@ func (m *Manager) snapshot(uids []string) (snapshotResponse, error) {
 	for uid := range requested {
 		for id := range m.byUID[uid] {
 			conn := m.physical[id].conn
-			if conn == nil || !conn.Auth || conn.Uid != uid {
+			if conn == nil || conn.Uid != uid {
 				continue
 			}
-			safe := copyConn(conn)
-			safe.AesIV = nil
-			safe.AesKey = nil
+			var safe *eventbus.Conn
+			if conn.Auth {
+				safe = copyConn(conn)
+				safe.AesIV = nil
+				safe.AesKey = nil
+			} else {
+				safe = &eventbus.Conn{
+					Uid: conn.Uid, NodeId: conn.NodeId, ConnId: conn.ConnId,
+					OwnerBootID: conn.OwnerBootID, SessionID: conn.SessionID,
+				}
+			}
 			data, err := safe.Encode()
 			if err != nil {
 				return snapshotResponse{}, err
 			}
-			response.Sessions = append(response.Sessions, data)
+			if conn.Auth {
+				response.Sessions = append(response.Sessions, data)
+			} else if conn.HasSessionIdentity() {
+				response.PreparedSessions = append(response.PreparedSessions, data)
+			}
 		}
 	}
 	return response, nil

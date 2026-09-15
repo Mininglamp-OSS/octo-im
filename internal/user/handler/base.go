@@ -120,7 +120,7 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 		}
 		known := eventbus.User.ConnById(uid, event.Conn.NodeId, event.Conn.ConnId)
 		if known != nil && known.Auth && known.SameSession(event.Conn) {
-			event.Conn = known
+			event.Conn = verifiedSessionDescriptor(known, event.Conn)
 			verifiedEvents = append(verifiedEvents, event)
 			continue
 		}
@@ -170,6 +170,25 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 		verifiedEvents = append(verifiedEvents, event)
 	}
 	return verifiedEvents
+}
+
+func verifiedSessionDescriptor(known, claimed *eventbus.Conn) *eventbus.Conn {
+	if known == nil || claimed == nil || !known.SameSession(claimed) ||
+		(len(known.AesIV) > 0 && len(known.AesKey) > 0) || len(claimed.AesIV) == 0 || len(claimed.AesKey) == 0 {
+		return known
+	}
+	data, err := known.Encode()
+	if err != nil {
+		return known
+	}
+	merged := &eventbus.Conn{}
+	if err := merged.Decode(data); err != nil {
+		return known
+	}
+	merged.AesIV = append([]byte(nil), claimed.AesIV...)
+	merged.AesKey = append([]byte(nil), claimed.AesKey...)
+	merged.LastActive = known.LastActive
+	return merged
 }
 
 func verificationKey(conn *eventbus.Conn) verificationSessionKey {
@@ -352,7 +371,7 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 		if e.Conn != nil {
 			conn := eventbus.User.ConnById(e.Conn.Uid, e.Conn.NodeId, e.Conn.ConnId)
 			if e.Type != eventbus.EventConnack && conn != nil && conn.SameSession(e.Conn) {
-				e.Conn = conn
+				e.Conn = verifiedSessionDescriptor(conn, e.Conn)
 			}
 
 		}

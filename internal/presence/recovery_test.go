@@ -223,6 +223,34 @@ func TestAuthenticationDuringRecoveryCannotBeEvictedByOlderSnapshot(t *testing.T
 	require.True(t, got[0].SameSession(newConn) || got[1].SameSession(newConn))
 }
 
+func TestPreparedSessionCannotBeEvictedBeforeOwnerAuthentication(t *testing.T) {
+	owner, leader, _, users, _, oldConn := fixture(t)
+	require.NoError(t, leader.Recover(context.Background(), []string{oldConn.Uid}))
+
+	newRaw := &testSocket{id: 8}
+	newConn := &eventbus.Conn{Uid: oldConn.Uid, NodeId: 1, ConnId: 8, DeviceId: "mobile"}
+	owner.Track(newRaw)
+	owner.Prepare(newRaw, newConn)
+	snapshot, err := owner.snapshot([]string{newConn.Uid})
+	require.NoError(t, err)
+	require.Len(t, snapshot.PreparedSessions, 1)
+	prepared := &eventbus.Conn{}
+	require.NoError(t, prepared.Decode(snapshot.PreparedSessions[0]))
+	require.False(t, prepared.Auth)
+	require.Empty(t, prepared.AesIV)
+	require.Empty(t, prepared.AesKey)
+	require.True(t, prepared.SameSession(newConn))
+
+	newConn.Auth = true
+	leader.Invalidate(newConn.Uid)
+	users.UpdateConn(newConn)
+	require.NoError(t, leader.recoverBatch(context.Background(), []string{newConn.Uid}))
+
+	got := users.ConnsByUid(newConn.Uid)
+	require.Len(t, got, 2)
+	require.True(t, got[0].SameSession(newConn) || got[1].SameSession(newConn))
+}
+
 func TestOneInvalidatedUIDDoesNotPoisonRecoveryBatch(t *testing.T) {
 	owner, leader, cluster, users, _, first := fixture(t)
 	secondRaw := &testSocket{id: 8}
