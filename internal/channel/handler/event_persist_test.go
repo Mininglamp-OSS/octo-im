@@ -40,6 +40,14 @@ func TestPersistCanonicalRetryResults(t *testing.T) {
 	// External plugin and webhook side effects remain suppressed.
 	require.Equal(t, wkproto.ReasonSuccess, events[0].ReasonCode)
 }
+
+func TestCommittedDuplicateStillQualifiesForDistribution(t *testing.T) {
+	event := &eventbus.Event{ReasonCode: wkproto.ReasonSuccess, PersistedDuplicate: true}
+
+	require.False(t, shouldRunPersistSideEffects(event))
+	require.True(t, shouldDistributePersistResult(event))
+}
+
 func TestPersistRejectsIncompleteCanonicalResponse(t *testing.T) {
 	for _, rs := range []types.ProposeRespSet{nil, {{Id: 10, Index: 1}}, {{Id: 11, Index: 1, CanonicalID: 10}}, {{Id: 10, Index: 0, CanonicalID: 10}}} {
 		events := []*eventbus.Event{{MessageId: 10, ReasonCode: wkproto.ReasonSuccess, Frame: &wkproto.SendPacket{}}}

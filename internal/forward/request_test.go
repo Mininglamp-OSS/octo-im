@@ -55,6 +55,33 @@ func TestRequestDoesNotReplayAfterAmbiguousSend(t *testing.T) {
 	require.Len(t, bodies, 1)
 }
 
+func TestAmbiguousResponseCannotContradictPeerSuccess(t *testing.T) {
+	oldOptions, oldCluster, oldUser := options.G, service.Cluster, eventbus.User
+	t.Cleanup(func() { options.G, service.Cluster, eventbus.User = oldOptions, oldCluster, oldUser })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 1
+	u := &failUser{}
+	eventbus.RegisterUser(u)
+	conn := &eventbus.Conn{Uid: "u", NodeId: 1}
+	event := &eventbus.Event{Type: eventbus.EventOnSend, Conn: conn, Frame: &wkproto.SendPacket{ClientSeq: 7, ClientMsgNo: "stable"}}
+	service.Cluster = &requestCluster{request: func(_ context.Context, _ uint64, _ string, _ []byte) (*proto.Response, error) {
+		// The remote side admitted the event and its canonical success ACK raced
+		// with the lost admission response.
+		eventbus.User.ConnWrite("peer", conn, &wkproto.SendackPacket{ClientSeq: 7, ClientMsgNo: "stable", ReasonCode: wkproto.ReasonSuccess})
+		eventbus.User.Advance(conn.Uid)
+		return nil, errors.New("response lost after admission")
+	}}
+
+	err := Request(UserPath, nil, []*eventbus.Event{event}, func() uint64 { return 2 }, 1, nil)
+	require.ErrorIs(t, err, ErrOutcomeUnknown)
+	Fail([]*eventbus.Event{event}, err)
+
+	require.Len(t, u.events, 1)
+	ack := u.events[0].Frame.(*wkproto.SendackPacket)
+	require.Equal(t, wkproto.ReasonSuccess, ack.ReasonCode)
+	require.Equal(t, 1, u.advances)
+}
+
 func TestRequestReResolvesAfterExplicitRetry(t *testing.T) {
 	old := service.Cluster
 	t.Cleanup(func() { service.Cluster = old })
