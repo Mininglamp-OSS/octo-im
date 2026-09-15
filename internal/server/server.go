@@ -16,6 +16,7 @@ import (
 	channelhandler "github.com/WuKongIM/WuKongIM/internal/channel/handler"
 	"github.com/WuKongIM/WuKongIM/internal/common"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/forward"
 	"github.com/WuKongIM/WuKongIM/internal/ingress"
 	"github.com/WuKongIM/WuKongIM/internal/manager"
 	"github.com/WuKongIM/WuKongIM/internal/options"
@@ -269,6 +270,7 @@ func (s *Server) Start() error {
 	}
 
 	s.ingress.SetRoutes()
+	forward.RegisterCapabilityRoute()
 	s.userHandler.SetForwardRoutes()
 	s.channelHandler.SetForwardRoutes()
 

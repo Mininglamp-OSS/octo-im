@@ -50,9 +50,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 			}
 		}
 		if reasonCode == wkproto.ReasonSuccess {
-			// Retried delivery is intentional: the first process may have committed
-			// and crashed before dispatching. Side effects use the canonical identity.
-			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, persists)
+			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, newlyPersistedMessages(events, persists))
 		} else {
 			for _, e := range events {
 				if packet, ok := e.Frame.(*wkproto.SendPacket); ok && packet != nil && !packet.NoPersist && e.ReasonCode == wkproto.ReasonSuccess {
@@ -75,7 +73,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	if options.G.WebhookOn(types.EventMsgNotify) {
 		for _, e := range events {
 			sendPacket := e.Frame.(*wkproto.SendPacket)
-			if e.ReasonCode == wkproto.ReasonSuccess && !sendPacket.NoPersist {
+			if shouldRunPersistSideEffects(e) && !sendPacket.NoPersist {
 				cloneEvent := e.Clone()
 				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 				cloneEvent.Type = eventbus.EventChannelWebhook
@@ -86,7 +84,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 	// ========== 分发 ==========
 	for _, e := range events {
-		if e.ReasonCode != wkproto.ReasonSuccess {
+		if !shouldRunPersistSideEffects(e) {
 			continue
 		}
 		cloneEvent := e.Clone()
@@ -99,7 +97,14 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 }
 
+func shouldRunPersistSideEffects(event *eventbus.Event) bool {
+	return event.ReasonCode == wkproto.ReasonSuccess && !event.PersistedDuplicate
+}
+
 func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, msgs []wkdb.Message) {
+	if len(msgs) == 0 {
+		return
+	}
 	plugins := service.PluginManager.Plugins(types.PluginPersistAfter)
 	if len(plugins) == 0 {
 		return
@@ -144,6 +149,22 @@ func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, 
 
 	// 当前节点非频道领导节点，转发请求到领导节点执行
 	h.forwardPersistAfterToLeader(leaderId, channelId, channelType, msgBatch)
+}
+
+func newlyPersistedMessages(events []*eventbus.Event, messages []wkdb.Message) []wkdb.Message {
+	result := make([]wkdb.Message, 0, len(messages))
+	messageIndex := 0
+	for _, e := range events {
+		packet, ok := e.Frame.(*wkproto.SendPacket)
+		if !ok || packet == nil || packet.NoPersist || e.ReasonCode != wkproto.ReasonSuccess {
+			continue
+		}
+		if !e.PersistedDuplicate {
+			result = append(result, messages[messageIndex])
+		}
+		messageIndex++
+	}
+	return result
 }
 
 // executePluginPersistAfterLocal 在本地执行插件PersistAfter调用
@@ -240,6 +261,7 @@ func applyPersistResults(events []*eventbus.Event, messages []wkdb.Message, resu
 	for i, r := range results {
 		eligible[i].MessageId = int64(r.CanonicalID)
 		eligible[i].MessageSeq = r.Index
+		eligible[i].PersistedDuplicate = r.Duplicate
 		messages[i].MessageID = int64(r.CanonicalID)
 		messages[i].MessageSeq = uint32(r.Index)
 	}

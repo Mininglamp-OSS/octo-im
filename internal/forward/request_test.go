@@ -2,11 +2,13 @@ package forward
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
@@ -18,6 +20,15 @@ type requestCluster struct {
 	icluster.ICluster
 	request func(context.Context, uint64, string, []byte) (*proto.Response, error)
 }
+
+type failUser struct {
+	eventbus.IUser
+	events   []*eventbus.Event
+	advances int
+}
+
+func (u *failUser) AddEvent(_ string, event *eventbus.Event) { u.events = append(u.events, event) }
+func (u *failUser) Advance(string)                           { u.advances++ }
 
 func (c *requestCluster) RequestWithContext(ctx context.Context, node uint64, path string, body []byte) (*proto.Response, error) {
 	return c.request(ctx, node, path, body)
@@ -73,7 +84,89 @@ func TestRequestBudgetAndPermanentRejection(t *testing.T) {
 	start := time.Now()
 	require.Error(t, Request(UserPath, nil, []*eventbus.Event{event}, func() uint64 { return 0 }, 1, nil))
 	require.Less(t, time.Since(start), time.Second)
+	event.ForwardDeadline = time.Now().Add(Budget).UnixMilli()
 	event.ForwardHops = maxHops
 	_, _, err := Envelope(nil, []*eventbus.Event{event})
 	require.Error(t, err)
+}
+
+func TestRequestCompatibleFallsBackBeforeAdmission(t *testing.T) {
+	old := service.Cluster
+	t.Cleanup(func() { service.Cluster = old })
+	var paths []string
+	service.Cluster = &requestCluster{request: func(_ context.Context, _ uint64, path string, _ []byte) (*proto.Response, error) {
+		paths = append(paths, path)
+		return nil, context.DeadlineExceeded
+	}}
+	legacyNode := uint64(0)
+	err := RequestCompatible(UserPath, nil, []*eventbus.Event{{Frame: &wkproto.SendPacket{ClientMsgNo: "stable"}}}, func() uint64 { return 2 }, 1, nil, &CapabilityCache{}, func(node uint64) error {
+		legacyNode = node
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{CapabilityPath}, paths)
+	require.Equal(t, uint64(2), legacyNode)
+}
+
+func TestRequestCompatibleDoesNotFallBackAfterAmbiguousV1Attempt(t *testing.T) {
+	old := service.Cluster
+	t.Cleanup(func() { service.Cluster = old })
+	leader := uint64(2)
+	legacyCalls := 0
+	service.Cluster = &requestCluster{request: func(_ context.Context, node uint64, path string, _ []byte) (*proto.Response, error) {
+		if path == CapabilityPath {
+			if node == 2 {
+				return &proto.Response{Status: proto.StatusOK}, nil
+			}
+			return nil, context.DeadlineExceeded
+		}
+		leader = 3
+		return nil, context.DeadlineExceeded
+	}}
+	err := RequestCompatible(UserPath, nil, []*eventbus.Event{{Frame: &wkproto.SendPacket{ClientMsgNo: "stable"}}}, func() uint64 { return leader }, 1, nil, &CapabilityCache{}, func(uint64) error {
+		legacyCalls++
+		return nil
+	})
+	require.ErrorIs(t, err, ErrOutcomeUnknown)
+	require.Zero(t, legacyCalls)
+}
+
+func TestDecodeUsesRelativeBudgetAndClampsFutureValues(t *testing.T) {
+	data := make([]byte, 9)
+	binary.BigEndian.PutUint64(data, uint64((Budget+time.Minute)/time.Millisecond))
+	data[8] = 1
+	start := time.Now()
+	_, deadline, hops, err := Decode(data)
+	require.NoError(t, err)
+	require.Equal(t, uint8(1), hops)
+	require.WithinDuration(t, start.Add(Budget), time.UnixMilli(deadline), 100*time.Millisecond)
+
+	data[8] = maxHops + 1
+	_, _, _, err = Decode(data)
+	require.Error(t, err)
+}
+
+func TestFailClassifiesAmbiguityAndSkipsPostCommitEvents(t *testing.T) {
+	oldOptions, oldUser := options.G, eventbus.User
+	t.Cleanup(func() { options.G, eventbus.User = oldOptions, oldUser })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 1
+	u := &failUser{}
+	eventbus.RegisterUser(u)
+	conn := &eventbus.Conn{Uid: "u", NodeId: 1}
+	unkeyed := &eventbus.Event{Type: eventbus.EventOnSend, Conn: conn, Frame: &wkproto.SendPacket{ClientSeq: 7}}
+
+	Fail([]*eventbus.Event{unkeyed}, ErrOutcomeUnknown)
+
+	require.Len(t, u.events, 1)
+	require.Equal(t, wkproto.ReasonSystemError, u.events[0].Frame.(*wkproto.SendackPacket).ReasonCode)
+	require.Equal(t, 1, u.advances)
+
+	u.events = nil
+	Fail([]*eventbus.Event{{Type: eventbus.EventChannelDistribute, Conn: conn, Frame: &wkproto.SendPacket{ClientSeq: 7}}}, ErrUnavailable)
+	require.Empty(t, u.events)
+
+	conn.DeviceId = options.G.SystemDeviceId
+	Fail([]*eventbus.Event{{Type: eventbus.EventChannelOnSend, Conn: conn, Frame: &wkproto.SendPacket{ClientSeq: 7}}}, ErrUnavailable)
+	require.Empty(t, u.events)
 }

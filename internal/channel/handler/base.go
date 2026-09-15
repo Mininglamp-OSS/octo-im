@@ -16,8 +16,9 @@ import (
 
 type Handler struct {
 	wklog.Log
-	client        *ingress.Client
-	commonService *common.Service
+	client              *ingress.Client
+	commonService       *common.Service
+	forwardCapabilities forward.CapabilityCache
 }
 
 func NewHandler() *Handler {
@@ -81,7 +82,7 @@ func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType ui
 	data, err := req.encode()
 	if err != nil {
 		h.Error("forwardToLeader: encode failed", zap.Error(err))
-		forward.Fail(events)
+		forward.Fail(events, err)
 		return
 	}
 	target := func() uint64 {
@@ -94,10 +95,12 @@ func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType ui
 		}
 		return leader
 	}
-	err = forward.Request(forward.ChannelPath, data, events, target, options.G.Cluster.NodeId, h.acceptForward)
+	err = forward.RequestCompatible(forward.ChannelPath, data, events, target, options.G.Cluster.NodeId, h.acceptForward, &h.forwardCapabilities, func(targetNode uint64) error {
+		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardChannelEvent), Content: data})
+	})
 	if err != nil {
 		h.Error("channel forwarding failed", zap.Error(err), zap.String("channelId", channelId))
-		forward.Fail(events)
+		forward.Fail(events, err)
 	}
 }
 

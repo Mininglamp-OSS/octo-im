@@ -18,32 +18,48 @@ import (
 
 type forwardCluster struct {
 	icluster.ICluster
-	leader uint64
-	calls  int
+	leader    uint64
+	calls     int
+	sendCalls int
+	sendErr   error
+	supportV1 bool
 }
 
 func (c *forwardCluster) GetSlotId(string) uint32    { return 19 }
 func (c *forwardCluster) SlotLeaderId(uint32) uint64 { return c.leader }
-func (c *forwardCluster) RequestWithContext(context.Context, uint64, string, []byte) (*proto.Response, error) {
+func (c *forwardCluster) RequestWithContext(_ context.Context, _ uint64, path string, _ []byte) (*proto.Response, error) {
 	c.calls++
+	if path == forward.CapabilityPath && c.supportV1 {
+		return &proto.Response{Status: proto.StatusOK}, nil
+	}
 	return nil, errors.New("connection unavailable")
+}
+func (c *forwardCluster) Send(uint64, *proto.Message) error {
+	c.sendCalls++
+	return c.sendErr
 }
 
 type forwardUser struct {
 	eventbus.IUser
-	events []*eventbus.Event
+	events  []*eventbus.Event
+	cached  *eventbus.Conn
+	touches int
 }
 
 func (u *forwardUser) AddEvent(_ string, e *eventbus.Event)          { u.events = append(u.events, e) }
 func (u *forwardUser) Advance(string)                                {}
-func (u *forwardUser) ConnById(string, uint64, int64) *eventbus.Conn { return nil }
+func (u *forwardUser) ConnById(string, uint64, int64) *eventbus.Conn { return u.cached }
+func (u *forwardUser) TouchConn(string, uint64, int64) bool {
+	u.touches++
+	return u.cached != nil
+}
 
 func TestForwardRejectsFormerLeaderAndReportsFailure(t *testing.T) {
 	oldOptions, oldCluster, oldUser := options.G, service.Cluster, eventbus.User
 	t.Cleanup(func() { options.G, service.Cluster, eventbus.User = oldOptions, oldCluster, oldUser })
 	options.G = options.New()
 	options.G.Cluster.NodeId = 3
-	c := &forwardCluster{leader: 4}
+	c := &forwardCluster{leader: 4, sendErr: errors.New("legacy send unavailable")}
 	service.Cluster = c
 	u := &forwardUser{}
 	eventbus.RegisterUser(u)
@@ -87,4 +103,80 @@ func TestForwardReuseRequiresTheCompleteAuthenticatedDescriptor(t *testing.T) {
 	require.True(t, sameForwardedConn(cached, incoming))
 	incoming.AesKey = []byte("changed-key")
 	require.False(t, sameForwardedConn(cached, incoming))
+}
+
+func TestAmbiguousUnkeyedSendGetsNonRetryableAck(t *testing.T) {
+	oldOptions, oldCluster, oldUser := options.G, service.Cluster, eventbus.User
+	t.Cleanup(func() { options.G, service.Cluster, eventbus.User = oldOptions, oldCluster, oldUser })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 1
+	service.Cluster = &forwardCluster{leader: 2, supportV1: true}
+	u := &forwardUser{}
+	eventbus.RegisterUser(u)
+	h := NewHandler()
+	e := &eventbus.Event{Type: eventbus.EventOnSend, Conn: &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7}, Frame: &wkproto.SendPacket{ClientSeq: 42}}
+
+	h.OnEvent(&eventbus.UserContext{Uid: "u", EventType: eventbus.EventOnSend, Events: []*eventbus.Event{e}})
+
+	require.Len(t, u.events, 1)
+	ack := u.events[0].Frame.(*wkproto.SendackPacket)
+	require.Equal(t, wkproto.ReasonSystemError, ack.ReasonCode)
+}
+
+func TestWriteFrameBatchesRemoteEventsByDestination(t *testing.T) {
+	oldOptions, oldCluster := options.G, service.Cluster
+	t.Cleanup(func() { options.G, service.Cluster = oldOptions, oldCluster })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 1
+	c := &forwardCluster{leader: 2}
+	service.Cluster = c
+	h := NewHandler()
+	conn := &eventbus.Conn{Uid: "u", NodeId: 2, ConnId: 7}
+
+	h.writeFrame(&eventbus.UserContext{Events: []*eventbus.Event{
+		{Type: eventbus.EventConnWriteFrame, Conn: conn, Frame: &wkproto.PongPacket{}},
+		{Type: eventbus.EventConnWriteFrame, Conn: conn, Frame: &wkproto.PongPacket{}},
+	}})
+
+	require.Equal(t, 1, c.sendCalls)
+}
+
+func TestForwardAdmissionValidatesBatchAndRefreshesCachedActivity(t *testing.T) {
+	oldOptions, oldCluster, oldUser := options.G, service.Cluster, eventbus.User
+	t.Cleanup(func() { options.G, service.Cluster, eventbus.User = oldOptions, oldCluster, oldUser })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 3
+	service.Cluster = &forwardCluster{leader: 3}
+	cached := &eventbus.Conn{Uid: "u", NodeId: 3, ConnId: 7}
+	u := &forwardUser{cached: cached}
+	eventbus.RegisterUser(u)
+	h := NewHandler()
+
+	incoming := &eventbus.Conn{Uid: "u", NodeId: 3, ConnId: 7, Auth: true}
+	e := &eventbus.Event{Type: eventbus.EventConnWriteFrame, Conn: incoming, Frame: &wkproto.PongPacket{}}
+	req := &forwardUserEventReq{uid: "u", events: eventbus.EventBatch{e}}
+	body, err := req.encode()
+	require.NoError(t, err)
+	data, _, err := forward.Envelope(body, req.events)
+	require.NoError(t, err)
+	require.Equal(t, proto.StatusOK, h.acceptForward(data))
+	require.Equal(t, 1, u.touches)
+	require.NotSame(t, cached, u.events[0].Conn)
+	require.True(t, u.events[0].Conn.Auth)
+
+	bad := &eventbus.Event{Type: eventbus.EventOnSend, Conn: incoming}
+	req.events = eventbus.EventBatch{bad}
+	body, err = req.encode()
+	require.NoError(t, err)
+	data, _, err = forward.Envelope(body, req.events)
+	require.NoError(t, err)
+	require.Equal(t, forward.StatusInvalid, h.acceptForward(data))
+
+	mixed := &eventbus.Event{Type: eventbus.EventConnRemove, Conn: incoming}
+	req.events = eventbus.EventBatch{e, mixed}
+	body, err = req.encode()
+	require.NoError(t, err)
+	data, _, err = forward.Envelope(body, req.events)
+	require.NoError(t, err)
+	require.Equal(t, forward.StatusInvalid, h.acceptForward(data))
 }

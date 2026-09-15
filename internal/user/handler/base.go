@@ -13,6 +13,7 @@ import (
 
 type Handler struct {
 	wklog.Log
+	forwardCapabilities forward.CapabilityCache
 }
 
 func NewHandler() *Handler {
@@ -128,17 +129,19 @@ func (h *Handler) forwardsToNode(nodeId uint64, uid string, events []*eventbus.E
 	data, err := req.encode()
 	if err != nil {
 		h.Error("forwardToLeader: encode failed", zap.Error(err))
-		forward.Fail(events)
+		forward.Fail(events, err)
 		return
 	}
 	target := func() uint64 { return nodeId }
 	if !h.notForwardToLeader(events[0].Type) {
 		target = func() uint64 { return h.userLeaderNodeId(uid) }
 	}
-	err = forward.Request(forward.UserPath, data, events, target, options.G.Cluster.NodeId, h.acceptForward)
+	err = forward.RequestCompatible(forward.UserPath, data, events, target, options.G.Cluster.NodeId, h.acceptForward, &h.forwardCapabilities, func(targetNode uint64) error {
+		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardUserEvent), Content: data})
+	})
 	if err != nil {
 		h.Error("user forwarding failed", zap.Error(err), zap.String("uid", uid))
-		forward.Fail(events)
+		forward.Fail(events, err)
 	}
 }
 
@@ -162,7 +165,7 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 	slotLeaderId := h.userLeaderNodeId(req.uid)
 	if slotLeaderId == 0 {
 		h.Error("OnEvent: get slotLeaderId is 0")
-		forward.Fail(req.events)
+		forward.Fail(req.events, forward.ErrUnavailable)
 		return
 	}
 
@@ -172,7 +175,7 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 		if !h.notForwardToLeader(e.Type) {
 			if !isSlotLeader {
 				h.Error("onForwardUserEvent: event type is not EventConnWriteFrame, but not slot leader", zap.String("uid", req.uid), zap.Uint64("slotLeaderId", slotLeaderId))
-				forward.Fail([]*eventbus.Event{e})
+				forward.Fail([]*eventbus.Event{e}, forward.ErrUnavailable)
 				continue
 			}
 		}

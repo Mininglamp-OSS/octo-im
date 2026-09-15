@@ -55,3 +55,29 @@ func TestChannelForwardAdmissionFollowsAuthority(t *testing.T) {
 	require.Len(t, sink.events, 1)
 	require.Greater(t, sink.events[0].ForwardDeadline, int64(0))
 }
+
+func TestChannelForwardAdmissionRejectsWrongFrameAndMixedBatch(t *testing.T) {
+	oldOptions, oldCluster, oldChannel := options.G, service.Cluster, eventbus.Channel
+	t.Cleanup(func() { options.G, service.Cluster, eventbus.Channel = oldOptions, oldCluster, oldChannel })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 3
+	service.Cluster = &forwardChannelCluster{leader: 3}
+	eventbus.RegisterChannel(&forwardChannel{})
+	h := NewHandler()
+	conn := &eventbus.Conn{Uid: "u", NodeId: 1}
+
+	for _, events := range []eventbus.EventBatch{
+		{{Type: eventbus.EventChannelOnSend, Conn: conn, Frame: &wkproto.PingPacket{}}},
+		{
+			{Type: eventbus.EventChannelOnSend, Conn: conn, Frame: &wkproto.SendPacket{}},
+			{Type: eventbus.EventChannelDistribute, Conn: conn, Frame: &wkproto.SendPacket{}},
+		},
+	} {
+		req := &forwardChannelEventReq{channelId: "room", channelType: 2, events: events}
+		body, err := req.encode()
+		require.NoError(t, err)
+		data, _, err := forward.Envelope(body, events)
+		require.NoError(t, err)
+		require.Equal(t, forward.StatusInvalid, h.acceptForward(data))
+	}
+}

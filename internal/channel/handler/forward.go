@@ -7,6 +7,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
 
 func (h *Handler) SetForwardRoutes() {
@@ -22,8 +23,9 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 	if err := req.decode(body); err != nil || req.channelId == "" || len(req.events) == 0 {
 		return forward.StatusInvalid
 	}
+	eventType := req.events[0].Type
 	for _, e := range req.events {
-		if (e.Type != eventbus.EventChannelOnSend && !h.notForwardToLeader(e.Type)) || e.Conn == nil || e.Frame == nil {
+		if e.Type != eventType || !validChannelForwardEvent(e) {
 			return forward.StatusInvalid
 		}
 		if !h.notForwardToLeader(e.Type) {
@@ -39,4 +41,17 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 	}
 	eventbus.Channel.Advance(req.channelId, req.channelType)
 	return proto.StatusOK
+}
+
+func validChannelForwardEvent(e *eventbus.Event) bool {
+	if e.Conn == nil {
+		return false
+	}
+	switch e.Type {
+	case eventbus.EventChannelOnSend, eventbus.EventChannelWebhook, eventbus.EventChannelDistribute:
+		_, ok := e.Frame.(*wkproto.SendPacket)
+		return ok
+	default:
+		return false
+	}
 }
