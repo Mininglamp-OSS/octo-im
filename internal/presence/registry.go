@@ -60,7 +60,7 @@ func (m *Manager) Prepare(raw wknet.Conn, conn *eventbus.Conn) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	entry, ok := m.physical[raw.ID()]
-	if !ok || entry.raw != raw {
+	if !ok || !samePhysicalSocket(entry.raw, raw) {
 		return
 	}
 	ownerBootID, sessionID := m.boot, ""
@@ -148,11 +148,22 @@ func (m *Manager) Close(raw wknet.Conn) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	entry, ok := m.physical[raw.ID()]
-	if !ok || entry.raw != raw {
+	if !ok || !samePhysicalSocket(entry.raw, raw) {
 		return
 	}
 	delete(m.physical, raw.ID())
 	m.unindexLocked(entry.conn)
+}
+
+// The network engine passes transport wrappers to OnConnect/OnData but the
+// embedded DefaultConn to OnClose. Match the socket generation rather than
+// Go interface identity so every transport can release its registry entry,
+// while a delayed close cannot remove a newer socket that reused the ID.
+func samePhysicalSocket(left, right wknet.Conn) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	return left.ID() == right.ID() && left.Uptime().Equal(right.Uptime())
 }
 
 func (m *Manager) unindexLocked(conn *eventbus.Conn) {

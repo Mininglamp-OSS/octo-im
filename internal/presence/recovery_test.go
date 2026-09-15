@@ -26,6 +26,10 @@ type testSocket struct {
 	uptime time.Time
 }
 
+type testSocketWrapper struct {
+	wknet.Conn
+}
+
 func (c *testSocket) ID() int64                { return c.id }
 func (c *testSocket) SetContext(v interface{}) { c.ctx = v }
 func (c *testSocket) Context() interface{}     { return c.ctx }
@@ -341,7 +345,7 @@ func TestRecoveryEvictionSchedulesOfflineNotification(t *testing.T) {
 func TestSessionIdentityFencesIDReuseAndOwnerRestart(t *testing.T) {
 	owner, leader, _, _, oldRaw, oldConn := fixture(t)
 	owner.Close(oldRaw)
-	newRaw := &testSocket{id: 7}
+	newRaw := &testSocket{id: 7, uptime: oldRaw.Uptime().Add(time.Nanosecond)}
 	newConn := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7}
 	owner.Track(newRaw)
 	owner.Prepare(newRaw, newConn)
@@ -384,7 +388,7 @@ func TestRecoveryRepairsAnEvictedLogicalView(t *testing.T) {
 
 func TestRegistryReindexesReplacedSocketsAndPendingIdentities(t *testing.T) {
 	owner, _, _, _, oldRaw, oldConn := fixture(t)
-	replacement := &testSocket{id: oldRaw.ID()}
+	replacement := &testSocket{id: oldRaw.ID(), uptime: oldRaw.Uptime().Add(time.Nanosecond)}
 	owner.Track(replacement)
 	require.Empty(t, owner.byUID)
 	pending := &eventbus.Conn{Uid: "pending", NodeId: 1, ConnId: replacement.ID()}
@@ -406,6 +410,51 @@ func TestPrepareKeepsOneSessionIdentityPerSocket(t *testing.T) {
 	owner.Prepare(raw, second)
 	require.Equal(t, first.OwnerBootID, second.OwnerBootID)
 	require.Equal(t, first.SessionID, second.SessionID)
+}
+
+func TestWrappedSocketCloseRemovesPhysicalSession(t *testing.T) {
+	owner := New(1)
+	underlying := &testSocket{id: 7, uptime: time.Unix(10, 20)}
+	wrapper := &testSocketWrapper{Conn: underlying}
+	conn := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: underlying.ID(), DeviceId: "web"}
+
+	owner.Track(wrapper)
+	owner.Prepare(wrapper, conn)
+	conn.Auth = true
+	require.True(t, owner.Authenticate(conn))
+	require.Contains(t, owner.liveUIDs(), conn.Uid)
+
+	owner.Close(underlying)
+
+	snapshot, err := owner.snapshot([]string{conn.Uid})
+	require.NoError(t, err)
+	require.Empty(t, snapshot.Sessions)
+	require.NotContains(t, owner.liveUIDs(), conn.Uid)
+	require.Empty(t, owner.physical)
+	require.Empty(t, owner.byUID)
+}
+
+func TestStaleCloseCannotRemoveReusedConnectionID(t *testing.T) {
+	owner := New(1)
+	oldRaw := &testSocket{id: 7, uptime: time.Unix(10, 20)}
+	owner.Track(&testSocketWrapper{Conn: oldRaw})
+
+	newRaw := &testSocket{id: 7, uptime: time.Unix(10, 21)}
+	wrapper := &testSocketWrapper{Conn: newRaw}
+	conn := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: newRaw.ID(), DeviceId: "web"}
+	owner.Track(wrapper)
+	owner.Prepare(newRaw, conn)
+	conn.Auth = true
+	require.True(t, owner.Authenticate(conn))
+
+	owner.Close(oldRaw)
+
+	snapshot, err := owner.snapshot([]string{conn.Uid})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Sessions, 1)
+	require.Contains(t, owner.liveUIDs(), conn.Uid)
+	require.Len(t, owner.physical, 1)
+	require.Len(t, owner.byUID, 1)
 }
 
 func TestLegacyDescriptorCannotAuthenticateReusedConnectionID(t *testing.T) {
