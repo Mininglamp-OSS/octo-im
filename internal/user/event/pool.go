@@ -107,6 +107,10 @@ func (e *EventPool) UpdateConn(conn *eventbus.Conn) {
 	e.pollerByUid(conn.Uid).updateConn(conn)
 }
 
+func (e *EventPool) UpdateConnRecovered(conn *eventbus.Conn) {
+	e.pollerByUid(conn.Uid).updateConnRecovered(conn)
+}
+
 func (e *EventPool) AllUserCount() int {
 	count := 0
 	for _, p := range e.pollers {

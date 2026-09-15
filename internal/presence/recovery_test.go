@@ -58,6 +58,21 @@ func (u *testUsers) UpdateConn(conn *eventbus.Conn) {
 	}
 	u.conns = append(u.conns, conn)
 }
+func (u *testUsers) UpdateConnRecovered(conn *eventbus.Conn) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for i, current := range u.conns {
+		if !current.Equal(conn) {
+			continue
+		}
+		if !current.SameSession(conn) {
+			return
+		}
+		u.conns[i] = conn
+		return
+	}
+	u.conns = append(u.conns, conn)
+}
 func (u *testUsers) RemoveConn(conn *eventbus.Conn) {
 	u.mu.Lock()
 	defer u.mu.Unlock()

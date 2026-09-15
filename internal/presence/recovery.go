@@ -321,7 +321,7 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 			}
 		}
 		for _, conn := range current {
-			eventbus.User.UpdateConn(conn)
+			eventbus.User.UpdateConnRecovered(conn)
 		}
 		if complete {
 			r.version = version

@@ -19,7 +19,7 @@ func TestRecoveredSessionCreatesUserAndSurvivesStaleClose(t *testing.T) {
 	pool := NewEventPool(&mockUserEventHandler{})
 	defer pool.Stop()
 	current := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "new"}
-	pool.UpdateConn(current)
+	pool.UpdateConnRecovered(current)
 	require.Len(t, pool.AuthedConnsByUid("u"), 1)
 	pool.RemoveConn(&eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, OwnerBootID: "boot", SessionID: "old"})
 	require.Len(t, pool.AuthedConnsByUid("u"), 1)
@@ -37,13 +37,32 @@ func TestUpdateRecoveredSessionPreservesRuntimeState(t *testing.T) {
 	current := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "session", AesIV: []byte("iv"), AesKey: []byte("key"), LastActive: 9}
 	current.InPacketCount.Store(4)
 	pool.UpdateConn(current)
-	pool.UpdateConn(&eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "session", LastActive: 2})
+	pool.UpdateConnRecovered(&eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "session", LastActive: 2})
 	got := pool.ConnsByUid("u")
 	require.Len(t, got, 1)
 	require.Equal(t, int64(4), got[0].InPacketCount.Load())
 	require.Equal(t, []byte("iv"), got[0].AesIV)
 	require.Equal(t, []byte("key"), got[0].AesKey)
 	require.Equal(t, uint64(9), got[0].LastActive)
+}
+
+func TestRecoveredSessionCannotOverwriteReusedConnectionID(t *testing.T) {
+	old := options.G
+	t.Cleanup(func() { options.G = old })
+	options.G = options.New()
+	options.G.Poller.UserCount = 1
+	pool := NewEventPool(&mockUserEventHandler{})
+	defer pool.Stop()
+
+	sessionA := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "a"}
+	sessionB := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, Auth: true, OwnerBootID: "boot", SessionID: "b"}
+	pool.UpdateConn(sessionA)
+	pool.UpdateConn(sessionB)
+	pool.UpdateConnRecovered(sessionA)
+
+	got := pool.ConnsByUid("u")
+	require.Len(t, got, 1)
+	require.True(t, got[0].SameSession(sessionB))
 }
 
 func TestConnsByUidReturnsSnapshotDuringConcurrentUpdates(t *testing.T) {

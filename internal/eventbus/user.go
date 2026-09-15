@@ -39,6 +39,9 @@ type IUser interface {
 
 	// UpdateConn 更新连接
 	UpdateConn(conn *Conn)
+	// UpdateConnRecovered applies a recovered snapshot without replacing a
+	// different live session that has reused the same numeric connection ID.
+	UpdateConnRecovered(conn *Conn)
 	// AllUserCount 所有用户数量
 	AllUserCount() int
 	// AllConnCount 所有连接数量
@@ -128,6 +131,11 @@ func (u *userPlus) ConnById(uid string, fromNode uint64, id int64) *Conn {
 // UpdateConn 更新连接
 func (u *userPlus) UpdateConn(conn *Conn) {
 	u.user.UpdateConn(conn)
+}
+
+// UpdateConnRecovered updates a connection from a recovery snapshot.
+func (u *userPlus) UpdateConnRecovered(conn *Conn) {
+	u.user.UpdateConnRecovered(conn)
 }
 
 // ConnWrite 连接写包

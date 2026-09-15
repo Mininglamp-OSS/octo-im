@@ -41,6 +41,26 @@ func (c *conns) addOrUpdateConn(conn *eventbus.Conn) {
 	}
 }
 
+// addOrUpdateRecoveredConn installs a recovery snapshot only when the
+// numeric connection ID is still unclaimed or belongs to the same session.
+// A normal connection event remains authoritative when an ID is reused.
+func (c *conns) addOrUpdateRecoveredConn(conn *eventbus.Conn) {
+	c.Lock()
+	defer c.Unlock()
+	for i, current := range c.conns {
+		if current.NodeId != conn.NodeId || current.ConnId != conn.ConnId {
+			continue
+		}
+		if !current.SameSession(conn) {
+			return
+		}
+		preserveRuntimeState(current, conn)
+		c.conns[i] = conn
+		return
+	}
+	c.conns = append(c.conns, conn)
+}
+
 func (c *conns) remove(cn *eventbus.Conn) {
 	c.Lock()
 	defer c.Unlock()
