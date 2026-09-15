@@ -97,6 +97,15 @@ func (r *RetryManager) retry(msg *types.RetryMessage) {
 		}
 		return
 	}
+	if !retrySessionMatches(msg, conn) {
+		r.Warn("retry session no longer matches connection",
+			zap.String("uid", msg.Uid),
+			zap.Uint64("fromNode", msg.FromNode),
+			zap.Int64("connId", msg.ConnId),
+			zap.Int64("messageId", msg.MessageId),
+		)
+		return
+	}
 	// 添加到重试队列
 	r.AddRetry(msg)
 
@@ -112,6 +121,13 @@ func (r *RetryManager) retry(msg *types.RetryMessage) {
 
 	eventbus.User.ConnWrite("", conn, msg.RecvPacket)
 
+}
+
+func retrySessionMatches(msg *types.RetryMessage, conn *eventbus.Conn) bool {
+	return msg != nil && conn != nil &&
+		msg.Uid == conn.Uid && msg.FromNode == conn.NodeId && msg.ConnId == conn.ConnId &&
+		msg.OwnerBootID != "" && msg.SessionID != "" &&
+		msg.OwnerBootID == conn.OwnerBootID && msg.SessionID == conn.SessionID
 }
 
 // Schedule 延迟任务

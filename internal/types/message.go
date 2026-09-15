@@ -15,7 +15,7 @@ type MessageResp struct {
 	Setting      uint8         `json:"setting"`       // 设置
 	MessageId    int64         `json:"message_id"`    // 服务端的消息ID(全局唯一)
 	MessageIdStr string        `json:"message_idstr"` // 服务端的消息ID(全局唯一)
-	ClientMsgNo string `json:"client_msg_no"` // 客户端消息唯一编号
+	ClientMsgNo  string        `json:"client_msg_no"` // 客户端消息唯一编号
 
 	End        uint8                 `json:"end,omitempty"` // 是否是最后一段
 	EndReason  uint8                 `json:"end_reason,omitempty"`
@@ -35,13 +35,13 @@ type MessageResp struct {
 }
 
 type MessageEventMeta struct {
-	HasEvents          bool                    `json:"has_events"`
-	Completed          bool                    `json:"completed"`
-	EventVersion       uint64                  `json:"event_version,omitempty"`
-	LastMsgEventSeq    uint64                  `json:"last_msg_event_seq,omitempty"`
-	EventCount         int                     `json:"event_count,omitempty"`
-	OpenEventCount     int                     `json:"open_event_count,omitempty"`
-	Events             []*MessageEventKeyMeta  `json:"events,omitempty"`
+	HasEvents       bool                   `json:"has_events"`
+	Completed       bool                   `json:"completed"`
+	EventVersion    uint64                 `json:"event_version,omitempty"`
+	LastMsgEventSeq uint64                 `json:"last_msg_event_seq,omitempty"`
+	EventCount      int                    `json:"event_count,omitempty"`
+	OpenEventCount  int                    `json:"open_event_count,omitempty"`
+	Events          []*MessageEventKeyMeta `json:"events,omitempty"`
 }
 
 type MessageEventKeyMeta struct {
@@ -118,9 +118,10 @@ type RetryMessage struct {
 	Uid         string              // 用户id
 	FromNode    uint64              // 来源节点
 	ConnId      int64               // 需要接受的连接id
+	OwnerBootID string              // 物理连接所属进程启动标识
+	SessionID   string              // 物理连接会话标识
 	MessageId   int64               // 消息id
 	Retry       int                 // 重试次数
 	Index       int                 //在切片中的索引值
 	Pri         int64               // 优先级的时间点 值越小越优先
 }
-
