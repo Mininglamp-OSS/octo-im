@@ -124,9 +124,13 @@ func (r *RetryManager) retry(msg *types.RetryMessage) {
 }
 
 func retrySessionMatches(msg *types.RetryMessage, conn *eventbus.Conn) bool {
-	return msg != nil && conn != nil &&
-		msg.Uid == conn.Uid && msg.FromNode == conn.NodeId && msg.ConnId == conn.ConnId &&
-		msg.OwnerBootID != "" && msg.SessionID != "" &&
+	if msg == nil || conn == nil || msg.Uid != conn.Uid || msg.FromNode != conn.NodeId || msg.ConnId != conn.ConnId {
+		return false
+	}
+	if msg.OwnerBootID == "" && msg.SessionID == "" && conn.IsLegacySession() {
+		return msg.Uptime != 0 && msg.Uptime == conn.Uptime
+	}
+	return msg.OwnerBootID != "" && msg.SessionID != "" &&
 		msg.OwnerBootID == conn.OwnerBootID && msg.SessionID == conn.SessionID
 }
 

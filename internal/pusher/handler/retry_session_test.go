@@ -23,7 +23,7 @@ func TestSetupRetryBindsPhysicalSessionIdentity(t *testing.T) {
 	captured := &capturedRetryManager{}
 	service.RetryManager = captured
 	conn := &eventbus.Conn{
-		Uid: "u", NodeId: 2, ConnId: 7, OwnerBootID: "boot", SessionID: "session",
+		Uid: "u", NodeId: 2, ConnId: 7, Uptime: 101, OwnerBootID: "boot", SessionID: "session",
 	}
 
 	(&Handler{}).setupRetryIfNeeded(&wkproto.RecvPacket{}, "channel", 1, conn, 9)
@@ -31,4 +31,5 @@ func TestSetupRetryBindsPhysicalSessionIdentity(t *testing.T) {
 	require.NotNil(t, captured.msg)
 	require.Equal(t, "boot", captured.msg.OwnerBootID)
 	require.Equal(t, "session", captured.msg.SessionID)
+	require.Equal(t, uint64(101), captured.msg.Uptime)
 }

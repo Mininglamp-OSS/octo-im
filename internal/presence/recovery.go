@@ -129,7 +129,7 @@ func (m *Manager) read(ctx context.Context, node uint64, uids []string) (snapsho
 
 func (m *Manager) Verify(ctx context.Context, expected *eventbus.Conn) (*eventbus.Conn, error) {
 	if expected == nil || expected.SessionID == "" || expected.OwnerBootID == "" {
-		return nil, ErrNotReady
+		return nil, service.ErrPresenceSessionNotFound
 	}
 	state, err := m.read(ctx, expected.NodeId, []string{expected.Uid})
 	if err != nil {
@@ -142,7 +142,7 @@ func (m *Manager) Verify(ctx context.Context, expected *eventbus.Conn) (*eventbu
 			return expected, nil
 		}
 	}
-	return nil, ErrNotReady
+	return nil, service.ErrPresenceSessionNotFound
 }
 
 func (m *Manager) Recover(parent context.Context, uids []string) error {

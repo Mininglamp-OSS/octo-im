@@ -118,6 +118,7 @@ type RetryMessage struct {
 	Uid         string              // 用户id
 	FromNode    uint64              // 来源节点
 	ConnId      int64               // 需要接受的连接id
+	Uptime      uint64              // 物理连接启动时间（legacy 会话代际标识）
 	OwnerBootID string              // 物理连接所属进程启动标识
 	SessionID   string              // 物理连接会话标识
 	MessageId   int64               // 消息id

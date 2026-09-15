@@ -76,3 +76,46 @@ func TestRetryKeepsMatchingSession(t *testing.T) {
 	require.Same(t, conn, users.events[0].Conn)
 	require.Same(t, packet, users.events[0].Frame)
 }
+
+func TestRetryKeepsMatchingLegacySocketBirth(t *testing.T) {
+	oldOptions, oldUser := options.G, eventbus.User
+	t.Cleanup(func() {
+		options.G, eventbus.User = oldOptions, oldUser
+	})
+	options.G = options.New()
+	conn := &eventbus.Conn{Uid: "u", NodeId: 2, ConnId: 7, Uptime: 101}
+	users := &retrySessionUsers{conn: conn}
+	eventbus.RegisterUser(users)
+	r := newRetryManagerForSessionTest()
+	packet := &wkproto.RecvPacket{Payload: []byte("plaintext")}
+	msg := &types.RetryMessage{
+		Uid: "u", FromNode: 2, ConnId: 7, Uptime: 101,
+		MessageId: 9, RecvPacket: packet,
+	}
+
+	r.retry(msg)
+
+	require.Equal(t, 1, r.RetryMessageCount())
+	require.Len(t, users.events, 1)
+	require.Same(t, conn, users.events[0].Conn)
+	require.Same(t, packet, users.events[0].Frame)
+}
+
+func TestRetryRejectsReusedLegacyConnectionID(t *testing.T) {
+	oldOptions, oldUser := options.G, eventbus.User
+	t.Cleanup(func() {
+		options.G, eventbus.User = oldOptions, oldUser
+	})
+	options.G = options.New()
+	users := &retrySessionUsers{conn: &eventbus.Conn{Uid: "u", NodeId: 2, ConnId: 7, Uptime: 102}}
+	eventbus.RegisterUser(users)
+	r := newRetryManagerForSessionTest()
+
+	r.retry(&types.RetryMessage{
+		Uid: "u", FromNode: 2, ConnId: 7, Uptime: 101,
+		MessageId: 9, RecvPacket: &wkproto.RecvPacket{Payload: []byte("plaintext")},
+	})
+
+	require.Empty(t, users.events)
+	require.Zero(t, r.RetryMessageCount())
+}

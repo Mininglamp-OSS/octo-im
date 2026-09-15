@@ -412,6 +412,25 @@ func TestPrepareKeepsOneSessionIdentityPerSocket(t *testing.T) {
 	require.Equal(t, first.SessionID, second.SessionID)
 }
 
+func TestPrepareBeforeTrackKeepsPreparedSession(t *testing.T) {
+	owner := New(1)
+	underlying := &testSocket{id: 7, uptime: time.Unix(10, 20)}
+	wrapper := &testSocketWrapper{Conn: underlying}
+	conn := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: underlying.ID(), DeviceId: "web"}
+
+	owner.Prepare(underlying, conn)
+	require.NotEmpty(t, conn.OwnerBootID)
+	require.NotEmpty(t, conn.SessionID)
+	owner.Track(wrapper)
+
+	conn.Auth = true
+	require.True(t, owner.Authenticate(conn))
+	snapshot, err := owner.snapshot([]string{conn.Uid})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Sessions, 1)
+	require.Contains(t, owner.liveUIDs(), conn.Uid)
+}
+
 func TestWrappedSocketCloseRemovesPhysicalSession(t *testing.T) {
 	owner := New(1)
 	underlying := &testSocket{id: 7, uptime: time.Unix(10, 20)}

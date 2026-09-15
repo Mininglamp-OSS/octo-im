@@ -51,6 +51,14 @@ func (m *Manager) Track(raw wknet.Conn) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if previous, ok := m.physical[raw.ID()]; ok {
+		if samePhysicalSocket(previous.raw, raw) {
+			previous.raw = raw
+			m.physical[raw.ID()] = previous
+			return
+		}
+		if !raw.Uptime().After(previous.raw.Uptime()) {
+			return
+		}
 		m.unindexLocked(previous.conn)
 	}
 	m.physical[raw.ID()] = physicalSession{raw: raw}
@@ -60,8 +68,14 @@ func (m *Manager) Prepare(raw wknet.Conn, conn *eventbus.Conn) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	entry, ok := m.physical[raw.ID()]
-	if !ok || !samePhysicalSocket(entry.raw, raw) {
-		return
+	if !ok {
+		entry = physicalSession{raw: raw}
+	} else if !samePhysicalSocket(entry.raw, raw) {
+		if !raw.Uptime().After(entry.raw.Uptime()) {
+			return
+		}
+		m.unindexLocked(entry.conn)
+		entry = physicalSession{raw: raw}
 	}
 	ownerBootID, sessionID := m.boot, ""
 	if entry.conn != nil {

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -29,8 +30,9 @@ type verificationSessionKey struct {
 }
 
 type verificationResult struct {
-	conn   *eventbus.Conn
-	failed bool
+	conn          *eventbus.Conn
+	failed        bool
+	failureReason wkproto.ReasonCode
 }
 
 type Handler struct {
@@ -127,7 +129,7 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 		key := verificationKey(event.Conn)
 		if result, ok := results[key]; ok {
 			if result.failed {
-				verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event)
+				verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event, result.failureReason)
 				continue
 			}
 			event.Conn = result.conn
@@ -135,8 +137,8 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 			continue
 		}
 		if h.verificationFailedRecently(key, time.Now()) {
-			results[key] = verificationResult{failed: true}
-			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event)
+			results[key] = verificationResult{failed: true, failureReason: wkproto.ReasonNodeNotMatch}
+			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event, wkproto.ReasonNodeNotMatch)
 			continue
 		}
 		if err := batchCtx.Err(); err != nil {
@@ -144,20 +146,24 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 				h.Warn("physical session verification budget exhausted", zap.Error(err), zap.String("uid", uid))
 				budgetWarned = true
 			}
-			results[key] = verificationResult{failed: true}
-			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event)
+			results[key] = verificationResult{failed: true, failureReason: wkproto.ReasonSystemError}
+			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event, wkproto.ReasonSystemError)
 			continue
 		}
 		verified, err := service.Presence.Verify(batchCtx, event.Conn)
 		if err != nil {
-			results[key] = verificationResult{failed: true}
-			h.rememberVerificationFailure(key, time.Now())
+			reason := wkproto.ReasonSystemError
+			if errors.Is(err, service.ErrPresenceSessionNotFound) {
+				reason = wkproto.ReasonNodeNotMatch
+				h.rememberVerificationFailure(key, time.Now())
+			}
+			results[key] = verificationResult{failed: true, failureReason: reason}
 			h.Warn("physical session verification failed",
 				zap.Error(err),
 				zap.String("uid", event.Conn.Uid),
 				zap.Uint64("nodeId", event.Conn.NodeId),
 				zap.Int64("connId", event.Conn.ConnId))
-			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event)
+			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event, reason)
 			continue
 		}
 		results[key] = verificationResult{conn: verified}
@@ -198,7 +204,7 @@ func verificationKey(conn *eventbus.Conn) verificationSessionKey {
 	}
 }
 
-func (h *Handler) handleUnverifiedOnSend(verifiedEvents []*eventbus.Event, event *eventbus.Event) []*eventbus.Event {
+func (h *Handler) handleUnverifiedOnSend(verifiedEvents []*eventbus.Event, event *eventbus.Event, reason wkproto.ReasonCode) []*eventbus.Event {
 	switch packet := event.Frame.(type) {
 	case *wkproto.SendPacket:
 		eventbus.User.ConnWrite(event.ReqId, event.Conn, &wkproto.SendackPacket{
@@ -206,7 +212,7 @@ func (h *Handler) handleUnverifiedOnSend(verifiedEvents []*eventbus.Event, event
 			MessageID:   event.MessageId,
 			ClientSeq:   packet.ClientSeq,
 			ClientMsgNo: packet.ClientMsgNo,
-			ReasonCode:  wkproto.ReasonNodeNotMatch,
+			ReasonCode:  reason,
 		})
 		eventbus.User.Advance(event.Conn.Uid)
 	case *wkproto.PingPacket, *wkproto.RecvackPacket:

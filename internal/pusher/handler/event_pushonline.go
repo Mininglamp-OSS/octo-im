@@ -129,6 +129,7 @@ func (h *Handler) setupRetryIfNeeded(recvPacket *wkproto.RecvPacket, fakeChannel
 			Uid:         toConn.Uid,
 			ConnId:      toConn.ConnId,
 			FromNode:    toConn.NodeId,
+			Uptime:      toConn.Uptime,
 			OwnerBootID: toConn.OwnerBootID,
 			SessionID:   toConn.SessionID,
 			MessageId:   messageId,

@@ -13,6 +13,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
+	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 	serverproto "github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
@@ -69,7 +70,7 @@ func TestVerifyOnSendRejectsOnlyTheInvalidEvent(t *testing.T) {
 	verifyCalls := 0
 	service.Presence = &verificationPresence{verify: func(*eventbus.Conn) (*eventbus.Conn, error) {
 		verifyCalls++
-		return nil, errors.New("stale session")
+		return nil, service.ErrPresenceSessionNotFound
 	}}
 	h := NewHandler()
 	var executed []*eventbus.Event
@@ -112,7 +113,7 @@ func TestVerifyOnSendCachesFailuresAcrossBatchesBySession(t *testing.T) {
 	verifyCalls := 0
 	service.Presence = &verificationPresence{verify: func(*eventbus.Conn) (*eventbus.Conn, error) {
 		verifyCalls++
-		return nil, errors.New("owner unavailable")
+		return nil, service.ErrPresenceSessionNotFound
 	}}
 	h := NewHandler()
 	event := func(seq uint64, session string) *eventbus.Event {
@@ -129,6 +130,37 @@ func TestVerifyOnSendCachesFailuresAcrossBatchesBySession(t *testing.T) {
 
 	require.Equal(t, 2, verifyCalls)
 	require.Len(t, users.events, 3)
+}
+
+func TestVerifyOnSendDoesNotCacheTransientFailures(t *testing.T) {
+	oldOptions, oldPresence, oldUser := options.G, service.Presence, eventbus.User
+	t.Cleanup(func() { options.G, service.Presence, eventbus.User = oldOptions, oldPresence, oldUser })
+	options.G = options.New()
+	users := &handlerUsers{}
+	eventbus.RegisterUser(users)
+	verifyCalls := 0
+	service.Presence = &verificationPresence{verify: func(*eventbus.Conn) (*eventbus.Conn, error) {
+		verifyCalls++
+		return nil, errors.New("owner unavailable")
+	}}
+	h := NewHandler()
+	event := func(seq uint64) *eventbus.Event {
+		return &eventbus.Event{
+			Type:  eventbus.EventOnSend,
+			Conn:  &eventbus.Conn{Uid: "u", NodeId: 2, ConnId: 7, OwnerBootID: "boot", SessionID: "session"},
+			Frame: &wkproto.SendPacket{ClientSeq: seq},
+		}
+	}
+
+	h.verifyOnSendEvents("u", []*eventbus.Event{event(1)})
+	h.verifyOnSendEvents("u", []*eventbus.Event{event(2)})
+
+	require.Equal(t, 2, verifyCalls)
+	require.Len(t, users.events, 2)
+	for _, written := range users.events {
+		ack := written.Frame.(*wkproto.SendackPacket)
+		require.Equal(t, wkproto.ReasonSystemError, ack.ReasonCode)
+	}
 }
 
 func TestVerifyOnSendHasOneBatchDeadlineForDistinctSessions(t *testing.T) {
@@ -159,6 +191,10 @@ func TestVerifyOnSendHasOneBatchDeadlineForDistinctSessions(t *testing.T) {
 	require.Empty(t, verified)
 	require.Equal(t, 1, verifyCalls)
 	require.Len(t, users.events, len(events))
+	for _, written := range users.events {
+		ack := written.Frame.(*wkproto.SendackPacket)
+		require.Equal(t, wkproto.ReasonSystemError, ack.ReasonCode)
+	}
 	require.Less(t, time.Since(start), 500*time.Millisecond)
 }
 
@@ -255,6 +291,34 @@ func TestRecvackCannotClearRetryFromReusedSession(t *testing.T) {
 	NewHandler().recvack(&eventbus.Event{Conn: conn, Frame: &wkproto.RecvackPacket{MessageID: 9}})
 
 	require.False(t, retry.removed)
+}
+
+func TestLegacyRecvackClearsMatchingSocketBirthOnly(t *testing.T) {
+	oldOptions, oldRetry, oldTrace := options.G, service.RetryManager, trace.GlobalTrace
+	t.Cleanup(func() {
+		options.G = oldOptions
+		service.RetryManager = oldRetry
+		trace.SetGlobalTrace(oldTrace)
+	})
+	options.G = options.New()
+	trace.SetGlobalTrace(trace.New(context.Background(), trace.NewOptions()))
+	retry := &recvackRetryManager{msg: &types.RetryMessage{
+		Uid: "u", FromNode: 1, ConnId: 7, Uptime: 101,
+	}}
+	service.RetryManager = retry
+	h := NewHandler()
+
+	h.recvack(&eventbus.Event{
+		Conn:  &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, Uptime: 102},
+		Frame: &wkproto.RecvackPacket{MessageID: 9},
+	})
+	require.False(t, retry.removed)
+
+	h.recvack(&eventbus.Event{
+		Conn:  &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, Uptime: 101},
+		Frame: &wkproto.RecvackPacket{MessageID: 9},
+	})
+	require.True(t, retry.removed)
 }
 
 type handlerSocket struct {

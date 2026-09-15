@@ -2,9 +2,13 @@ package service
 
 import (
 	"context"
+	"errors"
+
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 )
+
+var ErrPresenceSessionNotFound = errors.New("presence session not found")
 
 // Presence derives user authority's routing view from authenticated physical sessions.
 var Presence IPresence
