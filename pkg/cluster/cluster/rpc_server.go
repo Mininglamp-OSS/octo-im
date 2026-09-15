@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -29,7 +31,8 @@ func (r *rpcServer) setRoutes() {
 	r.s.netServer.Route(conversationConfigPath, func(c *wkserver.Context) { r.handleConversationRead(c, true) })
 	r.s.netServer.Route(conversationBoundaryPath, func(c *wkserver.Context) { r.handleConversationRead(c, false) })
 	// 频道提案
-	r.s.netServer.Route("/rpc/channel/propose", r.handleChannelPropose)
+	r.s.netServer.Route("/rpc/channel/propose", func(c *wkserver.Context) { c.WriteErr(errors.New("channel proposal RPC v2 required")) })
+	r.s.netServer.Route("/rpc/channel/propose/v2", r.handleChannelPropose)
 
 	// 槽提案
 	r.s.netServer.Route("/rpc/slot/propose", r.handleSlotPropose)
@@ -73,7 +76,7 @@ func (r *rpcServer) handleChannelPropose(c *wkserver.Context) {
 		c.WriteErr(err)
 		return
 	}
-	data, err := resps.Marshal()
+	data, err := json.Marshal(channelProposeResponse{Version: 2, Results: resps})
 	if err != nil {
 		r.Error("channel propose marshal failed", zap.Error(err))
 		c.WriteErr(err)
@@ -429,4 +432,10 @@ func (r *rpcServer) handleClusterLogs(c *wkserver.Context) {
 		return
 	}
 	c.Write(data)
+}
+
+// Versioned response preserves request correlation and canonical message IDs.
+type channelProposeResponse struct {
+	Version int                      `json:"version"`
+	Results rafttypes.ProposeRespSet `json:"results"`
 }

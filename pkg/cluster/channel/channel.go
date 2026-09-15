@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -9,6 +10,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
+	"time"
 )
 
 type Channel struct {
@@ -60,11 +62,26 @@ func createChannel(cfg wkdb.ChannelClusterConfig, s *Server, rg *raftgroup.RaftG
 
 func (ch *Channel) switchConfig(cfg rafttype.Config) error {
 
-	return ch.rg.AddEventWait(ch.channelKey, rafttype.Event{
+	err := ch.rg.AddEventWait(ch.channelKey, rafttype.Event{
 		Type:   rafttype.ConfChange,
 		Config: cfg,
 	})
-
+	if err != nil {
+		return err
+	}
+	// Keep this owner hop after ConfChange: Ready must persist a newly
+	// selected term before ResumeReplication can certify the stored tail.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return ch.rg.Do(ctx, ch.channelKey, func(r raftgroup.IRaft) error {
+		if r != ch {
+			return raftgroup.ErrRaftNotExist
+		}
+		if len(ch.Config().Replicas) == 1 {
+			ch.ResumeReplication()
+		}
+		return nil
+	})
 }
 
 // needUpdate 判断是否需要更新

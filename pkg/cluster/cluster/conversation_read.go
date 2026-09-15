@@ -177,6 +177,12 @@ func (r conversationReader) readLocal(ctx context.Context, expected wkdb.Channel
 		return 0, ErrConversationReadRetry
 	}
 	if after.Exists {
+		if seq > 0 && after.CommittedIndex == 0 {
+			// A recovered legacy channel may have a durable history but no
+			// commit marker. Until Raft re-confirms it, report a retry instead
+			// of an authoritative empty conversation (or trusting the tail).
+			return 0, ErrConversationReadRetry
+		}
 		// A stored suffix may still be waiting for quorum ACKs. Never persist it
 		// as a conversation cursor. Use the post-read snapshot so a first message
 		// committed during this read is not discarded by the older snapshot.

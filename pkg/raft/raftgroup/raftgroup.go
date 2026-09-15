@@ -19,6 +19,7 @@ type RaftGroup struct {
 	opts       *Options
 	advanceC   chan struct{}
 	readStateC chan readStateRequest
+	ownerC     chan ownerRequest
 
 	tmpRafts []IRaft
 	stopped  bool
@@ -40,6 +41,7 @@ func New(opts *Options) *RaftGroup {
 		opts:              opts,
 		advanceC:          make(chan struct{}, 1),
 		readStateC:        make(chan readStateRequest),
+		ownerC:            make(chan ownerRequest),
 		Log:               wklog.NewWKLog(fmt.Sprintf("RaftGroup[%s]", opts.LogPrefix)),
 		mq:                NewEventQueue(opts.ReceiveQueueLength, false, 0, 0),
 		wait:              newWait(),
@@ -166,6 +168,12 @@ func (rg *RaftGroup) loopEvent() {
 		case <-tk.C:
 			rg.ticks()
 		case <-rg.advanceC:
+		case req := <-rg.ownerC:
+			if err := req.ctx.Err(); err != nil {
+				req.result <- err
+			} else {
+				req.result <- req.fn(rg.GetRaft(req.key))
+			}
 		case req := <-rg.readStateC:
 			rg.handleReadState(req)
 		case <-rg.stopper.ShouldStop():
