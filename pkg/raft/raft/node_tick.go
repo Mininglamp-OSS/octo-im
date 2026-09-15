@@ -6,6 +6,9 @@ import (
 )
 
 func (n *Node) Tick() {
+	if n.applyRetryTicks > 0 {
+		n.applyRetryTicks--
+	}
 	n.idleTick++
 	if n.opts.AutoDestory {
 		if n.idleTick > n.opts.DestoryAfterIdleTick {
@@ -142,12 +145,18 @@ func (n *Node) resetRandomizedElectionTimeout() {
 
 // 开始选举
 func (n *Node) campaign() {
+	if !n.isVoter(n.opts.NodeId) || n.cfg.Role == types.RoleLearner {
+		return
+	}
 	if n.IsLeader() {
 		// 如果当前是领导，先变成follower
 		n.BecomeFollower(n.cfg.Term, 0)
 	} else {
 		n.BecomeCandidate()
 		for _, nodeId := range n.cfg.Replicas {
+			if !n.isVoter(nodeId) {
+				continue
+			}
 			if nodeId == n.opts.NodeId {
 				// 自己给自己投一票
 				n.sendVoteReq(types.LocalNode)
