@@ -30,20 +30,21 @@ type readiness struct {
 }
 
 type Manager struct {
-	byUID    map[string]map[int64]struct{}
-	mu       sync.Mutex
-	boot     string
-	node     uint64
-	physical map[int64]physicalSession
-	ready    map[string]*readiness
-	rejected atomic.Uint64
+	byUID            map[string]map[int64]struct{}
+	mu               sync.Mutex
+	boot             string
+	node             uint64
+	physical         map[int64]physicalSession
+	ready            map[string]*readiness
+	legacyUptimeSeed uint64
+	rejected         atomic.Uint64
 	// Bounds cold recovery work without serializing unrelated warm deliveries.
 	// Source snapshots never acquire this gate.
 	gate chan struct{}
 }
 
 func New(node uint64) *Manager {
-	return &Manager{byUID: make(map[string]map[int64]struct{}), boot: wkutil.GenUUID(), node: node, physical: make(map[int64]physicalSession), ready: make(map[string]*readiness), gate: make(chan struct{}, 8)}
+	return &Manager{byUID: make(map[string]map[int64]struct{}), boot: wkutil.GenUUID(), node: node, physical: make(map[int64]physicalSession), ready: make(map[string]*readiness), legacyUptimeSeed: uint64(time.Now().UnixNano()), gate: make(chan struct{}, 8)}
 }
 
 func (m *Manager) Track(raw wknet.Conn) {
@@ -65,6 +66,18 @@ func (m *Manager) Prepare(raw wknet.Conn, conn *eventbus.Conn) {
 	ownerBootID, sessionID := m.boot, ""
 	if entry.conn != nil {
 		sessionID = entry.conn.SessionID
+		conn.Uptime = entry.conn.Uptime
+	} else {
+		// Uptime is part of the legacy descriptor format, so old nodes preserve
+		// it even though they strip the appended boot/session fields. Give every
+		// physical socket a high-resolution, monotonically unique value to keep
+		// delayed legacy CONNACKs from authenticating a reused numeric ID.
+		candidate := uint64(raw.Uptime().UnixNano())
+		if candidate <= m.legacyUptimeSeed {
+			candidate = m.legacyUptimeSeed + 1
+		}
+		m.legacyUptimeSeed = candidate
+		conn.Uptime = candidate
 	}
 	m.unindexLocked(entry.conn)
 	if sessionID == "" {

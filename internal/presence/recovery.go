@@ -204,7 +204,7 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 	for _, uid := range uids {
 		logical[uid] = len(eventbus.User.ConnsByUid(uid)) > 0
 	}
-	var authorityIncomplete bool
+	var invalidUID bool
 	m.mu.Lock()
 	m.ensureReadyCapacityLocked(len(uids), now)
 	for _, uid := range uids {
@@ -212,7 +212,7 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 			continue
 		}
 		if service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid)) != m.node {
-			authorityIncomplete = true
+			invalidUID = true
 			continue
 		}
 		r := m.ready[uid]
@@ -233,7 +233,7 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 	}
 	m.mu.Unlock()
 	if len(missing) == 0 {
-		if authorityIncomplete {
+		if invalidUID {
 			return ErrNotReady
 		}
 		return nil
@@ -276,7 +276,7 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 		})
 	}
 	_ = group.Wait()
-	complete := !authorityIncomplete && !membershipIncomplete
+	complete := !membershipIncomplete
 	var ownerErrors []error
 	for _, err := range readErrors {
 		if err != nil {
@@ -291,7 +291,8 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 	}
 	for uid, r := range states {
 		if m.ready[uid] != r || r.generation != generations[uid] || service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid)) != m.node {
-			return ErrNotReady
+			delete(states, uid)
+			invalidUID = true
 		}
 	}
 	byUID := make(map[string][]*eventbus.Conn)
@@ -335,7 +336,13 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 		}
 	}
 	if !complete {
-		return fmt.Errorf("%w: %v", ErrNotReady, errors.Join(ownerErrors...))
+		if ownerErr := errors.Join(ownerErrors...); ownerErr != nil {
+			return fmt.Errorf("%w: %v", ErrNotReady, ownerErr)
+		}
+		return ErrNotReady
+	}
+	if invalidUID {
+		return ErrNotReady
 	}
 	return nil
 }

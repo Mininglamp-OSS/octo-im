@@ -126,11 +126,18 @@ type handlerSocket struct {
 	id      int64
 	ctx     interface{}
 	maxIdle time.Duration
+	uptime  time.Time
 }
 
 func (c *handlerSocket) ID() int64                { return c.id }
 func (c *handlerSocket) SetContext(v interface{}) { c.ctx = v }
 func (c *handlerSocket) Context() interface{}     { return c.ctx }
+func (c *handlerSocket) Uptime() time.Time {
+	if c.uptime.IsZero() {
+		return time.Unix(0, c.id)
+	}
+	return c.uptime
+}
 func (c *handlerSocket) SetMaxIdle(v time.Duration) {
 	c.maxIdle = v
 }
@@ -154,7 +161,7 @@ func TestConnackBindsLegacyDescriptorToPreparedSocket(t *testing.T) {
 	manager.Track(raw)
 	prepared := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, DeviceId: "web", DeviceFlag: wkproto.APP, Uptime: 11}
 	manager.Prepare(raw, prepared)
-	legacy := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, DeviceId: "web", DeviceFlag: wkproto.APP, Uptime: 11, Auth: true, AesIV: []byte("iv"), AesKey: []byte("key")}
+	legacy := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, DeviceId: "web", DeviceFlag: wkproto.APP, Uptime: prepared.Uptime, Auth: true, AesIV: []byte("iv"), AesKey: []byte("key")}
 	service.Presence = manager
 	service.ConnManager = &handlerConnManager{conn: raw}
 	users := &handlerUsers{}
@@ -182,7 +189,7 @@ func TestConnackReturnsAuthFailureForSessionMismatch(t *testing.T) {
 	service.Presence = manager
 	users := &handlerUsers{}
 	eventbus.RegisterUser(users)
-	stale := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, DeviceId: "web", DeviceFlag: wkproto.APP, Uptime: 11, Auth: true, OwnerBootID: prepared.OwnerBootID, SessionID: "stale"}
+	stale := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, DeviceId: "web", DeviceFlag: wkproto.APP, Uptime: prepared.Uptime, Auth: true, OwnerBootID: prepared.OwnerBootID, SessionID: "stale"}
 
 	NewHandler().connack(&eventbus.UserContext{Uid: "u", Events: []*eventbus.Event{{Conn: stale, Frame: &wkproto.ConnackPacket{ReasonCode: wkproto.ReasonSuccess}}}})
 	require.Empty(t, users.updated)

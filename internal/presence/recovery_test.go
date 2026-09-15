@@ -21,13 +21,20 @@ import (
 
 type testSocket struct {
 	wknet.Conn
-	id  int64
-	ctx interface{}
+	id     int64
+	ctx    interface{}
+	uptime time.Time
 }
 
 func (c *testSocket) ID() int64                { return c.id }
 func (c *testSocket) SetContext(v interface{}) { c.ctx = v }
 func (c *testSocket) Context() interface{}     { return c.ctx }
+func (c *testSocket) Uptime() time.Time {
+	if c.uptime.IsZero() {
+		return time.Unix(0, c.id)
+	}
+	return c.uptime
+}
 
 type testUsers struct {
 	eventbus.IUser
@@ -189,6 +196,27 @@ func TestCloseDuringRecoveryCannotResurrectSession(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestOneInvalidatedUIDDoesNotPoisonRecoveryBatch(t *testing.T) {
+	owner, leader, cluster, users, _, first := fixture(t)
+	secondRaw := &testSocket{id: 8}
+	second := &eventbus.Conn{Uid: "v", NodeId: 1, ConnId: 8, DeviceId: "web"}
+	owner.Track(secondRaw)
+	owner.Prepare(secondRaw, second)
+	second.Auth = true
+	require.True(t, owner.Authenticate(second))
+
+	once := sync.Once{}
+	cluster.afterRead = func() { once.Do(func() { leader.Forget(first) }) }
+	err := leader.recoverBatch(context.Background(), []string{first.Uid, second.Uid})
+
+	require.ErrorIs(t, err, ErrNotReady)
+	require.Empty(t, users.ConnsByUid(first.Uid))
+	got := users.ConnsByUid(second.Uid)
+	require.Len(t, got, 1)
+	require.True(t, got[0].SameSession(second))
+	require.True(t, leader.IsReady(second.Uid))
+}
+
 func TestRecoveryFailsClosedWhenAnOwnerCannotBeRead(t *testing.T) {
 	_, leader, cluster, users, _, _ := fixture(t)
 	cluster.request = func() error { return errors.New("owner unreachable") }
@@ -323,6 +351,27 @@ func TestPrepareKeepsOneSessionIdentityPerSocket(t *testing.T) {
 	owner.Prepare(raw, second)
 	require.Equal(t, first.OwnerBootID, second.OwnerBootID)
 	require.Equal(t, first.SessionID, second.SessionID)
+}
+
+func TestLegacyDescriptorCannotAuthenticateReusedConnectionID(t *testing.T) {
+	owner := New(1)
+	started := time.Unix(10, 20)
+	oldRaw := &testSocket{id: 7, uptime: started}
+	oldConn := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, DeviceId: "web", DeviceFlag: 1}
+	owner.Track(oldRaw)
+	owner.Prepare(oldRaw, oldConn)
+	staleLegacy := &eventbus.Conn{Uid: oldConn.Uid, NodeId: oldConn.NodeId, ConnId: oldConn.ConnId, DeviceId: oldConn.DeviceId, DeviceFlag: oldConn.DeviceFlag, Uptime: oldConn.Uptime, Auth: true}
+	owner.Close(oldRaw)
+
+	newRaw := &testSocket{id: 7, uptime: started}
+	newConn := &eventbus.Conn{Uid: "u", NodeId: 1, ConnId: 7, DeviceId: "web", DeviceFlag: 1}
+	owner.Track(newRaw)
+	owner.Prepare(newRaw, newConn)
+	require.NotEqual(t, oldConn.Uptime, newConn.Uptime)
+	require.False(t, owner.Authenticate(staleLegacy))
+
+	currentLegacy := &eventbus.Conn{Uid: newConn.Uid, NodeId: newConn.NodeId, ConnId: newConn.ConnId, DeviceId: newConn.DeviceId, DeviceFlag: newConn.DeviceFlag, Uptime: newConn.Uptime, Auth: true}
+	require.True(t, owner.Authenticate(currentLegacy))
 }
 
 func TestSnapshotOmitsCryptoAndVerifyKeepsCallerDescriptor(t *testing.T) {
