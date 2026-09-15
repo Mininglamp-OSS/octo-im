@@ -11,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
@@ -30,31 +31,21 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 		timeoutCtx, cancel := h.WithTimeout()
 		defer cancel()
-		reasonCode := wkproto.ReasonSuccess
-
 		results, err := service.Store.AppendMessages(timeoutCtx, ctx.ChannelId, ctx.ChannelType, persists)
 		if err != nil {
 			h.Error("store message failed", zap.Error(err), zap.Int("events", len(persists)), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-			reasonCode = wkproto.ReasonSystemError
+			markPersistFailure(events, err)
 		}
 
 		if err == nil {
 			err = applyPersistResults(events, persists, results)
 			if err != nil {
-				reasonCode = wkproto.ReasonSystemError
 				h.Error("invalid persistence response", zap.Error(err))
+				markPersistFailure(events, err)
 			}
 		}
-		if reasonCode == wkproto.ReasonSuccess {
-			// Retried delivery is intentional: the first process may have committed
-			// and crashed before dispatching. Side effects use the canonical identity.
-			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, persists)
-		} else {
-			for _, e := range events {
-				if packet, ok := e.Frame.(*wkproto.SendPacket); ok && packet != nil && !packet.NoPersist && e.ReasonCode == wkproto.ReasonSuccess {
-					e.ReasonCode = reasonCode
-				}
-			}
+		if err == nil {
+			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, newlyPersistedMessages(events, persists))
 		}
 
 	}
@@ -71,8 +62,9 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	if options.G.WebhookOn(types.EventMsgNotify) {
 		for _, e := range events {
 			sendPacket := e.Frame.(*wkproto.SendPacket)
-			if e.ReasonCode == wkproto.ReasonSuccess && !sendPacket.NoPersist {
+			if shouldRunPersistSideEffects(e) && !sendPacket.NoPersist {
 				cloneEvent := e.Clone()
+				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 				cloneEvent.Type = eventbus.EventChannelWebhook
 				eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 			}
@@ -81,10 +73,11 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 	// ========== 分发 ==========
 	for _, e := range events {
-		if e.ReasonCode != wkproto.ReasonSuccess {
+		if !shouldDistributePersistResult(e) {
 			continue
 		}
 		cloneEvent := e.Clone()
+		cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 		cloneEvent.Type = eventbus.EventChannelDistribute
 		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 	}
@@ -93,7 +86,42 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 }
 
+func markPersistFailure(events []*eventbus.Event, err error) {
+	retryable := channel.IsRetryableSendError(err)
+	ambiguous := channel.IsAmbiguousSendError(err)
+	for _, event := range events {
+		packet, ok := event.Frame.(*wkproto.SendPacket)
+		if !ok || packet == nil || packet.NoPersist || event.ReasonCode != wkproto.ReasonSuccess {
+			continue
+		}
+		event.ReasonCode = wkproto.ReasonSystemError
+		if !retryable {
+			continue
+		}
+		if ambiguous && packet.ClientMsgNo == "" {
+			event.PersistenceOutcomeUnknown = true
+			continue
+		}
+		event.ReasonCode = wkproto.ReasonNodeNotMatch
+	}
+}
+
+func shouldRunPersistSideEffects(event *eventbus.Event) bool {
+	return event.ReasonCode == wkproto.ReasonSuccess && !event.PersistedDuplicate
+}
+
+func shouldDistributePersistResult(event *eventbus.Event) bool {
+	// Duplicate proves persistence, not that the earlier process reached the
+	// in-memory distribution stage. Redistribute the canonical message so a
+	// commit followed by a crash cannot strand it; recipients deduplicate by
+	// the canonical message identity.
+	return event.ReasonCode == wkproto.ReasonSuccess
+}
+
 func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, msgs []wkdb.Message) {
+	if len(msgs) == 0 {
+		return
+	}
 	plugins := service.PluginManager.Plugins(types.PluginPersistAfter)
 	if len(plugins) == 0 {
 		return
@@ -138,6 +166,22 @@ func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, 
 
 	// 当前节点非频道领导节点，转发请求到领导节点执行
 	h.forwardPersistAfterToLeader(leaderId, channelId, channelType, msgBatch)
+}
+
+func newlyPersistedMessages(events []*eventbus.Event, messages []wkdb.Message) []wkdb.Message {
+	result := make([]wkdb.Message, 0, len(messages))
+	messageIndex := 0
+	for _, e := range events {
+		packet, ok := e.Frame.(*wkproto.SendPacket)
+		if !ok || packet == nil || packet.NoPersist || e.ReasonCode != wkproto.ReasonSuccess {
+			continue
+		}
+		if !e.PersistedDuplicate {
+			result = append(result, messages[messageIndex])
+		}
+		messageIndex++
+	}
+	return result
 }
 
 // executePluginPersistAfterLocal 在本地执行插件PersistAfter调用
@@ -234,6 +278,7 @@ func applyPersistResults(events []*eventbus.Event, messages []wkdb.Message, resu
 	for i, r := range results {
 		eligible[i].MessageId = int64(r.CanonicalID)
 		eligible[i].MessageSeq = r.Index
+		eligible[i].PersistedDuplicate = r.Duplicate
 		messages[i].MessageID = int64(r.CanonicalID)
 		messages[i].MessageSeq = uint32(r.Index)
 	}

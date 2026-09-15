@@ -38,7 +38,7 @@ func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, channelId 
 	// ========== 如果不存在，则先从频道的槽领导获取频道的分布式配置，然后根据配置执行对应逻辑 ==========
 	clusterConfig, err := s.opts.Cluster.GetOrCreateChannelClusterConfigFromSlotLeader(channelId, channelType)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrSendUnavailable, err)
 	}
 
 	// 如果当前节点是频道的领导节点
@@ -72,12 +72,12 @@ func (s *Server) ProposeBatchUntilAppliedTimeoutForLocal(ctx context.Context, ch
 	// ========== 如果不存在，则先从频道的槽领导获取频道的分布式配置，然后根据配置执行对应逻辑 ==========
 	clusterConfig, err := s.opts.Cluster.GetOrCreateChannelClusterConfigFromSlotLeader(channelId, channelType)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrSendUnavailable, err)
 	}
 
 	// 如果当前节点是频道的领导节点
 	if clusterConfig.LeaderId != s.opts.NodeId {
-		return nil, fmt.Errorf("ProposeBatchUntilAppliedTimeoutForLocal failed, not leader")
+		return nil, ErrSendUnavailable
 	}
 	// 根据需要唤醒频道领导
 	err = s.WakeLeaderIfNeed(clusterConfig)

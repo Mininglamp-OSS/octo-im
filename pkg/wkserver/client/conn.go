@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -33,6 +34,7 @@ type conn struct {
 	status      atomic.Value // 是否已认证
 	c           *Client
 	addr        string // 服务端地址
+	gcMu        sync.RWMutex
 	gc          gnet.Conn
 	idleTick    int // 空闲tick数
 	timeoutTick int
@@ -55,7 +57,28 @@ func newConn(addr string, c *Client) *conn {
 }
 
 func (c *conn) asyncWrite(b []byte) error {
-	return c.gc.AsyncWrite(b, nil)
+	if c.status.Load() != authed {
+		return errors.New("connect is not connected")
+	}
+	gc := c.transport()
+	if gc == nil {
+		return errors.New("conn is nil")
+	}
+	return gc.AsyncWrite(b, nil)
+}
+
+func (c *conn) transport() gnet.Conn {
+	c.gcMu.RLock()
+	defer c.gcMu.RUnlock()
+	return c.gc
+}
+
+func (c *conn) replaceTransport(gc gnet.Conn) gnet.Conn {
+	c.gcMu.Lock()
+	defer c.gcMu.Unlock()
+	old := c.gc
+	c.gc = gc
+	return old
 }
 
 func (c *conn) startDial() {
@@ -74,18 +97,19 @@ func (c *conn) startDial() {
 		addr = c.addr
 	}
 	c.no = wkutil.GenUUID()
-	if c.gc != nil {
-		_ = c.gc.Close()
-		c.gc = nil
+	old := c.replaceTransport(nil)
+	if old != nil {
+		_ = old.Close()
 	}
 
-	c.gc, err = c.c.cli.DialContext(proto, addr, connCtx{
+	gc, err := c.c.cli.DialContext(proto, addr, connCtx{
 		no: c.no,
 	})
 	if err != nil {
 		// c.Foucs("conn failed", zap.Error(err))
 		c.status.Store(disconnect)
 	} else {
+		c.replaceTransport(gc)
 		c.status.Store(connected)
 		c.Foucs("conn success")
 	}
@@ -120,7 +144,11 @@ func (c *conn) sendAuth() error {
 	}
 
 	waitC := c.c.w.Register(conn.Id)
-	err = c.gc.AsyncWrite(msgData, nil)
+	gc := c.transport()
+	if gc == nil {
+		return errors.New("conn is nil")
+	}
+	err = gc.AsyncWrite(msgData, nil)
 	if err != nil {
 		c.Error("write failed", zap.Error(err))
 		return err
@@ -163,7 +191,10 @@ func (c *conn) tick() {
 
 func (c *conn) reconnect() {
 	c.status.Store(disconnect)
-	_ = c.gc.Close()
+	gc := c.transport()
+	if gc != nil {
+		_ = gc.Close()
+	}
 }
 
 // 发送心跳
@@ -173,7 +204,12 @@ func (c *conn) sendHeartbeat() {
 		c.Warn("encode heartbeat error", zap.Error(err))
 		return
 	}
-	err = c.gc.AsyncWrite(data, nil)
+	gc := c.transport()
+	if gc == nil {
+		c.Warn("send heartbeat failed, conn is nil")
+		return
+	}
+	err = gc.AsyncWrite(data, nil)
 	if err != nil {
 		c.Warn("send heartbeat error", zap.Error(err))
 		return

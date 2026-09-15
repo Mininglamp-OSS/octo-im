@@ -54,6 +54,10 @@ type userPlus struct {
 	user IUser
 }
 
+type connToucher interface {
+	TouchConn(uid string, nodeId uint64, connId int64) bool
+}
+
 func newUserPlus(user IUser) *userPlus {
 	return &userPlus{
 		user: user,
@@ -123,6 +127,13 @@ func (u *userPlus) LocalConnByUid(uid string) []*Conn {
 // ConnById 获取连接
 func (u *userPlus) ConnById(uid string, fromNode uint64, id int64) *Conn {
 	return u.user.ConnById(uid, fromNode, id)
+}
+
+// TouchConn refreshes activity on the registered descriptor without replacing
+// session identity or authentication fields received from another node.
+func (u *userPlus) TouchConn(uid string, nodeId uint64, connId int64) bool {
+	toucher, ok := u.user.(connToucher)
+	return ok && toucher.TouchConn(uid, nodeId, connId)
 }
 
 // UpdateConn 更新连接
