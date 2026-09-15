@@ -18,9 +18,13 @@ type Handler struct {
 }
 
 func NewHandler() *Handler {
+	workerCount := 1
+	if options.G != nil {
+		workerCount = options.G.Poller.UserGoroutine
+	}
 	h := &Handler{
 		Log:         wklog.NewWKLog("handler"),
-		forwardGate: forward.NewGate(options.G.Poller.UserGoroutine),
+		forwardGate: forward.NewGate(workerCount),
 	}
 	h.routes()
 	return h

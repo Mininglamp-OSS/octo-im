@@ -23,11 +23,15 @@ type Handler struct {
 }
 
 func NewHandler() *Handler {
+	workerCount := 1
+	if options.G != nil {
+		workerCount = options.G.Poller.ChannelGoroutine
+	}
 	h := &Handler{
 		Log:           wklog.NewWKLog("handler"),
 		client:        ingress.NewClient(),
 		commonService: common.NewService(),
-		forwardGate:   forward.NewGate(options.G.Poller.ChannelGoroutine),
+		forwardGate:   forward.NewGate(workerCount),
 	}
 	h.routes()
 	return h
