@@ -25,6 +25,7 @@ type verificationSessionKey struct {
 	uid         string
 	nodeID      uint64
 	connID      int64
+	uptime      uint64
 	ownerBootID string
 	sessionID   string
 }
@@ -121,7 +122,7 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 			continue
 		}
 		known := eventbus.User.ConnById(uid, event.Conn.NodeId, event.Conn.ConnId)
-		if known != nil && known.Auth && known.SameSession(event.Conn) {
+		if known != nil && known.Auth && sessionDescriptorMatches(known, event.Conn) {
 			event.Conn = verifiedSessionDescriptor(known, event.Conn)
 			verifiedEvents = append(verifiedEvents, event)
 			continue
@@ -179,7 +180,7 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 }
 
 func verifiedSessionDescriptor(known, claimed *eventbus.Conn) *eventbus.Conn {
-	if known == nil || claimed == nil || !known.SameSession(claimed) ||
+	if known == nil || claimed == nil || !sessionDescriptorMatches(known, claimed) ||
 		(len(known.AesIV) > 0 && len(known.AesKey) > 0) || len(claimed.AesIV) == 0 || len(claimed.AesKey) == 0 {
 		return known
 	}
@@ -197,9 +198,19 @@ func verifiedSessionDescriptor(known, claimed *eventbus.Conn) *eventbus.Conn {
 	return merged
 }
 
+func sessionDescriptorMatches(known, claimed *eventbus.Conn) bool {
+	if known == nil || claimed == nil {
+		return false
+	}
+	if known.IsLegacySession() && claimed.IsLegacySession() {
+		return known.LegacyMatches(claimed)
+	}
+	return known.HasSessionIdentity() && claimed.HasSessionIdentity() && known.SameSession(claimed)
+}
+
 func verificationKey(conn *eventbus.Conn) verificationSessionKey {
 	return verificationSessionKey{
-		uid: conn.Uid, nodeID: conn.NodeId, connID: conn.ConnId,
+		uid: conn.Uid, nodeID: conn.NodeId, connID: conn.ConnId, uptime: conn.Uptime,
 		ownerBootID: conn.OwnerBootID, sessionID: conn.SessionID,
 	}
 }

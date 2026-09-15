@@ -163,6 +163,44 @@ func TestVerifyOnSendDoesNotCacheTransientFailures(t *testing.T) {
 	}
 }
 
+func TestVerifyOnSendLegacyFastPathUsesSocketBirth(t *testing.T) {
+	oldOptions, oldPresence, oldUser := options.G, service.Presence, eventbus.User
+	t.Cleanup(func() { options.G, service.Presence, eventbus.User = oldOptions, oldPresence, oldUser })
+	options.G = options.New()
+	known := &eventbus.Conn{
+		Uid: "u", NodeId: 2, ConnId: 7, DeviceId: "web", DeviceFlag: wkproto.APP, Uptime: 102, Auth: true,
+	}
+	users := &handlerUsers{known: known}
+	eventbus.RegisterUser(users)
+	verifyCalls := 0
+	service.Presence = &verificationPresence{verify: func(*eventbus.Conn) (*eventbus.Conn, error) {
+		verifyCalls++
+		return nil, service.ErrPresenceSessionNotFound
+	}}
+	h := NewHandler()
+	stale := &eventbus.Event{
+		Type: eventbus.EventOnSend,
+		Conn: &eventbus.Conn{
+			Uid: "u", NodeId: 2, ConnId: 7, DeviceId: "web", DeviceFlag: wkproto.APP, Uptime: 101, Auth: true,
+		},
+		Frame: &wkproto.SendPacket{ClientSeq: 1},
+	}
+	current := &eventbus.Event{
+		Type: eventbus.EventOnSend,
+		Conn: &eventbus.Conn{
+			Uid: "u", NodeId: 2, ConnId: 7, DeviceId: "web", DeviceFlag: wkproto.APP, Uptime: 102, Auth: true,
+		},
+		Frame: &wkproto.SendPacket{ClientSeq: 2},
+	}
+
+	verified := h.verifyOnSendEvents("u", []*eventbus.Event{stale, current})
+
+	require.Equal(t, 1, verifyCalls)
+	require.Len(t, users.events, 1)
+	require.Len(t, verified, 1)
+	require.Same(t, current, verified[0])
+}
+
 func TestVerifyOnSendHasOneBatchDeadlineForDistinctSessions(t *testing.T) {
 	oldOptions, oldPresence, oldUser := options.G, service.Presence, eventbus.User
 	t.Cleanup(func() { options.G, service.Presence, eventbus.User = oldOptions, oldPresence, oldUser })
