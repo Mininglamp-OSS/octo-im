@@ -16,3 +16,8 @@ func TestSendErrorRetryability(t *testing.T) {
 	require.False(t, IsRetryableSendError(ErrMessageConflict))
 	require.False(t, IsRetryableSendError(errors.New("malformed canonical result")))
 }
+
+func TestSendErrorAmbiguity(t *testing.T) {
+	require.True(t, IsAmbiguousSendError(fmt.Errorf("remote: %w", context.DeadlineExceeded)))
+	require.False(t, IsAmbiguousSendError(fmt.Errorf("pre-admission: %w", types.ErrNotLeader)))
+}

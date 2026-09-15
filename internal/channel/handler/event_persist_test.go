@@ -1,13 +1,33 @@
 package handler
 
 import (
+	"context"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
-	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/stretchr/testify/require"
 	"testing"
 )
+
+func TestPersistFailureDoesNotInviteUnkeyedAmbiguousReplay(t *testing.T) {
+	unkeyed := &eventbus.Event{ReasonCode: wkproto.ReasonSuccess, Frame: &wkproto.SendPacket{}}
+	keyed := &eventbus.Event{ReasonCode: wkproto.ReasonSuccess, Frame: &wkproto.SendPacket{ClientMsgNo: "stable"}}
+	markPersistFailure([]*eventbus.Event{unkeyed, keyed}, context.DeadlineExceeded)
+
+	require.True(t, unkeyed.PersistenceOutcomeUnknown)
+	require.Equal(t, wkproto.ReasonSystemError, unkeyed.ReasonCode)
+	require.False(t, keyed.PersistenceOutcomeUnknown)
+	require.Equal(t, wkproto.ReasonNodeNotMatch, keyed.ReasonCode)
+}
+
+func TestPersistFailureRetriesUnkeyedPreAdmissionRejection(t *testing.T) {
+	event := &eventbus.Event{ReasonCode: wkproto.ReasonSuccess, Frame: &wkproto.SendPacket{}}
+	markPersistFailure([]*eventbus.Event{event}, rafttypes.ErrNotLeader)
+
+	require.False(t, event.PersistenceOutcomeUnknown)
+	require.Equal(t, wkproto.ReasonNodeNotMatch, event.ReasonCode)
+}
 
 func TestPersistCanonicalRetryResults(t *testing.T) {
 	e := func(id int64, noPersist bool, reason wkproto.ReasonCode) *eventbus.Event {
@@ -15,7 +35,7 @@ func TestPersistCanonicalRetryResults(t *testing.T) {
 	}
 	events := []*eventbus.Event{e(10, false, wkproto.ReasonSuccess), e(11, true, wkproto.ReasonSuccess), e(12, false, wkproto.ReasonSystemError), e(13, false, wkproto.ReasonSuccess)}
 	messages := []wkdb.Message{{RecvPacket: wkproto.RecvPacket{MessageID: 10}}, {RecvPacket: wkproto.RecvPacket{MessageID: 13}}}
-	results := types.ProposeRespSet{{Id: 10, Index: 7, CanonicalID: 5, Duplicate: true}, {Id: 13, Index: 7, CanonicalID: 5, Duplicate: true}}
+	results := rafttypes.ProposeRespSet{{Id: 10, Index: 7, CanonicalID: 5, Duplicate: true}, {Id: 13, Index: 7, CanonicalID: 5, Duplicate: true}}
 	require.NoError(t, applyPersistResults(events, messages, results))
 	for _, i := range []int{0, 3} {
 		require.Equal(t, int64(5), events[i].MessageId)
@@ -49,7 +69,7 @@ func TestCommittedDuplicateStillQualifiesForDistribution(t *testing.T) {
 }
 
 func TestPersistRejectsIncompleteCanonicalResponse(t *testing.T) {
-	for _, rs := range []types.ProposeRespSet{nil, {{Id: 10, Index: 1}}, {{Id: 11, Index: 1, CanonicalID: 10}}, {{Id: 10, Index: 0, CanonicalID: 10}}} {
+	for _, rs := range []rafttypes.ProposeRespSet{nil, {{Id: 10, Index: 1}}, {{Id: 11, Index: 1, CanonicalID: 10}}, {{Id: 10, Index: 0, CanonicalID: 10}}} {
 		events := []*eventbus.Event{{MessageId: 10, ReasonCode: wkproto.ReasonSuccess, Frame: &wkproto.SendPacket{}}}
 		msgs := []wkdb.Message{{RecvPacket: wkproto.RecvPacket{MessageID: 10}}}
 		require.Error(t, applyPersistResults(events, msgs, rs))

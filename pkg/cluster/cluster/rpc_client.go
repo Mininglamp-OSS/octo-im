@@ -38,7 +38,7 @@ func (r *rpcClient) RequestChannelProposeBatchUntilApplied(ctx context.Context, 
 	}
 	resp, err := r.s.RequestWithContext(ctx, nodeId, "/rpc/channel/propose/v2", data)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", channel.ErrSendUnavailable, err)
+		return nil, fmt.Errorf("%w: %w", channel.ErrSendUnavailable, err)
 	}
 	if resp == nil || resp.Status == channelProposalUnavailable {
 		return nil, channel.ErrSendUnavailable

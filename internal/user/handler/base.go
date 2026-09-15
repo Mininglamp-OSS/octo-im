@@ -14,11 +14,13 @@ import (
 type Handler struct {
 	wklog.Log
 	forwardCapabilities forward.CapabilityCache
+	forwardGate         *forward.Gate
 }
 
 func NewHandler() *Handler {
 	h := &Handler{
-		Log: wklog.NewWKLog("handler"),
+		Log:         wklog.NewWKLog("handler"),
+		forwardGate: forward.NewGate(options.G.Poller.UserGoroutine),
 	}
 	h.routes()
 	return h
@@ -132,6 +134,13 @@ func (h *Handler) forwardsToNode(nodeId uint64, uid string, events []*eventbus.E
 		forward.Fail(events, err)
 		return
 	}
+	if !h.forwardGate.TryAcquire() {
+		err = forward.ErrUnavailable
+		h.Error("user forwarding concurrency limit reached", zap.Error(err), zap.String("uid", uid))
+		forward.Fail(events, err)
+		return
+	}
+	defer h.forwardGate.Release()
 	target := func() uint64 { return nodeId }
 	if !h.notForwardToLeader(events[0].Type) {
 		target = func() uint64 { return h.userLeaderNodeId(uid) }

@@ -55,6 +55,16 @@ func TestRequestDoesNotReplayAfterAmbiguousSend(t *testing.T) {
 	require.Len(t, bodies, 1)
 }
 
+func TestGateRejectsWithoutBlockingWhenForwardCapacityIsBusy(t *testing.T) {
+	gate := NewGate(4)
+	require.True(t, gate.TryAcquire())
+	defer gate.Release()
+
+	start := time.Now()
+	require.False(t, gate.TryAcquire())
+	require.Less(t, time.Since(start), 100*time.Millisecond)
+}
+
 func TestAmbiguousResponseCannotContradictPeerSuccess(t *testing.T) {
 	oldOptions, oldCluster, oldUser := options.G, service.Cluster, eventbus.User
 	t.Cleanup(func() { options.G, service.Cluster, eventbus.User = oldOptions, oldCluster, oldUser })
@@ -151,6 +161,25 @@ func TestRequestCompatibleFallsBackBeforeAdmission(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{CapabilityPath}, paths)
 	require.Equal(t, uint64(2), legacyNode)
+}
+
+func TestCapabilityProbeCannotOverrunEnvelopeBudget(t *testing.T) {
+	old := service.Cluster
+	t.Cleanup(func() { service.Cluster = old })
+	service.Cluster = &requestCluster{request: func(ctx context.Context, _ uint64, _ string, _ []byte) (*proto.Response, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	event := &eventbus.Event{Frame: &wkproto.SendPacket{ClientMsgNo: "stable"}, ForwardDeadline: time.Now().Add(40 * time.Millisecond).UnixMilli()}
+	legacyCalls := 0
+	start := time.Now()
+	err := RequestCompatible(UserPath, nil, []*eventbus.Event{event}, func() uint64 { return 2 }, 1, nil, &CapabilityCache{}, func(uint64) error {
+		legacyCalls++
+		return nil
+	})
+	require.Error(t, err)
+	require.Zero(t, legacyCalls)
+	require.Less(t, time.Since(start), 200*time.Millisecond)
 }
 
 func TestRequestCompatibleDoesNotFallBackAfterAmbiguousV1Attempt(t *testing.T) {

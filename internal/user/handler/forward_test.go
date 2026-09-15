@@ -121,6 +121,30 @@ func TestAmbiguousUnkeyedSendWaitsForPeerOrClientTimeout(t *testing.T) {
 	require.Empty(t, u.events)
 }
 
+func TestForwardConcurrencyGateFailsFastBeforeNetworkWait(t *testing.T) {
+	oldOptions, oldCluster, oldUser := options.G, service.Cluster, eventbus.User
+	t.Cleanup(func() { options.G, service.Cluster, eventbus.User = oldOptions, oldCluster, oldUser })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 1
+	c := &forwardCluster{leader: 2, supportV1: true}
+	service.Cluster = c
+	u := &forwardUser{}
+	eventbus.RegisterUser(u)
+	h := NewHandler()
+	h.forwardGate = forward.NewGate(4)
+	require.True(t, h.forwardGate.TryAcquire())
+	defer h.forwardGate.Release()
+	e := &eventbus.Event{Type: eventbus.EventOnSend, Conn: &eventbus.Conn{Uid: "u", NodeId: 1}, Frame: &wkproto.SendPacket{ClientSeq: 42, ClientMsgNo: "stable"}}
+
+	start := time.Now()
+	h.OnEvent(&eventbus.UserContext{Uid: "u", EventType: eventbus.EventOnSend, Events: []*eventbus.Event{e}})
+
+	require.Less(t, time.Since(start), 100*time.Millisecond)
+	require.Zero(t, c.calls)
+	require.Len(t, u.events, 1)
+	require.Equal(t, wkproto.ReasonNodeNotMatch, u.events[0].Frame.(*wkproto.SendackPacket).ReasonCode)
+}
+
 func TestWriteFrameBatchesRemoteEventsByDestination(t *testing.T) {
 	oldOptions, oldCluster := options.G, service.Cluster
 	t.Cleanup(func() { options.G, service.Cluster = oldOptions, oldCluster })

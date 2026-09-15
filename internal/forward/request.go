@@ -38,6 +38,39 @@ type capabilityEntry struct {
 	expiresAt time.Time
 }
 
+// Gate reserves only a bounded fraction of an event worker pool for forwarding
+// waits. Admission is non-blocking so a peer outage cannot occupy every shared
+// worker and stall unrelated users or channels.
+type Gate struct {
+	slots chan struct{}
+}
+
+func NewGate(workerCount int) *Gate {
+	limit := workerCount / 4
+	if limit < 1 {
+		limit = 1
+	}
+	return &Gate{slots: make(chan struct{}, limit)}
+}
+
+func (g *Gate) TryAcquire() bool {
+	if g == nil {
+		return true
+	}
+	select {
+	case g.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (g *Gate) Release() {
+	if g != nil {
+		<-g.slots
+	}
+}
+
 // CapabilityCache probes a peer before the first side-effecting v1 request.
 // A failed read-only probe can safely select the legacy transport during a
 // rolling upgrade without guessing after an admission response is lost.
@@ -52,7 +85,7 @@ func RegisterCapabilityRoute() {
 	})
 }
 
-func (c *CapabilityCache) Supports(node uint64) bool {
+func (c *CapabilityCache) Supports(ctx context.Context, node uint64) bool {
 	now := time.Now()
 	c.mu.Lock()
 	if entry, ok := c.entries[node]; ok && now.Before(entry.expiresAt) {
@@ -61,10 +94,13 @@ func (c *CapabilityCache) Supports(node uint64) bool {
 	}
 	c.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	resp, err := service.Cluster.RequestWithContext(ctx, node, CapabilityPath, nil)
+	probeCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	resp, err := service.Cluster.RequestWithContext(probeCtx, node, CapabilityPath, nil)
 	cancel()
 	supported := err == nil && resp != nil && resp.Status == proto.StatusOK
+	if ctx.Err() != nil {
+		return false
+	}
 
 	c.mu.Lock()
 	if c.entries == nil {
@@ -146,7 +182,10 @@ func request(path string, body []byte, events []*eventbus.Event, target func() u
 			status = accept(data)
 		} else if node != 0 {
 			zeroTargets = 0
-			if capabilities != nil && legacy != nil && !capabilities.Supports(node) {
+			if capabilities != nil && legacy != nil && !capabilities.Supports(ctx, node) {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				return legacy(node)
 			}
 			attemptCtx, done := context.WithTimeout(ctx, 750*time.Millisecond)

@@ -31,32 +31,21 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 		timeoutCtx, cancel := h.WithTimeout()
 		defer cancel()
-		reasonCode := wkproto.ReasonSuccess
-
 		results, err := service.Store.AppendMessages(timeoutCtx, ctx.ChannelId, ctx.ChannelType, persists)
 		if err != nil {
 			h.Error("store message failed", zap.Error(err), zap.Int("events", len(persists)), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-			reasonCode = wkproto.ReasonSystemError
-			if channel.IsRetryableSendError(err) {
-				reasonCode = wkproto.ReasonNodeNotMatch
-			}
+			markPersistFailure(events, err)
 		}
 
 		if err == nil {
 			err = applyPersistResults(events, persists, results)
 			if err != nil {
-				reasonCode = wkproto.ReasonSystemError
 				h.Error("invalid persistence response", zap.Error(err))
+				markPersistFailure(events, err)
 			}
 		}
-		if reasonCode == wkproto.ReasonSuccess {
+		if err == nil {
 			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, newlyPersistedMessages(events, persists))
-		} else {
-			for _, e := range events {
-				if packet, ok := e.Frame.(*wkproto.SendPacket); ok && packet != nil && !packet.NoPersist && e.ReasonCode == wkproto.ReasonSuccess {
-					e.ReasonCode = reasonCode
-				}
-			}
 		}
 
 	}
@@ -95,6 +84,26 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 	eventbus.Channel.Advance(ctx.ChannelId, ctx.ChannelType)
 
+}
+
+func markPersistFailure(events []*eventbus.Event, err error) {
+	retryable := channel.IsRetryableSendError(err)
+	ambiguous := channel.IsAmbiguousSendError(err)
+	for _, event := range events {
+		packet, ok := event.Frame.(*wkproto.SendPacket)
+		if !ok || packet == nil || packet.NoPersist || event.ReasonCode != wkproto.ReasonSuccess {
+			continue
+		}
+		event.ReasonCode = wkproto.ReasonSystemError
+		if !retryable {
+			continue
+		}
+		if ambiguous && packet.ClientMsgNo == "" {
+			event.PersistenceOutcomeUnknown = true
+			continue
+		}
+		event.ReasonCode = wkproto.ReasonNodeNotMatch
+	}
 }
 
 func shouldRunPersistSideEffects(event *eventbus.Event) bool {

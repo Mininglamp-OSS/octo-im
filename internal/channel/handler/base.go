@@ -19,6 +19,7 @@ type Handler struct {
 	client              *ingress.Client
 	commonService       *common.Service
 	forwardCapabilities forward.CapabilityCache
+	forwardGate         *forward.Gate
 }
 
 func NewHandler() *Handler {
@@ -26,6 +27,7 @@ func NewHandler() *Handler {
 		Log:           wklog.NewWKLog("handler"),
 		client:        ingress.NewClient(),
 		commonService: common.NewService(),
+		forwardGate:   forward.NewGate(options.G.Poller.ChannelGoroutine),
 	}
 	h.routes()
 	return h
@@ -85,6 +87,13 @@ func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType ui
 		forward.Fail(events, err)
 		return
 	}
+	if !h.forwardGate.TryAcquire() {
+		err = forward.ErrUnavailable
+		h.Error("channel forwarding concurrency limit reached", zap.Error(err), zap.String("channelId", channelId))
+		forward.Fail(events, err)
+		return
+	}
+	defer h.forwardGate.Release()
 	target := func() uint64 {
 		if len(events) > 0 && h.notForwardToLeader(events[0].Type) {
 			return nodeId
