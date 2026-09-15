@@ -40,11 +40,8 @@ func (r *rpcClient) RequestChannelProposeBatchUntilApplied(ctx context.Context, 
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", channel.ErrSendUnavailable, err)
 	}
-	if resp == nil || resp.Status == channelProposalUnavailable {
-		return nil, channel.ErrSendUnavailable
-	}
-	if resp.Status != proto.StatusOK {
-		return nil, fmt.Errorf("channel proposal rejected")
+	if err := channelProposalResponseError(resp); err != nil {
+		return nil, err
 	}
 	body := resp.Body
 
@@ -59,6 +56,19 @@ func (r *rpcClient) RequestChannelProposeBatchUntilApplied(ctx context.Context, 
 		return nil, err
 	}
 	return response.Results, nil
+}
+
+func channelProposalResponseError(resp *proto.Response) error {
+	if resp == nil || resp.Status == channelProposalOutcomeUnknown {
+		return channel.ErrSendOutcomeUnknown
+	}
+	if resp.Status == channelProposalUnavailable {
+		return channel.ErrSendUnavailable
+	}
+	if resp.Status != proto.StatusOK {
+		return fmt.Errorf("channel proposal rejected")
+	}
+	return nil
 }
 
 // RequestSlotProposeBatchUntilApplied 向指定节点请求槽提案

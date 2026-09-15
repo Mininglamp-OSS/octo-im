@@ -10,7 +10,7 @@ import (
 )
 
 func TestSendErrorRetryability(t *testing.T) {
-	for _, err := range []error{context.DeadlineExceeded, types.ErrNotLeader, types.ErrStopped, errMessageLeaderChanged, ErrSendUnavailable} {
+	for _, err := range []error{context.DeadlineExceeded, types.ErrNotLeader, types.ErrStopped, errMessageLeaderChanged, ErrSendUnavailable, ErrSendOutcomeUnknown} {
 		require.True(t, IsRetryableSendError(fmt.Errorf("append: %w", err)))
 	}
 	require.False(t, IsRetryableSendError(ErrMessageConflict))
@@ -19,5 +19,6 @@ func TestSendErrorRetryability(t *testing.T) {
 
 func TestSendErrorAmbiguity(t *testing.T) {
 	require.True(t, IsAmbiguousSendError(fmt.Errorf("remote: %w", context.DeadlineExceeded)))
+	require.True(t, IsAmbiguousSendError(fmt.Errorf("remote: %w", ErrSendOutcomeUnknown)))
 	require.False(t, IsAmbiguousSendError(fmt.Errorf("pre-admission: %w", types.ErrNotLeader)))
 }

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -19,6 +20,14 @@ func TestPersistFailureDoesNotInviteUnkeyedAmbiguousReplay(t *testing.T) {
 	require.Equal(t, wkproto.ReasonSystemError, unkeyed.ReasonCode)
 	require.False(t, keyed.PersistenceOutcomeUnknown)
 	require.Equal(t, wkproto.ReasonNodeNotMatch, keyed.ReasonCode)
+}
+
+func TestPersistFailurePreservesRemoteOutcomeUnknown(t *testing.T) {
+	event := &eventbus.Event{ReasonCode: wkproto.ReasonSuccess, Frame: &wkproto.SendPacket{}}
+	markPersistFailure([]*eventbus.Event{event}, channel.ErrSendOutcomeUnknown)
+
+	require.True(t, event.PersistenceOutcomeUnknown)
+	require.Equal(t, wkproto.ReasonSystemError, event.ReasonCode)
 }
 
 func TestPersistFailureRetriesUnkeyedPreAdmissionRejection(t *testing.T) {
