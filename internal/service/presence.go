@@ -16,6 +16,7 @@ type IPresence interface {
 	RejectedCount() uint64
 	LocalSession(*eventbus.Conn) *eventbus.Conn
 	Close(wknet.Conn)
+	Invalidate(string)
 	Forget(*eventbus.Conn)
 	Recover(context.Context, []string) error
 	IsReady(string) bool

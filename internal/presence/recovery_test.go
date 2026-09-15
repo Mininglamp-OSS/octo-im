@@ -196,6 +196,33 @@ func TestCloseDuringRecoveryCannotResurrectSession(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestAuthenticationDuringRecoveryCannotBeEvictedByOlderSnapshot(t *testing.T) {
+	owner, leader, cluster, users, _, oldConn := fixture(t)
+	users.UpdateConn(oldConn)
+	newRaw := &testSocket{id: 8}
+	newConn := &eventbus.Conn{Uid: oldConn.Uid, NodeId: 1, ConnId: 8, DeviceId: "mobile"}
+
+	once := sync.Once{}
+	cluster.afterRead = func() {
+		once.Do(func() {
+			owner.Track(newRaw)
+			owner.Prepare(newRaw, newConn)
+			newConn.Auth = true
+			require.True(t, owner.Authenticate(newConn))
+			leader.Invalidate(newConn.Uid)
+			users.UpdateConn(newConn)
+		})
+	}
+
+	err := leader.recoverBatch(context.Background(), []string{oldConn.Uid})
+
+	require.ErrorIs(t, err, ErrNotReady)
+	got := users.ConnsByUid(oldConn.Uid)
+	require.Len(t, got, 2)
+	require.True(t, got[0].SameSession(oldConn) || got[1].SameSession(oldConn))
+	require.True(t, got[0].SameSession(newConn) || got[1].SameSession(newConn))
+}
+
 func TestOneInvalidatedUIDDoesNotPoisonRecoveryBatch(t *testing.T) {
 	owner, leader, cluster, users, _, first := fixture(t)
 	secondRaw := &testSocket{id: 8}

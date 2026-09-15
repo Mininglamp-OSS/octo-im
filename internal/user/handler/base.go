@@ -163,6 +163,9 @@ func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*ev
 		results[key] = verificationResult{conn: verified}
 		h.clearVerificationFailure(key)
 		event.Conn = verified
+		// Verification can republish a logical session that was missing locally.
+		// Fence recovery before the update so an older snapshot cannot evict it.
+		service.Presence.Invalidate(verified.Uid)
 		eventbus.User.UpdateConn(verified)
 		verifiedEvents = append(verifiedEvents, event)
 	}

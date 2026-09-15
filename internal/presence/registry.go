@@ -172,9 +172,18 @@ func (m *Manager) Forget(conn *eventbus.Conn) {
 	if conn == nil {
 		return
 	}
+	m.Invalidate(conn.Uid)
+}
+
+// Invalidate fences an in-flight snapshot before a logical session is added
+// or removed. Callers must invalidate before publishing the logical mutation.
+func (m *Manager) Invalidate(uid string) {
+	if uid == "" {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.invalidateLocked(conn.Uid)
+	m.invalidateLocked(uid)
 }
 func (m *Manager) invalidateLocked(uid string) {
 	if r := m.ready[uid]; r != nil {
