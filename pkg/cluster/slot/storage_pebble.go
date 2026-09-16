@@ -30,8 +30,9 @@ type PebbleShardLogStorage struct {
 	stopper syncutil.Stopper
 	s       *Server
 
-	// 每个 shard 的操作锁，防止 Apply 和 Truncate 并发导致数据不一致
-	shardLocks []sync.Mutex
+	// slotLocks serializes operations for the same raft slot without coupling
+	// unrelated slots that happen to share one physical Pebble DB shard.
+	slotLocks sync.Map // map[string]*sync.Mutex
 }
 
 func NewPebbleShardLogStorage(s *Server, path string, shardNum uint32) *PebbleShardLogStorage {
@@ -85,9 +86,6 @@ func (p *PebbleShardLogStorage) defaultPebbleOptions() *pebble.Options {
 func (p *PebbleShardLogStorage) Open() error {
 
 	opts := p.defaultPebbleOptions()
-
-	// 初始化分片锁，每个 shard 有独立的锁，避免全局锁影响性能
-	p.shardLocks = make([]sync.Mutex, p.shardNum)
 
 	for i := 0; i < int(p.shardNum); i++ {
 		db, err := pebble.Open(fmt.Sprintf("%s/shard%03d", p.path, i), opts)
@@ -146,6 +144,11 @@ func (p *PebbleShardLogStorage) shardId(v string) uint32 {
 	return h.Sum32() % p.shardNum
 }
 
+func (p *PebbleShardLogStorage) slotLock(shardNo string) *sync.Mutex {
+	lock, _ := p.slotLocks.LoadOrStore(shardNo, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
 func (p *PebbleShardLogStorage) shardBatchDBWithIndex(index uint32) *wkdb.BatchDB {
 	return p.batchDbs[index]
 }
@@ -189,9 +192,9 @@ func (p *PebbleShardLogStorage) GetState(shardNo string) (types.RaftState, error
 
 func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) error {
 	// 加锁保护，防止与 TruncateLogTo 并发执行
-	shardId := p.shardId(shardNo)
-	p.shardLocks[shardId].Lock()
-	defer p.shardLocks[shardId].Unlock()
+	lock := p.slotLock(shardNo)
+	lock.Lock()
+	defer lock.Unlock()
 
 	batch := p.shardDB(shardNo).NewBatch()
 	defer batch.Close()
@@ -234,9 +237,9 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 	}
 
 	// 加锁保护，防止与 Apply 并发执行导致 appliedIndex > lastLogIndex
-	shardId := p.shardId(shardNo)
-	p.shardLocks[shardId].Lock()
-	defer p.shardLocks[shardId].Unlock()
+	lock := p.slotLock(shardNo)
+	lock.Lock()
+	defer lock.Unlock()
 
 	lastLog, err := p.lastLog(shardNo)
 	if err != nil {
@@ -335,9 +338,9 @@ func (p *PebbleShardLogStorage) GetLogs(shardNo string, startLogIndex uint64, en
 
 func (p *PebbleShardLogStorage) Apply(shardNo string, logs []types.Log) error {
 	// 加锁保护，防止与 TruncateLogTo 并发执行导致 appliedIndex > lastLogIndex
-	shardId := p.shardId(shardNo)
-	p.shardLocks[shardId].Lock()
-	defer p.shardLocks[shardId].Unlock()
+	lock := p.slotLock(shardNo)
+	lock.Lock()
+	defer lock.Unlock()
 
 	if p.s.opts.OnApply != nil {
 		slotId := KeyToSlotId(shardNo)
