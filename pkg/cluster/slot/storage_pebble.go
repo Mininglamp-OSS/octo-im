@@ -103,14 +103,13 @@ func (p *PebbleShardLogStorage) Open() error {
 }
 
 func (p *PebbleShardLogStorage) Close() error {
+	for _, db := range p.batchDbs {
+		db.Stop()
+	}
 	for _, db := range p.dbs {
 		if err := db.Close(); err != nil {
 			p.Error("close db error", zap.Error(err))
 		}
-	}
-
-	for _, db := range p.batchDbs {
-		db.Stop()
 	}
 
 	p.stopper.Stop()
@@ -196,8 +195,7 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 	lock.Lock()
 	defer lock.Unlock()
 
-	batch := p.shardDB(shardNo).NewBatch()
-	defer batch.Close()
+	batch := p.shardBatchDB(shardNo).NewBatch()
 
 	if termStartIndexInfo != nil {
 		err := p.SetLeaderTermStartIndex(shardNo, termStartIndexInfo.Term, termStartIndexInfo.Index)
@@ -220,14 +218,10 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 		logData = append(logData, timeData...)
 
 		keyData := key.NewLogKey(shardNo, lg.Index)
-		err = batch.Set(keyData, logData, p.noSync)
-		if err != nil {
-			p.Panic("batch set failed", zap.Error(err))
-			return err
-		}
+		batch.Set(keyData, logData)
 	}
 
-	return batch.Commit(p.sync)
+	return batch.CommitWait()
 }
 
 // TruncateLogTo 截断日志
@@ -511,8 +505,9 @@ func (p *PebbleShardLogStorage) SetAppliedIndex(shardNo string, index uint64) er
 	lastTimeData := make([]byte, 8)
 	binary.BigEndian.PutUint64(lastTimeData, uint64(lastTime))
 
-	err := p.shardDB(shardNo).Set(maxIndexKeyData, append(maxIndexdata, lastTimeData...), p.sync)
-	return err
+	batch := p.shardBatchDB(shardNo).NewBatch()
+	batch.Set(maxIndexKeyData, append(maxIndexdata, lastTimeData...))
+	return batch.CommitWait()
 
 }
 
