@@ -16,8 +16,6 @@ func (wk *wukongDB) AddSubscribers(channelId string, channelType uint8, subscrib
 
 	wk.metrics.AddSubscribersAdd(1)
 
-	db := wk.channelDb(channelId, channelType)
-
 	channelPrimaryId, err := wk.getChannelPrimaryKey(channelId, channelType)
 	if err != nil {
 		return err
@@ -26,8 +24,7 @@ func (wk *wukongDB) AddSubscribers(channelId string, channelType uint8, subscrib
 		return fmt.Errorf("AddSubscribers: channelId: %s channelType: %d not found", channelId, channelType)
 	}
 
-	w := db.NewBatch()
-	defer w.Close()
+	w := wk.channelBatchDb(channelId, channelType).NewBatch()
 
 	for _, subscriber := range subscribers {
 		id := key.HashWithString(subscriber.Uid)
@@ -37,7 +34,7 @@ func (wk *wukongDB) AddSubscribers(channelId string, channelType uint8, subscrib
 		}
 	}
 
-	err = w.Commit(wk.sync)
+	err = w.CommitWait()
 	if err != nil {
 		return err
 	}
@@ -111,9 +108,7 @@ func (wk *wukongDB) RemoveSubscribers(channelId string, channelType uint8, subsc
 		}
 		return err
 	}
-	db := wk.channelDb(channelId, channelType)
-	w := db.NewIndexedBatch()
-	defer w.Close()
+	w := wk.channelBatchDb(channelId, channelType).NewBatch()
 	for _, member := range members {
 		if err := wk.removeSubscriber(channelId, channelType, member, w); err != nil {
 			return err
@@ -124,7 +119,7 @@ func (wk *wukongDB) RemoveSubscribers(channelId string, channelType uint8, subsc
 	// 	wk.Error("RemoveSubscribers: incChannelInfoSubscriberCount failed", zap.Error(err))
 	// 	return err
 	// }
-	err = w.Commit(wk.sync)
+	err = w.CommitWait()
 	if err != nil {
 		return err
 	}
@@ -224,17 +219,12 @@ func (wk *wukongDB) RemoveAllSubscriber(channelId string, channelType uint8) err
 	return nil
 }
 
-func (wk *wukongDB) removeSubscriber(channelId string, channelType uint8, member Member, w pebble.Writer) error {
-	var (
-		err error
-	)
+func (wk *wukongDB) removeSubscriber(channelId string, channelType uint8, member Member, w *Batch) error {
 	// remove all column
-	if err = w.DeleteRange(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.MinColumnKey), key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.MaxColumnKey), wk.noSync); err != nil {
-		return err
-	}
+	w.DeleteRange(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.MinColumnKey), key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.MaxColumnKey))
 
 	// delete index
-	if err = wk.deleteSubscriberIndex(channelId, channelType, member, w); err != nil {
+	if err := wk.deleteSubscriberIndex(channelId, channelType, member, w); err != nil {
 		return err
 	}
 
@@ -326,37 +316,28 @@ func (wk *wukongDB) iterateSubscriber(iter *pebble.Iterator, iterFnc func(member
 	return nil
 }
 
-func (wk *wukongDB) writeSubscriber(channelId string, channelType uint8, member Member, w pebble.Writer) error {
+func (wk *wukongDB) writeSubscriber(channelId string, channelType uint8, member Member, w *Batch) error {
 
 	if member.Id == 0 {
 		return errors.New("writeSubscriber: member.Id is 0")
 	}
-	var err error
 	// uid
-	if err = w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.Uid), []byte(member.Uid), wk.noSync); err != nil {
-		return err
-	}
+	w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.Uid), []byte(member.Uid))
 
 	// uid index
 	idBytes := make([]byte, 8)
 	wk.endian.PutUint64(idBytes, member.Id)
-	if err = w.Set(key.NewSubscriberIndexKey(channelId, channelType, key.TableSubscriber.Index.Uid, member.Id), idBytes, wk.noSync); err != nil {
-		return err
-	}
+	w.Set(key.NewSubscriberIndexKey(channelId, channelType, key.TableSubscriber.Index.Uid, member.Id), idBytes)
 
 	// createdAt
 	if member.CreatedAt != nil {
 		ct := uint64(member.CreatedAt.UnixNano())
 		createdAt := make([]byte, 8)
 		wk.endian.PutUint64(createdAt, ct)
-		if err := w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.CreatedAt), createdAt, wk.noSync); err != nil {
-			return err
-		}
+		w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.CreatedAt), createdAt)
 
 		// createdAt second index
-		if err := w.Set(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.CreatedAt, ct, member.Id), nil, wk.noSync); err != nil {
-			return err
-		}
+		w.Set(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.CreatedAt, ct, member.Id), nil)
 
 	}
 
@@ -364,13 +345,9 @@ func (wk *wukongDB) writeSubscriber(channelId string, channelType uint8, member 
 		// updatedAt
 		updatedAt := make([]byte, 8)
 		wk.endian.PutUint64(updatedAt, uint64(member.UpdatedAt.UnixNano()))
-		if err = w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.UpdatedAt), updatedAt, wk.noSync); err != nil {
-			return err
-		}
+		w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.UpdatedAt), updatedAt)
 		// updatedAt second index
-		if err = w.Set(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.UpdatedAt, uint64(member.UpdatedAt.UnixNano()), member.Id), nil, wk.noSync); err != nil {
-			return err
-		}
+		w.Set(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.UpdatedAt, uint64(member.UpdatedAt.UnixNano()), member.Id), nil)
 	}
 	return nil
 }
@@ -396,25 +373,18 @@ func (wk *wukongDB) deleteAllSubscriberIndex(channelId string, channelType uint8
 	return nil
 }
 
-func (wk *wukongDB) deleteSubscriberIndex(channelId string, channelType uint8, oldMember Member, w pebble.Writer) error {
-	var err error
+func (wk *wukongDB) deleteSubscriberIndex(channelId string, channelType uint8, oldMember Member, w *Batch) error {
 	// uid index
-	if err = w.Delete(key.NewSubscriberIndexKey(channelId, channelType, key.TableSubscriber.Index.Uid, key.HashWithString(oldMember.Uid)), wk.noSync); err != nil {
-		return err
-	}
+	w.Delete(key.NewSubscriberIndexKey(channelId, channelType, key.TableSubscriber.Index.Uid, key.HashWithString(oldMember.Uid)))
 
 	// createdAt second index
 	if oldMember.CreatedAt != nil {
-		if err = w.Delete(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.CreatedAt, uint64(oldMember.CreatedAt.UnixNano()), oldMember.Id), wk.noSync); err != nil {
-			return err
-		}
+		w.Delete(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.CreatedAt, uint64(oldMember.CreatedAt.UnixNano()), oldMember.Id))
 	}
 
 	// updatedAt second index
 	if oldMember.UpdatedAt != nil {
-		if err = w.Delete(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.UpdatedAt, uint64(oldMember.UpdatedAt.UnixNano()), oldMember.Id), wk.noSync); err != nil {
-			return err
-		}
+		w.Delete(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.UpdatedAt, uint64(oldMember.UpdatedAt.UnixNano()), oldMember.Id))
 	}
 
 	return nil
