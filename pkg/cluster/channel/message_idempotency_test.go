@@ -247,6 +247,7 @@ func TestMessageRetryRequiresQuorumAndDurableApply(t *testing.T) {
 		_, err := s.proposeMessages(ctx, "retry", 2, retryRequests(t, retryMessage(1, "a", "key")))
 		cancel()
 		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.ErrorIs(t, err, ErrSendOutcomeUnknown)
 		db.failApply.Store(false)
 		r := retryPropose(t, s, retryMessage(2, "a", "key"))
 		require.Equal(t, uint64(1), r[0].CanonicalID)
