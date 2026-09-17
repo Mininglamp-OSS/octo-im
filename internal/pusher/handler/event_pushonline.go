@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -130,6 +129,9 @@ func (h *Handler) setupRetryIfNeeded(recvPacket *wkproto.RecvPacket, fakeChannel
 			Uid:         toConn.Uid,
 			ConnId:      toConn.ConnId,
 			FromNode:    toConn.NodeId,
+			Uptime:      toConn.Uptime,
+			OwnerBootID: toConn.OwnerBootID,
+			SessionID:   toConn.SessionID,
 			MessageId:   messageId,
 			RecvPacket:  recvPacket,
 		})
@@ -208,13 +210,9 @@ func (h *Handler) processPayloadEncryption(payload []byte, toConn *eventbus.Conn
 	// 根据配置决定是否加密消息负载
 	if !options.G.DisableEncryption && !toConn.IsJsonRpc {
 		if len(toConn.AesIV) == 0 || len(toConn.AesKey) == 0 {
-			h.Error("aesIV or aesKey is empty, cannot encrypt payload",
-				zap.String("uid", toConn.Uid),
-				zap.String("deviceId", toConn.DeviceId),
-				zap.String("channelId", recvPacket.ChannelID),
-				zap.Uint8("channelType", recvPacket.ChannelType),
-			)
-			return nil, errors.New("encryption keys missing")
+			// Recovered descriptors intentionally omit session crypto. The physical
+			// owner finalizes encryption from its live socket context before write.
+			return payload, nil
 		}
 
 		finalPayload, err := encryptMessagePayload(payload, toConn)
@@ -237,6 +235,9 @@ func (h *Handler) processPayloadEncryption(payload []byte, toConn *eventbus.Conn
 // generateMsgKey 生成消息密钥
 func (h *Handler) generateMsgKey(recvPacket *wkproto.RecvPacket, toConn *eventbus.Conn) error {
 	if !options.G.DisableEncryption && !toConn.IsJsonRpc {
+		if len(toConn.AesIV) == 0 || len(toConn.AesKey) == 0 {
+			return nil
+		}
 		// 只有启用了加密才生成 MsgKey
 		signStr := recvPacket.VerityString()       // VerityString 可能依赖 Payload
 		msgKey, err := makeMsgKey(signStr, toConn) // makeMsgKey 内部会使用 AES 加密

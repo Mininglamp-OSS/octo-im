@@ -8,6 +8,8 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
 
@@ -52,6 +54,26 @@ func (h *Handler) writeFrame(ctx *eventbus.UserContext) {
 func (h *Handler) writeLocalFrame(event *eventbus.Event) {
 	conn := event.Conn
 	frame := event.Frame
+	if recvPacket, ok := frame.(*wkproto.RecvPacket); ok && !options.G.DisableEncryption && !conn.IsJsonRpc && recvPacket.MsgKey == "" {
+		realConn, err := common.CheckConnValidAndGetRealConn(conn)
+		if err != nil || realConn == nil {
+			h.Warn("writeFrame: cannot resolve physical session for deferred encryption",
+				zap.Error(err), zap.String("uid", conn.Uid), zap.Int64("connId", conn.ConnId))
+			return
+		}
+		physical, ok := realConn.Context().(*eventbus.Conn)
+		if !ok || physical == nil || len(physical.AesKey) == 0 || len(physical.AesIV) == 0 {
+			h.Warn("writeFrame: physical session crypto is unavailable",
+				zap.String("uid", conn.Uid), zap.Int64("connId", conn.ConnId))
+			return
+		}
+		finalized, err := finalizeRecvPacket(recvPacket, physical)
+		if err != nil {
+			h.Warn("writeFrame: deferred encryption failed", zap.Error(err), zap.String("uid", conn.Uid))
+			return
+		}
+		frame = finalized
+	}
 
 	var (
 		data []byte
@@ -120,4 +142,19 @@ func (h *Handler) writeLocalFrame(event *eventbus.Event) {
 		}
 	}
 	_ = realConn.WakeWrite()
+}
+
+func finalizeRecvPacket(packet *wkproto.RecvPacket, conn *eventbus.Conn) (*wkproto.RecvPacket, error) {
+	clone := *packet
+	payload, err := wkutil.AesEncryptPkcs7Base64(packet.Payload, conn.AesKey, conn.AesIV)
+	if err != nil {
+		return nil, err
+	}
+	clone.Payload = payload
+	msgKeyBytes, err := wkutil.AesEncryptPkcs7Base64([]byte(clone.VerityString()), conn.AesKey, conn.AesIV)
+	if err != nil {
+		return nil, err
+	}
+	clone.MsgKey = wkutil.MD5(string(msgKeyBytes))
+	return &clone, nil
 }
