@@ -2,6 +2,7 @@ package handler
 
 import (
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/forward"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -12,11 +13,18 @@ import (
 
 type Handler struct {
 	wklog.Log
+	forwardCapabilities forward.CapabilityCache
+	forwardGate         *forward.Gate
 }
 
 func NewHandler() *Handler {
+	workerCount := 1
+	if options.G != nil {
+		workerCount = options.G.Poller.UserGoroutine
+	}
 	h := &Handler{
-		Log: wklog.NewWKLog("handler"),
+		Log:         wklog.NewWKLog("handler"),
+		forwardGate: forward.NewGate(workerCount),
 	}
 	h.routes()
 	return h
@@ -51,10 +59,6 @@ func (h *Handler) OnMessage(m *proto.Message) {
 // 收到事件
 func (h *Handler) OnEvent(ctx *eventbus.UserContext) {
 	slotLeaderId := h.userLeaderNodeId(ctx.Uid)
-	if slotLeaderId == 0 {
-		h.Error("OnEvent: get slotLeaderId is 0")
-		return
-	}
 
 	// 统计
 	h.totalIn(ctx)
@@ -65,12 +69,7 @@ func (h *Handler) OnEvent(ctx *eventbus.UserContext) {
 		// 执行本地事件
 		eventbus.ExecuteUserEvent(ctx)
 	} else {
-		if slotLeaderId != 0 {
-			// 转发到leader节点
-			h.forwardsToNode(slotLeaderId, ctx.Uid, ctx.Events)
-		} else {
-			h.Error("user: OnEvent: slotLeaderId is 0", zap.String("uid", ctx.Uid), zap.Uint64("slotLeaderId", slotLeaderId))
-		}
+		h.forwardsToNode(slotLeaderId, ctx.Uid, ctx.Events)
 	}
 }
 
@@ -128,13 +127,6 @@ func (h *Handler) forwardsToNode(nodeId uint64, uid string, events []*eventbus.E
 		return
 	}
 
-	for _, e := range events {
-		if e.SourceNodeId != 0 && e.SourceNodeId == nodeId {
-			h.Error("forwardsToNode: event source node id is equal to nodeId,end forward", zap.Uint64("sourceNodeId", e.SourceNodeId), zap.Uint64("nodeId", nodeId), zap.String("uid", uid), zap.String("eventType", e.Type.String()))
-			return
-		}
-	}
-
 	req := &forwardUserEventReq{
 		uid:      uid,
 		fromNode: options.G.Cluster.NodeId,
@@ -143,16 +135,37 @@ func (h *Handler) forwardsToNode(nodeId uint64, uid string, events []*eventbus.E
 	data, err := req.encode()
 	if err != nil {
 		h.Error("forwardToLeader: encode failed", zap.Error(err))
+		forward.Fail(events, err)
 		return
 	}
-	msg := &proto.Message{
-		MsgType: uint32(msgForwardUserEvent),
-		Content: data,
+	legacy := func(targetNode uint64) error {
+		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardUserEvent), Content: data})
 	}
-	err = h.sendToNode(nodeId, msg)
+	if !forward.OnlyRetryableSends(events) {
+		// Events without a retryable client ACK must not enter the v1 ambiguity
+		// window. Keep the base transport's reconnect retention for their entire
+		// path, regardless of current gate capacity.
+		if err = legacy(nodeId); err != nil {
+			h.Error("user forwarding through retained transport failed", zap.Error(err), zap.String("uid", uid))
+			forward.Fail(events, err)
+		}
+		return
+	}
+	if !h.forwardGate.TryAcquire() {
+		err = forward.ErrUnavailable
+		h.Error("user forwarding concurrency limit reached", zap.Error(err), zap.String("uid", uid))
+		forward.Fail(events, err)
+		return
+	}
+	defer h.forwardGate.Release()
+	target := func() uint64 { return nodeId }
+	if !h.notForwardToLeader(events[0].Type) {
+		target = func() uint64 { return h.userLeaderNodeId(uid) }
+	}
+	err = forward.RequestCompatible(forward.UserPath, data, events, target, options.G.Cluster.NodeId, h.acceptForward, &h.forwardCapabilities, legacy)
 	if err != nil {
-		h.Error("user:forwardToLeader: send failed", zap.Error(err), zap.Uint64("nodeId", nodeId), zap.String("uid", uid))
-		return
+		h.Error("user forwarding failed", zap.Error(err), zap.String("uid", uid))
+		forward.Fail(events, err)
 	}
 }
 
@@ -176,6 +189,7 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 	slotLeaderId := h.userLeaderNodeId(req.uid)
 	if slotLeaderId == 0 {
 		h.Error("OnEvent: get slotLeaderId is 0")
+		forward.Fail(req.events, forward.ErrUnavailable)
 		return
 	}
 
@@ -185,6 +199,7 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 		if !h.notForwardToLeader(e.Type) {
 			if !isSlotLeader {
 				h.Error("onForwardUserEvent: event type is not EventConnWriteFrame, but not slot leader", zap.String("uid", req.uid), zap.Uint64("slotLeaderId", slotLeaderId))
+				forward.Fail([]*eventbus.Event{e}, forward.ErrUnavailable)
 				continue
 			}
 		}

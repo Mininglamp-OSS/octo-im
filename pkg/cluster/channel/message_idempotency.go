@@ -15,7 +15,7 @@ import (
 )
 
 var ErrMessageConflict = errors.New("client_msg_no already used for different message content")
-var errMessageLeaderChanged = errors.New("channel leader changed; retry message")
+var errMessageLeaderChanged = fmt.Errorf("%w: channel leader changed", ErrSendUnavailable)
 var errMessageSnapshotChanged = errors.New("channel log changed during lookup")
 var errMessageNotReady = errors.New("channel leader is preparing durable state")
 
@@ -46,6 +46,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 	var term uint32
 	var version uint64
 	var maxIndex uint64
+	var proposed bool
 	resps := make(types.ProposeRespSet, len(reqs))
 	admit := func() error {
 		var revision uint64
@@ -154,6 +155,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				if err := ch.Step(types.Event{Type: types.Propose, Logs: logs}); err != nil {
 					return err
 				}
+				proposed = true
 			}
 			ch.ResumeReplication()
 			return nil
@@ -202,7 +204,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, classifyPostProposalError(proposed, err)
 		}
 		if done {
 			// The committed/applied prefix is immutable. Verify the canonical
@@ -210,11 +212,11 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 			// still serving that prefix. A new append does not invalidate it.
 			for i, resp := range resps {
 				if err := ctx.Err(); err != nil {
-					return nil, err
+					return nil, classifyPostProposalError(proposed, err)
 				}
 				stored, err := s.opts.DB.LoadMsg(id, typ, resp.Index)
 				if err != nil {
-					return nil, err
+					return nil, classifyPostProposalError(proposed, err)
 				}
 				if uint64(stored.MessageID) != resp.CanonicalID || !sameMessageContent(stored, messages[i]) {
 					return nil, fmt.Errorf("canonical message changed at index %d", resp.Index)
@@ -234,15 +236,22 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				return resps, nil
 			}
 			if !errors.Is(err, errMessageNotReady) {
-				return nil, err
+				return nil, classifyPostProposalError(proposed, err)
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, classifyPostProposalError(proposed, ctx.Err())
 		case <-ticker.C:
 		}
 	}
+}
+
+func classifyPostProposalError(proposed bool, err error) error {
+	if proposed && IsRetryableSendError(err) {
+		return fmt.Errorf("%w: %w", ErrSendOutcomeUnknown, err)
+	}
+	return err
 }
 
 // Exclude server identity, timestamps, transport client sequence and DUP. They

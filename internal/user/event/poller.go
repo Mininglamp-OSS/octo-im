@@ -122,13 +122,14 @@ func (p *poller) handleEvents() {
 	p.waitlist.readHandlers(&p.tmpHandlers)
 	var err error
 	for _, h := range p.tmpHandlers {
-		if h.hasEvent() {
-			events := h.events()
+		if h.hasEvent() && h.processing.CompareAndSwap(false, true) {
 			err = p.handlePool.Submit(func() {
+				events := h.events()
 				h.advanceEvents(events)
 			})
 			if err != nil {
-				p.Error("submit user handle task failed", zap.String("error", err.Error()), zap.Int("events", len(events)))
+				h.processing.Store(false)
+				p.Error("submit user handle task failed", zap.String("error", err.Error()))
 			}
 		}
 	}

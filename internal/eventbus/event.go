@@ -77,42 +77,51 @@ func (e EventType) Uint8() uint8 {
 }
 
 type Event struct {
-	Type         EventType
-	Conn         *Conn
-	Frame        wkproto.Frame
-	MessageId  int64
-	MessageSeq uint64
-	ReasonCode wkproto.ReasonCode
-	TagKey       string // tag的key
-	ToUid        string // 发送事件的目标用户
-	SourceNodeId uint64 // 事件发起源节点
+	// Forwarding metadata is carried by the versioned RPC envelope, not legacy events.
+	ForwardDeadline int64
+	ForwardHops     uint8
+	Type            EventType
+	Conn            *Conn
+	Frame           wkproto.Frame
+	MessageId       int64
+	MessageSeq      uint64
+	ReasonCode      wkproto.ReasonCode
+	TagKey          string // tag的key
+	ToUid           string // 发送事件的目标用户
+	SourceNodeId    uint64 // 事件发起源节点
 	// 事件记录
 	Track track.Message
 	// 不需要编码
-	Index        uint64
-	OfflineUsers []string // 离线用户集合
-	ChannelId    string   // 频道ID
-	ChannelType  uint8    // 频道类型
-	ReqId        string   // 请求ID(非必填)(jsonrpc)
+	Index                     uint64
+	PersistedDuplicate        bool     // persistence returned an already committed logical message
+	PersistenceOutcomeUnknown bool     // persistence may have committed; do not emit a contradictory local SENDACK
+	OfflineUsers              []string // 离线用户集合
+	ChannelId                 string   // 频道ID
+	ChannelType               uint8    // 频道类型
+	ReqId                     string   // 请求ID(非必填)(jsonrpc)
 }
 
 func (e *Event) Clone() *Event {
 	return &Event{
-		Type:         e.Type,
-		Conn:         e.Conn,
-		Frame:        e.Frame,
-		MessageId:  e.MessageId,
-		MessageSeq: e.MessageSeq,
-		ReasonCode: e.ReasonCode,
-		TagKey:       e.TagKey,
-		ToUid:        e.ToUid,
-		SourceNodeId: e.SourceNodeId,
-		Track:        e.Track.Clone(),
-		Index:        e.Index,
-		OfflineUsers: e.OfflineUsers,
-		ChannelId:    e.ChannelId,
-		ChannelType:  e.ChannelType,
-		ReqId:        e.ReqId,
+		ForwardDeadline:           e.ForwardDeadline,
+		ForwardHops:               e.ForwardHops,
+		Type:                      e.Type,
+		Conn:                      e.Conn,
+		Frame:                     e.Frame,
+		MessageId:                 e.MessageId,
+		MessageSeq:                e.MessageSeq,
+		ReasonCode:                e.ReasonCode,
+		TagKey:                    e.TagKey,
+		ToUid:                     e.ToUid,
+		SourceNodeId:              e.SourceNodeId,
+		Track:                     e.Track.Clone(),
+		Index:                     e.Index,
+		PersistedDuplicate:        e.PersistedDuplicate,
+		PersistenceOutcomeUnknown: e.PersistenceOutcomeUnknown,
+		OfflineUsers:              e.OfflineUsers,
+		ChannelId:                 e.ChannelId,
+		ChannelType:               e.ChannelType,
+		ReqId:                     e.ReqId,
 	}
 }
 
@@ -126,12 +135,12 @@ func (e *Event) Size() uint64 {
 	if e.hasFrame() == 1 {
 		size += 4 + uint64(e.Frame.GetFrameSize())
 	}
-	size += 8 // message id
-	size += 8 // message seq
-	size += 1 // reason code
-	size += uint64(2 + len(e.TagKey))   // tag key
-	size += uint64(2 + len(e.ToUid))    // to uid
-	size += 8                           // source node id
+	size += 8                         // message id
+	size += 8                         // message seq
+	size += 1                         // reason code
+	size += uint64(2 + len(e.TagKey)) // tag key
+	size += uint64(2 + len(e.ToUid))  // to uid
+	size += 8                         // source node id
 
 	if e.hasTrack() == 1 {
 		size += e.Track.Size()

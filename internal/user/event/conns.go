@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/pkg/fasttime"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
 
@@ -160,6 +161,18 @@ func (c *conns) connById(nodeId uint64, connId int64) *eventbus.Conn {
 		}
 	}
 	return nil
+}
+
+func (c *conns) touch(nodeId uint64, connId int64) bool {
+	c.Lock()
+	defer c.Unlock()
+	for _, conn := range c.conns {
+		if conn.ConnId == connId && conn.NodeId == nodeId {
+			conn.LastActive = fasttime.UnixTimestamp()
+			return true
+		}
+	}
+	return false
 }
 
 func (c *conns) connsByNodeId(nodeId uint64) []*eventbus.Conn {

@@ -6,13 +6,20 @@ import (
 	"errors"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
+	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
+)
+
+const (
+	channelProposalUnavailable    proto.Status = 3
+	channelProposalOutcomeUnknown proto.Status = 4
 )
 
 type rpcServer struct {
@@ -73,7 +80,12 @@ func (r *rpcServer) handleChannelPropose(c *wkserver.Context) {
 	resps, err := r.s.channelServer.ProposeBatchUntilAppliedTimeoutForLocal(timeoutCtx, req.channelId, req.channelType, req.reqs)
 	if err != nil {
 		r.Error("channel propose failed", zap.Error(err), zap.String("channelId", req.channelId), zap.Uint8("channelType", req.channelType), zap.Uint64("nodeId", r.s.opts.ConfigOptions.NodeId))
-		c.WriteErr(err)
+		status := channelProposalFailureStatus(err)
+		if status == proto.StatusError {
+			c.WriteErr(err)
+		} else {
+			c.WriteErrorAndStatus(err, status)
+		}
 		return
 	}
 	data, err := json.Marshal(channelProposeResponse{Version: 2, Results: resps})
@@ -83,6 +95,16 @@ func (r *rpcServer) handleChannelPropose(c *wkserver.Context) {
 		return
 	}
 	c.Write(data)
+}
+
+func channelProposalFailureStatus(err error) proto.Status {
+	if errors.Is(err, channel.ErrSendOutcomeUnknown) {
+		return channelProposalOutcomeUnknown
+	}
+	if channel.IsRetryableSendError(err) {
+		return channelProposalUnavailable
+	}
+	return proto.StatusError
 }
 
 func (r *rpcServer) handleSlotPropose(c *wkserver.Context) {

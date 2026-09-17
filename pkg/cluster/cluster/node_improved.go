@@ -16,9 +16,14 @@ import (
 
 // ImprovedNode 改进的节点实现，支持自适应队列和背压机制
 type ImprovedNode struct {
-	id     uint64
-	addr   string
-	client *client.Client
+	sendMu  sync.Mutex
+	stopped bool
+	// Only the message worker owns these fields. Retained batches remain charged to backpressure.
+	pendingBatch     []*proto.Message
+	nextBatchAttempt time.Time
+	id               uint64
+	addr             string
+	client           *client.Client
 
 	// 自适应发送队列
 	adaptiveQueue *AdaptiveSendQueue
@@ -165,9 +170,19 @@ func (n *ImprovedNode) Start() {
 
 // Stop 停止节点
 func (n *ImprovedNode) Stop() {
+	n.sendMu.Lock()
+	if n.stopped {
+		n.sendMu.Unlock()
+		return
+	}
+	n.stopped = true
+	n.sendMu.Unlock()
 	n.stopper.Stop()
 	n.client.Stop()
 	n.adaptiveQueue.Close()
+	n.pendingBatch = nil
+	n.perfMonitor.totalDropped.Add(uint64(n.backpressure.currentCount.Swap(0)))
+	n.backpressure.currentBytes.Store(0)
 }
 
 // Send 发送消息（改进版本）
@@ -177,12 +192,21 @@ func (n *ImprovedNode) Send(msg *proto.Message) error {
 
 // SendWithPriority 带优先级的发送消息
 func (n *ImprovedNode) SendWithPriority(msg *proto.Message, highPriority bool) error {
+	n.sendMu.Lock()
+	defer n.sendMu.Unlock()
+	if n.stopped {
+		return ErrQueueClosed
+	}
 	start := time.Now()
 	defer func() {
 		latency := time.Since(start)
 		n.perfMonitor.recordSendLatency(latency)
 	}()
 
+	if n.backpressure.maxPendingBytes > 0 && uint64(msg.Size()) > n.backpressure.maxPendingBytes-min(n.backpressure.currentBytes.Load(), n.backpressure.maxPendingBytes) {
+		n.perfMonitor.totalBackpressure.Inc()
+		return ErrBackpressure
+	}
 	// 检查背压
 	if n.backpressure.shouldApplyBackpressure() {
 		n.perfMonitor.totalBackpressure.Inc()
@@ -195,26 +219,35 @@ func (n *ImprovedNode) SendWithPriority(msg *proto.Message, highPriority bool) e
 		}
 
 		// 应用减速策略
-		time.Sleep(time.Millisecond * 10) // 简单的减速策略
+		n.sendMu.Unlock()
+		time.Sleep(time.Millisecond * 10)
+		n.sendMu.Lock()
+		if n.stopped {
+			return ErrQueueClosed
+		}
+		if n.backpressure.shouldBlock() {
+			return ErrBackpressure
+		}
 	}
 
+	if n.backpressure.maxPendingBytes > 0 && uint64(msg.Size()) > n.backpressure.maxPendingBytes-min(n.backpressure.currentBytes.Load(), n.backpressure.maxPendingBytes) {
+		return ErrBackpressure
+	}
 	// 尝试发送到自适应队列
+	n.backpressure.currentBytes.Add(uint64(msg.Size()))
+	n.backpressure.currentCount.Inc()
 	err := n.adaptiveQueue.Send(msg, highPriority)
 	if err != nil {
+		n.backpressure.currentBytes.Sub(uint64(msg.Size()))
+		n.backpressure.currentCount.Dec()
 		if err == ErrChanIsFull {
 			n.perfMonitor.totalDropped.Inc()
 
-			// 如果启用了丢弃最旧消息策略
-			if n.backpressure.dropOldest {
-				return n.handleDropOldest(msg, highPriority)
-			}
 		}
 		return err
 	}
 
-	// 更新背压统计
-	n.backpressure.currentBytes.Add(uint64(msg.Size()))
-	n.backpressure.currentCount.Inc()
+	// Admission counts are installed before publishing to the consumer.
 	n.perfMonitor.totalSent.Inc()
 
 	return nil
@@ -258,7 +291,14 @@ func (n *ImprovedNode) processMessages() {
 
 				// 连续处理模式：如果还有消息，继续处理
 				for n.hasMessages() {
-					n.processBatch(ctx)
+					select {
+					case <-n.stopper.ShouldStop():
+						return
+					default:
+					}
+					if !n.processBatch(ctx) {
+						break
+					}
 				}
 			}
 		}
@@ -279,52 +319,39 @@ func (n *ImprovedNode) hasMessages() bool {
 }
 
 // processBatch 批量处理消息
-func (n *ImprovedNode) processBatch(ctx context.Context) {
-	// 根据发送策略调整批量参数
-	maxBatchSize, maxBatchBytes := n.getBatchParams()
-	msgs, ok := n.adaptiveQueue.BatchReceive(ctx, maxBatchSize, maxBatchBytes)
-	if !ok || len(msgs) == 0 {
-		return
+func (n *ImprovedNode) processBatch(ctx context.Context) bool {
+	if !n.client.IsAuthed() && !n.isTestMode() {
+		return false
 	}
-
-	if !n.client.IsAuthed() {
-		// 客户端未认证，在测试模式下模拟发送成功
-		for _, msg := range msgs {
-			n.backpressure.currentBytes.Sub(uint64(msg.Size()))
-			n.backpressure.currentCount.Dec()
-
-			// 在测试环境中，模拟发送成功
-			if n.isTestMode() {
-				n.perfMonitor.totalSent.Inc()
-			}
+	if time.Now().Before(n.nextBatchAttempt) {
+		return false
+	}
+	msgs := n.pendingBatch
+	if len(msgs) == 0 {
+		maxBatchSize, maxBatchBytes := n.getBatchParams()
+		var ok bool
+		msgs, ok = n.adaptiveQueue.BatchReceive(ctx, maxBatchSize, maxBatchBytes)
+		if !ok || len(msgs) == 0 {
+			return false
 		}
-		return
 	}
-
-	// 发送批量消息
-	start := time.Now()
-	err := n.sendBatch(msgs)
-	duration := time.Since(start)
-
-	// 更新统计
+	var err error
+	if !n.isTestMode() {
+		err = n.sendBatch(msgs)
+	}
+	if err != nil {
+		n.pendingBatch = msgs
+		n.nextBatchAttempt = time.Now().Add(100 * time.Millisecond)
+		n.perfMonitor.totalRetried.Add(uint64(len(msgs)))
+		return false
+	}
+	n.pendingBatch = nil
+	n.nextBatchAttempt = time.Time{}
 	for _, msg := range msgs {
 		n.backpressure.currentBytes.Sub(uint64(msg.Size()))
 		n.backpressure.currentCount.Dec()
-
-		if n.client.Options().LogDetailOn {
-			n.Debug("sent message", zap.Uint32("msgType", msg.MsgType))
-		}
 	}
-
-	if err != nil {
-		if n.client.IsAuthed() {
-			n.Error("sendBatch failed",
-				zap.Error(err),
-				zap.Int("batchSize", len(msgs)),
-				zap.Duration("duration", duration))
-		}
-		n.perfMonitor.totalRetried.Add(uint64(len(msgs)))
-	}
+	return true
 }
 
 // getBatchParams 根据发送策略获取批量参数
