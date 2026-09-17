@@ -88,6 +88,11 @@ func (e *EventPool) ConnCountByDeviceFlag(uid string, deviceFlag wkproto.DeviceF
 func (e *EventPool) ConnById(uid string, nodeId uint64, id int64) *eventbus.Conn {
 	return e.pollerByUid(uid).connById(uid, nodeId, id)
 }
+func (e *EventPool) TouchConn(uid string, nodeId uint64, id int64) bool {
+	p := e.pollerByUid(uid)
+	h := p.handler(uid)
+	return h != nil && h.conns.touch(nodeId, id)
+}
 func (e *EventPool) LocalConnById(uid string, id int64) *eventbus.Conn {
 	return e.pollerByUid(uid).localConnById(uid, id)
 }

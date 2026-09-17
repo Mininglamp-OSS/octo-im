@@ -14,6 +14,12 @@ import (
 )
 
 func (h *Handler) writeFrame(ctx *eventbus.UserContext) {
+	type forwardKey struct {
+		nodeId uint64
+		uid    string
+	}
+	forwarded := make(map[forwardKey][]*eventbus.Event)
+	forwardOrder := make([]forwardKey, 0)
 	for _, event := range ctx.Events {
 		conn := event.Conn
 		frame := event.Frame
@@ -29,13 +35,20 @@ func (h *Handler) writeFrame(ctx *eventbus.UserContext) {
 		if !options.G.IsLocalNode(conn.NodeId) {
 			// 统计
 			h.totalOut(conn, frame)
-			h.forwardsToNode(conn.NodeId, conn.Uid, []*eventbus.Event{event})
+			key := forwardKey{nodeId: conn.NodeId, uid: conn.Uid}
+			if _, ok := forwarded[key]; !ok {
+				forwardOrder = append(forwardOrder, key)
+			}
+			forwarded[key] = append(forwarded[key], event)
 			continue
 		}
 
 		// 本地节点写请求
 		h.writeLocalFrame(event)
 
+	}
+	for _, key := range forwardOrder {
+		h.forwardsToNode(key.nodeId, key.uid, forwarded[key])
 	}
 }
 func (h *Handler) writeLocalFrame(event *eventbus.Event) {
