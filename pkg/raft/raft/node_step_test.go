@@ -595,13 +595,13 @@ func TestFollower_ConfigResp_SwitchesConfig(t *testing.T) {
 	assert.Equal(t, 4, len(n.cfg.Replicas))
 }
 
-func TestFollower_Propose_Ignored(t *testing.T) {
+func TestFollower_Propose_Rejected(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeFollower(n, 3, 2)
 	err := n.Step(types.Event{
 		Type: types.Propose, Logs: []types.Log{{Term: 3, Index: 1, Data: []byte("data")}},
 	})
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, types.ErrNotLeader)
 	// No StoreReq should be generated
 	events := collectEvents(n)
 	assert.Equal(t, 0, countEvents(events, types.StoreReq))
@@ -672,7 +672,7 @@ func TestCandidate_VoteResp_NotEnough_Waiting(t *testing.T) {
 	assert.Equal(t, types.RoleCandidate, n.cfg.Role)
 }
 
-func TestCandidate_Propose_Ignored(t *testing.T) {
+func TestCandidate_Propose_Rejected(t *testing.T) {
 	opts := NewOptions(
 		WithNodeId(1),
 		WithReplicas([]uint64{1, 2, 3}),
@@ -687,7 +687,7 @@ func TestCandidate_Propose_Ignored(t *testing.T) {
 	err := n.Step(types.Event{
 		Type: types.Propose, Logs: []types.Log{{Term: 1, Index: 1}},
 	})
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, types.ErrNotLeader)
 	events := collectEvents(n)
 	assert.Equal(t, 0, countEvents(events, types.StoreReq))
 }
