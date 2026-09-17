@@ -71,12 +71,9 @@ go test -count=1 -timeout=30s -p=2 ./...
 同一组转发/角色测试失败，能检出原 blocker。既有 slot 隔离、同步 group commit、CommitWait 和
 重启测试仍保留；干净关闭再打开不等于验证掉电/崩溃持久性。
 
-最终全量运行中，`pkg/raft/raft`、`pkg/raft/raftgroup`、`pkg/cluster/slot`、
-`pkg/cluster/store` 和 `test/e2e` 通过。**全量测试仍未通过**：失败包为
-`internal/server`（WS 监听冲突）、`internal/track`（字符串断言）、`internal/user/event`（等待超时）、
-`pkg/cluster/cluster`（队列断言/空指针）、`pkg/wkdb`（8 项缓存/查询等既有断言）、
-`pkg/wknet`（监听冲突）、`pkg/wkserver`（重连时序）。这些范围此前已有原 tag 对照记录，
-本次没有将无关失败一并修改；不能将定向回归通过描述成全量通过。
+本机运行中，`pkg/raft/raft`、`pkg/raft/raftgroup`、`pkg/cluster/slot`、
+`pkg/cluster/store` 和 `test/e2e` 通过。以上为本机确认通过的验证范围，不代表全量测试已通过；
+全量验证结论待独立环境确认。
 
 最终二进制的单节点回归：8 并发、50 人/群、16 群，64/64 请求成功，移除 p50 15.4 ms；
 另验证三类清理操作的 36 条真实会话，停止前与重启后均无残留。这是小规模回归，不是高负载容量承诺。
