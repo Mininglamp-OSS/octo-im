@@ -7,6 +7,12 @@ import (
 )
 
 func (n *Node) Step(e types.Event) error {
+	// Before configuration has installed a role handler, no proposal can be
+	// admitted. Config.Role can still be Unknown after a leader handler is
+	// installed on this release, so the handlers below enforce role rejection.
+	if e.Type == types.Propose && n.stepFunc == nil {
+		return types.ErrNotLeader
+	}
 	// n.Info("step event", zap.Uint64("from", e.From), zap.Uint64("to", e.To), zap.Uint32("term", e.Term), zap.Uint64("index", e.Index), zap.String("type", e.Type.String()))
 	switch {
 	case e.Term == 0: // 本地消息
@@ -204,6 +210,7 @@ func (n *Node) stepFollower(e types.Event) error {
 	switch e.Type {
 	case types.Propose:
 		n.Foucs("follower not allow propose", zap.String("key", n.Key()), zap.Int("logs", len(e.Logs)))
+		return types.ErrNotLeader
 	case types.Ping: // 心跳
 		n.electionElapsed = 0
 		if n.cfg.Leader == None {
@@ -298,6 +305,7 @@ func (n *Node) stepCandidate(e types.Event) error {
 	switch e.Type {
 	case types.Propose:
 		n.Foucs("candidate not allow propose", zap.String("key", n.Key()), zap.Int("logs", len(e.Logs)))
+		return types.ErrNotLeader
 	case types.VoteResp: // 投票返回
 		if e.From != n.opts.NodeId {
 			n.Info("received vote response", zap.Uint8("reason", e.Reason.Uint8()), zap.Uint64("from", e.From), zap.Uint64("to", e.To), zap.Uint32("term", e.Term), zap.Uint64("index", e.Index))
@@ -311,6 +319,7 @@ func (n *Node) stepLearner(e types.Event) error {
 	switch e.Type {
 	case types.Propose:
 		n.Foucs("learner not allow propose", zap.String("key", n.Key()), zap.Int("logs", len(e.Logs)))
+		return types.ErrNotLeader
 	case types.Ping: // 心跳
 		n.electionElapsed = 0
 		if n.cfg.Leader == None {

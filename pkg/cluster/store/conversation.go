@@ -196,8 +196,9 @@ func (s *Store) DeleteConversation(uid string, channelID string, channelType uin
 }
 
 // DeleteConversationAsync submits the cleanup to Raft without waiting for the
-// command to be applied to the business database. A successful return means
-// the proposal was accepted; application continues in Raft order.
+// command to be applied to the business database. Slot.Propose forwards to the
+// slot leader when needed. Success means leader admission, not majority commit
+// or completed deletion; an error does not necessarily mean nothing was admitted.
 func (s *Store) DeleteConversationAsync(uid string, channelID string, channelType uint8) error {
 	data := EncodeCMDDeleteConversation(uid, channelID, channelType)
 	cmd := NewCMD(CMDDeleteConversation, data)
