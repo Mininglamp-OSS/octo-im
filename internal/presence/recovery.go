@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -14,7 +15,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const snapshotPath = "/wk/presence/snapshot/v1"
+// v2 replaces raw prepared-session identities with non-authenticating digests.
+// Do not serve v1: an old reader would mistake a digest for a different session
+// and evict a live logical connection while its CONNACK is in flight.
+const snapshotPath = "/wk/presence/snapshot/v2"
 const touchPath = "/wk/presence/touch/v1"
 const maxPresenceRequestBody = 64 << 10
 
@@ -36,6 +40,10 @@ func (m *Manager) SetRoutes() {
 			c.WriteErr(ErrNotReady)
 			return
 		}
+		if err := m.authorizeSnapshot(c.PeerUID(), uids); err != nil {
+			c.WriteErr(err)
+			return
+		}
 		response, err := m.snapshot(uids)
 		if err != nil {
 			c.WriteErr(err)
@@ -54,6 +62,10 @@ func (m *Manager) SetRoutes() {
 			c.WriteErr(ErrNotReady)
 			return
 		}
+		if m.peerNode(c.PeerUID()) == 0 {
+			c.WriteErr(ErrNotReady)
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		// A touch carries no authentication assertion. Pull current physical
@@ -64,6 +76,34 @@ func (m *Manager) SetRoutes() {
 		}
 		c.WriteOk()
 	})
+}
+
+// These checks narrow access within the trusted cluster network. The transport
+// UID is self-declared, so membership/authority checks do not replace peer auth.
+func (m *Manager) peerNode(peerUID string) uint64 {
+	node, err := strconv.ParseUint(peerUID, 10, 64)
+	if err != nil || node == 0 || strconv.FormatUint(node, 10) != peerUID || service.Cluster == nil {
+		return 0
+	}
+	for _, member := range service.Cluster.Nodes() {
+		if member != nil && member.Id == node {
+			return node
+		}
+	}
+	return 0
+}
+
+func (m *Manager) authorizeSnapshot(peerUID string, uids []string) error {
+	caller := m.peerNode(peerUID)
+	if caller == 0 || len(uids) == 0 || len(uids) > 128 {
+		return ErrNotReady
+	}
+	for _, uid := range uids {
+		if uid == "" || service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid)) != caller {
+			return ErrNotReady
+		}
+	}
+	return nil
 }
 
 func (m *Manager) read(ctx context.Context, node uint64, uids []string) (snapshotState, error) {
@@ -128,6 +168,11 @@ func (m *Manager) read(ctx context.Context, node uint64, uids []string) (snapsho
 }
 
 func (m *Manager) Verify(ctx context.Context, expected *eventbus.Conn) (*eventbus.Conn, error) {
+	if expected != nil && expected.IsLegacySession() {
+		// Missing identity is not an owner snapshot proving absence. Keep the
+		// fail-closed SEND policy, but do not poison the stale-session cache.
+		return nil, ErrNotReady
+	}
 	if expected == nil || expected.SessionID == "" || expected.OwnerBootID == "" {
 		return nil, service.ErrPresenceSessionNotFound
 	}
@@ -347,7 +392,7 @@ func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
 				}
 				if !found {
 					for _, conn := range preparedByUID[uid] {
-						if old.SameSession(conn) {
+						if preparedSessionMatches(old, conn) {
 							found = true
 							break
 						}

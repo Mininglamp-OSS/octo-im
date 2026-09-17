@@ -402,7 +402,7 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 		// 替换成本地的连接
 		if e.Conn != nil {
 			conn := eventbus.User.ConnById(e.Conn.Uid, e.Conn.NodeId, e.Conn.ConnId)
-			if e.Type != eventbus.EventConnack && conn != nil && conn.SameSession(e.Conn) {
+			if e.Type != eventbus.EventConnack && sessionDescriptorMatches(conn, e.Conn) {
 				e.Conn = verifiedSessionDescriptor(conn, e.Conn)
 			}
 

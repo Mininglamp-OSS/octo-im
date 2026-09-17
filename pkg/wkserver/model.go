@@ -179,3 +179,17 @@ func (c *Context) Conn() gnet.Conn {
 
 	return c.conn
 }
+
+// PeerUID returns the UID declared by the peer's transport CONNECT. It is
+// routing metadata, not a cryptographically authenticated principal; callers
+// must retain the cluster network's trust boundary.
+func (c *Context) PeerUID() string {
+	if c.conn == nil {
+		return ""
+	}
+	ctx, ok := c.conn.Context().(*connContext)
+	if !ok || ctx == nil {
+		return ""
+	}
+	return ctx.uid.Load()
+}

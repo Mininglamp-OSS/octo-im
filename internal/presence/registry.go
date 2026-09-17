@@ -3,6 +3,8 @@ package presence
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"sort"
 	"sync"
@@ -250,7 +252,7 @@ func (m *Manager) snapshot(uids []string) (snapshotResponse, error) {
 			} else {
 				safe = &eventbus.Conn{
 					Uid: conn.Uid, NodeId: conn.NodeId, ConnId: conn.ConnId,
-					OwnerBootID: conn.OwnerBootID, SessionID: conn.SessionID,
+					OwnerBootID: conn.OwnerBootID, SessionID: preparedSessionID(conn),
 				}
 			}
 			data, err := safe.Encode()
@@ -265,6 +267,25 @@ func (m *Manager) snapshot(uids []string) (snapshotResponse, error) {
 		}
 	}
 	return response, nil
+}
+
+// A prepared marker only protects an in-flight CONNACK from recovery eviction.
+// The random boot ID salts this domain-separated digest; neither the raw
+// SessionID nor the legacy Uptime authentication fence is exported.
+func preparedSessionID(conn *eventbus.Conn) string {
+	identity := &eventbus.Conn{
+		Uid: conn.Uid, NodeId: conn.NodeId, ConnId: conn.ConnId,
+		OwnerBootID: conn.OwnerBootID, SessionID: conn.SessionID,
+	}
+	data, _ := identity.Encode()
+	digest := sha256.Sum256(append([]byte("wk/presence/prepared/v1\x00"), data...))
+	return "prepared-sha256:" + hex.EncodeToString(digest[:])
+}
+
+func preparedSessionMatches(expected, marker *eventbus.Conn) bool {
+	return expected != nil && marker != nil && expected.HasSessionIdentity() &&
+		!marker.Auth && expected.Equal(marker) && expected.OwnerBootID == marker.OwnerBootID &&
+		marker.SessionID == preparedSessionID(expected)
 }
 
 func (m *Manager) liveUIDs() []string {

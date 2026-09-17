@@ -553,7 +553,7 @@ func (l byInPacketDesc) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.
 type byUptime struct{ Conns []*connzResp }
 
 func (l byUptime) Less(i, j int) bool {
-	return l.Conns[i].Uptime < l.Conns[j].Uptime
+	return connUptime(l.Conns[i].Uptime).Before(connUptime(l.Conns[j].Uptime))
 }
 func (l byUptime) Len() int      { return len(l.Conns) }
 func (l byUptime) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Conns[i] }
@@ -561,7 +561,7 @@ func (l byUptime) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Conns[
 type byUptimeDesc struct{ Conns []*connzResp }
 
 func (l byUptimeDesc) Less(i, j int) bool {
-	return l.Conns[i].Uptime > l.Conns[j].Uptime
+	return connUptime(l.Conns[i].Uptime).After(connUptime(l.Conns[j].Uptime))
 }
 func (l byUptimeDesc) Len() int      { return len(l.Conns) }
 func (l byUptimeDesc) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Conns[i] }

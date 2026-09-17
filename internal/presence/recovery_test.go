@@ -282,7 +282,8 @@ func TestPreparedSessionCannotBeEvictedBeforeOwnerAuthentication(t *testing.T) {
 	require.False(t, prepared.Auth)
 	require.Empty(t, prepared.AesIV)
 	require.Empty(t, prepared.AesKey)
-	require.True(t, prepared.SameSession(newConn))
+	require.False(t, prepared.SameSession(newConn))
+	require.True(t, preparedSessionMatches(newConn, prepared))
 
 	newConn.Auth = true
 	leader.Invalidate(newConn.Uid)
