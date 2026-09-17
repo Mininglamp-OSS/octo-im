@@ -1,6 +1,11 @@
 package handler
 
 import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/forward"
 	"github.com/WuKongIM/WuKongIM/internal/options"
@@ -11,10 +16,35 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	verificationBatchBudget = 250 * time.Millisecond
+	verificationFailureTTL  = time.Second
+	verificationFailureCap  = 4096
+)
+
+type verificationSessionKey struct {
+	uid         string
+	nodeID      uint64
+	connID      int64
+	uptime      uint64
+	ownerBootID string
+	sessionID   string
+}
+
+type verificationResult struct {
+	conn          *eventbus.Conn
+	failed        bool
+	failureReason wkproto.ReasonCode
+}
+
 type Handler struct {
 	wklog.Log
-	forwardCapabilities forward.CapabilityCache
-	forwardGate         *forward.Gate
+	forwardCapabilities  forward.CapabilityCache
+	forwardGate          *forward.Gate
+	verificationFailures struct {
+		sync.Mutex
+		entries map[verificationSessionKey]time.Time
+	}
 }
 
 func NewHandler() *Handler {
@@ -66,18 +96,183 @@ func (h *Handler) OnEvent(ctx *eventbus.UserContext) {
 	// 如果本节点的事件则执行，非本节点事件转发到leader节点
 	if options.G.IsLocalNode(slotLeaderId) ||
 		h.notForwardToLeader(ctx.EventType) {
-		// 执行本地事件
+		// A forwarded descriptor is only a claim until its physical owner verifies it.
+		if ctx.EventType == eventbus.EventOnSend && service.Presence != nil {
+			ctx.Events = h.verifyOnSendEvents(ctx.Uid, ctx.Events)
+			if len(ctx.Events) == 0 {
+				return
+			}
+		}
 		eventbus.ExecuteUserEvent(ctx)
 	} else {
 		h.forwardsToNode(slotLeaderId, ctx.Uid, ctx.Events)
 	}
 }
 
+func (h *Handler) verifyOnSendEvents(uid string, events []*eventbus.Event) []*eventbus.Event {
+	verifiedEvents := make([]*eventbus.Event, 0, len(events))
+	results := make(map[verificationSessionKey]verificationResult)
+	batchCtx, cancelBatch := context.WithTimeout(context.Background(), verificationBatchBudget)
+	defer cancelBatch()
+	budgetWarned := false
+	for _, event := range events {
+		if event == nil || event.Conn == nil || event.Frame == nil {
+			h.Warn("skip malformed on-send event", zap.String("uid", uid))
+			continue
+		}
+		known := eventbus.User.ConnById(uid, event.Conn.NodeId, event.Conn.ConnId)
+		if known != nil && known.Auth && sessionDescriptorMatches(known, event.Conn) {
+			event.Conn = verifiedSessionDescriptor(known, event.Conn)
+			verifiedEvents = append(verifiedEvents, event)
+			continue
+		}
+		key := verificationKey(event.Conn)
+		if result, ok := results[key]; ok {
+			if result.failed {
+				verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event, result.failureReason)
+				continue
+			}
+			event.Conn = result.conn
+			verifiedEvents = append(verifiedEvents, event)
+			continue
+		}
+		if h.verificationFailedRecently(key, time.Now()) {
+			results[key] = verificationResult{failed: true, failureReason: wkproto.ReasonNodeNotMatch}
+			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event, wkproto.ReasonNodeNotMatch)
+			continue
+		}
+		if err := batchCtx.Err(); err != nil {
+			if !budgetWarned {
+				h.Warn("physical session verification budget exhausted", zap.Error(err), zap.String("uid", uid))
+				budgetWarned = true
+			}
+			results[key] = verificationResult{failed: true, failureReason: wkproto.ReasonSystemError}
+			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event, wkproto.ReasonSystemError)
+			continue
+		}
+		verified, err := service.Presence.Verify(batchCtx, event.Conn)
+		if err != nil {
+			reason := wkproto.ReasonSystemError
+			if errors.Is(err, service.ErrPresenceSessionNotFound) {
+				reason = wkproto.ReasonNodeNotMatch
+				h.rememberVerificationFailure(key, time.Now())
+			}
+			results[key] = verificationResult{failed: true, failureReason: reason}
+			h.Warn("physical session verification failed",
+				zap.Error(err),
+				zap.String("uid", event.Conn.Uid),
+				zap.Uint64("nodeId", event.Conn.NodeId),
+				zap.Int64("connId", event.Conn.ConnId))
+			verifiedEvents = h.handleUnverifiedOnSend(verifiedEvents, event, reason)
+			continue
+		}
+		results[key] = verificationResult{conn: verified}
+		h.clearVerificationFailure(key)
+		event.Conn = verified
+		// Verification can republish a logical session that was missing locally.
+		// Fence recovery before the update so an older snapshot cannot evict it.
+		service.Presence.Invalidate(verified.Uid)
+		eventbus.User.UpdateConn(verified)
+		verifiedEvents = append(verifiedEvents, event)
+	}
+	return verifiedEvents
+}
+
+func verifiedSessionDescriptor(known, claimed *eventbus.Conn) *eventbus.Conn {
+	if known == nil || claimed == nil || !sessionDescriptorMatches(known, claimed) ||
+		(len(known.AesIV) > 0 && len(known.AesKey) > 0) || len(claimed.AesIV) == 0 || len(claimed.AesKey) == 0 {
+		return known
+	}
+	data, err := known.Encode()
+	if err != nil {
+		return known
+	}
+	merged := &eventbus.Conn{}
+	if err := merged.Decode(data); err != nil {
+		return known
+	}
+	merged.AesIV = append([]byte(nil), claimed.AesIV...)
+	merged.AesKey = append([]byte(nil), claimed.AesKey...)
+	merged.LastActive = known.LastActive
+	return merged
+}
+
+func sessionDescriptorMatches(known, claimed *eventbus.Conn) bool {
+	if known == nil || claimed == nil {
+		return false
+	}
+	if known.IsLegacySession() && claimed.IsLegacySession() {
+		return known.LegacyMatches(claimed)
+	}
+	return known.HasSessionIdentity() && claimed.HasSessionIdentity() && known.SameSession(claimed)
+}
+
+func verificationKey(conn *eventbus.Conn) verificationSessionKey {
+	return verificationSessionKey{
+		uid: conn.Uid, nodeID: conn.NodeId, connID: conn.ConnId, uptime: conn.Uptime,
+		ownerBootID: conn.OwnerBootID, sessionID: conn.SessionID,
+	}
+}
+
+func (h *Handler) handleUnverifiedOnSend(verifiedEvents []*eventbus.Event, event *eventbus.Event, reason wkproto.ReasonCode) []*eventbus.Event {
+	switch packet := event.Frame.(type) {
+	case *wkproto.SendPacket:
+		eventbus.User.ConnWrite(event.ReqId, event.Conn, &wkproto.SendackPacket{
+			Framer:      packet.Framer,
+			MessageID:   event.MessageId,
+			ClientSeq:   packet.ClientSeq,
+			ClientMsgNo: packet.ClientMsgNo,
+			ReasonCode:  reason,
+		})
+		eventbus.User.Advance(event.Conn.Uid)
+	case *wkproto.PingPacket, *wkproto.RecvackPacket:
+		// These frames are idempotent. Let the physical write/session fence
+		// protect PONG delivery, and let recvack validate the retry's session.
+		verifiedEvents = append(verifiedEvents, event)
+	}
+	return verifiedEvents
+}
+
+func (h *Handler) verificationFailedRecently(key verificationSessionKey, now time.Time) bool {
+	h.verificationFailures.Lock()
+	defer h.verificationFailures.Unlock()
+	until, ok := h.verificationFailures.entries[key]
+	if !ok {
+		return false
+	}
+	if !now.Before(until) {
+		delete(h.verificationFailures.entries, key)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) rememberVerificationFailure(key verificationSessionKey, now time.Time) {
+	h.verificationFailures.Lock()
+	defer h.verificationFailures.Unlock()
+	if h.verificationFailures.entries == nil {
+		h.verificationFailures.entries = make(map[verificationSessionKey]time.Time)
+	}
+	if len(h.verificationFailures.entries) >= verificationFailureCap {
+		for cached := range h.verificationFailures.entries {
+			delete(h.verificationFailures.entries, cached)
+			break
+		}
+	}
+	h.verificationFailures.entries[key] = now.Add(verificationFailureTTL)
+}
+
+func (h *Handler) clearVerificationFailure(key verificationSessionKey) {
+	h.verificationFailures.Lock()
+	delete(h.verificationFailures.entries, key)
+	h.verificationFailures.Unlock()
+}
+
 // 统计输入
 func (h *Handler) totalIn(ctx *eventbus.UserContext) {
 	// 统计
 	for _, event := range ctx.Events {
-		if event.Type == eventbus.EventOnSend {
+		if event != nil && event.Type == eventbus.EventOnSend && event.Frame != nil && event.Conn != nil {
 			frameType := event.Frame.GetFrameType()
 			// 统计
 			conn := event.Conn
@@ -207,8 +402,8 @@ func (h *Handler) onForwardUserEvent(m *proto.Message) {
 		// 替换成本地的连接
 		if e.Conn != nil {
 			conn := eventbus.User.ConnById(e.Conn.Uid, e.Conn.NodeId, e.Conn.ConnId)
-			if conn != nil {
-				e.Conn = conn
+			if e.Type != eventbus.EventConnack && sessionDescriptorMatches(conn, e.Conn) {
+				e.Conn = verifiedSessionDescriptor(conn, e.Conn)
 			}
 
 		}

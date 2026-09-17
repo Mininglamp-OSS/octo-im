@@ -99,6 +99,9 @@ type Event struct {
 	ChannelId                 string   // 频道ID
 	ChannelType               uint8    // 频道类型
 	ReqId                     string   // 请求ID(非必填)(jsonrpc)
+	// PresenceReconciled marks a local recovery eviction whose logical removal
+	// already happened; the user handler only needs to emit the offline signal.
+	PresenceReconciled bool
 }
 
 func (e *Event) Clone() *Event {
@@ -122,6 +125,7 @@ func (e *Event) Clone() *Event {
 		ChannelId:                 e.ChannelId,
 		ChannelType:               e.ChannelType,
 		ReqId:                     e.ReqId,
+		PresenceReconciled:        e.PresenceReconciled,
 	}
 }
 

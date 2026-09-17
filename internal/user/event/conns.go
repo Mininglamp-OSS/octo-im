@@ -32,6 +32,7 @@ func (c *conns) addOrUpdateConn(conn *eventbus.Conn) {
 	for i, cn := range c.conns {
 		if cn.NodeId == conn.NodeId && cn.ConnId == conn.ConnId {
 			exist = true
+			preserveRuntimeState(cn, conn)
 			c.conns[i] = conn
 			break
 		}
@@ -41,14 +42,61 @@ func (c *conns) addOrUpdateConn(conn *eventbus.Conn) {
 	}
 }
 
+// addOrUpdateRecoveredConn installs a recovery snapshot only when the
+// numeric connection ID is still unclaimed or belongs to the same session.
+// A normal connection event remains authoritative when an ID is reused.
+func (c *conns) addOrUpdateRecoveredConn(conn *eventbus.Conn) {
+	c.Lock()
+	defer c.Unlock()
+	for i, current := range c.conns {
+		if current.NodeId != conn.NodeId || current.ConnId != conn.ConnId {
+			continue
+		}
+		if !current.SameSession(conn) {
+			return
+		}
+		preserveRuntimeState(current, conn)
+		c.conns[i] = conn
+		return
+	}
+	c.conns = append(c.conns, conn)
+}
+
 func (c *conns) remove(cn *eventbus.Conn) {
 	c.Lock()
 	defer c.Unlock()
 	for i, conn := range c.conns {
-		if conn.ConnId == cn.ConnId && conn.NodeId == cn.NodeId {
+		matches := conn.SameSession(cn)
+		if cn.IsLegacySession() {
+			matches = conn.LegacyMatches(cn)
+		}
+		if matches {
 			c.conns = append(c.conns[:i], c.conns[i+1:]...)
 			return
 		}
+	}
+}
+
+func preserveRuntimeState(current, incoming *eventbus.Conn) {
+	if current == nil || incoming == nil || current == incoming || !current.SameSession(incoming) {
+		return
+	}
+	incoming.InPacketCount.Store(current.InPacketCount.Load())
+	incoming.OutPacketCount.Store(current.OutPacketCount.Load())
+	incoming.InPacketByteCount.Store(current.InPacketByteCount.Load())
+	incoming.OutPacketByteCount.Store(current.OutPacketByteCount.Load())
+	incoming.InMsgCount.Store(current.InMsgCount.Load())
+	incoming.OutMsgCount.Store(current.OutMsgCount.Load())
+	incoming.InMsgByteCount.Store(current.InMsgByteCount.Load())
+	incoming.OutMsgByteCount.Store(current.OutMsgByteCount.Load())
+	if len(incoming.AesIV) == 0 && len(current.AesIV) > 0 {
+		incoming.AesIV = append([]byte(nil), current.AesIV...)
+	}
+	if len(incoming.AesKey) == 0 && len(current.AesKey) > 0 {
+		incoming.AesKey = append([]byte(nil), current.AesKey...)
+	}
+	if current.LastActive > incoming.LastActive {
+		incoming.LastActive = current.LastActive
 	}
 }
 
@@ -107,7 +155,7 @@ func (c *conns) len() int {
 func (c *conns) allConns() []*eventbus.Conn {
 	c.RLock()
 	defer c.RUnlock()
-	return c.conns
+	return append([]*eventbus.Conn(nil), c.conns...)
 }
 
 func (c *conns) authedConns() []*eventbus.Conn {

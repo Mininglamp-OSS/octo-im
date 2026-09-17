@@ -24,6 +24,8 @@ type ConnStats struct {
 }
 
 type Conn struct {
+	OwnerBootID string
+	SessionID   string
 	ConnStats
 	// 连接属于用户
 	Uid string
@@ -68,6 +70,8 @@ func (c *Conn) Encode() ([]byte, error) {
 	enc.WriteUint8(c.ProtoVersion)
 	enc.WriteUint64(c.Uptime)
 	enc.WriteUint8(wkutil.BoolToUint8(c.IsJsonRpc))
+	enc.WriteString(c.OwnerBootID)
+	enc.WriteString(c.SessionID)
 	return enc.Bytes(), nil
 }
 
@@ -123,12 +127,20 @@ func (c *Conn) Decode(data []byte) error {
 		return err
 	}
 	c.IsJsonRpc = wkutil.Uint8ToBool(isJsonRpc)
+	if dec.Len() > 0 {
+		if c.OwnerBootID, err = dec.String(); err != nil {
+			return err
+		}
+		if c.SessionID, err = dec.String(); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
 
 func (c *Conn) Size() uint64 {
-	return uint64(8 + len(c.Uid) + len(c.DeviceId) + 1 + 1 + 8 + 1 + len(c.AesIV) + len(c.AesKey) + 1)
+	return uint64(4 + len(c.OwnerBootID) + len(c.SessionID) + 8 + len(c.Uid) + len(c.DeviceId) + 1 + 1 + 8 + 1 + len(c.AesIV) + len(c.AesKey) + 1)
 }
 
 func (c *Conn) Equal(cn *Conn) bool {
@@ -139,4 +151,28 @@ func (c *Conn) Equal(cn *Conn) bool {
 func (c *Conn) String() string {
 
 	return fmt.Sprintf("ConnId:%d, Uid:%s, DeviceId:%s, DeviceFlag:%d, DeviceLevel:%d, NodeId:%d, Auth:%v, ProtoVersion:%d, AesIV:%s, AesKey:%s", c.ConnId, c.Uid, c.DeviceId, c.DeviceFlag, c.DeviceLevel, c.NodeId, c.Auth, c.ProtoVersion, c.AesIV, c.AesKey)
+}
+
+// SameSession fences delayed events against socket ID reuse and owner restarts.
+func (c *Conn) SameSession(other *Conn) bool {
+	return other != nil && c.Equal(other) && c.OwnerBootID == other.OwnerBootID && c.SessionID == other.SessionID
+}
+
+// HasSessionIdentity reports whether the descriptor carries the complete
+// owner/session fence introduced by presence recovery.
+func (c *Conn) HasSessionIdentity() bool {
+	return c != nil && c.OwnerBootID != "" && c.SessionID != ""
+}
+
+// IsLegacySession reports an identity-less descriptor produced by a node that
+// predates presence recovery. A partially populated identity is never legacy.
+func (c *Conn) IsLegacySession() bool {
+	return c != nil && c.OwnerBootID == "" && c.SessionID == ""
+}
+
+// LegacyMatches provides the strongest comparison available after an old
+// node has decoded and re-encoded a descriptor without the appended identity.
+func (c *Conn) LegacyMatches(other *Conn) bool {
+	return other != nil && c.Equal(other) && c.DeviceId == other.DeviceId &&
+		c.DeviceFlag == other.DeviceFlag && c.Uptime == other.Uptime
 }
