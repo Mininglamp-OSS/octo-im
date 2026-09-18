@@ -68,6 +68,10 @@ func (wk *wukongDB) GetDenylist(channelId string, channelType uint8) ([]Member, 
 
 func (wk *wukongDB) ExistDenylist(channelId string, channelType uint8, uid string) (bool, error) {
 
+	channelLock := &wk.recoveryChannelLocks[key.ChannelToNum(channelId, channelType)%64]
+	channelLock.RLock()
+	defer channelLock.RUnlock()
+
 	wk.metrics.ExistDenylistAdd(1)
 
 	// 先从缓存获取

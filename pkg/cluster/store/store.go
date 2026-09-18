@@ -7,7 +7,8 @@ import (
 )
 
 type Store struct {
-	opts *Options
+	opts     *Options
+	recovery *subscriberRecovery
 	wklog.Log
 
 	wdb wkdb.DB
@@ -55,6 +56,10 @@ func (s *Store) Start() error {
 }
 
 func (s *Store) Stop() {
+	if s.recovery != nil {
+		s.recovery.cancel()
+		s.recovery.wg.Wait()
+	}
 	s.stopper.Stop()
 }
 

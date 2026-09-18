@@ -25,12 +25,14 @@ type syncState struct {
 // }
 
 type Node struct {
-	events      []types.Event
-	opts        *Options
-	syncElapsed int // 同步计数
-	tickFnc     func()
-	stepFunc    func(event types.Event) error
-	queue       *queue // 日志队列
+	applyFailures   int
+	applyRetryTicks int // Only Tick advances retries; role changes do not reset it.
+	events          []types.Event
+	opts            *Options
+	syncElapsed     int // 同步计数
+	tickFnc         func()
+	stepFunc        func(event types.Event) error
+	queue           *queue // 日志队列
 	wklog.Log
 	heartbeatElapsed int          // 心跳计时器
 	cfg              types.Config // 分布式配置
@@ -125,7 +127,7 @@ func (n *Node) HasReady() bool {
 	if n.queue.hasNextStoreLogs() {
 		return true
 	}
-	if n.queue.hasNextApplyLogs() {
+	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
 		return true
 	}
 	return len(n.events) > 0
@@ -157,7 +159,7 @@ func (n *Node) Ready() []types.Event {
 		}
 	}
 
-	if n.queue.hasNextApplyLogs() {
+	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
 		start, end := n.queue.nextApplyLogs()
 		if start > 0 {
 			n.sendApplyReq(start, end)

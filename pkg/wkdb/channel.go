@@ -119,6 +119,10 @@ func (wk *wukongDB) UpdateChannel(channelInfo ChannelInfo) error {
 
 func (wk *wukongDB) GetChannel(channelId string, channelType uint8) (ChannelInfo, error) {
 
+	channelLock := &wk.recoveryChannelLocks[key.ChannelToNum(channelId, channelType)%64]
+	channelLock.RLock()
+	defer channelLock.RUnlock()
+
 	wk.metrics.GetChannelAdd(1)
 
 	// 先从缓存获取

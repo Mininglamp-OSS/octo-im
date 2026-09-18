@@ -11,83 +11,50 @@ import (
 )
 
 // ApplyLogs 应用槽日志
+// ApplySlotLogs preserves log order. Only contiguous config saves can be
+// grouped; delaying conversation writes past removals can resurrect rows.
 func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
-
-	if len(logs) >= 10 { // 如果日志数量大于10条，批量处理
-		cmds := make([]*CMD, 0, len(logs))
-		logIndexs := make([]uint64, 0, len(logs))
-		for _, log := range logs {
-			cmd := &CMD{}
-			err := cmd.Unmarshal(log.Data)
-			if err != nil {
-				s.Panic("unmarshal cmd err", zap.Error(err), zap.Uint64("index", log.Index), zap.ByteString("data", log.Data))
-				return err
-			}
-			cmds = append(cmds, cmd)
-			logIndexs = append(logIndexs, log.Index)
-
-		}
-		err := s.applyCMDs(cmds, logIndexs)
-		if err != nil {
+	for i := 0; i < len(logs); {
+		cmd := &CMD{}
+		if err := cmd.Unmarshal(logs[i].Data); err != nil {
 			return err
 		}
-	} else {
-		for _, log := range logs {
-			err := s.applyLog(slotId, log)
-			if err != nil {
-				cmd := &CMD{}
-				cmd.Unmarshal(log.Data)
-				s.Panic("apply log err", zap.Error(err), zap.String("cmd", cmd.CmdType.String()), zap.Uint64("index", log.Index), zap.ByteString("data", log.Data))
+		if cmd.CmdType == CMDChannelClusterConfigSave {
+			cmds := []*CMD{cmd}
+			versions := []uint64{logs[i].Index}
+			i++
+			for i < len(logs) {
+				next := &CMD{}
+				if err := next.Unmarshal(logs[i].Data); err != nil {
+					return err
+				}
+				if next.CmdType != CMDChannelClusterConfigSave {
+					break
+				}
+				cmds = append(cmds, next)
+				versions = append(versions, logs[i].Index)
+				i++
+			}
+			if err := s.handleChannelClusterConfigSavesForCMDs(cmds, versions); err != nil {
 				return err
 			}
+		} else {
+			if err := s.applyCMDForSlot(slotId, cmd, logs[i].Index); err != nil {
+				return err
+			}
+			i++
 		}
 	}
-
 	return nil
 }
 
-func (s *Store) applyCMDs(cmds []*CMD, logIndexs []uint64) error {
-	channelClusterConfigsCMDs := make([]*CMD, 0, len(cmds))
-	confVersions := make([]uint64, 0, len(cmds))
-	var addOrUpdateUserConversationsCMDs []*CMD
-	var addOrUpdateConversationsBatchIfNotExistCMDs []*CMD
-
-	for i, cmd := range cmds {
-
-		switch cmd.CmdType {
-		case CMDChannelClusterConfigSave: // 保存频道分布式配置
-			channelClusterConfigsCMDs = append(channelClusterConfigsCMDs, cmd)
-			confVersions = append(confVersions, logIndexs[i])
-		case CMDAddOrUpdateUserConversations: // 添加或更新会话
-			addOrUpdateUserConversationsCMDs = append(addOrUpdateUserConversationsCMDs, cmd)
-		case CMDAddOrUpdateConversationsBatchIfNotExist: // 添加或更新用户会话
-			addOrUpdateConversationsBatchIfNotExistCMDs = append(addOrUpdateConversationsBatchIfNotExistCMDs, cmd)
-		default:
-			err := s.applyCMD(cmd, logIndexs[i])
-			if err != nil {
-				return err
-			}
-		}
+func (s *Store) applyCMDForSlot(slot uint32, cmd *CMD, index uint64) error {
+	switch cmd.CmdType {
+	case CMDSubscriberOperation, CMDConversationEffects, CMDSubscriberCheckpoint:
+		return s.applySubscriberRecovery(slot, cmd, index)
+	default:
+		return s.applyCMD(cmd, index)
 	}
-	if len(channelClusterConfigsCMDs) > 0 {
-		err := s.handleChannelClusterConfigSavesForCMDs(channelClusterConfigsCMDs, confVersions)
-		if err != nil {
-			return err
-		}
-	}
-	if len(addOrUpdateUserConversationsCMDs) > 0 {
-		err := s.handleAddOrUpdateUserConversationsForCMDs(addOrUpdateUserConversationsCMDs)
-		if err != nil {
-			return err
-		}
-	}
-	if len(addOrUpdateConversationsBatchIfNotExistCMDs) > 0 {
-		err := s.handleAddOrUpdateConversationsBatchIfNotExistForCMDs(addOrUpdateConversationsBatchIfNotExistCMDs)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (s *Store) applyCMD(cmd *CMD, logIndex uint64) error {
@@ -170,7 +137,7 @@ func (s *Store) applyCMD(cmd *CMD, logIndex uint64) error {
 	}
 }
 
-func (s *Store) applyLog(_ uint32, log types.Log) error {
+func (s *Store) applyLog(slot uint32, log types.Log) error {
 	cmd := &CMD{}
 	err := cmd.Unmarshal(log.Data)
 	if err != nil {
@@ -178,7 +145,7 @@ func (s *Store) applyLog(_ uint32, log types.Log) error {
 		return err
 	}
 
-	return s.applyCMD(cmd, log.Index)
+	return s.applyCMDForSlot(slot, cmd, log.Index)
 }
 
 func (s *Store) loopSaveChannelClusterConfig() {
@@ -503,6 +470,18 @@ func (s *Store) handleBatchUpdateConversation(cmd *CMD) error {
 			conversationType = wkdb.ConversationTypeCMD
 		}
 		for uid, seq := range model.Uids {
+			lifecycle, managed, err := s.wdb.ConversationLifecycle(uid, model.ChannelId, model.ChannelType)
+			if err != nil {
+				return err
+			}
+			if managed {
+				if !lifecycle.Deleted {
+					if err := s.wdb.UpdateConversationIfSeqGreater(uid, model.ChannelId, model.ChannelType, seq); err != nil {
+						return err
+					}
+				}
+				continue
+			}
 			conversation := wkdb.Conversation{
 				Uid:          uid,
 				Type:         conversationType,
