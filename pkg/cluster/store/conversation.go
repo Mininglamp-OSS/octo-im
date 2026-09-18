@@ -195,6 +195,22 @@ func (s *Store) DeleteConversation(uid string, channelID string, channelType uin
 	return err
 }
 
+// DeleteConversationAsync submits the cleanup to Raft without waiting for the
+// command to be applied to the business database. Slot.Propose forwards to the
+// slot leader when needed. Success means leader admission, not majority commit
+// or completed deletion; an error does not necessarily mean nothing was admitted.
+func (s *Store) DeleteConversationAsync(uid string, channelID string, channelType uint8) error {
+	data := EncodeCMDDeleteConversation(uid, channelID, channelType)
+	cmd := NewCMD(CMDDeleteConversation, data)
+	cmdData, err := cmd.Marshal()
+	if err != nil {
+		return err
+	}
+	slotId := s.opts.Slot.GetSlotId(uid)
+	_, err = s.opts.Slot.Propose(slotId, cmdData)
+	return err
+}
+
 func (s *Store) DeleteConversations(uid string, channels []wkdb.Channel) error {
 	data := EncodeCMDDeleteConversations(uid, channels)
 	cmd := NewCMD(CMDDeleteConversations, data)
