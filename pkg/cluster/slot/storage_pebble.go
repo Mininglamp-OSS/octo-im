@@ -30,8 +30,9 @@ type PebbleShardLogStorage struct {
 	stopper syncutil.Stopper
 	s       *Server
 
-	// 每个 shard 的操作锁，防止 Apply 和 Truncate 并发导致数据不一致
-	shardLocks []sync.Mutex
+	// slotLocks serializes operations for the same raft slot without coupling
+	// unrelated slots that happen to share one physical Pebble DB shard.
+	slotLocks sync.Map // map[string]*sync.Mutex
 }
 
 func NewPebbleShardLogStorage(s *Server, path string, shardNum uint32) *PebbleShardLogStorage {
@@ -86,9 +87,6 @@ func (p *PebbleShardLogStorage) Open() error {
 
 	opts := p.defaultPebbleOptions()
 
-	// 初始化分片锁，每个 shard 有独立的锁，避免全局锁影响性能
-	p.shardLocks = make([]sync.Mutex, p.shardNum)
-
 	for i := 0; i < int(p.shardNum); i++ {
 		db, err := pebble.Open(fmt.Sprintf("%s/shard%03d", p.path, i), opts)
 		if err != nil {
@@ -105,14 +103,13 @@ func (p *PebbleShardLogStorage) Open() error {
 }
 
 func (p *PebbleShardLogStorage) Close() error {
+	for _, db := range p.batchDbs {
+		db.Stop()
+	}
 	for _, db := range p.dbs {
 		if err := db.Close(); err != nil {
 			p.Error("close db error", zap.Error(err))
 		}
-	}
-
-	for _, db := range p.batchDbs {
-		db.Stop()
 	}
 
 	p.stopper.Stop()
@@ -144,6 +141,11 @@ func (p *PebbleShardLogStorage) shardId(v string) uint32 {
 	h.Write([]byte(v))
 
 	return h.Sum32() % p.shardNum
+}
+
+func (p *PebbleShardLogStorage) slotLock(shardNo string) *sync.Mutex {
+	lock, _ := p.slotLocks.LoadOrStore(shardNo, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 func (p *PebbleShardLogStorage) shardBatchDBWithIndex(index uint32) *wkdb.BatchDB {
@@ -189,12 +191,11 @@ func (p *PebbleShardLogStorage) GetState(shardNo string) (types.RaftState, error
 
 func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) error {
 	// 加锁保护，防止与 TruncateLogTo 并发执行
-	shardId := p.shardId(shardNo)
-	p.shardLocks[shardId].Lock()
-	defer p.shardLocks[shardId].Unlock()
+	lock := p.slotLock(shardNo)
+	lock.Lock()
+	defer lock.Unlock()
 
-	batch := p.shardDB(shardNo).NewBatch()
-	defer batch.Close()
+	batch := p.shardBatchDB(shardNo).NewBatch()
 
 	if termStartIndexInfo != nil {
 		err := p.SetLeaderTermStartIndex(shardNo, termStartIndexInfo.Term, termStartIndexInfo.Index)
@@ -217,14 +218,10 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 		logData = append(logData, timeData...)
 
 		keyData := key.NewLogKey(shardNo, lg.Index)
-		err = batch.Set(keyData, logData, p.noSync)
-		if err != nil {
-			p.Panic("batch set failed", zap.Error(err))
-			return err
-		}
+		batch.Set(keyData, logData)
 	}
 
-	return batch.Commit(p.sync)
+	return batch.CommitWait()
 }
 
 // TruncateLogTo 截断日志
@@ -234,9 +231,9 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 	}
 
 	// 加锁保护，防止与 Apply 并发执行导致 appliedIndex > lastLogIndex
-	shardId := p.shardId(shardNo)
-	p.shardLocks[shardId].Lock()
-	defer p.shardLocks[shardId].Unlock()
+	lock := p.slotLock(shardNo)
+	lock.Lock()
+	defer lock.Unlock()
 
 	lastLog, err := p.lastLog(shardNo)
 	if err != nil {
@@ -335,9 +332,9 @@ func (p *PebbleShardLogStorage) GetLogs(shardNo string, startLogIndex uint64, en
 
 func (p *PebbleShardLogStorage) Apply(shardNo string, logs []types.Log) error {
 	// 加锁保护，防止与 TruncateLogTo 并发执行导致 appliedIndex > lastLogIndex
-	shardId := p.shardId(shardNo)
-	p.shardLocks[shardId].Lock()
-	defer p.shardLocks[shardId].Unlock()
+	lock := p.slotLock(shardNo)
+	lock.Lock()
+	defer lock.Unlock()
 
 	if p.s.opts.OnApply != nil {
 		slotId := KeyToSlotId(shardNo)
@@ -508,8 +505,9 @@ func (p *PebbleShardLogStorage) SetAppliedIndex(shardNo string, index uint64) er
 	lastTimeData := make([]byte, 8)
 	binary.BigEndian.PutUint64(lastTimeData, uint64(lastTime))
 
-	err := p.shardDB(shardNo).Set(maxIndexKeyData, append(maxIndexdata, lastTimeData...), p.sync)
-	return err
+	batch := p.shardBatchDB(shardNo).NewBatch()
+	batch.Set(maxIndexKeyData, append(maxIndexdata, lastTimeData...))
+	return batch.CommitWait()
 
 }
 

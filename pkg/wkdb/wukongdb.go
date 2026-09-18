@@ -38,15 +38,15 @@ type wukongDB struct {
 
 	metrics trace.IDBMetrics
 
-	channelSeqCache      *channelSeqCache
-	conversationCache    *ConversationCache
-	channelInfoCache     *ChannelInfoCache
-	permissionCache      *PermissionCache           // 统一的权限缓存（替代 denylistCache, subscriberCache, allowlistCache）
-	clusterConfigCache   *ChannelClusterConfigCache // 频道集群配置缓存
-	deviceCache          *DeviceCache               // 设备缓存
-	userLastMsgSeqCache  *userLastMsgSeqCache       // 用户在频道内发送的最后一条消息序号缓存
-	cacheManager         *CacheManager              // 缓存管理器
-	performanceMonitor   *PerformanceMonitor        // 性能监控器
+	channelSeqCache     *channelSeqCache
+	conversationCache   *ConversationCache
+	channelInfoCache    *ChannelInfoCache
+	permissionCache     *PermissionCache           // 统一的权限缓存（替代 denylistCache, subscriberCache, allowlistCache）
+	clusterConfigCache  *ChannelClusterConfigCache // 频道集群配置缓存
+	deviceCache         *DeviceCache               // 设备缓存
+	userLastMsgSeqCache *userLastMsgSeqCache       // 用户在频道内发送的最后一条消息序号缓存
+	cacheManager        *CacheManager              // 缓存管理器
+	performanceMonitor  *PerformanceMonitor        // 性能监控器
 
 	h hash.Hash32
 }
@@ -68,13 +68,13 @@ func NewWukongDB(opts *Options) DB {
 
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 	wk := &wukongDB{
-		opts:               opts,
-		shardNum:           uint32(opts.ShardNum),
-		prmaryKeyGen:       prmaryKeyGen,
-		endian:             endian,
-		cancelCtx:          cancelCtx,
-		cancelFunc:         cancelFunc,
-		metrics:            metrics,
+		opts:                opts,
+		shardNum:            uint32(opts.ShardNum),
+		prmaryKeyGen:        prmaryKeyGen,
+		endian:              endian,
+		cancelCtx:           cancelCtx,
+		cancelFunc:          cancelFunc,
+		metrics:             metrics,
 		channelSeqCache:     newChannelSeqCache(1000, endian),
 		conversationCache:   NewConversationCache(1000),         // 缓存1000个 GetLastConversations 查询结果
 		channelInfoCache:    NewChannelInfoCache(1000),          // 缓存频道信息
@@ -83,7 +83,7 @@ func NewWukongDB(opts *Options) DB {
 		deviceCache:         NewDeviceCache(1000),               // 缓存1000个设备
 		userLastMsgSeqCache: newUserLastMsgSeqCache(10000),      // 缓存10000个用户在频道内发送的最后一条消息序号
 		performanceMonitor:  NewPerformanceMonitor(),            // 性能监控器
-		h:                  fnv.New32(),
+		h:                   fnv.New32(),
 		sync: &pebble.WriteOptions{
 			Sync: true,
 		},
@@ -542,9 +542,10 @@ func (b *Batch) Commit() error {
 }
 
 func (b *Batch) CommitWait() error {
-	b.waitC = make(chan error, 1)
+	waitC := make(chan error, 1)
+	b.waitC = waitC
 	b.db.batchChan <- b
-	return <-b.waitC
+	return <-waitC
 }
 
 func (b *Batch) release() {

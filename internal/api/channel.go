@@ -480,10 +480,10 @@ func (ch *channel) removeSubscriber(c *wkhttp.Context) {
 				return
 			}
 
-			// 删除订阅者的会话
-			err = service.Store.DeleteConversation(subscriber, req.ChannelId, req.ChannelType)
+			// 异步删除订阅者的会话，不等待业务存储应用完成
+			err = service.Store.DeleteConversationAsync(subscriber, req.ChannelId, req.ChannelType)
 			if err != nil {
-				ch.Error("删除订阅者的会话失败！", zap.Error(err))
+				ch.Error("提交订阅者的会话清理失败！", zap.Error(err))
 				c.ResponseError(err)
 				return
 			}
@@ -645,10 +645,10 @@ func (ch *channel) blacklistAdd(c *wkhttp.Context) {
 				c.ResponseError(err)
 				return
 			}
-			// 删除订阅者的会话
-			err = service.Store.DeleteConversation(uid, req.ChannelId, req.ChannelType)
+			// 异步删除订阅者的会话，不等待业务存储应用完成
+			err = service.Store.DeleteConversationAsync(uid, req.ChannelId, req.ChannelType)
 			if err != nil {
-				ch.Error("删除订阅者的会话失败！", zap.Error(err))
+				ch.Error("提交订阅者的会话清理失败！", zap.Error(err))
 				c.ResponseError(err)
 				return
 			}
@@ -718,10 +718,10 @@ func (ch *channel) blacklistSet(c *wkhttp.Context) {
 					c.ResponseError(err)
 					return
 				}
-				// 删除订阅者的会话
-				err = service.Store.DeleteConversation(uid, req.ChannelId, req.ChannelType)
+				// 异步删除订阅者的会话，不等待业务存储应用完成
+				err = service.Store.DeleteConversationAsync(uid, req.ChannelId, req.ChannelType)
 				if err != nil {
-					ch.Error("删除订阅者的会话失败！", zap.Error(err))
+					ch.Error("提交订阅者的会话清理失败！", zap.Error(err))
 					c.ResponseError(err)
 					return
 				}

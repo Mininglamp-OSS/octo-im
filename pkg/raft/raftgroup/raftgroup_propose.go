@@ -16,11 +16,9 @@ func (rg *RaftGroup) Propose(raftKey string, id uint64, data []byte) (*types.Pro
 }
 
 func (rg *RaftGroup) ProposeBatch(raftKey string, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
-	raft := rg.raftList.get(raftKey)
-	if raft == nil {
-		return nil, fmt.Errorf("raft not found, key:%s", raftKey)
-	}
-	return rg.proposeBatchTimeout(context.Background(), raft, reqs, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), rg.opts.ProposeTimeout)
+	defer cancel()
+	return rg.ProposeBatchTimeout(ctx, raftKey, reqs)
 }
 
 func (rg *RaftGroup) ProposeUntilApplied(raftKey string, id uint64, data []byte) (*types.ProposeResp, error) {
@@ -40,16 +38,12 @@ func (rg *RaftGroup) ProposeUntilApplied(raftKey string, id uint64, data []byte)
 }
 
 func (rg *RaftGroup) ProposeTimeout(ctx context.Context, raftKey string, id uint64, data []byte) (*types.ProposeResp, error) {
-	raft := rg.raftList.get(raftKey)
-	if raft == nil {
-		return nil, fmt.Errorf("raft not found, key:%s", raftKey)
-	}
-	resps, err := rg.proposeBatchTimeout(ctx, raft, []types.ProposeReq{
+	resps, err := rg.ProposeBatchTimeout(ctx, raftKey, types.ProposeReqSet{
 		{
 			Id:   id,
 			Data: data,
 		},
-	}, nil)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -60,10 +54,24 @@ func (rg *RaftGroup) ProposeTimeout(ctx context.Context, raftKey string, id uint
 	return nil, fmt.Errorf("propose failed")
 }
 
+// ProposeBatchTimeout waits for leader admission, not replication or business Apply.
+// A failed/expired acknowledgement may still leave an admitted proposal; callers
+// must not blindly replay it across newer business operations.
 func (rg *RaftGroup) ProposeBatchTimeout(ctx context.Context, raftKey string, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-rg.stopper.ShouldStop():
+		return nil, ErrGroupStopped
+	default:
+	}
 	raft := rg.raftList.get(raftKey)
 	if raft == nil {
 		return nil, fmt.Errorf("raft not found, key:%s", raftKey)
+	}
+	if !raft.IsLeader() {
+		return rg.fowardPropose(ctx, raft, reqs)
 	}
 	return rg.proposeBatchTimeout(ctx, raft, reqs, nil)
 }
@@ -140,6 +148,9 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 
 // ProposeBatchTimeout 批量提案
 func (rg *RaftGroup) proposeBatchTimeout(ctx context.Context, raft IRaft, reqs []types.ProposeReq, addBefore func(logs []types.Log)) ([]*types.ProposeResp, error) {
+	if len(reqs) == 0 {
+		return nil, errors.New("raftgroup: empty proposal batch")
+	}
 
 	raft.Lock()
 	defer raft.Unlock()
@@ -176,7 +187,9 @@ func (rg *RaftGroup) proposeBatchTimeout(ctx context.Context, raft IRaft, reqs [
 
 	select {
 	case <-ctx.Done():
-		return nil, fmt.Errorf("propose timeout")
+		return nil, ctx.Err()
+	case <-rg.stopper.ShouldStop():
+		return nil, ErrGroupStopped
 	case err := <-waitC:
 		if err != nil {
 			return nil, err
@@ -194,6 +207,13 @@ func (rg *RaftGroup) proposeBatchTimeout(ctx context.Context, raft IRaft, reqs [
 }
 
 func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.ProposeReqSet) ([]*types.ProposeResp, error) {
+	if len(reqs) == 0 {
+		return nil, errors.New("raftgroup: empty proposal batch")
+	}
+	leaderID := raft.LeaderId()
+	if leaderID == 0 {
+		return nil, types.ErrNotLeader
+	}
 	data, err := reqs.Marshal()
 	if err != nil {
 		return nil, err
@@ -204,7 +224,7 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 
 	rg.opts.Transport.Send(raft.Key(), types.Event{
 		From: raft.NodeId(),
-		To:   raft.LeaderId(),
+		To:   leaderID,
 		Type: types.SendPropose,
 		Logs: []types.Log{
 			{
@@ -224,9 +244,12 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 		}
 		return result.(types.ProposeRespSet), nil
 	case <-ctx.Done():
+		// Releasing the waiter does not cancel a proposal already admitted.
+		rg.fowardProposeWait.Trigger(key, nil)
 		rg.Error("foward propose timeout", zap.String("raftKey", raft.Key()))
 		return nil, ctx.Err()
 	case <-rg.stopper.ShouldStop():
+		rg.fowardProposeWait.Trigger(key, nil)
 		return nil, ErrGroupStopped
 	}
 }
