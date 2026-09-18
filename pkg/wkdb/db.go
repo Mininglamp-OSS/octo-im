@@ -1,6 +1,7 @@
 package wkdb
 
 type DB interface {
+	SubscriberRecoveryDB
 	Open() error
 	Close() error
 	// 获取下一个主键

@@ -268,6 +268,9 @@ func (h *Handler) requestTag(leaderId uint64, tagKey string) (*types.Tag, error)
 }
 
 func (h *Handler) getOrMakeTagForLeader(fakeChannelId string, channelType uint8) (*types.Tag, error) {
+	unlock := service.LockSubscriberTag(fakeChannelId, channelType)
+	defer unlock()
+
 	var (
 		tag *types.Tag
 		err error

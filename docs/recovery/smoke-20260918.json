@@ -1,0 +1,50 @@
+{
+  "concurrency": 2,
+  "nodes": 3,
+  "workers_per_node": 2,
+  "groups_per_burst": 12,
+  "members_per_group": 8,
+  "rounds": [
+    {
+      "name": "create burst",
+      "request_p95_s": 0.2287763400017866,
+      "first_successful_probe_s": 0.002033204000326805,
+      "drain_observed_s": 4.910179563998099,
+      "consistent_observed_s": 4.919681709001452
+    },
+    {
+      "name": "stable retries, input conflict and blacklist unblock",
+      "passed": true
+    },
+    {
+      "name": "leave/rejoin with old cleanup pending",
+      "first_successful_probe_s": 0.006613123001443455,
+      "drain_observed_s": 4.048741192000307,
+      "consistent_observed_s": 4.061271762002434
+    },
+    {
+      "name": "crash/restart with accepted pending reset",
+      "pending_before_crash": 108,
+      "first_successful_probe_s": 0.3467850160013768,
+      "drain_observed_s": 6.434766647002107,
+      "consistent_observed_s": 6.439289659003407
+    },
+    {
+      "name": "remove-all drain and final consistency",
+      "first_successful_probe_s": 0.0018307999998796731,
+      "drain_observed_s": 2.414733253997838,
+      "consistent_observed_s": 2.4178425969985256
+    }
+  ],
+  "passed": true,
+  "memory_peak_bytes": 127221760,
+  "memory_events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0\n",
+  "base_pr": 50,
+  "base_sha": "93c6331ad2a60af26902ff541bb12d2e010296a3",
+  "binary_sha256": "5877bcfe114d0af981ecbf373055e363333eb5defc00b06e9ce00034da4fad96",
+  "date": "2026-09-18",
+  "memory_limit_bytes": 4294967296,
+  "swap_limit_bytes": 0,
+  "cpu_quota_cores": 2,
+  "workload_note": "Finite smoke scenarios for this change, not the prior PR #51 benchmark; no messages sent; foreground probe is conversation/channels."
+}

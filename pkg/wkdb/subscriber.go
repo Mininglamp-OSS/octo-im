@@ -132,6 +132,10 @@ func (wk *wukongDB) RemoveSubscribers(channelId string, channelType uint8, subsc
 
 func (wk *wukongDB) ExistSubscriber(channelId string, channelType uint8, uid string) (bool, error) {
 
+	channelLock := &wk.recoveryChannelLocks[key.ChannelToNum(channelId, channelType)%64]
+	channelLock.RLock()
+	defer channelLock.RUnlock()
+
 	wk.metrics.ExistSubscriberAdd(1)
 
 	// 先从缓存获取

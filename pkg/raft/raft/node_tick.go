@@ -6,6 +6,9 @@ import (
 )
 
 func (n *Node) Tick() {
+	if n.applyRetryTicks > 0 {
+		n.applyRetryTicks--
+	}
 	n.idleTick++
 	if n.opts.AutoDestory {
 		if n.idleTick > n.opts.DestoryAfterIdleTick {

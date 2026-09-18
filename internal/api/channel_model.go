@@ -42,6 +42,7 @@ func (c channelInfoReq) ToChannelInfo() wkdb.ChannelInfo {
 
 // ChannelCreateReq 频道创建请求
 type channelCreateReq struct {
+	OperationID string `json:"operation_id,omitempty"`
 	channelInfoReq
 	Reset       int      `json:"reset"`       // 是否重置订阅者 （0.不重置 1.重置），选择重置，将删除原来的所有成员
 	Subscribers []string `json:"subscribers"` // 订阅者
@@ -62,6 +63,7 @@ func (r channelCreateReq) Check() error {
 }
 
 type subscriberAddReq struct {
+	OperationID    string   `json:"operation_id,omitempty"`
 	ChannelId      string   `json:"channel_id"`      // 频道ID
 	ChannelType    uint8    `json:"channel_type"`    // 频道类型
 	Reset          int      `json:"reset"`           // 是否重置订阅者 （0.不重置 1.重置），选择重置，将删除原来的所有成员
@@ -83,6 +85,7 @@ func (s subscriberAddReq) Check() error {
 }
 
 type subscriberRemoveReq struct {
+	OperationID    string   `json:"operation_id,omitempty"`
 	ChannelId      string   `json:"channel_id"`
 	ChannelType    uint8    `json:"channel_type"`
 	TempSubscriber int      `json:"temp_subscriber"` //  是否是临时订阅者 (1. 是 0. 否)
@@ -134,6 +137,7 @@ func (r tmpSubscriberSetReq) Check() error {
 }
 
 type blacklistReq struct {
+	OperationID string   `json:"operation_id,omitempty"`
 	ChannelId   string   `json:"channel_id"`   // 频道ID
 	ChannelType uint8    `json:"channel_type"` // 频道类型
 	UIDs        []string `json:"uids"`         // 订阅者
@@ -153,12 +157,14 @@ func (r blacklistReq) Check() error {
 }
 
 type channelDeleteReq struct {
+	OperationID string `json:"operation_id,omitempty"`
 	ChannelId   string `json:"channel_id"`   // 频道ID
 	ChannelType uint8  `json:"channel_type"` // 频道类型
 }
 
 // channelReq 通用频道请求
 type channelReq struct {
+	OperationID string `json:"operation_id,omitempty"`
 	ChannelId   string `json:"channel_id"`   // 频道ID
 	ChannelType uint8  `json:"channel_type"` // 频道类型
 }

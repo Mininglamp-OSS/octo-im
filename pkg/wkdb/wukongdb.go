@@ -7,6 +7,7 @@ import (
 	"hash"
 	"hash/fnv"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
@@ -23,12 +24,15 @@ import (
 var _ DB = (*wukongDB)(nil)
 
 type wukongDB struct {
-	dbs      []*pebble.DB
-	wkdbs    []*BatchDB
-	shardNum uint32 // 分区数量，这个一但设置就不能修改
-	opts     *Options
-	sync     *pebble.WriteOptions
-	endian   binary.ByteOrder
+	recoveryChannelLocks [64]sync.RWMutex
+	subscriberRecoveryMu sync.Mutex
+	recoveryUserLocks    [64]sync.Mutex
+	dbs                  []*pebble.DB
+	wkdbs                []*BatchDB
+	shardNum             uint32 // 分区数量，这个一但设置就不能修改
+	opts                 *Options
+	sync                 *pebble.WriteOptions
+	endian               binary.ByteOrder
 	wklog.Log
 	prmaryKeyGen *snowflake.Node // 消息ID生成器
 	noSync       *pebble.WriteOptions

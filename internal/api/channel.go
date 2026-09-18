@@ -21,36 +21,41 @@ import (
 
 type channel struct {
 	wklog.Log
-	s *Server
+	s                 *Server
+	recoveryAdmission chan struct{}
 }
 
 // NewChannel 创建API
 func newChannel(s *Server) *channel {
 	return &channel{
-		s:   s,
-		Log: wklog.NewWKLog("Channel"),
+		s:                 s,
+		recoveryAdmission: make(chan struct{}, 4),
+		Log:               wklog.NewWKLog("Channel"),
 	}
 }
 
 // Route Route
 func (ch *channel) route(r *wkhttp.WKHttp) {
 	//################### 频道 ###################
-	r.POST("/channel", ch.channelCreateOrUpdate)       // 创建或修改频道
-	r.POST("/channel/info", ch.updateOrAddChannelInfo) // 更新或添加频道基础信息
-	r.POST("/channel/delete", ch.channelDelete)        // 删除频道
+	r.POST("/channel", ch.limitSubscriberRequests(ch.channelCreateOrUpdate)) // 创建或修改频道
+	r.POST("/channel/info", ch.updateOrAddChannelInfo)                       // 更新或添加频道基础信息
+	r.POST("/channel/delete", ch.limitSubscriberRequests(ch.channelDelete))  // 删除频道
+
+	r.POST("/channel/subscriber_operation", ch.subscriberOperationStatus)
+	r.GET("/channel/subscriber_recovery", ch.subscriberRecoveryStatus)
 
 	//################### 订阅者 ###################// 删除频道
-	r.POST("/channel/subscriber_add", ch.addSubscriber)              // 添加订阅者
-	r.POST("/channel/subscriber_remove", ch.removeSubscriber)        // 移除订阅者
-	r.POST("/channel/subscriber_remove_all", ch.removeAllSubscriber) // 移除所有订阅者
+	r.POST("/channel/subscriber_add", ch.limitSubscriberRequests(ch.addSubscriber))              // 添加订阅者
+	r.POST("/channel/subscriber_remove", ch.limitSubscriberRequests(ch.removeSubscriber))        // 移除订阅者
+	r.POST("/channel/subscriber_remove_all", ch.limitSubscriberRequests(ch.removeAllSubscriber)) // 移除所有订阅者
 
 	r.POST("/tmpchannel/subscriber_set", ch.setTmpSubscriber) // 临时频道设置订阅者(节点内部调用)
 
 	//################### 黑名单 ###################// 删除频道
-	r.POST("/channel/blacklist_add", ch.blacklistAdd)              // 添加黑名单
-	r.POST("/channel/blacklist_set", ch.blacklistSet)              // 设置黑名单（覆盖原来的黑名单数据）
-	r.POST("/channel/blacklist_remove", ch.blacklistRemove)        // 移除黑名单
-	r.POST("/channel/blacklist_remove_all", ch.blacklistRemoveAll) // 移除所有黑名单
+	r.POST("/channel/blacklist_add", ch.limitSubscriberRequests(ch.blacklistAdd))              // 添加黑名单
+	r.POST("/channel/blacklist_set", ch.limitSubscriberRequests(ch.blacklistSet))              // 设置黑名单（覆盖原来的黑名单数据）
+	r.POST("/channel/blacklist_remove", ch.limitSubscriberRequests(ch.blacklistRemove))        // 移除黑名单
+	r.POST("/channel/blacklist_remove_all", ch.limitSubscriberRequests(ch.blacklistRemoveAll)) // 移除所有黑名单
 
 	//################### 白名单 ###################
 	r.POST("/channel/whitelist_add", ch.whitelistAdd)              // 添加白名单
@@ -88,6 +93,10 @@ func (ch *channel) channelCreateOrUpdate(c *wkhttp.Context) {
 	if !leaderIsSelf {
 		ch.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+		return
+	}
+	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelID, ChannelType: req.ChannelType, Mode: recoveryAddMode(req.Reset), UIDs: req.Subscribers, Channel: func() *wkdb.ChannelInfo { v := req.ToChannelInfo(); return &v }()})
 		return
 	}
 
@@ -184,6 +193,10 @@ func (ch *channel) addSubscriber(c *wkhttp.Context) {
 	if !leaderIsSelf {
 		ch.Info("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)), zap.Uint64("leaderId ", leaderInfo.Id))
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+		return
+	}
+	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: recoveryAddMode(req.Reset), UIDs: req.Subscribers, Channel: nil})
 		return
 	}
 
@@ -463,6 +476,11 @@ func (ch *channel) removeSubscriber(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
+	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "remove", UIDs: req.Subscribers, Channel: nil})
+		return
+	}
+
 	err = service.Store.RemoveSubscribers(req.ChannelId, req.ChannelType, req.Subscribers)
 	if err != nil {
 		ch.Error("移除订阅者失败！", zap.Error(err))
@@ -526,6 +544,10 @@ func (ch *channel) removeAllSubscriber(c *wkhttp.Context) {
 	if !leaderIsSelf {
 		ch.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+		return
+	}
+	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "remove_all", UIDs: nil, Channel: nil})
 		return
 	}
 
@@ -617,6 +639,10 @@ func (ch *channel) blacklistAdd(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
+	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "deny_add", UIDs: req.UIDs, Channel: nil})
+		return
+	}
 
 	members := make([]wkdb.Member, 0, len(req.UIDs))
 	createdAt := time.Now()
@@ -680,6 +706,10 @@ func (ch *channel) blacklistSet(c *wkhttp.Context) {
 	if !leaderIsSelf {
 		ch.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+		return
+	}
+	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "deny_set", UIDs: req.UIDs, Channel: nil})
 		return
 	}
 
@@ -757,6 +787,11 @@ func (ch *channel) blacklistRemove(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
+	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "deny_remove", UIDs: req.UIDs, Channel: nil})
+		return
+	}
+
 	err = service.Store.RemoveDenylist(req.ChannelId, req.ChannelType, req.UIDs)
 	if err != nil {
 		ch.Error("移除黑名单失败！", zap.Error(err))
@@ -816,6 +851,10 @@ func (ch *channel) blacklistRemoveAll(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
+	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "deny_remove_all", UIDs: nil, Channel: nil})
+		return
+	}
 
 	err = service.Store.RemoveAllDenylist(req.ChannelId, req.ChannelType)
 	if err != nil {
@@ -849,6 +888,10 @@ func (ch *channel) channelDelete(c *wkhttp.Context) {
 	if !leaderIsSelf {
 		ch.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+		return
+	}
+	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "disband", UIDs: nil, Channel: nil})
 		return
 	}
 
