@@ -20,10 +20,12 @@ type poller struct {
 	wklog.Log
 	sync.RWMutex
 
-	tmpHandlers []*userHandler
-	stopper     *syncutil.Stopper
-	handlePool  *ants.Pool
-	index       int
+	// loopHandlers is reused only by loopEvent's serial handleEvents and tick calls.
+	// Concurrent callers, including connection statistics, must use their own slice.
+	loopHandlers []*userHandler
+	stopper      *syncutil.Stopper
+	handlePool   *ants.Pool
+	index        int
 
 	// tick次数
 	tickCount int
@@ -98,14 +100,14 @@ func (p *poller) loopEvent() {
 func (p *poller) tick() {
 	p.tickCount++
 
-	p.waitlist.readHandlers(&p.tmpHandlers)
+	p.waitlist.readHandlers(&p.loopHandlers)
 
-	for _, h := range p.tmpHandlers {
+	for _, h := range p.loopHandlers {
 		h.tick()
 	}
 	if p.tickCount%options.G.Poller.ClearIntervalTick == 0 {
 		p.tickCount = 0
-		for _, h := range p.tmpHandlers {
+		for _, h := range p.loopHandlers {
 			if h.isTimeout() {
 				p.waitlist.remove(h.Uid)
 				if options.G.IsLocalNode(h.leaderId()) {
@@ -115,13 +117,13 @@ func (p *poller) tick() {
 		}
 	}
 
-	p.tmpHandlers = p.tmpHandlers[:0]
+	p.loopHandlers = p.loopHandlers[:0]
 }
 
 func (p *poller) handleEvents() {
-	p.waitlist.readHandlers(&p.tmpHandlers)
+	p.waitlist.readHandlers(&p.loopHandlers)
 	var err error
-	for _, h := range p.tmpHandlers {
+	for _, h := range p.loopHandlers {
 		if h.hasEvent() && h.processing.CompareAndSwap(false, true) {
 			err = p.handlePool.Submit(func() {
 				events := h.events()
@@ -133,9 +135,9 @@ func (p *poller) handleEvents() {
 			}
 		}
 	}
-	p.tmpHandlers = p.tmpHandlers[:0]
-	if cap(p.tmpHandlers) > 1024 {
-		p.tmpHandlers = nil
+	p.loopHandlers = p.loopHandlers[:0]
+	if cap(p.loopHandlers) > 1024 {
+		p.loopHandlers = nil
 	}
 }
 
@@ -254,14 +256,13 @@ func (p *poller) allUserCount() int {
 }
 
 func (p *poller) allConnCount() int {
+	// Statistics can run concurrently with the event loop and other readers.
+	// The list's read lock protects collection, not a shared destination slice.
+	var handlers []*userHandler
+	p.waitlist.readHandlers(&handlers)
 	count := 0
-	p.waitlist.readHandlers(&p.tmpHandlers)
-	for _, h := range p.tmpHandlers {
+	for _, h := range handlers {
 		count += h.conns.count()
-	}
-	p.tmpHandlers = p.tmpHandlers[:0]
-	if cap(p.tmpHandlers) > 1024 {
-		p.tmpHandlers = nil
 	}
 	return count
 }
