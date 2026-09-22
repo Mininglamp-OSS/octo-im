@@ -48,6 +48,13 @@ func (s *Server) applyLog(log types.Log) error {
 
 func (s *Server) handleCmd(cmd *CMD) error {
 	switch cmd.CmdType {
+	case CMDTypeSubscriberProtocols:
+		confirmed := &pb.Config{}
+		if err := confirmed.Unmarshal(cmd.Data); err != nil {
+			return err
+		}
+		s.config.confirmSubscriberProtocols(confirmed.Nodes)
+		return nil
 	case CMDTypeConfigChange: // 配置改变
 		return s.handleConfigChange(cmd)
 	case CMDTypeConfigApiServerAddrChange: // 节点api server地址改变

@@ -12,9 +12,10 @@ import (
 func (s *Server) joinLoop() {
 	seedNodeId, _, _ := seedNode(s.opts.Seed)
 	req := &ClusterJoinReq{
-		NodeId:     s.opts.ConfigOptions.NodeId,
-		ServerAddr: s.opts.ServerAddr,
-		Role:       s.opts.Role,
+		SubscriberProtocol: subscriberProtocolVersion,
+		NodeId:             s.opts.ConfigOptions.NodeId,
+		ServerAddr:         s.opts.ServerAddr,
+		Role:               s.opts.Role,
 	}
 	for {
 		select {

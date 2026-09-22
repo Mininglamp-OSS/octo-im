@@ -64,6 +64,9 @@ message Node {
     NodeStatus status = 10; // 节点状态
     int64 createdAt = 11; // 创建时间
 
+    // Confirmed by config Raft for this exact node identity, not local reachability.
+    uint32 subscriberProtocol = 12;
+
 }
 
 

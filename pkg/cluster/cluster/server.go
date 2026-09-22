@@ -54,12 +54,15 @@ type Server struct {
 	opts      *Options
 	apiPrefix string // api前缀
 	wklog.Log
-	cancelCtx     context.Context
-	cancelFnc     context.CancelFunc
-	onMessageFnc  func(fromNodeId uint64, msg *proto.Message)
-	onMessagePool *ants.Pool
-	uptime        time.Time // 服务启动时间
-	stopper       *syncutil.Stopper
+	cancelCtx                  context.Context
+	cancelFnc                  context.CancelFunc
+	onMessageFnc               func(fromNodeId uint64, msg *proto.Message)
+	onMessagePool              *ants.Pool
+	uptime                     time.Time // 服务启动时间
+	stopper                    *syncutil.Stopper
+	subscriberCapabilityGate   chan struct{}
+	subscriberCapabilityCancel context.CancelFunc
+	subscriberCapabilityWG     sync.WaitGroup
 
 	channelKeyLock *keylock.KeyLock // 频道锁
 
@@ -68,12 +71,13 @@ type Server struct {
 
 func New(opts *Options) *Server {
 	s := &Server{
-		opts:           opts,
-		nodeManager:    newNodeManager(opts),
-		Log:            wklog.NewWKLog("cluster"),
-		channelKeyLock: keylock.NewKeyLock(),
-		uptime:         time.Now(),
-		stopper:        syncutil.NewStopper(),
+		opts:                     opts,
+		nodeManager:              newNodeManager(opts),
+		Log:                      wklog.NewWKLog("cluster"),
+		channelKeyLock:           keylock.NewKeyLock(),
+		uptime:                   time.Now(),
+		stopper:                  syncutil.NewStopper(),
+		subscriberCapabilityGate: make(chan struct{}, 1),
 	}
 	s.cancelCtx, s.cancelFnc = context.WithCancel(context.Background())
 	// 初始化传输层
@@ -101,6 +105,7 @@ func New(opts *Options) *Server {
 			wkdb.WithNodeId(opts.ConfigOptions.NodeId),
 			wkdb.WithMemTableSize(opts.DB.WKDbMemTableSize),
 			wkdb.WithSlotCount(int(opts.ConfigOptions.SlotCount)),
+			wkdb.WithSubscriberRecoveryEnabled(opts.SubscriberRecoveryEnabled),
 		),
 	)
 
@@ -130,6 +135,8 @@ func New(opts *Options) *Server {
 		slot.WithTransport(opts.SlotTransport),
 		slot.WithNode(s.cfgServer),
 		slot.WithOnApply(s.slotApplyLogs),
+		slot.WithBeforePropose(s.checkSubscriberProposal),
+		slot.WithApplyErrorRetry(true),
 		slot.WithOnSaveConfig(s.onSaveSlotConfig),
 		slot.WithRPC(s.rpcClient),
 	))
@@ -154,6 +161,7 @@ func New(opts *Options) *Server {
 		store.WithChannel(s.channelServer),
 		store.WithDB(s.db),
 		store.WithIsCmdChannel(opts.IsCmdChannel),
+		store.WithSubscriberRecoveryEnabled(opts.SubscriberRecoveryEnabled),
 	))
 
 	// 添加事件监听
@@ -239,11 +247,22 @@ func (s *Server) Start() error {
 	if join { // 需要加入集群
 		s.stopper.RunWorker(s.joinLoop)
 	}
+	capabilityCtx, capabilityCancel := context.WithCancel(s.cancelCtx)
+	s.subscriberCapabilityCancel = capabilityCancel
+	s.subscriberCapabilityWG.Add(1)
+	go func() {
+		defer s.subscriberCapabilityWG.Done()
+		s.subscriberCapabilityLoop(capabilityCtx)
+	}()
 
 	return nil
 }
 
 func (s *Server) Stop() {
+	if s.subscriberCapabilityCancel != nil {
+		s.subscriberCapabilityCancel()
+		s.subscriberCapabilityWG.Wait()
+	}
 	s.eventServer.Stop()
 	s.cfgServer.Stop()
 	s.slotServer.Stop()
@@ -293,7 +312,11 @@ func (s *Server) OnConfigChange(cfg *types.Config) {
 func (s *Server) slotApplyLogs(slotId uint32, logs []rafttype.Log) error {
 	err := s.store.ApplySlotLogs(slotId, logs)
 	if err != nil {
-		s.Panic("apply slot logs failed", zap.Uint32("slotId", slotId), zap.Error(err))
+		var permanent *store.PermanentApplyError
+		if errors.As(err, &permanent) {
+			s.Panic("apply slot logs failed", zap.Uint32("slotId", slotId), zap.Error(err))
+		}
+		s.Error("apply slot logs failed", zap.Uint32("slotId", slotId), zap.Error(err))
 		return err
 	}
 	return nil

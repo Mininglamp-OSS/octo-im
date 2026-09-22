@@ -1,6 +1,8 @@
 package wkdb
 
 type DB interface {
+	SlotApplyDB
+	SubscriberRecoveryDB
 	Open() error
 	Close() error
 	// 获取下一个主键
@@ -40,9 +42,13 @@ type DB interface {
 	GetShardNum() int
 	// GetChannelShardIndex 获取频道所在的分片索引
 	GetChannelShardIndex(channelId string, channelType uint8) uint32
+
+	// SubscriberRecoveryActive reports whether lifecycle fencing is required.
+	SubscriberRecoveryActive() bool
 }
 
 type MessageEventDB interface {
+	AppendMessageEventForSlot(slot uint32, index uint64, event *MessageEvent) error
 	// AppendMessageEventWithState applies one event and updates the event key projection state.
 	AppendMessageEventWithState(event *MessageEvent) (*MessageEvent, *MessageEventState, error)
 	// GetMessageEventByEventID finds a projected event view by (channel, client_msg_no, event_id).

@@ -8,6 +8,9 @@ func (s *Store) AddSubscribers(channelId string, channelType uint8, subscribers 
 	if len(subscribers) == 0 {
 		return nil
 	}
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
+	}
 
 	data := EncodeMembers(channelId, channelType, subscribers)
 	cmd := NewCMD(CMDAddSubscribers, data)
@@ -30,6 +33,9 @@ func (s *Store) RemoveSubscribers(channelId string, channelType uint8, subscribe
 	if len(subscribers) == 0 {
 		return nil
 	}
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
+	}
 
 	data := EncodeChannelUids(channelId, channelType, subscribers)
 	cmd := NewCMD(CMDRemoveSubscribers, data)
@@ -43,6 +49,9 @@ func (s *Store) RemoveSubscribers(channelId string, channelType uint8, subscribe
 }
 
 func (s *Store) RemoveAllSubscriber(channelId string, channelType uint8) error {
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
+	}
 	data := EncodeChannel(channelId, channelType)
 	cmd := NewCMD(CMDRemoveAllSubscriber, data)
 	cmdData, err := cmd.Marshal()
@@ -114,6 +123,9 @@ func (s *Store) AddDenylist(channelId string, channelType uint8, members []wkdb.
 	if len(members) == 0 {
 		return nil
 	}
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
+	}
 
 	data := EncodeMembers(channelId, channelType, members)
 	cmd := NewCMD(CMDAddDenylist, data)
@@ -137,6 +149,9 @@ func (s *Store) ExistDenylist(channelId string, channelType uint8, uid string) (
 }
 
 func (s *Store) RemoveAllDenylist(channelId string, channelType uint8) error {
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
+	}
 	data := EncodeChannel(channelId, channelType)
 	cmd := NewCMD(CMDRemoveAllDenylist, data)
 	cmdData, err := cmd.Marshal()
@@ -152,6 +167,9 @@ func (s *Store) RemoveDenylist(channelId string, channelType uint8, uids []strin
 
 	if len(uids) == 0 {
 		return nil
+	}
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
 	}
 
 	data := EncodeChannelUids(channelId, channelType, uids)

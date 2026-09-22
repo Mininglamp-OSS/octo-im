@@ -29,7 +29,11 @@ func newSlot(slot *types.Slot, s *Server) *Slot {
 	if err != nil {
 		st.Panic("get last term failed", zap.Error(err))
 	}
-	node := raft.NewNode(lastLogIndex, state, raft.NewOptions(raft.WithKey(shardNo), raft.WithNodeId(s.opts.NodeId)))
+	node := raft.NewNode(lastLogIndex, state, raft.NewOptions(
+		raft.WithKey(shardNo),
+		raft.WithNodeId(s.opts.NodeId),
+		raft.WithApplyErrorRetry(s.opts.ApplyErrorRetry),
+	))
 	st.Node = node
 
 	return st

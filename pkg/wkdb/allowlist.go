@@ -11,6 +11,10 @@ import (
 
 func (wk *wukongDB) AddAllowlist(channelId string, channelType uint8, members []Member) error {
 
+	lock := &wk.recoveryChannelLocks[key.ChannelToNum(channelId, channelType)%64]
+	lock.Lock()
+	defer lock.Unlock()
+
 	wk.metrics.AddAllowlistAdd(1)
 
 	db := wk.channelDb(channelId, channelType)
@@ -22,14 +26,28 @@ func (wk *wukongDB) AddAllowlist(channelId string, channelType uint8, members []
 
 	w := db.NewIndexedBatch()
 	defer w.Close()
+	added := 0
 	for _, member := range members {
+		_, closer, err := w.Get(key.NewAllowlistIndexKey(channelId, channelType, key.TableAllowlist.Index.Uid, key.HashWithString(member.Uid)))
+		if closer != nil {
+			closer.Close()
+		}
+		if err == nil {
+			continue
+		}
+		if err != pebble.ErrNotFound {
+			return err
+		}
+		added++
 		member.Id = key.HashWithString(member.Uid)
 		if err := wk.writeAllowlist(channelId, channelType, member, w); err != nil {
 			return err
 		}
 	}
 
-	err = wk.incChannelInfoAllowlistCount(channelPrimaryId, len(members), w)
+	if added > 0 {
+		err = wk.incChannelInfoAllowlistCount(channelPrimaryId, added, w)
+	}
 	if err != nil {
 		wk.Error("incChannelInfoAllowlistCount failed", zap.Error(err))
 		return err
@@ -132,6 +150,10 @@ func (wk *wukongDB) ExistAllowlist(channeId string, channelType uint8, uid strin
 
 func (wk *wukongDB) RemoveAllowlist(channelId string, channelType uint8, uids []string) error {
 
+	lock := &wk.recoveryChannelLocks[key.ChannelToNum(channelId, channelType)%64]
+	lock.Lock()
+	defer lock.Unlock()
+
 	wk.metrics.RemoveAllowlistAdd(1)
 
 	db := wk.channelDb(channelId, channelType)
@@ -156,7 +178,9 @@ func (wk *wukongDB) RemoveAllowlist(channelId string, channelType uint8, uids []
 		}
 	}
 
-	err = wk.incChannelInfoAllowlistCount(channelPrimaryId, -len(members), w)
+	if len(members) > 0 {
+		err = wk.incChannelInfoAllowlistCount(channelPrimaryId, -len(members), w)
+	}
 	if err != nil {
 		wk.Error("RemoveAllowlist: incChannelInfoAllowlistCount failed", zap.Error(err))
 		return err
@@ -174,6 +198,10 @@ func (wk *wukongDB) RemoveAllowlist(channelId string, channelType uint8, uids []
 }
 
 func (wk *wukongDB) RemoveAllAllowlist(channelId string, channelType uint8) error {
+
+	lock := &wk.recoveryChannelLocks[key.ChannelToNum(channelId, channelType)%64]
+	lock.Lock()
+	defer lock.Unlock()
 
 	wk.metrics.RemoveAllAllowlistAdd(1)
 
@@ -238,18 +266,23 @@ func (wk *wukongDB) removeAllowlist(channelId string, channelType uint8, member 
 func (wk *wukongDB) getAllowlistByUids(channelId string, channelType uint8, uids []string) ([]Member, error) {
 	members := make([]Member, 0, len(uids))
 	db := wk.channelDb(channelId, channelType)
+	seen := make(map[string]bool, len(uids))
 	for _, uid := range uids {
+		if seen[uid] {
+			continue
+		}
+		seen[uid] = true
 		id := key.HashWithString(uid)
 		iter := db.NewIter(&pebble.IterOptions{
 			LowerBound: key.NewAllowlistColumnKey(channelId, channelType, id, key.MinColumnKey),
 			UpperBound: key.NewAllowlistColumnKey(channelId, channelType, id, key.MaxColumnKey),
 		})
-		defer iter.Close()
 
 		err := wk.iterateAllowlist(iter, func(member Member) bool {
 			members = append(members, member)
 			return true
 		})
+		iter.Close()
 		if err != nil {
 			return nil, err
 		}

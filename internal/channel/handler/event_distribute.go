@@ -268,25 +268,27 @@ func (h *Handler) requestTag(leaderId uint64, tagKey string) (*types.Tag, error)
 }
 
 func (h *Handler) getOrMakeTagForLeader(fakeChannelId string, channelType uint8) (*types.Tag, error) {
-	var (
-		tag *types.Tag
-		err error
-	)
-
-	tagKey := service.TagManager.GetChannelTag(fakeChannelId, channelType)
-	if tagKey != "" {
-		tag = service.TagManager.Get(tagKey)
-	}
-	if tag == nil {
-		// 如果没有则制作tag
-		tag, err = h.makeChannelTag(fakeChannelId, channelType)
+	for attempt := 0; attempt < 3; attempt++ {
+		version, release := service.BeginSubscriberTag(fakeChannelId, channelType)
+		tagKey := service.TagManager.GetChannelTag(fakeChannelId, channelType)
+		if tag := service.TagManager.Get(tagKey); tag != nil {
+			release()
+			return tag, nil
+		}
+		// Membership reads and RPC must not hold the invalidation lock.
+		tag, err := h.makeChannelTag(fakeChannelId, channelType)
 		if err != nil {
-			h.Error("processMakeTag: makeTag failed", zap.Error(err), zap.String("tagKey", tagKey))
+			release()
 			return nil, err
 		}
-
+		published := service.PublishSubscriberTag(fakeChannelId, channelType, version, tag.Key)
+		release()
+		if published {
+			return tag, nil
+		}
+		service.TagManager.RemoveTag(tag.Key)
 	}
-	return tag, nil
+	return nil, errors.New("subscriber membership changed during tag creation")
 }
 
 func (h *Handler) makeChannelTag(fakeChannelId string, channelType uint8) (*types.Tag, error) {
@@ -330,7 +332,6 @@ func (h *Handler) makeChannelTag(fakeChannelId string, channelType uint8) (*type
 		h.Error("processMakeTag: makeTag failed", zap.Error(err), zap.String("fakeChannelId", fakeChannelId), zap.Uint8("channelType", channelType))
 		return nil, err
 	}
-	service.TagManager.SetChannelTag(fakeChannelId, channelType, tag.Key)
 	return tag, nil
 }
 

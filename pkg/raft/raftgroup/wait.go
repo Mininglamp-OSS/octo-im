@@ -34,8 +34,8 @@ func (m *wait) bucketIndex(key string) int {
 	return int(fnv32(key) % uint32(len(m.buckets)))
 }
 
-func (m *wait) put(progress *progress) {
-	m.buckets[m.bucketIndex(progress.key)].put(progress)
+func (m *wait) put(progress *progress) bool {
+	return m.buckets[m.bucketIndex(progress.key)].put(progress)
 }
 
 func fnv32(key string) uint32 {
@@ -144,10 +144,22 @@ func (m *waitBucket) didApply(key string, maxLogIndex uint64) {
 	m.clean()
 }
 
-func (m *waitBucket) put(progress *progress) {
+func (m *waitBucket) put(progress *progress) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	done := progress.done
+	// A failed admission can return a waiter before didApply removes it.
+	// Detach under the notification lock before resetting or pooling it.
+	for i, p := range m.progresses {
+		if p == progress {
+			m.progresses = append(m.progresses[:i], m.progresses[i+1:]...)
+			break
+		}
+	}
 	close(progress.waitC)
 	progress.reset()
 	m.progressPool.Put(progress)
+	return done
 }
 
 // 清理已完成的

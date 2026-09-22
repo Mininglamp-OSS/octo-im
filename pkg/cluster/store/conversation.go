@@ -62,6 +62,18 @@ func (s *Store) AddOrUpdateUserConversations(uid string, conversations []wkdb.Co
 	}
 	for i, c := range conversations {
 		if c.Id == 0 {
+			if s.wdb.SubscriberRecoveryActive() {
+				lifecycle, managed, err := s.wdb.ConversationLifecycle(uid, c.ChannelId, c.ChannelType)
+				if err != nil {
+					return err
+				}
+				if managed && !lifecycle.Deleted {
+					// A user may hide a conversation without leaving the channel.
+					// Re-use its current identity; explicit/stale IDs remain fenced.
+					conversations[i].Id = lifecycle.ConversationID
+					continue
+				}
+			}
 			conversations[i].Id = s.wdb.NextPrimaryKey() // 如果id为0，生成一个新的id
 		}
 	}

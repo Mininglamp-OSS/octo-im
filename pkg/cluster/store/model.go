@@ -68,8 +68,8 @@ const (
 	CMDSystemUIDsAdd
 	// 移除系统UID
 	CMDSystemUIDsRemove
-	_cmdSaveStreamMetaRemoved  // 已移除，保留占位
-	_cmdStreamEndRemoved       // 已移除，保留占位
+	_cmdSaveStreamMetaRemoved   // 已移除，保留占位
+	_cmdStreamEndRemoved        // 已移除，保留占位
 	_cmdAppendStreamItemRemoved // 已移除，保留占位
 	// 频道分布式配置保存
 	CMDChannelClusterConfigSave
@@ -78,8 +78,8 @@ const (
 
 	// 批量更新最近会话
 	CMDBatchUpdateConversation
-	_cmdAddStreamMetaRemoved  // 已移除，保留占位
-	_cmdAddStreamsRemoved     // 已移除，保留占位
+	_cmdAddStreamMetaRemoved // 已移除，保留占位
+	_cmdAddStreamsRemoved    // 已移除，保留占位
 	// 批量添加最近会话
 	CMDAddOrUpdateConversations
 	// 添加或更新测试机
@@ -103,6 +103,9 @@ const (
 	CMDAppendMessageEvent
 	// 更新最近会话的已读位置（如果seq更大）
 	CMDUpdateConversationIfSeqGreater
+	CMDSubscriberOperation
+	CMDConversationEffects
+	CMDSubscriberCheckpoint
 )
 
 func (c CMDType) Uint16() uint16 {
@@ -111,6 +114,12 @@ func (c CMDType) Uint16() uint16 {
 
 func (c CMDType) String() string {
 	switch c {
+	case CMDSubscriberOperation:
+		return "CMDSubscriberOperation"
+	case CMDConversationEffects:
+		return "CMDConversationEffects"
+	case CMDSubscriberCheckpoint:
+		return "CMDSubscriberCheckpoint"
 	case CMDAddDevice:
 		return "CMDAddDevice"
 	case CMDUpdateDevice:
