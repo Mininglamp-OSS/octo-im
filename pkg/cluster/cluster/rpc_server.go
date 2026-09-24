@@ -13,6 +13,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
@@ -35,6 +36,8 @@ func newRpcServer(s *Server) *rpcServer {
 }
 
 func (r *rpcServer) setRoutes() {
+	r.s.netServer.Route(channelConfigTransitionPath, r.handleChannelConfigTransition)
+	r.s.netServer.Route(channelConfigReconcilePath, r.handleChannelConfigReconcile)
 	r.s.netServer.Route(conversationConfigPath, func(c *wkserver.Context) { r.handleConversationRead(c, true) })
 	r.s.netServer.Route(conversationBoundaryPath, func(c *wkserver.Context) { r.handleConversationRead(c, false) })
 	// 频道提案
@@ -310,7 +313,9 @@ func (r *rpcServer) handleChannelLastLogInfo(c *wkserver.Context) {
 		return
 	}
 
-	resp, err := r.s.getChannelLastLogInfo(req.channelId, req.channelType)
+	ctx, cancel := context.WithTimeout(r.s.cancelCtx, 4*time.Second)
+	defer cancel()
+	resp, err := r.s.getChannelLastLogInfo(ctx, req.channelId, req.channelType)
 	if err != nil {
 		r.Error("get channel last log info failed", zap.Error(err))
 		c.WriteErr(err)
@@ -327,7 +332,10 @@ func (r *rpcServer) handleChannelLastLogInfo(c *wkserver.Context) {
 	c.Write(data)
 }
 
-func (s *Server) getChannelLastLogInfo(channelId string, channelType uint8) (*ChannelLastLogInfoResponse, error) {
+func (s *Server) getChannelLastLogInfo(ctx context.Context, channelId string, channelType uint8) (*ChannelLastLogInfoResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	lastLogTerm, lastLogIndex, err := s.channelServer.LastLogIndexAndTerm(channelId, channelType)
 	if err != nil {
 		return nil, err
@@ -338,10 +346,18 @@ func (s *Server) getChannelLastLogInfo(channelId string, channelType uint8) (*Ch
 		return nil, err
 	}
 
+	hard, err := s.db.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return nil, err
+	}
+	state, err := s.channelServer.ReadLeaderState(ctx, channelId, channelType)
+	if err != nil {
+		return nil, err
+	}
 	resp := &ChannelLastLogInfoResponse{
 		LogTerm:  lastLogTerm,
 		LogIndex: lastLogIndex,
-		Term:     cfg.Term,
+		Term:     max(cfg.Term, hard.Term, state.Term),
 	}
 	return resp, nil
 }

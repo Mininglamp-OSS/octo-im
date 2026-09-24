@@ -178,7 +178,7 @@ func (r *rpcClient) RequestChannelSwitchConfig(nodeId uint64, config wkdb.Channe
 }
 
 // RequestChannelLastLogInfo 请求频道最后日志信息
-func (r *rpcClient) RequestChannelLastLogInfo(nodeId uint64, channelId string, channelType uint8) (*ChannelLastLogInfoResponse, error) {
+func (r *rpcClient) RequestChannelLastLogInfo(ctx context.Context, nodeId uint64, channelId string, channelType uint8) (*ChannelLastLogInfoResponse, error) {
 	req := &channelReq{
 		channelId:   channelId,
 		channelType: channelType,
@@ -187,13 +187,16 @@ func (r *rpcClient) RequestChannelLastLogInfo(nodeId uint64, channelId string, c
 	if err != nil {
 		return nil, err
 	}
-	body, err := r.request(nodeId, "/rpc/channel/lastLogInfo", data)
+	result, err := r.s.RequestWithContext(ctx, nodeId, "/rpc/channel/lastLogInfo", data)
 	if err != nil {
 		return nil, err
 	}
 
+	if result == nil || result.Status != proto.StatusOK {
+		return nil, ErrConversationReadRetry
+	}
 	resp := &ChannelLastLogInfoResponse{}
-	if err := resp.Unmarshal(body); err != nil {
+	if err := resp.Unmarshal(result.Body); err != nil {
 		return nil, err
 	}
 	return resp, nil
