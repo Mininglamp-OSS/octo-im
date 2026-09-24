@@ -320,6 +320,20 @@ func (s *Server) addOrUpdateNodes(nodeMap map[uint64]string) {
 			continue
 		}
 
+		// 空地址不可拨号：standalone 节点未配置 cluster.serverAddr 时，
+		// 其配置记录里的 cluster_addr 为空。若用空地址替换或新建节点，
+		// 会杀掉 seed join 已建立的可用连接并留下一个永远拨不通的节点
+		if strings.TrimSpace(addr) == "" {
+			// configNotifyPending 每次 applyLog 都触发一次(不管本次改的是不是
+			// cluster_addr),所以任何 cluster_addr 长期为空的 peer 会在每次
+			// 配置变更时都进到这里。只在真的会"顶掉"现有连接的场景下告警,
+			// 避免刷日志。
+			if s.nodeManager.exist(nodeId) {
+				s.Warn("node addr is empty, keep existing connection", zap.Uint64("nodeId", nodeId))
+			}
+			continue
+		}
+
 		existNode := s.nodeManager.node(nodeId)
 
 		if existNode != nil {

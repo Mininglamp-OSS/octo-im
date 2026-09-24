@@ -370,6 +370,16 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 		return
 	}
 
+	// req.ServerAddr 会被直接写进 ClusterAddr(见下方 ProposeJoin),然后复制给
+	// 全集群 peer 当作拨号目标。这里在 follower 侧就先拦掉 bind-all / portless
+	// 之类的非法值,避免一路 forward 到 leader 再写进 raft 状态。
+	if err := types.ValidateAdvertiseAddr(req.ServerAddr); err != nil {
+		r.Error("cluster join rejected: invalid ServerAddr",
+			zap.Uint64("nodeId", req.NodeId), zap.String("serverAddr", req.ServerAddr), zap.Error(err))
+		c.WriteErr(err)
+		return
+	}
+
 	if !r.s.cfgServer.IsLeader() {
 		resp, err := r.s.rpcClient.RequestClusterJoin(r.s.cfgServer.LeaderId(), req)
 		if err != nil {

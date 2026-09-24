@@ -77,6 +77,8 @@ func (s *Server) handleCmd(cmd *CMD) error {
 		return s.handleConfigChange(cmd)
 	case CMDTypeConfigApiServerAddrChange: // 节点api server地址改变
 		return s.handleApiServerAddrChange(cmd)
+	case CMDTypeConfigClusterAddrChange: // 节点cluster通讯地址改变
+		return s.handleClusterAddrChange(cmd)
 	case CMDTypeNodeOnlineStatusChange: // 节点在线状态改变
 		return s.handleNodeOnlineStatusChange(cmd)
 	case CMDTypeSlotUpdate: // 槽更新
@@ -114,6 +116,17 @@ func (s *Server) handleApiServerAddrChange(cmd *CMD) error {
 	}
 
 	s.config.updateApiServerAddr(nodeId, apiServerAddr)
+	return nil
+}
+
+func (s *Server) handleClusterAddrChange(cmd *CMD) error {
+	nodeId, clusterAddr, err := DecodeClusterAddrChange(cmd.Data)
+	if err != nil {
+		s.Error("decode cluster addr change err", zap.Error(err))
+		return err
+	}
+
+	s.config.updateClusterAddr(nodeId, clusterAddr)
 	return nil
 }
 

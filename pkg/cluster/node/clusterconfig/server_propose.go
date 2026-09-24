@@ -45,6 +45,28 @@ func (s *Server) ProposeApiServerAddr(nodeId uint64, apiServerAddr string) error
 	return nil
 }
 
+// ProposeClusterAddr 提案节点cluster通讯地址变更
+func (s *Server) ProposeClusterAddr(nodeId uint64, clusterAddr string) error {
+
+	data, err := EncodeClusterAddrChange(nodeId, clusterAddr)
+	if err != nil {
+		return err
+	}
+
+	cmd := NewCMD(CMDTypeConfigClusterAddrChange, data)
+	cmdBytes, err := cmd.Marshal()
+	if err != nil {
+		return err
+	}
+
+	_, err = s.ProposeUntilApplied(s.genConfigId(), cmdBytes)
+	if err != nil {
+		s.Error("ProposeClusterAddr failed", zap.Error(err))
+		return err
+	}
+	return nil
+}
+
 // ProposeLeave 提案节点在线状态变更
 func (s *Server) ProposeNodeOnlineStatus(nodeId uint64, online bool) error {
 	data, err := EncodeNodeOnlineStatusChange(nodeId, online)

@@ -22,6 +22,7 @@ const (
 	CMDTypeSlotUpdate                        // 槽更新
 	CMDTypeNodeStatusChange                  // 节点状态改变
 	CMDTypeSlotStatusChange                  // 槽状态改变
+	CMDTypeConfigClusterAddrChange           // 节点cluster通讯地址变更
 
 )
 
@@ -35,6 +36,8 @@ func (c CMDType) String() string {
 		return "CMDTypeConfigChange"
 	case CMDTypeConfigApiServerAddrChange:
 		return "CMDTypeConfigApiServerAddrChange"
+	case CMDTypeConfigClusterAddrChange:
+		return "CMDTypeConfigClusterAddrChange"
 	case CMDTypeNodeJoin:
 		return "CMDTypeNodeJoin"
 	case CMDTypeNodeJoining:
@@ -113,6 +116,16 @@ func (c *CMD) CMDContent() (string, error) {
 		return wkutil.ToJSON(map[string]interface{}{
 			"nodeId":        nodeId,
 			"apiServerAddr": apiServerAddr,
+		}), nil
+
+	case CMDTypeConfigClusterAddrChange:
+		nodeId, clusterAddr, err := DecodeClusterAddrChange(c.Data)
+		if err != nil {
+			return "", err
+		}
+		return wkutil.ToJSON(map[string]interface{}{
+			"nodeId":      nodeId,
+			"clusterAddr": clusterAddr,
 		}), nil
 
 	case CMDTypeNodeJoin:
@@ -203,6 +216,25 @@ func DecodeApiServerAddrChange(data []byte) (uint64, string, error) {
 	}
 	apiServerAddr, err := dec.String()
 	return nodeId, apiServerAddr, err
+}
+
+func EncodeClusterAddrChange(nodeId uint64, clusterAddr string) ([]byte, error) {
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+	enc.WriteUint64(nodeId)
+	enc.WriteString(clusterAddr)
+	return enc.Bytes(), nil
+}
+
+func DecodeClusterAddrChange(data []byte) (uint64, string, error) {
+	dec := wkproto.NewDecoder(data)
+	var err error
+	var nodeId uint64
+	if nodeId, err = dec.Uint64(); err != nil {
+		return 0, "", err
+	}
+	clusterAddr, err := dec.String()
+	return nodeId, clusterAddr, err
 }
 
 func EncodeNodeOnlineStatusChange(nodeId uint64, online bool) ([]byte, error) {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/auth"
 	"github.com/WuKongIM/WuKongIM/pkg/auth/resource"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/crypto/tls"
 	"github.com/bwmarrin/snowflake"
@@ -970,6 +971,12 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.Cluster.SlotReplicaCount = o.getInt("cluster.slotReplicaCount", o.Cluster.SlotReplicaCount)
 	o.Cluster.ChannelReplicaCount = o.getInt("cluster.channelReplicaCount", o.Cluster.ChannelReplicaCount)
 	o.Cluster.ServerAddr = o.getString("cluster.serverAddr", o.Cluster.ServerAddr)
+	// 一次性 fail-loud：cluster.serverAddr 会被复制成所有 peer 的拨号目标，
+	// bind-all / portless 之类会造成 silent 自连或全集群拨不通，起启动就拦掉，
+	// 避免让下游 propose/replicate 沉默地把非法地址写入 raft 状态。
+	if err := types.ValidateAdvertiseAddr(o.Cluster.ServerAddr); err != nil {
+		wklog.Panic("cluster.serverAddr invalid: " + err.Error())
+	}
 	o.Cluster.PongMaxTick = o.getInt("cluster.pongMaxTick", o.Cluster.PongMaxTick)
 
 	o.Cluster.ReqTimeout = o.getDuration("cluster.reqTimeout", o.Cluster.ReqTimeout)
