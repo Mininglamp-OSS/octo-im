@@ -33,7 +33,9 @@ Dormant channels remain readable without being created or woken. This preserves
 the v2.2.5 behavior and the above residual risk; it is not a claim of the stronger
 committed-history guarantee provided by the refactored main branch. Missing
 metadata returns an empty boundary without creating a channel. Dormant channels
-with migration in progress are rejected.
+with either migration marker still set are rejected. A residual learner entry
+without migration markers does not block a dormant read: that learner may be
+offline or decommissioned, so reading cannot depend on its eventual promotion.
 
 These local role/configuration checks are not a quorum ReadIndex or a leader
 lease. They do not guarantee linearizability across network partitions.

@@ -44,6 +44,7 @@ type conversationReader struct {
 	state  func(context.Context, string, uint8) (raftgroup.ReadState, error)
 	local  func(string, uint8) (uint64, uint64, error)
 	remote func(context.Context, uint64, string, conversationReadRequest) (conversationReadResponse, error)
+	hint   func(string, uint8)
 }
 
 func (s *Server) conversationReader() conversationReader {
@@ -53,6 +54,7 @@ func (s *Server) conversationReader() conversationReader {
 		state:  s.channelServer.ReadLeaderState,
 		local:  s.db.GetChannelLastMessageSeq,
 		remote: s.requestConversationRead,
+		hint:   s.hintChannelConfig,
 	}
 }
 
@@ -153,6 +155,7 @@ func (r conversationReader) readLocal(ctx context.Context, expected wkdb.Channel
 		return 0, err
 	}
 	if !conversationStateReady(before, cfg) {
+		r.hintLaggingConfig(before, cfg)
 		return 0, ErrConversationReadRetry
 	}
 	seq, _, err := r.local(id, typ)
@@ -164,6 +167,7 @@ func (r conversationReader) readLocal(ctx context.Context, expected wkdb.Channel
 		return 0, err
 	}
 	if before.Exists != after.Exists || !conversationStateReady(after, cfg) {
+		r.hintLaggingConfig(after, cfg)
 		return 0, ErrConversationReadRetry
 	}
 	latest, err := r.load(ctx, id, typ)
@@ -193,12 +197,24 @@ func conversationStateReady(state raftgroup.ReadState, cfg wkdb.ChannelClusterCo
 		// Idle channels are automatically destroyed in this architecture. Reading
 		// their designated owner's durable tail must not wake them. A dormant
 		// channel in transfer cannot establish that it finished draining.
+		// An orphan learner without migration markers must not block that read:
+		// the learner may be gone and unable to finish promotion.
 		// Legacy storage does not persist a trustworthy committed bound across
 		// eviction/restart: dormant tails can include crash residue. See the
 		// compatibility note in docs/conversation-boundary-reads.md.
 		return cfg.MigrateFrom == 0 && cfg.MigrateTo == 0
 	}
 	return state.Ready && state.LeaderID == cfg.LeaderId && state.Term == cfg.Term && state.ConfigVersion == cfg.ConfVersion
+}
+
+func (r conversationReader) hintLaggingConfig(state raftgroup.ReadState, cfg wkdb.ChannelClusterConfig) {
+	if r.hint == nil {
+		return
+	}
+	if state.Exists && state.ConfigVersion <= cfg.ConfVersion && !conversationStateReady(state, cfg) ||
+		!state.Exists && (len(cfg.Learners) > 0 || cfg.MigrateFrom != 0 || cfg.MigrateTo != 0) {
+		r.hint(cfg.ChannelId, cfg.ChannelType)
+	}
 }
 
 func (s *Server) conversationReadTimeout() time.Duration {
@@ -356,6 +372,7 @@ func (r conversationReader) validateLocal(ctx context.Context, expected wkdb.Cha
 		return err
 	}
 	if !conversationStateReady(state, cfg) {
+		r.hintLaggingConfig(state, cfg)
 		return ErrConversationReadRetry
 	}
 	// Successful metadata and state checks complete the fence, even when

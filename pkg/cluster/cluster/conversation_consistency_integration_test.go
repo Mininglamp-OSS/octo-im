@@ -46,6 +46,49 @@ func consistencyMessage(seq uint32) wkdb.Message {
 		MessageID: int64(seq), MessageSeq: seq, Payload: []byte("diagnostic")}}
 }
 
+func TestConversationDormantOrphanLearner(t *testing.T) {
+	s, ctx := newConversationConsistencyServer(t, nil)
+	// Exercise dormant reads independently of background activation/promotion.
+	// Node 2 is absent, so no learner acknowledgement can make this read succeed.
+	s.configReconciler.stop()
+	require.False(t, s.cfgServer.NodeIsOnline(2))
+	cfg := consistencyConfig()
+	cfg.Learners = []uint64{2}
+	require.NoError(t, s.db.AppendMessages(cfg.ChannelId, cfg.ChannelType, []wkdb.Message{consistencyMessage(42)}))
+	for _, tc := range []struct {
+		name     string
+		from, to uint64
+	}{
+		{"orphan learner", 0, 0},
+		{"migration source only", 1, 0},
+		{"migration target only", 0, 2},
+		{"migration in progress", 1, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg.ConfVersion++
+			cfg.MigrateFrom, cfg.MigrateTo = tc.from, tc.to
+			require.NoError(t, s.db.SaveChannelClusterConfig(cfg))
+			expected, err := s.db.GetChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
+			require.NoError(t, err)
+			seq, readErr := s.GetChannelLastMessageSeq(ctx, cfg.ChannelId, cfg.ChannelType)
+			fenceErr := s.ValidateLocalChannelRead(ctx, expected)
+			if tc.from == 0 && tc.to == 0 {
+				require.NoError(t, readErr)
+				require.Equal(t, uint64(42), seq)
+				require.NoError(t, fenceErr)
+			} else {
+				require.ErrorIs(t, readErr, ErrConversationReadRetry)
+				require.Zero(t, seq)
+				require.ErrorIs(t, fenceErr, ErrConversationReadRetry)
+			}
+			require.False(t, s.channelServer.ExistChannel(cfg.ChannelId, cfg.ChannelType), "reads must not require waking the channel")
+			stored, err := s.db.GetChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
+			require.NoError(t, err)
+			require.True(t, expected.Equal(stored), "reads must not remove the learner or rewrite metadata")
+		})
+	}
+}
+
 type delayedConversationDB struct {
 	wkdb.DB
 	entered chan struct{}
@@ -147,6 +190,9 @@ func (d *conversationConfigHookDB) GetChannelClusterConfig(id string, typ uint8)
 func TestConversationConcurrentSlotWrite(t *testing.T) {
 	var db *conversationConfigHookDB
 	s, ctx := newConversationConsistencyServer(t, func(s *Server) { db = &conversationConfigHookDB{DB: s.db}; s.db = db })
+	// This one-shot hook belongs to the foreground consistency read. A scan
+	// must not consume it on a worker or run test assertions on that goroutine.
+	s.configReconciler.stop()
 	cfg := consistencyConfig()
 	require.NoError(t, s.db.SaveChannelClusterConfig(cfg))
 	before, err := s.slotServer.ReadLeaderState(ctx, 0)
