@@ -79,6 +79,15 @@ func TestServerStart(t *testing.T) {
 	assert.Nil(t, err)
 }
 
+func TestValidateStartupOptionsRejectsMigrationWithSubscriberRecovery(t *testing.T) {
+	opts := &options.Options{OldV1Api: "http://old-im"}
+	opts.SubscriberRecovery.Enabled = true
+	require.Error(t, validateStartupOptions(opts))
+
+	opts.OldV1Api = ""
+	require.NoError(t, validateStartupOptions(opts))
+}
+
 // 测试单节点发送消息
 func TestSingleSendMessage(t *testing.T) {
 	s := NewTestServer(t)
@@ -738,4 +747,3 @@ func TestClusterSaveClusterConfig(t *testing.T) {
 	})
 	assert.Nil(t, err)
 }
-

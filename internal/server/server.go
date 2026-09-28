@@ -212,6 +212,7 @@ func New(opts *options.Options) *Server {
 			cluster.WithDBWKDbMemTableSize(s.opts.Db.MemTableSize),
 			cluster.WithAuth(s.opts.Auth),
 			cluster.WithIsCmdChannel(s.opts.IsCmdChannel),
+			cluster.WithSubscriberRecoveryEnabled(s.opts.SubscriberRecovery.Enabled),
 			cluster.WithAppVersion(version.Version),
 		),
 
@@ -251,6 +252,9 @@ func (s *Server) Init(env svc.Environment) error {
 }
 
 func (s *Server) Start() error {
+	if err := validateStartupOptions(s.opts); err != nil {
+		return err
+	}
 	// 显示增强的启动横幅
 	s.printEnhancedBanner()
 
@@ -340,6 +344,13 @@ func (s *Server) Start() error {
 		return err
 	}
 
+	return nil
+}
+
+func validateStartupOptions(opts *options.Options) error {
+	if opts.SubscriberRecovery.Enabled && strings.TrimSpace(opts.OldV1Api) != "" {
+		return fmt.Errorf("subscriberRecovery.enabled cannot be used with oldV1Api migration")
+	}
 	return nil
 }
 

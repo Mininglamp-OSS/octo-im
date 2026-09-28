@@ -55,6 +55,9 @@ type Options struct {
 	// AutoDestory 是否自动销毁
 	AutoDestory bool
 
+	// ApplyErrorRetry enables tick-paced retries after an Apply error.
+	ApplyErrorRetry bool
+
 	// 在空同步指定次数后，进入挂起状态
 	SuspendAfterEmptySyncTick int
 
@@ -214,5 +217,11 @@ func WithAutoDestory(autoDestory bool) Option {
 
 	return func(opts *Options) {
 		opts.AutoDestory = autoDestory
+	}
+}
+
+func WithApplyErrorRetry(enabled bool) Option {
+	return func(opts *Options) {
+		opts.ApplyErrorRetry = enabled
 	}
 }

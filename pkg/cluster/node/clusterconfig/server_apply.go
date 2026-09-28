@@ -48,6 +48,13 @@ func (s *Server) applyLog(log types.Log) error {
 
 func (s *Server) handleCmd(cmd *CMD) error {
 	switch cmd.CmdType {
+	case CMDTypeSubscriberProtocols:
+		confirmed := &pb.Config{}
+		if err := confirmed.Unmarshal(cmd.Data); err != nil {
+			return err
+		}
+		s.config.confirmSubscriberProtocols(confirmed.Nodes)
+		return nil
 	case CMDTypeConfigChange: // 配置改变
 		return s.handleConfigChange(cmd)
 	case CMDTypeConfigApiServerAddrChange: // 节点api server地址改变
@@ -122,6 +129,11 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 	if err != nil {
 		s.Error("unmarshal node err", zap.Error(err))
 		return err
+	}
+	if !s.subscriberRevisionJoinAllowed(newNode.SubscriberProtocol) {
+		// Deterministic no-op: rejecting an already-committed command with
+		// a retryable Apply error would stop configuration progress forever.
+		return nil
 	}
 	s.config.addOrUpdateNode(newNode)
 

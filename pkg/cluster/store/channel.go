@@ -1,12 +1,19 @@
 package store
 
-import "github.com/WuKongIM/WuKongIM/pkg/wkdb"
+import (
+	"fmt"
+
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+)
 
 // AddSubscribers 添加订阅者
 func (s *Store) AddSubscribers(channelId string, channelType uint8, subscribers []wkdb.Member) error {
 
 	if len(subscribers) == 0 {
 		return nil
+	}
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
 	}
 
 	data := EncodeMembers(channelId, channelType, subscribers)
@@ -30,6 +37,9 @@ func (s *Store) RemoveSubscribers(channelId string, channelType uint8, subscribe
 	if len(subscribers) == 0 {
 		return nil
 	}
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
+	}
 
 	data := EncodeChannelUids(channelId, channelType, subscribers)
 	cmd := NewCMD(CMDRemoveSubscribers, data)
@@ -43,6 +53,9 @@ func (s *Store) RemoveSubscribers(channelId string, channelType uint8, subscribe
 }
 
 func (s *Store) RemoveAllSubscriber(channelId string, channelType uint8) error {
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
+	}
 	data := EncodeChannel(channelId, channelType)
 	cmd := NewCMD(CMDRemoveAllSubscriber, data)
 	cmdData, err := cmd.Marshal()
@@ -60,6 +73,11 @@ func (s *Store) GetSubscribers(channelID string, channelType uint8) ([]wkdb.Memb
 
 // AddOrUpdateChannel add or update channel
 func (s *Store) AddChannelInfo(channelInfo wkdb.ChannelInfo) error {
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelInfo.ChannelId, channelInfo.ChannelType); err != nil {
+		return err
+	} else if managed {
+		return fmt.Errorf("managed channel metadata requires a business revision")
+	}
 	data, err := EncodeChannelInfo(channelInfo, CmdVersionChannelInfo)
 	if err != nil {
 		return err
@@ -75,6 +93,11 @@ func (s *Store) AddChannelInfo(channelInfo wkdb.ChannelInfo) error {
 }
 
 func (s *Store) UpdateChannelInfo(channelInfo wkdb.ChannelInfo) error {
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelInfo.ChannelId, channelInfo.ChannelType); err != nil {
+		return err
+	} else if managed {
+		return fmt.Errorf("managed channel metadata requires a business revision")
+	}
 	data, err := EncodeChannelInfo(channelInfo, CmdVersionChannelInfo)
 	if err != nil {
 		return err
@@ -114,6 +137,9 @@ func (s *Store) AddDenylist(channelId string, channelType uint8, members []wkdb.
 	if len(members) == 0 {
 		return nil
 	}
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
+	}
 
 	data := EncodeMembers(channelId, channelType, members)
 	cmd := NewCMD(CMDAddDenylist, data)
@@ -137,6 +163,9 @@ func (s *Store) ExistDenylist(channelId string, channelType uint8, uid string) (
 }
 
 func (s *Store) RemoveAllDenylist(channelId string, channelType uint8) error {
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
+	}
 	data := EncodeChannel(channelId, channelType)
 	cmd := NewCMD(CMDRemoveAllDenylist, data)
 	cmdData, err := cmd.Marshal()
@@ -152,6 +181,9 @@ func (s *Store) RemoveDenylist(channelId string, channelType uint8, uids []strin
 
 	if len(uids) == 0 {
 		return nil
+	}
+	if err := s.rejectLegacySubscriberMutation(channelType); err != nil {
+		return err
 	}
 
 	data := EncodeChannelUids(channelId, channelType, uids)

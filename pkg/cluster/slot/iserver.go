@@ -68,7 +68,7 @@ func (s *Server) ProposeUntilAppliedTimeout(ctx context.Context, slotId uint32, 
 	// 如果当前节点不是槽的领导节点，则向槽的领导节点请求提案
 	if slotConfig.Leader != s.opts.NodeId {
 
-		resps, err := s.opts.RPC.RequestSlotProposeBatchUntilApplied(slotConfig.Leader, slotId, types.ProposeReqSet{
+		resps, err := s.opts.RPC.RequestSlotProposeBatchUntilAppliedWithContext(ctx, slotConfig.Leader, slotId, types.ProposeReqSet{
 			{
 				Id:   logId,
 				Data: data,
@@ -100,6 +100,11 @@ func (s *Server) ProposeUntilAppliedTimeout(ctx context.Context, slotId uint32, 
 }
 
 func (s *Server) ProposeUntilAppliedTimeoutForLocal(ctx context.Context, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+	if s.opts.BeforePropose != nil {
+		if err := s.opts.BeforePropose(ctx, slotId, reqs); err != nil {
+			return nil, err
+		}
+	}
 	shardNo := SlotIdToKey(slotId)
 
 	resps, err := s.raftGroup.ProposeBatchUntilAppliedTimeout(ctx, shardNo, reqs)

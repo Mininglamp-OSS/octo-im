@@ -30,9 +30,17 @@ type PebbleShardLogStorage struct {
 	stopper syncutil.Stopper
 	s       *Server
 
-	// slotLocks serializes operations for the same raft slot without coupling
-	// unrelated slots that happen to share one physical Pebble DB shard.
-	slotLocks sync.Map // map[string]*sync.Mutex
+	slotLocks sync.Map // map[string]*slotStorageLocks
+}
+
+// Append and Apply operate on different keys and may run concurrently: the
+// Raft log must be durable before Apply is scheduled. Truncation must exclude
+// both, so it cannot remove logs while their applied index is advancing.
+// Each stream remains serialized within a slot.
+type slotStorageLocks struct {
+	truncate sync.RWMutex
+	append   sync.Mutex
+	apply    sync.Mutex
 }
 
 func NewPebbleShardLogStorage(s *Server, path string, shardNum uint32) *PebbleShardLogStorage {
@@ -70,8 +78,15 @@ func (p *PebbleShardLogStorage) defaultPebbleOptions() *pebble.Options {
 	return &pebble.Options{
 		Levels:             lopts,
 		FormatMajorVersion: pebble.FormatNewest,
-		// 控制写缓冲区的大小。较大的写缓冲区可以减少磁盘写入次数，但会占用更多内存。
-		MemTableSize: 128 * 1024 * 1024,
+		// Coalesce concurrent slot appends and applied-index writes. With the
+		// default 8 shards this bounds steady WAL syncs to 400/s; callers
+		// still wait for the shared durability barrier before acknowledging.
+		WALMinSyncInterval: func() time.Duration { return 20 * time.Millisecond },
+		// This is per physical shard. Pebble also preallocates each WAL at
+		// 110% of this size, including its small startup memtables. A 128MiB
+		// table reserved nearly 1GiB of WAL space per shard before the first
+		// flush, and allowed 4GiB of slot memtables across the default 8 shards.
+		MemTableSize: 8 * 1024 * 1024,
 		// 当队列中的MemTables的大小超过 MemTableStopWritesThreshold*MemTableSize 时，将停止写入，
 		// 直到被刷到磁盘，这个值不能小于2
 		MemTableStopWritesThreshold: 4,
@@ -143,9 +158,9 @@ func (p *PebbleShardLogStorage) shardId(v string) uint32 {
 	return h.Sum32() % p.shardNum
 }
 
-func (p *PebbleShardLogStorage) slotLock(shardNo string) *sync.Mutex {
-	lock, _ := p.slotLocks.LoadOrStore(shardNo, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+func (p *PebbleShardLogStorage) slotLock(shardNo string) *slotStorageLocks {
+	lock, _ := p.slotLocks.LoadOrStore(shardNo, &slotStorageLocks{})
+	return lock.(*slotStorageLocks)
 }
 
 func (p *PebbleShardLogStorage) shardBatchDBWithIndex(index uint32) *wkdb.BatchDB {
@@ -190,10 +205,11 @@ func (p *PebbleShardLogStorage) GetState(shardNo string) (types.RaftState, error
 }
 
 func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) error {
-	// 加锁保护，防止与 TruncateLogTo 并发执行
 	lock := p.slotLock(shardNo)
-	lock.Lock()
-	defer lock.Unlock()
+	lock.truncate.RLock()
+	defer lock.truncate.RUnlock()
+	lock.append.Lock()
+	defer lock.append.Unlock()
 
 	batch := p.shardBatchDB(shardNo).NewBatch()
 
@@ -232,8 +248,8 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 
 	// 加锁保护，防止与 Apply 并发执行导致 appliedIndex > lastLogIndex
 	lock := p.slotLock(shardNo)
-	lock.Lock()
-	defer lock.Unlock()
+	lock.truncate.Lock()
+	defer lock.truncate.Unlock()
 
 	lastLog, err := p.lastLog(shardNo)
 	if err != nil {
@@ -333,8 +349,10 @@ func (p *PebbleShardLogStorage) GetLogs(shardNo string, startLogIndex uint64, en
 func (p *PebbleShardLogStorage) Apply(shardNo string, logs []types.Log) error {
 	// 加锁保护，防止与 TruncateLogTo 并发执行导致 appliedIndex > lastLogIndex
 	lock := p.slotLock(shardNo)
-	lock.Lock()
-	defer lock.Unlock()
+	lock.truncate.RLock()
+	defer lock.truncate.RUnlock()
+	lock.apply.Lock()
+	defer lock.apply.Unlock()
 
 	if p.s.opts.OnApply != nil {
 		slotId := KeyToSlotId(shardNo)
@@ -342,7 +360,7 @@ func (p *PebbleShardLogStorage) Apply(shardNo string, logs []types.Log) error {
 		if err != nil {
 			return err
 		}
-		err = p.SetAppliedIndex(shardNo, logs[len(logs)-1].Index)
+		err = p.setAppliedIndex(shardNo, logs[len(logs)-1].Index, !p.s.opts.ReplaySafeApply)
 		if err != nil {
 			return err
 		}
@@ -498,6 +516,10 @@ func (p *PebbleShardLogStorage) lastLog(shardNo string) (types.Log, error) {
 }
 
 func (p *PebbleShardLogStorage) SetAppliedIndex(shardNo string, index uint64) error {
+	return p.setAppliedIndex(shardNo, index, true)
+}
+
+func (p *PebbleShardLogStorage) setAppliedIndex(shardNo string, index uint64, durable bool) error {
 	maxIndexKeyData := key.NewAppliedIndexKey(shardNo)
 	maxIndexdata := make([]byte, 8)
 	binary.BigEndian.PutUint64(maxIndexdata, index)
@@ -505,8 +527,16 @@ func (p *PebbleShardLogStorage) SetAppliedIndex(shardNo string, index uint64) er
 	lastTimeData := make([]byte, 8)
 	binary.BigEndian.PutUint64(lastTimeData, uint64(lastTime))
 
+	value := append(maxIndexdata, lastTimeData...)
+	if !durable {
+		// The Raft log and replay-safe business state are already durable.
+		// Losing only this cursor repeats protected Apply work after restart;
+		// it cannot lose an acknowledged mutation. Publish before returning
+		// so in-process truncation still observes the full applied prefix.
+		return p.shardDB(shardNo).Set(maxIndexKeyData, value, p.noSync)
+	}
 	batch := p.shardBatchDB(shardNo).NewBatch()
-	batch.Set(maxIndexKeyData, append(maxIndexdata, lastTimeData...))
+	batch.Set(maxIndexKeyData, value)
 	return batch.CommitWait()
 
 }

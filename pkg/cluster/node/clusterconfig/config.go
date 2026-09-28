@@ -107,7 +107,17 @@ func (c *Config) data() ([]byte, error) {
 func (c *Config) update(cfg *types.Config) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.cfg = cfg.Clone()
+	next := cfg.Clone()
+	// A full config refresh must not erase a committed identity confirmation.
+	// A replacement (different address/creation epoch) still starts unconfirmed.
+	for _, node := range next.Nodes {
+		for _, previous := range c.cfg.Nodes {
+			if node.Id == previous.Id && node.ClusterAddr == previous.ClusterAddr && node.CreatedAt == previous.CreatedAt {
+				node.SubscriberProtocol = max(node.SubscriberProtocol, previous.SubscriberProtocol)
+			}
+		}
+	}
+	c.cfg = next
 }
 
 func (c *Config) nodes() []*types.Node {
@@ -477,5 +487,5 @@ func (c *Config) saveConfig() error {
 	if err != nil {
 		return err
 	}
-	return nil
+	return c.cfgFile.Sync()
 }

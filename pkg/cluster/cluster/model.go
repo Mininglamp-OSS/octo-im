@@ -588,9 +588,10 @@ func (s *SlotLogInfoResp) Unmarshal(data []byte) error {
 }
 
 type ClusterJoinReq struct {
-	NodeId     uint64
-	ServerAddr string
-	Role       types.NodeRole
+	SubscriberProtocol uint32
+	NodeId             uint64
+	ServerAddr         string
+	Role               types.NodeRole
 }
 
 func (c *ClusterJoinReq) Marshal() ([]byte, error) {
@@ -599,6 +600,7 @@ func (c *ClusterJoinReq) Marshal() ([]byte, error) {
 	enc.WriteUint64(c.NodeId)
 	enc.WriteString(c.ServerAddr)
 	enc.WriteUint32(uint32(c.Role))
+	enc.WriteUint32(c.SubscriberProtocol)
 	return enc.Bytes(), nil
 
 }
@@ -617,6 +619,11 @@ func (c *ClusterJoinReq) Unmarshal(data []byte) error {
 		return err
 	}
 	c.Role = types.NodeRole(role)
+	if dec.Len() > 0 {
+		if c.SubscriberProtocol, err = dec.Uint32(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

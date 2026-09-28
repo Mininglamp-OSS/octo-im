@@ -136,6 +136,13 @@ type Options struct {
 		Addr          string // 数据源地址
 		ChannelInfoOn bool   // 是否开启频道信息获取
 	}
+	SubscriberRecovery struct {
+		Enabled    bool
+		Workers    int
+		MaxPending uint64
+		Interval   time.Duration
+		Timeout    time.Duration
+	}
 	Conversation struct {
 		On                 bool          // 是否开启最近会话
 		CacheExpire        time.Duration // 最近会话缓存过期时间 (这个是热数据缓存时间，并非最近会话数据的缓存时间)
@@ -870,6 +877,11 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.MessageRetry.MaxCount = o.getInt("messageRetry.maxCount", o.MessageRetry.MaxCount)
 	o.MessageRetry.WorkerCount = o.getInt("messageRetry.workerCount", o.MessageRetry.WorkerCount)
 
+	o.SubscriberRecovery.Enabled = o.getBool("subscriberRecovery.enabled", true)
+	o.SubscriberRecovery.Workers = o.getInt("subscriberRecovery.workers", 2)
+	o.SubscriberRecovery.MaxPending = o.getUint64("subscriberRecovery.maxPending", 1024)
+	o.SubscriberRecovery.Interval = o.getDuration("subscriberRecovery.interval", 50*time.Millisecond)
+	o.SubscriberRecovery.Timeout = o.getDuration("subscriberRecovery.timeout", 5*time.Second)
 	o.Conversation.On = o.getBool("conversation.on", o.Conversation.On)
 	o.Conversation.CacheExpire = o.getDuration("conversation.cacheExpire", o.Conversation.CacheExpire)
 	o.Conversation.SyncInterval = o.getDuration("conversation.syncInterval", o.Conversation.SyncInterval)

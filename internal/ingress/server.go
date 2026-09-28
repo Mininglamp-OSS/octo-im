@@ -28,6 +28,8 @@ func New() *Ingress {
 }
 
 func (i *Ingress) SetRoutes() {
+	service.Cluster.Route("/wk/ingress/subscriberTagInvalidate", i.handleSubscriberTagInvalidate)
+	service.Cluster.Route("/wk/ingress/subscriberReadFloor", i.handleSubscriberReadFloor)
 	// 获取tag
 	service.Cluster.Route("/wk/ingress/getTag", i.handleGetTag)
 	// 判断接受者是否允许发送消息
@@ -280,4 +282,3 @@ func (i *Ingress) handleGetSubscribers(c *wkserver.Context) {
 	}
 	c.Write(data)
 }
-

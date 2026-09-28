@@ -58,6 +58,8 @@ type Options struct {
 	AppVersion string
 
 	IsCmdChannel func(channel string) bool
+
+	SubscriberRecoveryEnabled bool
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -211,5 +213,11 @@ func WithAppVersion(appVersion string) Option {
 func WithIsCmdChannel(isCmdChannel func(channel string) bool) Option {
 	return func(o *Options) {
 		o.IsCmdChannel = isCmdChannel
+	}
+}
+
+func WithSubscriberRecoveryEnabled(enabled bool) Option {
+	return func(o *Options) {
+		o.SubscriberRecoveryEnabled = enabled
 	}
 }

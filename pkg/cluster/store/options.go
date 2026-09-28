@@ -15,6 +15,8 @@ type Options struct {
 	Channel icluster.Channel
 
 	IsCmdChannel func(channel string) bool
+
+	SubscriberRecoveryEnabled bool
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -54,5 +56,11 @@ func WithDB(db wkdb.DB) Option {
 func WithIsCmdChannel(isCmdChannel func(channel string) bool) Option {
 	return func(o *Options) {
 		o.IsCmdChannel = isCmdChannel
+	}
+}
+
+func WithSubscriberRecoveryEnabled(enabled bool) Option {
+	return func(o *Options) {
+		o.SubscriberRecoveryEnabled = enabled
 	}
 }
