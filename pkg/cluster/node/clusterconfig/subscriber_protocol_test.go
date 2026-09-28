@@ -36,6 +36,29 @@ func TestSubscriberProtocolPersistsInConfigAndFencesReplacement(t *testing.T) {
 	require.Zero(t, s.SubscriberNodes()[1].SubscriberProtocol, "delayed old-identity proof must not authorize replacement")
 }
 
+func TestSubscriberAtomicProofRejectsLateProtocolFourJoin(t *testing.T) {
+	c := NewConfig(NewOptions(WithConfigPath(filepath.Join(t.TempDir(), "cluster.json"))))
+	defer c.cfgFile.Close()
+	c.update(&types.Config{Nodes: []*types.Node{{Id: 1, SubscriberProtocol: 5}, {Id: 2, SubscriberProtocol: 5}}})
+	s := &Server{config: c}
+	for _, id := range []uint64{2, 3} {
+		data, err := (&types.Node{Id: id, ClusterAddr: "old-node", CreatedAt: 20, SubscriberProtocol: 4}).Marshal()
+		require.NoError(t, err)
+		require.NoError(t, s.handleNodeJoin(NewCMD(CMDTypeNodeJoin, data)))
+		require.Len(t, s.SubscriberNodes(), 2)
+		require.EqualValues(t, 5, s.SubscriberNodes()[1].SubscriberProtocol)
+	}
+	require.True(t, s.subscriberRevisionJoinAllowed(5))
+	// A separate, not-yet-activated cluster: committed capability proofs in
+	// the cluster above deliberately cannot be downgraded by config refresh.
+	partial := NewConfig(NewOptions(WithConfigPath(filepath.Join(t.TempDir(), "partial.json"))))
+	defer partial.cfgFile.Close()
+	partial.update(&types.Config{Nodes: []*types.Node{{Id: 1, SubscriberProtocol: 5}, {Id: 2, SubscriberProtocol: 4}}})
+	s.config = partial
+	require.True(t, s.subscriberRevisionJoinAllowed(4))
+	require.False(t, s.subscriberRevisionJoinAllowed(3))
+}
+
 func TestSubscriberRevisionProofFencesAlreadyProposedOldJoin(t *testing.T) {
 	c := NewConfig(NewOptions(WithConfigPath(filepath.Join(t.TempDir(), "cluster.json"))))
 	defer c.cfgFile.Close()

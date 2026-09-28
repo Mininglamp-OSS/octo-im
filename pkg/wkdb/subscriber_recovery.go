@@ -36,9 +36,14 @@ const (
 // Pending work and lifecycle fences are never expired by this policy.
 const SubscriberReceiptRetention = 7 * 24 * time.Hour
 
+// Protocol 5 changes source admission and snapshot validation. The version is
+// replicated with the operation so old log entries retain their replay rules.
+const SubscriberAtomicProtocolVersion uint32 = 5
+
 // SubscriberOperation is an immutable request. IDs and timestamps are selected
 // before replication; retries reuse OperationID, not a newly generated intent.
 type SubscriberOperation struct {
+	SourceProtocol uint32 `json:"source_protocol,omitempty"`
 	// BusinessRevision orders authoritative snapshots independently of arrival
 	// order. It is only valid on the separately gated reconcile command.
 	BusinessRevision       uint64       `json:"business_revision,omitempty"`
@@ -63,6 +68,9 @@ type SubscriberOperation struct {
 }
 
 func (o SubscriberOperation) Validate() error {
+	if o.SourceProtocol != 0 && o.SourceProtocol != SubscriberAtomicProtocolVersion {
+		return errors.New("unsupported subscriber source protocol")
+	}
 	if err := o.validateSnapshotPage(); err != nil {
 		return err
 	}
@@ -118,6 +126,7 @@ func (o SubscriberOperation) Validate() error {
 // Digest excludes server-selected timestamps, IDs, tail and admission budget.
 // A retried client request must have identical business input.
 func (o SubscriberOperation) Digest() string {
+	o.SourceProtocol = 0
 	o.OperationID = ""
 	o.ConversationIDs = nil
 	o.RestoreConversationIDs = nil
@@ -157,30 +166,34 @@ type SubscriberReceipt struct {
 
 // ConversationEffect carries the source lifecycle, not a scheduling attempt ID.
 type ConversationEffect struct {
-	PreserveExisting bool   `json:"preserve_existing,omitempty"`
-	UID              string `json:"uid"`
-	ChannelID        string `json:"channel_id"`
-	ChannelType      uint8  `json:"channel_type"`
-	Version          uint64 `json:"version"`
-	ConversationID   uint64 `json:"conversation_id"`
-	Deleted          bool   `json:"deleted"`
-	ReadToMsgSeq     uint64 `json:"read_to_msg_seq"`
-	CreatedAt        int64  `json:"created_at"`
-	RelationDone     bool   `json:"relation_done,omitempty"`
+	// SourceWorkVersion identifies the work that established this intent. It
+	// differs from the target lifecycle version when adopting a legacy intent.
+	SourceWorkVersion uint64 `json:"source_work_version,omitempty"`
+	PreserveExisting  bool   `json:"preserve_existing,omitempty"`
+	UID               string `json:"uid"`
+	ChannelID         string `json:"channel_id"`
+	ChannelType       uint8  `json:"channel_type"`
+	Version           uint64 `json:"version"`
+	ConversationID    uint64 `json:"conversation_id"`
+	Deleted           bool   `json:"deleted"`
+	ReadToMsgSeq      uint64 `json:"read_to_msg_seq"`
+	CreatedAt         int64  `json:"created_at"`
+	RelationDone      bool   `json:"relation_done,omitempty"`
 }
 
 // SubscriberWork is source-owned and durably checkpointed after each bounded page.
 type SubscriberWork struct {
-	Paged       bool                 `json:"paged,omitempty"`
-	Total       int                  `json:"total"`
-	LastRetryAt int64                `json:"last_retry_at,omitempty"`
-	Attempts    uint32               `json:"attempts"`
-	NextAttempt int64                `json:"next_attempt,omitempty"`
-	SlotID      uint32               `json:"slot_id"`
-	Operation   SubscriberOperation  `json:"operation"`
-	Version     uint64               `json:"version"`
-	Effects     []ConversationEffect `json:"effects,omitempty"` // legacy on-disk format only
-	Next        int                  `json:"next"`
+	SnapshotDigest string               `json:"snapshot_digest,omitempty"`
+	Paged          bool                 `json:"paged,omitempty"`
+	Total          int                  `json:"total"`
+	LastRetryAt    int64                `json:"last_retry_at,omitempty"`
+	Attempts       uint32               `json:"attempts"`
+	NextAttempt    int64                `json:"next_attempt,omitempty"`
+	SlotID         uint32               `json:"slot_id"`
+	Operation      SubscriberOperation  `json:"operation"`
+	Version        uint64               `json:"version"`
+	Effects        []ConversationEffect `json:"effects,omitempty"` // legacy on-disk format only
+	Next           int                  `json:"next"`
 }
 
 type SubscriberCheckpoint struct {
@@ -216,6 +229,7 @@ type SubscriberRecoveryDB interface {
 	GetSubscriberWork(string, uint8, uint32, uint64) (SubscriberWork, bool, error)
 	GetSubscriberWorkPage(SubscriberWork, int) ([]ConversationEffect, error)
 	GetSubscriberIntent(string, uint8, string) (ConversationEffect, bool, error)
+	GetSubscriberSnapshotStatus(string, uint8) (SubscriberSnapshotStatus, bool, error)
 	ListSubscriberWork(int, []byte, int) ([]SubscriberWork, []byte, bool, error)
 	CheckpointSubscriberWork(SubscriberCheckpoint) error
 	ApplyConversationEffects([]ConversationEffect) error
@@ -481,6 +495,10 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 	}
 	removes := []string(nil)
 	adds := []string(nil)
+	legacyUIDs, legacyRepairComplete, e := legacySubscriberIntents(db, o)
+	if e != nil {
+		return e
+	}
 	switch o.Mode {
 	case "add":
 		adds = o.UIDs
@@ -501,6 +519,7 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 		}
 		if o.Mode == "reconcile" {
 			removes = append(removes, o.DenyUIDs...)
+			removes = append(removes, legacyUIDs...)
 		}
 	case "deny_add", "deny_set":
 		removes = o.UIDs
@@ -597,6 +616,7 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 	work := SubscriberWork{SlotID: slot, Operation: o, Version: version}
 	at := time.Unix(0, o.CreatedAt)
 	staged := &Batch{}
+	var intentUpdates []ConversationEffect
 	for _, uid := range uids {
 		var intent ConversationEffect
 		ok, e := recoveryRead(db, recoveryChannelKey(recoveryIntent, o.ChannelID, o.ChannelType, uid), &intent)
@@ -612,18 +632,34 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 		if !unchanged {
 			intent = ConversationEffect{PreserveExisting: !ok && !deleted && len(members) > 0, UID: uid, ChannelID: o.ChannelID, ChannelType: o.ChannelType, Version: version, ConversationID: addSet[uid], Deleted: deleted, ReadToMsgSeq: o.ReadToMsgSeq, CreatedAt: o.CreatedAt}
 		}
-		if o.Mode != "reconcile" || !unchanged {
-			if e := recoverySet(batch, recoveryChannelKey(recoveryIntent, o.ChannelID, o.ChannelType, uid), intent); e != nil {
-				return e
+		repairLegacy := o.SourceProtocol == SubscriberAtomicProtocolVersion && intent.SourceWorkVersion == 0
+		if repairLegacy {
+			// Preserve the existing target epoch/ID/read position. Replaying that
+			// epoch repairs missing effects without recreating healthy conversations.
+			intent.SourceWorkVersion = version
+		}
+		if o.Mode != "reconcile" || !unchanged || repairLegacy {
+			if o.SourceProtocol == SubscriberAtomicProtocolVersion {
+				intentUpdates = append(intentUpdates, intent)
+			} else {
+				// Historical protocol-3/4 log entries must replay identically on
+				// every replica. New requests always use atomic protocol 5.
+				if e := recoverySet(batch, recoveryChannelKey(recoveryIntent, o.ChannelID, o.ChannelType, uid), intent); e != nil {
+					return e
+				}
 			}
 		}
 		needTarget := true
-		if o.Mode == "reconcile" && unchanged {
+		if o.Mode == "reconcile" && unchanged && !repairLegacy {
 			// An intent is created atomically with its original source work.
 			// That work is removed only after all targets and tags complete.
 			// Do not fan out an entire group again for a one-member change, but
 			// never mistake an unchanged yet pending intent for completed work.
-			_, pending, err := wk.GetSubscriberWork(o.ChannelID, o.ChannelType, slot, intent.Version)
+			workVersion := intent.Version
+			if intent.SourceWorkVersion != 0 {
+				workVersion = intent.SourceWorkVersion
+			}
+			_, pending, err := wk.GetSubscriberWork(o.ChannelID, o.ChannelType, slot, workVersion)
 			if err != nil {
 				return err
 			}
@@ -662,6 +698,11 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 	if pending > 0 && (pending >= o.MaxPending || weight > o.MaxPending-pending) {
 		return reject("backlog_full")
 	}
+	for _, intent := range intentUpdates {
+		if err := recoverySet(batch, recoveryChannelKey(recoveryIntent, o.ChannelID, o.ChannelType, intent.UID), intent); err != nil {
+			return err
+		}
+	}
 	if e := stageRecoveryBatch(db, batch, staged); e != nil {
 		return e
 	}
@@ -674,7 +715,7 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 		if err := wk.stageSnapshotDenylist(batch, o, at); err != nil {
 			return err
 		}
-		if err := wk.stageSubscriberRevision(db, batch, o); err != nil {
+		if err := wk.stageSubscriberRevision(db, batch, o, legacyRepairComplete); err != nil {
 			return err
 		}
 	}
@@ -916,6 +957,9 @@ func (wk *wukongDB) checkpointSubscriberWork(c SubscriberCheckpoint, group *subs
 		r.LastError = ""
 	}
 	if c.Done {
+		if err := wk.completeSubscriberSnapshotPage(db, batch, w); err != nil {
+			return err
+		}
 		decrement++
 		r.State = "complete"
 		r.CompletedAt = c.At

@@ -177,6 +177,7 @@ func (s *Store) SubmitSubscriberOperation(ctx context.Context, o wkdb.Subscriber
 	if len(o.UIDs) > wkdb.MaxSubscriberOperationMembers {
 		return wkdb.SubscriberReceipt{}, fmt.Errorf("%w: too many subscribers", ErrInvalidSubscriberOperation)
 	}
+	o.SourceProtocol = wkdb.SubscriberAtomicProtocolVersion
 	o.UIDs = canonicalSubscriberUIDs(o.UIDs)
 	o.DenyUIDs = canonicalSubscriberUIDs(o.DenyUIDs)
 	if o.OperationID == "" {

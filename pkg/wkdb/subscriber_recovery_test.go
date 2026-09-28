@@ -63,7 +63,7 @@ func recoveryOperation(id, mode string, uids ...string) SubscriberOperation {
 	for i := range reserve {
 		reserve[i] = 1000 + uint64(i)
 	}
-	return SubscriberOperation{RestoreConversationIDs: reserve, OperationID: id, ChannelID: "group", ChannelType: 2, Mode: mode, UIDs: uids, ConversationIDs: ids, CreatedAt: time.Now().UnixNano(), MaxPending: 128, ReadToMsgSeq: 10}
+	return SubscriberOperation{SourceProtocol: SubscriberAtomicProtocolVersion, RestoreConversationIDs: reserve, OperationID: id, ChannelID: "group", ChannelType: 2, Mode: mode, UIDs: uids, ConversationIDs: ids, CreatedAt: time.Now().UnixNano(), MaxPending: 128, ReadToMsgSeq: 10}
 }
 
 func recoveryWork(t *testing.T, db *wukongDB, o SubscriberOperation) SubscriberWork {

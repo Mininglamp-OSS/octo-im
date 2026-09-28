@@ -12,7 +12,7 @@ import (
 func (s *Server) joinLoop() {
 	seedNodeId, _, _ := seedNode(s.opts.Seed)
 	req := &ClusterJoinReq{
-		SubscriberProtocol: subscriberRevisionProtocolVersion,
+		SubscriberProtocol: subscriberAtomicProtocolVersion,
 		NodeId:             s.opts.ConfigOptions.NodeId,
 		ServerAddr:         s.opts.ServerAddr,
 		Role:               s.opts.Role,

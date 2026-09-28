@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"golang.org/x/sync/errgroup"
@@ -22,27 +24,47 @@ const subscriberProtocolVersion uint32 = 3
 const subscriberRevisionProtocolVersion uint32 = 4
 const subscriberRevisionCapabilityPath = "/rpc/cluster/subscriber-revision-capability"
 const subscriberRevisionActivationPath = "/rpc/cluster/subscriber-revision-activation"
+const subscriberAtomicProtocolVersion = wkdb.SubscriberAtomicProtocolVersion
+const subscriberAtomicCapabilityPath = "/rpc/cluster/subscriber-atomic-capability"
+const subscriberAtomicActivationPath = "/rpc/cluster/subscriber-atomic-activation"
 const subscriberCapabilityPath = "/rpc/cluster/subscriber-capability"
 const subscriberActivationPath = "/rpc/cluster/subscriber-activation"
 
 func (s *Server) checkSubscriberProposal(ctx context.Context, _ uint32, reqs rafttypes.ProposeReqSet) error {
+	needed, err := subscriberProposalProtocol(reqs)
+	if err != nil || needed == 0 {
+		return err
+	}
+	return s.ensureSubscriberProtocol(ctx, needed)
+}
+
+func subscriberProposalProtocol(reqs rafttypes.ProposeReqSet) (uint32, error) {
 	needed := uint32(0)
 	for _, req := range reqs {
 		cmd := &store.CMD{}
 		if err := cmd.Unmarshal(req.Data); err != nil {
-			return err
+			return 0, err
 		}
 		switch cmd.CmdType {
 		case store.CMDSubscriberOperation, store.CMDConversationEffects, store.CMDSubscriberCheckpoint:
 			needed = max(needed, subscriberProtocolVersion)
 		case store.CMDSubscriberReconcile:
-			needed = subscriberRevisionProtocolVersion
+			needed = max(needed, subscriberRevisionProtocolVersion)
+		}
+		if cmd.CmdType == store.CMDSubscriberOperation || cmd.CmdType == store.CMDSubscriberReconcile {
+			var o wkdb.SubscriberOperation
+			if err := json.Unmarshal(cmd.Data, &o); err != nil {
+				return 0, err
+			}
+			if o.SourceProtocol != 0 {
+				if o.SourceProtocol != subscriberAtomicProtocolVersion {
+					return 0, errors.New("unsupported subscriber source protocol")
+				}
+				needed = max(needed, subscriberAtomicProtocolVersion)
+			}
 		}
 	}
-	if needed == 0 {
-		return nil
-	}
-	return s.ensureSubscriberProtocol(ctx, needed)
+	return needed, nil
 }
 
 func (s *Server) ensureSubscriberProtocol(ctx context.Context, required uint32) error {
@@ -63,6 +85,8 @@ func (s *Server) ensureSubscriberProtocol(ctx context.Context, required uint32) 
 	activationPath := subscriberActivationPath
 	if required == subscriberRevisionProtocolVersion {
 		activationPath = subscriberRevisionActivationPath
+	} else if required == subscriberAtomicProtocolVersion {
+		activationPath = subscriberAtomicActivationPath
 	}
 	response, err := s.RequestWithContext(ctx, leader, activationPath, nil)
 	if err != nil {
@@ -86,6 +110,9 @@ func (s *Server) ensureSubscriberProtocol(ctx context.Context, required uint32) 
 // join. Protocol 4 can first be emitted only with a proof covering every
 // current identity; after that, replacing a node cannot lower the requirement.
 func requiredSubscriberJoinProtocol(nodes []*types.Node) uint32 {
+	if subscriberNodesConfirmedAt(nodes, subscriberAtomicProtocolVersion) {
+		return subscriberAtomicProtocolVersion
+	}
 	if subscriberNodesConfirmedAt(nodes, subscriberRevisionProtocolVersion) {
 		return subscriberRevisionProtocolVersion
 	}
@@ -190,6 +217,8 @@ func (s *Server) activateSubscriberProtocolAt(ctx context.Context, required uint
 	capabilityPath := subscriberCapabilityPath
 	if required == subscriberRevisionProtocolVersion {
 		capabilityPath = subscriberRevisionCapabilityPath
+	} else if required == subscriberAtomicProtocolVersion {
+		capabilityPath = subscriberAtomicCapabilityPath
 	}
 	confirmed, probeErr := probeSubscriberNodesAt(ctx, nodes, s.opts.ConfigOptions.NodeId, required, func(ctx context.Context, id uint64) (bool, error) {
 		response, err := s.RequestWithContext(ctx, id, capabilityPath, nil)
@@ -219,6 +248,10 @@ func (r *rpcServer) handleSubscriberActivation(c *wkserver.Context) {
 
 func (r *rpcServer) handleSubscriberRevisionActivation(c *wkserver.Context) {
 	r.handleSubscriberActivationAt(c, subscriberRevisionProtocolVersion)
+}
+
+func (r *rpcServer) handleSubscriberAtomicActivation(c *wkserver.Context) {
+	r.handleSubscriberActivationAt(c, subscriberAtomicProtocolVersion)
 }
 
 func (r *rpcServer) handleSubscriberActivationAt(c *wkserver.Context, required uint32) {

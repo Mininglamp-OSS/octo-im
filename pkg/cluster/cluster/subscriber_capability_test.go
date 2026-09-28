@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
+	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -19,6 +23,33 @@ func TestSubscriberCapabilityRequiresProofBeforeActivation(t *testing.T) {
 	_, err = probeSubscriberNodes(context.Background(), nodes, 1, down)
 	require.ErrorContains(t, err, "unconfirmed")
 	require.False(t, subscriberNodesConfirmed(nodes))
+}
+
+func TestSubscriberAtomicRulesRequireAllReplicasAndStrongestBatchProof(t *testing.T) {
+	command := func(kind store.CMDType, protocol uint32) rafttypes.ProposeReq {
+		data, err := json.Marshal(wkdb.SubscriberOperation{SourceProtocol: protocol})
+		require.NoError(t, err)
+		wire, err := store.NewCMD(kind, data).Marshal()
+		require.NoError(t, err)
+		return rafttypes.ProposeReq{Data: wire}
+	}
+	strict := command(store.CMDSubscriberOperation, subscriberAtomicProtocolVersion)
+	legacy := command(store.CMDSubscriberReconcile, 0)
+	for _, batch := range []rafttypes.ProposeReqSet{{strict, legacy}, {legacy, strict}} {
+		need, err := subscriberProposalProtocol(batch)
+		require.NoError(t, err)
+		require.EqualValues(t, 5, need)
+	}
+	nodes := []*types.Node{{Id: 1, SubscriberProtocol: 5}, {Id: 2, SubscriberProtocol: 4}}
+	require.False(t, subscriberNodesConfirmedAt(nodes, 5))
+	require.EqualValues(t, 4, requiredSubscriberJoinProtocol(nodes))
+	_, err := probeSubscriberNodesAt(context.Background(), nodes, 1, 5, func(context.Context, uint64) (bool, error) { return false, nil })
+	require.Error(t, err)
+	nodes[1].SubscriberProtocol = 5
+	require.True(t, subscriberNodesConfirmedAt(nodes, 5))
+	require.EqualValues(t, 5, requiredSubscriberJoinProtocol(nodes))
+	_, err = subscriberProposalProtocol(rafttypes.ProposeReqSet{command(store.CMDSubscriberReconcile, 6)})
+	require.ErrorContains(t, err, "unsupported")
 }
 
 func TestSubscriberCapabilitySharedProofNeedsNoReachability(t *testing.T) {

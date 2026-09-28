@@ -68,7 +68,7 @@ func (ch *channel) submitSubscriberRecovery(c *wkhttp.Context, o wkdb.Subscriber
 	}
 	if r.State == "rejected" {
 		status := http.StatusUnprocessableEntity
-		if r.Error == "stale_revision" || r.Error == "revision_conflict" || r.Error == "managed_channel" {
+		if r.Error == "stale_revision" || r.Error == "revision_conflict" || r.Error == "managed_channel" || r.Error == "snapshot_upgrade_required" {
 			status = http.StatusConflict
 		}
 		if r.Error == "backlog_full" || r.Error == "restore_set_changed" {
@@ -134,7 +134,19 @@ func (ch *channel) subscriberOperationStatus(c *wkhttp.Context) {
 		c.JSON(http.StatusNotFound, map[string]any{"status": 404, "msg": "operation not found; a timed-out submission may still apply"})
 		return
 	}
-	c.ResponseOKWithData(receipt)
+	response := struct {
+		wkdb.SubscriberReceipt
+		Snapshot *wkdb.SubscriberSnapshotStatus `json:"snapshot,omitempty"`
+	}{SubscriberReceipt: receipt}
+	snapshot, found, err := service.Store.DB().GetSubscriberSnapshotStatus(req.ChannelId, req.ChannelType)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	if found {
+		response.Snapshot = &snapshot
+	}
+	c.ResponseOKWithData(response)
 }
 
 func (ch *channel) subscriberRecoveryStatus(c *wkhttp.Context) {

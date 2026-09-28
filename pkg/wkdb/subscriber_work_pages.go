@@ -34,7 +34,11 @@ func stageSubscriberWork(batch *pebble.Batch, w SubscriberWork) error {
 	}
 	w.Effects = nil
 	w.Paged = true
-	w.Operation = SubscriberOperation{OperationID: w.Operation.OperationID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, Mode: w.Operation.Mode, CreatedAt: w.Operation.CreatedAt}
+	if w.Operation.Mode == "reconcile" && w.Operation.SourceProtocol == SubscriberAtomicProtocolVersion {
+		w.SnapshotDigest = w.Operation.Digest()
+	}
+	w.Operation = SubscriberOperation{OperationID: w.Operation.OperationID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, Mode: w.Operation.Mode, CreatedAt: w.Operation.CreatedAt,
+		SourceProtocol: w.Operation.SourceProtocol, BusinessRevision: w.Operation.BusinessRevision, SnapshotID: w.Operation.SnapshotID, PageIndex: w.Operation.PageIndex, PageCount: w.Operation.PageCount}
 	return recoverySet(batch, recoveryPendingKey(w.SlotID, w.Version), w)
 }
 
