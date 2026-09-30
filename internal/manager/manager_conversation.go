@@ -136,7 +136,21 @@ func (c *ConversationManager) GetUserChannelsFromCache(uid string, conversationT
 		channels := updater.getUserChannels(uid, conversationType)
 		allChannels = append(allChannels, channels...)
 	}
-	return allChannels, nil
+	if !service.Store.DB().SubscriberRecoveryActive() {
+		return allChannels, nil
+	}
+	filtered := allChannels[:0]
+	for _, ch := range allChannels {
+		e, ok, err := service.Store.DB().ConversationLifecycle(uid, ch.ChannelID, ch.ChannelType)
+		if err != nil {
+			return nil, err
+		}
+		if ok && e.Deleted {
+			continue
+		}
+		filtered = append(filtered, ch)
+	}
+	return filtered, nil
 }
 
 // getShardIndex 根据频道 ID 获取分片索引

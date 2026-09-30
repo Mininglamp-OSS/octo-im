@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -26,6 +27,12 @@ func newRpcServer(s *Server) *rpcServer {
 }
 
 func (r *rpcServer) setRoutes() {
+	r.s.netServer.Route(subscriberCapabilityPath, func(c *wkserver.Context) { c.Write([]byte(fmt.Sprint(subscriberProtocolVersion))) })
+	r.s.netServer.Route(subscriberRevisionCapabilityPath, func(c *wkserver.Context) { c.Write([]byte(fmt.Sprint(subscriberRevisionProtocolVersion))) })
+	r.s.netServer.Route(subscriberRevisionActivationPath, r.handleSubscriberRevisionActivation)
+	r.s.netServer.Route(subscriberAtomicCapabilityPath, func(c *wkserver.Context) { c.Write([]byte(fmt.Sprint(subscriberAtomicProtocolVersion))) })
+	r.s.netServer.Route(subscriberAtomicActivationPath, r.handleSubscriberAtomicActivation)
+	r.s.netServer.Route(subscriberActivationPath, r.handleSubscriberActivation)
 	// 频道提案
 	r.s.netServer.Route("/rpc/channel/propose", r.handleChannelPropose)
 
@@ -343,6 +350,11 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 		c.Write(data)
 		return
 	}
+	required := requiredSubscriberJoinProtocol(r.s.cfgServer.SubscriberNodes())
+	if (r.s.opts.SubscriberRecoveryEnabled || r.s.db.SubscriberRecoveryActive() || required > subscriberProtocolVersion) && req.SubscriberProtocol < required {
+		c.WriteErr(fmt.Errorf("joining node must support subscriber protocol %d", required))
+		return
+	}
 
 	allowVote := false
 	if req.Role == types.NodeRole_NodeRoleReplica {
@@ -361,18 +373,24 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 	resp.Nodes = nodeInfos
 
 	err := r.s.cfgServer.ProposeJoin(&types.Node{
-		Id:          req.NodeId,
-		ClusterAddr: req.ServerAddr,
-		Join:        true,
-		Online:      true,
-		Role:        req.Role,
-		AllowVote:   allowVote,
-		CreatedAt:   time.Now().Unix(),
-		Status:      types.NodeStatus_NodeStatusWillJoin,
+		SubscriberProtocol: req.SubscriberProtocol,
+		Id:                 req.NodeId,
+		ClusterAddr:        req.ServerAddr,
+		Join:               true,
+		Online:             true,
+		Role:               req.Role,
+		AllowVote:          allowVote,
+		CreatedAt:          time.Now().Unix(),
+		Status:             types.NodeStatus_NodeStatusWillJoin,
 	})
 	if err != nil {
 		r.Error("proposeJoin failed", zap.Error(err))
 		c.WriteErr(err)
+		return
+	}
+
+	if required := requiredSubscriberJoinProtocol(r.s.cfgServer.SubscriberNodes()); required > subscriberProtocolVersion && required > req.SubscriberProtocol {
+		c.WriteErr(fmt.Errorf("subscriber protocol activated while node join was pending; upgrade the joining node"))
 		return
 	}
 

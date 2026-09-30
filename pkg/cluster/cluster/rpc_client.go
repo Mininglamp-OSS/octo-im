@@ -48,6 +48,12 @@ func (r *rpcClient) RequestChannelProposeBatchUntilApplied(nodeId uint64, channe
 
 // RequestSlotProposeBatchUntilApplied 向指定节点请求槽提案
 func (r *rpcClient) RequestSlotProposeBatchUntilApplied(nodeId uint64, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return r.RequestSlotProposeBatchUntilAppliedWithContext(ctx, nodeId, slotId, reqs)
+}
+
+func (r *rpcClient) RequestSlotProposeBatchUntilAppliedWithContext(ctx context.Context, nodeId uint64, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
 	req := &slotProposeReq{
 		SlotId: slotId,
 		reqs:   reqs,
@@ -56,10 +62,14 @@ func (r *rpcClient) RequestSlotProposeBatchUntilApplied(nodeId uint64, slotId ui
 	if err != nil {
 		return nil, err
 	}
-	body, err := r.request(nodeId, "/rpc/slot/propose", data)
+	response, err := r.s.RequestWithContext(ctx, nodeId, "/rpc/slot/propose", data)
 	if err != nil {
 		return nil, err
 	}
+	if response.Status != proto.StatusOK {
+		return nil, fmt.Errorf("slot proposal: %s", response.Body)
+	}
+	body := response.Body
 
 	resps := types.ProposeRespSet{}
 	if err := resps.Unmarshal(body); err != nil {

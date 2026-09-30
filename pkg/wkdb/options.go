@@ -11,6 +11,8 @@ type Options struct {
 	MemTableSize int
 
 	BatchPerSize int // 每个batch里key的大小
+
+	SubscriberRecoveryEnabled bool
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -70,5 +72,11 @@ func WithShardNum(shardNum int) Option {
 func WithMemTableSize(size int) Option {
 	return func(o *Options) {
 		o.MemTableSize = size
+	}
+}
+
+func WithSubscriberRecoveryEnabled(enabled bool) Option {
+	return func(o *Options) {
+		o.SubscriberRecoveryEnabled = enabled
 	}
 }

@@ -2,7 +2,6 @@ package wkdb
 
 import (
 	"encoding/json"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -79,6 +78,24 @@ type MessageEventState struct {
 }
 
 func (wk *wukongDB) AppendMessageEventWithState(event *MessageEvent) (*MessageEvent, *MessageEventState, error) {
+	return wk.appendMessageEvent(event, nil)
+}
+
+// A bounded per-slot marker shares the projection transaction, so even the
+// crash gap before Store checkpoints cannot append the same delta twice.
+func (wk *wukongDB) AppendMessageEventForSlot(slot uint32, index uint64, event *MessageEvent) error {
+	_, _, err := wk.appendMessageEvent(event, &eventLogPosition{slot, index})
+	return err
+}
+
+type eventLogPosition struct {
+	slot  uint32
+	index uint64
+}
+
+const messageEventApplied byte = 8
+
+func (wk *wukongDB) appendMessageEvent(event *MessageEvent, position *eventLogPosition) (*MessageEvent, *MessageEventState, error) {
 	if event == nil {
 		return nil, nil, ErrNotFound
 	}
@@ -104,6 +121,16 @@ func (wk *wukongDB) AppendMessageEventWithState(event *MessageEvent) (*MessageEv
 	lockKey := "message_event:" + event.ClientMsgNo
 	wk.dblock.userLock.Lock(lockKey)
 	defer wk.dblock.userLock.Unlock(lockKey)
+	db := wk.channelDb(event.ChannelId, event.ChannelType)
+	if position != nil {
+		var applied uint64
+		if _, err := recoveryRead(db, recoverySlotKey(messageEventApplied, position.slot), &applied); err != nil {
+			return nil, nil, err
+		}
+		if position.index <= applied {
+			return nil, nil, nil
+		}
+	}
 
 	eventState, err := wk.GetMessageEventState(event.ChannelId, event.ChannelType, event.ClientMsgNo, event.EventKey)
 	if err != nil {
@@ -125,7 +152,6 @@ func (wk *wukongDB) AppendMessageEventWithState(event *MessageEvent) (*MessageEv
 		return wk.buildProjectedEvent(event.ChannelId, event.ChannelType, event.ClientMsgNo, *eventState), eventState, nil
 	}
 
-	db := wk.channelDb(event.ChannelId, event.ChannelType)
 	batch := db.NewBatch()
 	defer batch.Close()
 
@@ -148,11 +174,15 @@ func (wk *wukongDB) AppendMessageEventWithState(event *MessageEvent) (*MessageEv
 	if err != nil {
 		return nil, nil, err
 	}
-	fmt.Println("NewMessageEventStateKey---->", event.ChannelId, event.ChannelType, event.ClientMsgNo, event.EventKey)
 	if err := batch.Set(key.NewMessageEventStateKey(mergedState.ChannelId, mergedState.ChannelType, mergedState.ClientMsgNo, mergedState.EventKey), stateBytes, wk.noSync); err != nil {
 		return nil, nil, err
 	}
 
+	if position != nil {
+		if err := recoverySet(batch, recoverySlotKey(messageEventApplied, position.slot), position.index); err != nil {
+			return nil, nil, err
+		}
+	}
 	if err := batch.Commit(wk.sync); err != nil {
 		return nil, nil, err
 	}

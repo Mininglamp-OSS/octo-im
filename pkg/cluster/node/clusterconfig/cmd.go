@@ -22,6 +22,7 @@ const (
 	CMDTypeSlotUpdate                        // 槽更新
 	CMDTypeNodeStatusChange                  // 节点状态改变
 	CMDTypeSlotStatusChange                  // 槽状态改变
+	CMDTypeSubscriberProtocols               // node-identity capability confirmations
 
 )
 
@@ -31,6 +32,8 @@ func (c CMDType) Uint16() uint16 {
 
 func (c CMDType) String() string {
 	switch c {
+	case CMDTypeSubscriberProtocols:
+		return "CMDTypeSubscriberProtocols"
 	case CMDTypeConfigChange:
 		return "CMDTypeConfigChange"
 	case CMDTypeConfigApiServerAddrChange:

@@ -1,13 +1,23 @@
 package store
 
 import (
+	"errors"
+	"sync"
+	"sync/atomic"
+
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/lni/goutils/syncutil"
 )
 
+var ErrLegacySubscriberMutationDisabled = errors.New("legacy subscriber mutation is disabled while subscriber recovery is active")
+
 type Store struct {
-	opts *Options
+	applyLocks      sync.Map // slot ID -> *sync.Mutex; independent slots do not block
+	opts            *Options
+	recovery        *subscriberRecovery
+	recoveryEnabled atomic.Bool
 	wklog.Log
 
 	wdb wkdb.DB
@@ -24,8 +34,21 @@ func New(opts *Options) *Store {
 		channelCfgCh: make(chan *channelCfgReq, 2048),
 		stopper:      syncutil.NewStopper(),
 	}
+	s.recoveryEnabled.Store(opts.SubscriberRecoveryEnabled)
 
 	return s
+}
+
+func (s *Store) rejectLegacySubscriberMutation(channelType uint8) error {
+	// Subscriber recovery intentionally excludes person channels. Preserve
+	// their existing denylist path while fencing every managed channel.
+	if channelType == wkproto.ChannelTypePerson {
+		return nil
+	}
+	if s.recoveryEnabled.Load() || (s.wdb != nil && s.wdb.SubscriberRecoveryActive()) {
+		return ErrLegacySubscriberMutationDisabled
+	}
+	return nil
 }
 
 func (s *Store) NextPrimaryKey() uint64 {
@@ -55,6 +78,10 @@ func (s *Store) Start() error {
 }
 
 func (s *Store) Stop() {
+	if s.recovery != nil {
+		s.recovery.cancel()
+		s.recovery.wg.Wait()
+	}
 	s.stopper.Stop()
 }
 

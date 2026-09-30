@@ -84,6 +84,7 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 		resps        []*types.ProposeResp
 		err          error
 		needWait     = true
+		maxLogIndex  uint64
 	)
 	raft := rg.raftList.get(raftKey)
 	if raft == nil {
@@ -98,7 +99,7 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 		if err != nil {
 			return nil, err
 		}
-		maxLogIndex := resps[len(resps)-1].Index
+		maxLogIndex = resps[len(resps)-1].Index
 		// 如果最大的日志下标大于已应用的日志下标，则不需要等待
 		// 如果最大的日志下标大于已应用的日志下标，则不需要等待
 		if raft.AppliedIndex() >= maxLogIndex {
@@ -109,7 +110,7 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 		}
 	} else {
 		resps, err = rg.proposeBatchTimeout(ctx, raft, reqs, func(logs []types.Log) {
-			maxLogIndex := logs[len(logs)-1].Index
+			maxLogIndex = logs[len(logs)-1].Index
 
 			// 如果最大的日志下标大于已应用的日志下标，则不需要等待
 			if raft.AppliedIndex() >= maxLogIndex {
@@ -134,11 +135,20 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 			rg.wait.put(applyProcess)
 			return resps, nil
 		case <-ctx.Done():
-			rg.Error("propose batch until applied timeout", zap.String("raftKey", raftKey), zap.Uint64("leader", raft.LeaderId()), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
-			// rg.wait.put(applyProcess) // 这里不需要put，因为如果这里put了，那么在waitApply中wait会出现close of nil channel
+			// The apply notification and the context deadline can become ready in
+			// the same scheduler turn. Detach under the wait-bucket lock and treat
+			// an already completed proposal as success instead of reporting a
+			// false timeout.
+			if rg.wait.put(applyProcess) {
+				return resps, nil
+			}
+			rg.Error("propose batch until applied timeout", zap.String("raftKey", raftKey), zap.Uint64("leader", raft.LeaderId()), zap.Any("resps", resps), zap.Uint64("maxIndex", maxLogIndex))
 			return nil, ctx.Err()
 		case <-rg.stopper.ShouldStop():
-			rg.Error("propose batch until applied stopped", zap.String("raftKey", raftKey), zap.Any("resps", resps), zap.String("progress", applyProcess.String()))
+			if rg.wait.put(applyProcess) {
+				return resps, nil
+			}
+			rg.Error("propose batch until applied stopped", zap.String("raftKey", raftKey), zap.Any("resps", resps), zap.Uint64("maxIndex", maxLogIndex))
 			return nil, ErrGroupStopped
 		}
 	} else {

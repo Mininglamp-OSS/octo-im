@@ -1,12 +1,14 @@
 package slot
 
 import (
+	"context"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 )
 
 type Options struct {
+	BeforePropose func(context.Context, uint32, types.ProposeReqSet) error
 	// 节点Id
 	NodeId uint64
 	// 数据目录
@@ -23,6 +25,12 @@ type Options struct {
 	RPC icluster.RPC
 	// OnApply 应用日志回调
 	OnApply func(slotId uint32, logs []types.Log) error
+	// ReplaySafeApply promises that OnApply durably commits both its effects
+	// and replay protection before returning. Only then may the separate Raft
+	// applied cursor lag on a crash. Log append durability is never relaxed.
+	ReplaySafeApply bool
+	// ApplyErrorRetry enables tick-paced retries for state-machine apply errors.
+	ApplyErrorRetry bool
 
 	// OnSaveConfig 保存槽配置
 	OnSaveConfig func(slotId uint32, cfg types.Config) error
@@ -41,6 +49,10 @@ func NewOptions(opt ...Option) *Options {
 }
 
 type Option func(*Options)
+
+func WithBeforePropose(f func(context.Context, uint32, types.ProposeReqSet) error) Option {
+	return func(o *Options) { o.BeforePropose = f }
+}
 
 func WithNodeId(nodeId uint64) Option {
 	return func(o *Options) {
@@ -81,6 +93,22 @@ func WithSlotCount(slotCount uint32) Option {
 func WithOnApply(onApply func(slotId uint32, logs []types.Log) error) Option {
 	return func(o *Options) {
 		o.OnApply = onApply
+		o.ReplaySafeApply = false
+	}
+}
+
+// WithReplaySafeOnApply is for a state machine with durable per-entry replay
+// protection. Arbitrary callbacks must use WithOnApply instead.
+func WithReplaySafeOnApply(onApply func(slotId uint32, logs []types.Log) error) Option {
+	return func(o *Options) {
+		o.OnApply = onApply
+		o.ReplaySafeApply = true
+	}
+}
+
+func WithApplyErrorRetry(enabled bool) Option {
+	return func(o *Options) {
+		o.ApplyErrorRetry = enabled
 	}
 }
 
