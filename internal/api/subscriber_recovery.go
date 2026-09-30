@@ -78,6 +78,20 @@ func (ch *channel) submitSubscriberRecovery(c *wkhttp.Context, o wkdb.Subscriber
 		c.JSON(status, map[string]any{"status": status, "msg": r.Error, "data": r})
 		return
 	}
+	if options.G.SubscriberRecovery.AsyncTargetEnabled {
+		accepted, err := service.Store.AcceptSubscriberOperation(ctx, r)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, map[string]any{
+				"status":       http.StatusServiceUnavailable,
+				"msg":          err.Error(),
+				"operation_id": r.OperationID,
+				"data":         accepted,
+			})
+			return
+		}
+		c.ResponseOK()
+		return
+	}
 	completed, err := service.Store.CompleteSubscriberOperation(ctx, r)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, map[string]any{
@@ -159,7 +173,7 @@ func (ch *channel) subscriberRecoveryStatus(c *wkhttp.Context) {
 	for _, p := range parts {
 		total += p.PendingUnits
 	}
-	c.ResponseOKWithData(map[string]any{"runtime": service.Store.SubscriberRecoveryStats(), "pending_units": total, "partitions": parts})
+	c.ResponseOKWithData(map[string]any{"runtime": service.Store.SubscriberRecoveryStats(), "group_commit": service.Store.DB().RecoveryGroupCommitStats(), "pending_units": total, "partitions": parts})
 }
 
 func (s *Server) subscriberReadFloor(ctx context.Context, ch string, tp uint8) (uint64, error) {

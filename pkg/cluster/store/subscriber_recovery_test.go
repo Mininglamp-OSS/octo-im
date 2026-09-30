@@ -123,6 +123,45 @@ func TestCompleteSubscriberOperationDrainsOnRequestPath(t *testing.T) {
 	require.Empty(t, parts)
 }
 
+func TestAcceptSubscriberOperationFencesWithoutTargetFanout(t *testing.T) {
+	s, _ := recoveryStore(t)
+	cfg := recoveryConfig()
+	cfg.Interval = time.Hour
+	fenced := make(chan wkdb.SubscriberWork, 1)
+	require.NoError(t, s.StartSubscriberRecovery(cfg, func(_ context.Context, work wkdb.SubscriberWork) error {
+		fenced <- work
+		return nil
+	}))
+	receipt, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{
+		OperationID: "async", ChannelID: "async-group", ChannelType: 2, Mode: "add", UIDs: []string{"a"},
+	})
+	require.NoError(t, err)
+	accepted, err := s.AcceptSubscriberOperation(context.Background(), receipt)
+	require.NoError(t, err)
+	require.Equal(t, "pending", accepted.State)
+	require.Equal(t, receipt.Version, (<-fenced).Version)
+	latest, ok, err := s.GetSubscriberReceipt(receipt.ChannelID, receipt.ChannelType, receipt.OperationID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 0, latest.Completed)
+}
+
+func TestAcceptSubscriberOperationRejectsLeaderMovement(t *testing.T) {
+	s, slots := recoveryStore(t)
+	cfg := recoveryConfig()
+	cfg.Interval = time.Hour
+	require.NoError(t, s.StartSubscriberRecovery(cfg, func(context.Context, wkdb.SubscriberWork) error {
+		slots.leader.Store(2)
+		return nil
+	}))
+	receipt, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{
+		OperationID: "move", ChannelID: "move-group", ChannelType: 2, Mode: "add", UIDs: []string{"a"},
+	})
+	require.NoError(t, err)
+	_, err = s.AcceptSubscriberOperation(context.Background(), receipt)
+	require.ErrorContains(t, err, "changed after routing fence")
+}
+
 func TestRecoveryDisbandPreservesMembersAndConversations(t *testing.T) {
 	s, _ := recoveryStore(t)
 	cfg := recoveryConfig()

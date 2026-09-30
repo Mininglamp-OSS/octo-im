@@ -106,6 +106,7 @@ func New(opts *Options) *Server {
 			wkdb.WithMemTableSize(opts.DB.WKDbMemTableSize),
 			wkdb.WithSlotCount(int(opts.ConfigOptions.SlotCount)),
 			wkdb.WithSubscriberRecoveryEnabled(opts.SubscriberRecoveryEnabled),
+			wkdb.WithRecoveryGroupCommit(opts.RecoveryGroupCommit),
 		),
 	)
 

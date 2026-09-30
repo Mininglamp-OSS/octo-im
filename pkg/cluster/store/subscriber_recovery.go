@@ -262,6 +262,50 @@ func (s *Store) GetSubscriberReceipt(ch string, tp uint8, id string) (wkdb.Subsc
 	return s.wdb.GetSubscriberReceipt(ch, tp, id)
 }
 
+// AcceptSubscriberOperation establishes the asynchronous HTTP completion
+// boundary. Source admission is already Sync-durable when this is called. The
+// routing/tag fence must also complete and source leadership must remain local
+// before a caller may receive 2xx. Target projection is deliberately left to
+// the durable source-work scanner.
+func (s *Store) AcceptSubscriberOperation(ctx context.Context, receipt wkdb.SubscriberReceipt) (wkdb.SubscriberReceipt, error) {
+	if s.recovery == nil {
+		return receipt, errors.New("subscriber recovery is disabled")
+	}
+	if receipt.State != "pending" && receipt.State != "complete" {
+		return receipt, errors.New("subscriber operation was not durably accepted")
+	}
+	slot := s.opts.Slot.GetSlotId(receipt.ChannelID)
+	if s.opts.Slot.SlotLeaderId(slot) != s.opts.NodeId {
+		return receipt, errors.New("subscriber source leader changed before routing fence")
+	}
+	work, found, err := s.wdb.GetSubscriberWork(receipt.ChannelID, receipt.ChannelType, slot, receipt.Version)
+	if err != nil {
+		return receipt, err
+	}
+	// A complete receipt may legitimately have no remaining work. Pending work
+	// must always be readable; otherwise returning 2xx would lose an accepted task.
+	if !found {
+		if receipt.State == "complete" {
+			return receipt, nil
+		}
+		return receipt, errors.New("subscriber recovery work not visible")
+	}
+	if err := s.recovery.finalize(ctx, work); err != nil {
+		return receipt, fmt.Errorf("subscriber routing fence: %w", err)
+	}
+	if s.opts.Slot.SlotLeaderId(slot) != s.opts.NodeId {
+		return receipt, errors.New("subscriber source leader changed after routing fence")
+	}
+	latest, ok, err := s.wdb.GetSubscriberReceipt(receipt.ChannelID, receipt.ChannelType, receipt.OperationID)
+	if err != nil {
+		return receipt, err
+	}
+	if !ok || latest.Digest != receipt.Digest || latest.State == "rejected" || latest.State == "unknown" {
+		return receipt, errors.New("subscriber receipt changed before asynchronous acceptance")
+	}
+	return latest, nil
+}
+
 // CompleteSubscriberOperation runs the durable work on the request path. The
 // record is committed before this method is called, so a timeout or process
 // failure leaves only the unfinished tail for background recovery.
@@ -561,12 +605,22 @@ func (s *Store) runSubscriberRecovery(ctx context.Context, worker int) {
 				w := work[0]
 				// Persist retry scheduling so failover/restart cannot create a retry storm.
 				wait := 250 * time.Millisecond * time.Duration(1<<min(w.Attempts, 7))
+				blocked := w.Attempts+1 >= 20
+				var permanent *PermanentApplyError
+				if errors.As(err, &permanent) {
+					blocked = true
+				}
+				if blocked {
+					// Keep poison work durable and probe it at most hourly. Operators can
+					// inspect the receipt error without allowing false completion or GC.
+					wait = time.Hour
+				}
 				retryCtx, retryCancel := context.WithTimeout(ctx, r.config.Timeout)
 				message := err.Error()
 				if len(message) > 512 {
 					message = message[:512]
 				}
-				checkpointErr := s.proposeRecovery(retryCtx, w.SlotID, CMDSubscriberCheckpoint, wkdb.SubscriberCheckpoint{SlotID: w.SlotID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, OperationID: w.Operation.OperationID, Version: w.Version, Previous: w.Next, Next: w.Next, RetryAt: time.Now().Add(wait).UnixNano(), Error: message})
+				checkpointErr := s.proposeRecovery(retryCtx, w.SlotID, CMDSubscriberCheckpoint, wkdb.SubscriberCheckpoint{SlotID: w.SlotID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, OperationID: w.Operation.OperationID, Version: w.Version, Previous: w.Next, Next: w.Next, RetryAt: time.Now().Add(wait).UnixNano(), Error: message, Blocked: blocked})
 				retryCancel()
 				if checkpointErr != nil {
 					err = errors.Join(err, fmt.Errorf("persist subscriber retry: %w", checkpointErr))

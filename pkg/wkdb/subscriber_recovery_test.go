@@ -165,6 +165,7 @@ func TestSubscriberRecoveryRestartCheckpointAndReset(t *testing.T) {
 	cp.Next = 1
 	cp.RetryAt = time.Now().Add(time.Minute).UnixNano()
 	cp.Error = "target unavailable"
+	cp.Blocked = true
 	require.NoError(t, db.CheckpointSubscriberWork(cp))
 	require.NoError(t, db.CheckpointSubscriberWork(cp))
 	require.NoError(t, db.Close())
@@ -174,9 +175,11 @@ func TestSubscriberRecoveryRestartCheckpointAndReset(t *testing.T) {
 	require.Equal(t, 1, w.Next)
 	require.Equal(t, uint32(1), w.Attempts)
 	require.Equal(t, cp.RetryAt, w.NextAttempt)
+	require.True(t, w.Blocked)
 	r, _, err := db.GetSubscriberReceipt("group", 2, "reset")
 	require.NoError(t, err)
 	require.Equal(t, "target unavailable", r.LastError)
+	require.Equal(t, "blocked", r.State)
 	stale := cp
 	stale.Previous = 0
 	stale.Next = 3

@@ -189,6 +189,7 @@ type SubscriberWork struct {
 	LastRetryAt    int64                `json:"last_retry_at,omitempty"`
 	Attempts       uint32               `json:"attempts"`
 	NextAttempt    int64                `json:"next_attempt,omitempty"`
+	Blocked        bool                 `json:"blocked,omitempty"`
 	SlotID         uint32               `json:"slot_id"`
 	Operation      SubscriberOperation  `json:"operation"`
 	Version        uint64               `json:"version"`
@@ -199,6 +200,7 @@ type SubscriberWork struct {
 type SubscriberCheckpoint struct {
 	RetryAt     int64  `json:"retry_at,omitempty"`
 	Error       string `json:"error,omitempty"`
+	Blocked     bool   `json:"blocked,omitempty"`
 	SlotID      uint32 `json:"slot_id"`
 	ChannelID   string `json:"channel_id"`
 	ChannelType uint8  `json:"channel_type"`
@@ -948,9 +950,13 @@ func (wk *wukongDB) checkpointSubscriberWork(c SubscriberCheckpoint, group *subs
 		w.LastRetryAt = c.RetryAt
 		w.Attempts++
 		w.NextAttempt = c.RetryAt
+		w.Blocked = c.Blocked
 		r.Attempts = w.Attempts
 		r.NextAttempt = c.RetryAt
 		r.LastError = c.Error
+		if c.Blocked {
+			r.State = "blocked"
+		}
 	} else {
 		w.NextAttempt = 0
 		r.NextAttempt = 0

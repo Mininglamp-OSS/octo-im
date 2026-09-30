@@ -32,6 +32,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkcache"
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
@@ -213,6 +214,11 @@ func New(opts *options.Options) *Server {
 			cluster.WithAuth(s.opts.Auth),
 			cluster.WithIsCmdChannel(s.opts.IsCmdChannel),
 			cluster.WithSubscriberRecoveryEnabled(s.opts.SubscriberRecovery.Enabled),
+			cluster.WithRecoveryGroupCommit(wkdb.RecoveryGroupCommitOptions{
+				Enabled: s.opts.SubscriberRecovery.GroupCommit.Enabled, Window: s.opts.SubscriberRecovery.GroupCommit.Window,
+				MaxCount: s.opts.SubscriberRecovery.GroupCommit.MaxCount, MaxBytes: s.opts.SubscriberRecovery.GroupCommit.MaxBytes,
+				OldestAge: s.opts.SubscriberRecovery.GroupCommit.OldestAge, QueueHard: s.opts.SubscriberRecovery.GroupCommit.QueueHard,
+			}),
 			cluster.WithAppVersion(version.Version),
 		),
 

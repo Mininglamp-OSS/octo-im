@@ -320,7 +320,7 @@ func (wk *wukongDB) applyConversationEffectBatch(effects []ConversationEffect) e
 	// Same-shard rows and relations use one atomic batch. Cross-shard writes
 	// share one wait-all barrier instead of two serial fsync rounds. On a
 	// partial failure, RelationDone stays false and the target is not ACKed.
-	if err := commitRecoveryBatches(stageBatches, wk.sync, func(shard uint32) {
+	if err := wk.commitRecoveryBatches(stageBatches, wk.sync, func(shard uint32) {
 		for _, effect := range stageRows[shard] {
 			wk.lifecycleCacheVersion[key.HashWithString(effect.UID)%64].Add(1)
 			wk.conversationCache.InvalidateUserConversations(effect.UID)
@@ -352,6 +352,38 @@ func (wk *wukongDB) applyConversationEffectBatch(effects []ConversationEffect) e
 			wk.lifecycleCacheVersion[key.HashWithString(effect.UID)%64].Add(1)
 		}
 	})
+}
+
+func (wk *wukongDB) commitRecoveryBatches(batches map[uint32]*pebble.Batch, options *pebble.WriteOptions, committed func(uint32)) error {
+	if !options.Sync || len(wk.recoveryGroupCommit) == 0 {
+		return commitRecoveryBatches(batches, options, committed)
+	}
+	shards := make([]int, 0, len(batches))
+	for shard := range batches {
+		shards = append(shards, int(shard))
+	}
+	sort.Ints(shards)
+	errs := make([]error, len(shards))
+	var wg sync.WaitGroup
+	for i, shard := range shards {
+		wg.Add(1)
+		go func(i, shard int) {
+			defer wg.Done()
+			errs[i] = wk.recoveryGroupCommit[shard].Submit(batches[uint32(shard)])
+		}(i, shard)
+	}
+	wg.Wait()
+	var firstErr error
+	for i, shard := range shards {
+		if errs[i] != nil {
+			if firstErr == nil {
+				firstErr = errs[i]
+			}
+		} else if committed != nil {
+			committed(uint32(shard))
+		}
+	}
+	return firstErr
 }
 
 func closeRecoveryBatches(batches map[uint32]*pebble.Batch) {
