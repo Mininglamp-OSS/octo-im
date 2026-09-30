@@ -1,16 +1,5 @@
 package wkdb
 
-import "time"
-
-type RecoveryGroupCommitOptions struct {
-	Enabled   bool
-	Window    time.Duration
-	MaxCount  int
-	MaxBytes  int
-	OldestAge time.Duration
-	QueueHard int
-}
-
 type Options struct {
 	NodeId            uint64
 	DataDir           string
@@ -24,19 +13,17 @@ type Options struct {
 	BatchPerSize int // 每个batch里key的大小
 
 	SubscriberRecoveryEnabled bool
-	RecoveryGroupCommit       RecoveryGroupCommitOptions
 }
 
 func NewOptions(opt ...Option) *Options {
 	o := &Options{
-		DataDir:             "./data",
-		ConversationLimit:   10000,
-		SlotCount:           128,
-		EnableCost:          true,
-		ShardNum:            8,
-		MemTableSize:        16 * 1024 * 1024,
-		BatchPerSize:        10240,
-		RecoveryGroupCommit: RecoveryGroupCommitOptions{Window: 2 * time.Millisecond, MaxCount: 32, MaxBytes: 1 << 20, OldestAge: 5 * time.Millisecond, QueueHard: 256},
+		DataDir:           "./data",
+		ConversationLimit: 10000,
+		SlotCount:         128,
+		EnableCost:        true,
+		ShardNum:          8,
+		MemTableSize:      16 * 1024 * 1024,
+		BatchPerSize:      10240,
 	}
 	for _, f := range opt {
 		f(o)
@@ -92,8 +79,4 @@ func WithSubscriberRecoveryEnabled(enabled bool) Option {
 	return func(o *Options) {
 		o.SubscriberRecoveryEnabled = enabled
 	}
-}
-
-func WithRecoveryGroupCommit(options RecoveryGroupCommitOptions) Option {
-	return func(o *Options) { o.RecoveryGroupCommit = options }
 }

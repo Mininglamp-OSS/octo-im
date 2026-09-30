@@ -32,7 +32,6 @@ type wukongDB struct {
 	subscriberRecoveryMu  []sync.Mutex
 	recoveryUserLocks     [64]sync.Mutex
 	recoveryActive        atomic.Bool
-	recoveryGroupCommit   []*recoveryShardCoordinator
 	dbs                   []*pebble.DB
 	wkdbs                 []*BatchDB
 	shardNum              uint32 // 分区数量，这个一但设置就不能修改
@@ -155,19 +154,10 @@ func (wk *wukongDB) defaultPebbleOptions() *pebble.Options {
 }
 
 func (wk *wukongDB) Open() error {
-
 	wk.dblock.start()
 
 	opts := wk.defaultPebbleOptions()
-	wk.Info("subscriber recovery durability configuration",
-		zap.Bool("groupCommitEnabled", wk.opts.RecoveryGroupCommit.Enabled),
-		zap.Duration("groupCommitWindow", wk.opts.RecoveryGroupCommit.Window),
-		zap.Int("groupCommitMaxCount", wk.opts.RecoveryGroupCommit.MaxCount),
-		zap.Int("groupCommitMaxBytes", wk.opts.RecoveryGroupCommit.MaxBytes),
-		zap.Duration("groupCommitOldestAge", wk.opts.RecoveryGroupCommit.OldestAge),
-		zap.Int("groupCommitQueueHard", wk.opts.RecoveryGroupCommit.QueueHard),
-		zap.Duration("wkdbWALMinSyncInterval", 20*time.Millisecond),
-		zap.String("targetProjectionDurability", "sync"))
+	wk.Info("subscriber recovery durability configuration", zap.Duration("wkdbWALMinSyncInterval", 20*time.Millisecond), zap.String("targetProjectionDurability", "sync"))
 	for i := 0; i < int(wk.shardNum); i++ {
 
 		db, err := pebble.Open(filepath.Join(wk.opts.DataDir, "wukongimdb", fmt.Sprintf("shard%03d", i)), opts)
@@ -190,15 +180,6 @@ func (wk *wukongDB) Open() error {
 		wkdb.Start()
 		wk.wkdbs = append(wk.wkdbs, wkdb)
 	}
-	if wk.opts.RecoveryGroupCommit.Enabled {
-		if err := validateRecoveryGroupCommit(wk.opts.RecoveryGroupCommit); err != nil {
-			wk.closeOpenedShards()
-			return err
-		}
-		for _, db := range wk.dbs {
-			wk.recoveryGroupCommit = append(wk.recoveryGroupCommit, newRecoveryShardCoordinator(db, wk.opts.RecoveryGroupCommit))
-		}
-	}
 
 	go wk.collectMetricsLoop()
 
@@ -220,9 +201,6 @@ func (wk *wukongDB) closeOpenedShards() {
 
 func (wk *wukongDB) Close() error {
 	wk.cancelFunc()
-	for _, coordinator := range wk.recoveryGroupCommit {
-		coordinator.Close()
-	}
 
 	// 停止缓存管理器
 	if wk.cacheManager != nil {
@@ -288,18 +266,6 @@ func (wk *wukongDB) channelSlotId(channelId string) uint32 {
 // GetShardNum 获取数据库分片数量
 func (wk *wukongDB) GetShardNum() int {
 	return int(wk.shardNum)
-}
-
-func (wk *wukongDB) RecoveryGroupCommitStats() RecoveryGroupCommitStats {
-	stats := RecoveryGroupCommitStats{Enabled: len(wk.recoveryGroupCommit) > 0}
-	for _, c := range wk.recoveryGroupCommit {
-		stats.QueueDepth += c.queued.Load()
-		stats.Inflight += c.inflight.Load()
-		stats.PhysicalCommits += c.commits.Load()
-		stats.Fragments += c.fragments.Load()
-		stats.MutationBytes += c.bytes.Load()
-	}
-	return stats
 }
 
 // GetChannelShardIndex 获取频道所在的分片索引

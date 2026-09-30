@@ -7,7 +7,6 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/clusterconfig"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
-	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 )
 
 type Options struct {
@@ -61,7 +60,6 @@ type Options struct {
 	IsCmdChannel func(channel string) bool
 
 	SubscriberRecoveryEnabled bool
-	RecoveryGroupCommit       wkdb.RecoveryGroupCommitOptions
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -222,8 +220,4 @@ func WithSubscriberRecoveryEnabled(enabled bool) Option {
 	return func(o *Options) {
 		o.SubscriberRecoveryEnabled = enabled
 	}
-}
-
-func WithRecoveryGroupCommit(options wkdb.RecoveryGroupCommitOptions) Option {
-	return func(o *Options) { o.RecoveryGroupCommit = options }
 }

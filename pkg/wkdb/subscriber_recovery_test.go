@@ -180,13 +180,23 @@ func TestSubscriberRecoveryRestartCheckpointAndReset(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "target unavailable", r.LastError)
 	require.Equal(t, "blocked", r.State)
+	progress := SubscriberCheckpoint{SlotID: 1, ChannelID: "group", ChannelType: 2, OperationID: "reset", Version: 11, Previous: 1, Next: 2}
+	require.NoError(t, db.CheckpointSubscriberWork(progress))
+	w = recoveryWork(t, db, reset)
+	require.Equal(t, 2, w.Next)
+	require.Zero(t, w.Attempts)
+	require.False(t, w.Blocked)
+	r, _, err = db.GetSubscriberReceipt("group", 2, "reset")
+	require.NoError(t, err)
+	require.Equal(t, "pending", r.State)
+	require.Zero(t, r.Attempts)
 	stale := cp
 	stale.Previous = 0
 	stale.Next = 3
 	stale.Done = true
 	stale.RetryAt = 0
 	require.NoError(t, db.CheckpointSubscriberWork(stale))
-	require.Equal(t, 1, recoveryWork(t, db, reset).Next)
+	require.Equal(t, 2, recoveryWork(t, db, reset).Next)
 	completeRecoveryWork(t, db, w)
 	members, err := db.GetSubscribers("group", 2)
 	require.NoError(t, err)

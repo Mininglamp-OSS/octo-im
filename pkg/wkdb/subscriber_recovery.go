@@ -959,8 +959,14 @@ func (wk *wukongDB) checkpointSubscriberWork(c SubscriberCheckpoint, group *subs
 		}
 	} else {
 		w.NextAttempt = 0
+		w.Blocked = false
 		r.NextAttempt = 0
 		r.LastError = ""
+		if c.Next > c.Previous {
+			w.Attempts = 0
+			r.Attempts = 0
+			r.State = "pending"
+		}
 	}
 	if c.Done {
 		if err := wk.completeSubscriberSnapshotPage(db, batch, w); err != nil {

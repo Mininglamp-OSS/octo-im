@@ -78,6 +78,10 @@ func (ch *channel) submitSubscriberRecovery(c *wkhttp.Context, o wkdb.Subscriber
 		c.JSON(status, map[string]any{"status": status, "msg": r.Error, "data": r})
 		return
 	}
+	if r.State == "blocked" {
+		c.JSON(http.StatusConflict, map[string]any{"status": http.StatusConflict, "msg": "subscriber recovery is durably blocked", "data": r})
+		return
+	}
 	if options.G.SubscriberRecovery.AsyncTargetEnabled {
 		accepted, err := service.Store.AcceptSubscriberOperation(ctx, r)
 		if err != nil {
@@ -173,7 +177,7 @@ func (ch *channel) subscriberRecoveryStatus(c *wkhttp.Context) {
 	for _, p := range parts {
 		total += p.PendingUnits
 	}
-	c.ResponseOKWithData(map[string]any{"runtime": service.Store.SubscriberRecoveryStats(), "group_commit": service.Store.DB().RecoveryGroupCommitStats(), "pending_units": total, "partitions": parts})
+	c.ResponseOKWithData(map[string]any{"runtime": service.Store.SubscriberRecoveryStats(), "pending_units": total, "partitions": parts})
 }
 
 func (s *Server) subscriberReadFloor(ctx context.Context, ch string, tp uint8) (uint64, error) {
@@ -196,7 +200,12 @@ func (s *Server) subscriberReadFloor(ctx context.Context, ch string, tp uint8) (
 func (s *Server) finalizeSubscriberWork(ctx context.Context, w wkdb.SubscriberWork) error {
 	// Tag authority is the SLOT leader (not the message-channel Raft leader).
 	// Invalidate from current membership; replaying old add/remove deltas is unsafe.
-	for _, ch := range []string{w.Operation.ChannelID, options.G.OrginalConvertCmdChannel(w.Operation.ChannelID)} {
+	channels := []string{w.Operation.ChannelID}
+	converted := options.G.OrginalConvertCmdChannel(w.Operation.ChannelID)
+	if converted != w.Operation.ChannelID {
+		channels = append(channels, converted)
+	}
+	for _, ch := range channels {
 		leader, err := service.Cluster.SlotLeaderIdOfChannel(ch, w.Operation.ChannelType)
 		if err != nil {
 			return err

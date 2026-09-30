@@ -45,7 +45,6 @@ type DB interface {
 
 	// SubscriberRecoveryActive reports whether lifecycle fencing is required.
 	SubscriberRecoveryActive() bool
-	RecoveryGroupCommitStats() RecoveryGroupCommitStats
 }
 
 type MessageEventDB interface {

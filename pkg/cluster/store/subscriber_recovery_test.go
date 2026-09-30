@@ -162,6 +162,32 @@ func TestAcceptSubscriberOperationRejectsLeaderMovement(t *testing.T) {
 	require.ErrorContains(t, err, "changed after routing fence")
 }
 
+func TestAcceptSubscriberOperationUsesPerWorkGate(t *testing.T) {
+	s, _ := recoveryStore(t)
+	cfg := recoveryConfig()
+	cfg.Interval = time.Hour
+	fenced := make(chan struct{}, 1)
+	require.NoError(t, s.StartSubscriberRecovery(cfg, func(context.Context, wkdb.SubscriberWork) error { fenced <- struct{}{}; return nil }))
+	receipt, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{OperationID: "gated", ChannelID: "gated-group", ChannelType: 2, Mode: "add", UIDs: []string{"a"}})
+	require.NoError(t, err)
+	unlock, _, err := s.recovery.lockWork(context.Background(), subscriberWorkKey{receipt.ChannelID, receipt.ChannelType, receipt.Version}, true)
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() { _, err := s.AcceptSubscriberOperation(context.Background(), receipt); done <- err }()
+	select {
+	case <-fenced:
+		t.Fatal("finalizer bypassed per-work gate")
+	case <-time.After(25 * time.Millisecond):
+	}
+	unlock()
+	require.NoError(t, <-done)
+	select {
+	case <-fenced:
+	default:
+		t.Fatal("finalizer did not run after gate release")
+	}
+}
+
 func TestRecoveryDisbandPreservesMembersAndConversations(t *testing.T) {
 	s, _ := recoveryStore(t)
 	cfg := recoveryConfig()
@@ -294,6 +320,19 @@ func TestSubscriberRecoveryWorkerDrainAfterTimeout(t *testing.T) {
 		}
 	}
 	require.GreaterOrEqual(t, s.SubscriberRecoveryStats().Failures, uint64(4))
+}
+
+func TestSubscriberRecoveryPermanentFailureBecomesDurablyBlocked(t *testing.T) {
+	s, _ := recoveryStore(t)
+	require.NoError(t, s.StartSubscriberRecovery(recoveryConfig(), func(context.Context, wkdb.SubscriberWork) error {
+		return &PermanentApplyError{Err: errors.New("poison tag state")}
+	}))
+	receipt, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{OperationID: "poison", ChannelID: "poison-group", ChannelType: 2, Mode: "add", UIDs: []string{"a"}})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		got, found, err := s.GetSubscriberReceipt(receipt.ChannelID, receipt.ChannelType, receipt.OperationID)
+		return err == nil && found && got.State == "blocked" && got.Attempts == 1 && got.NextAttempt > time.Now().Add(50*time.Minute).UnixNano()
+	}, 3*time.Second, 10*time.Millisecond)
 }
 
 func TestSubscriberRecoveryLeaderLossAndStableRequest(t *testing.T) {

@@ -143,14 +143,6 @@ type Options struct {
 		MaxPending         uint64
 		Interval           time.Duration
 		Timeout            time.Duration
-		GroupCommit        struct {
-			Enabled   bool
-			Window    time.Duration
-			MaxCount  int
-			MaxBytes  int
-			OldestAge time.Duration
-			QueueHard int
-		}
 	}
 	Conversation struct {
 		On                 bool          // 是否开启最近会话
@@ -892,12 +884,6 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.SubscriberRecovery.MaxPending = o.getUint64("subscriberRecovery.maxPending", 1024)
 	o.SubscriberRecovery.Interval = o.getDuration("subscriberRecovery.interval", 50*time.Millisecond)
 	o.SubscriberRecovery.Timeout = o.getDuration("subscriberRecovery.timeout", 5*time.Second)
-	o.SubscriberRecovery.GroupCommit.Enabled = o.getBool("subscriberRecovery.groupCommit.enabled", false)
-	o.SubscriberRecovery.GroupCommit.Window = o.getDuration("subscriberRecovery.groupCommit.window", 2*time.Millisecond)
-	o.SubscriberRecovery.GroupCommit.MaxCount = o.getInt("subscriberRecovery.groupCommit.maxCount", 32)
-	o.SubscriberRecovery.GroupCommit.MaxBytes = o.getInt("subscriberRecovery.groupCommit.maxBytes", 1<<20)
-	o.SubscriberRecovery.GroupCommit.OldestAge = o.getDuration("subscriberRecovery.groupCommit.oldestAge", 5*time.Millisecond)
-	o.SubscriberRecovery.GroupCommit.QueueHard = o.getInt("subscriberRecovery.groupCommit.queueHard", 256)
 	o.Conversation.On = o.getBool("conversation.on", o.Conversation.On)
 	o.Conversation.CacheExpire = o.getDuration("conversation.cacheExpire", o.Conversation.CacheExpire)
 	o.Conversation.SyncInterval = o.getDuration("conversation.syncInterval", o.Conversation.SyncInterval)

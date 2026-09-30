@@ -118,3 +118,43 @@ func TestSubscriberRecoveryMissingChannelHTTPCompatibility(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, parts)
 }
+
+func TestSubscriberRecoveryAsyncAdmissionPublicEndpoint(t *testing.T) {
+	oldStore, oldCluster, oldOptions := service.Store, service.Cluster, options.G
+	t.Cleanup(func() { service.Store, service.Cluster, options.G = oldStore, oldCluster, oldOptions })
+	options.G = options.New()
+	options.G.Cluster.NodeId = 1
+	options.G.SubscriberRecovery.Enabled = true
+	options.G.SubscriberRecovery.AsyncTargetEnabled = true
+	options.G.SubscriberRecovery.Timeout = time.Second
+	db := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(t.TempDir()), wkdb.WithNodeId(1), wkdb.WithShardNum(1), wkdb.WithMemTableSize(1<<20)))
+	require.NoError(t, db.Open())
+	cluster := &compatibilityCluster{}
+	s := store.New(store.NewOptions(store.WithNodeId(1), store.WithDB(db), store.WithSlot(cluster)))
+	cluster.store = s
+	service.Store, service.Cluster = s, cluster
+	fenced := make(chan wkdb.SubscriberWork, 1)
+	require.NoError(t, s.StartSubscriberRecovery(store.SubscriberRecoveryConfig{Workers: 1, MaxPending: 1024, Interval: time.Hour, Timeout: time.Second}, func(_ context.Context, work wkdb.SubscriberWork) error { fenced <- work; return nil }))
+	t.Cleanup(func() { s.Stop(); require.NoError(t, db.Close()) })
+	r := wkhttp.New()
+	newChannel(&Server{}).route(r)
+	body, err := json.Marshal(map[string]any{"channel_id": "async-public", "channel_type": 2, "subscribers": []string{"u"}, "operation_id": "async-public-op"})
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodPost, "/channel/subscriber_add", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	r.GetGinRoute().ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, "async-public-op", (<-fenced).Operation.OperationID)
+	receipt, found, err := db.GetSubscriberReceipt("async-public", 2, "async-public-op")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "pending", receipt.State, "2xx is durable admission, not target completion")
+	require.NoError(t, db.(wkdb.SubscriberRecoveryDB).CheckpointSubscriberWork(wkdb.SubscriberCheckpoint{SlotID: 0, ChannelID: "async-public", ChannelType: 2, OperationID: "async-public-op", Version: receipt.Version, Previous: 0, Next: 0, RetryAt: time.Now().Add(time.Hour).UnixNano(), Error: "poison", Blocked: true}))
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/channel/subscriber_add", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	r.GetGinRoute().ServeHTTP(response, request)
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), "durably blocked")
+}

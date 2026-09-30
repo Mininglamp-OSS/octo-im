@@ -272,8 +272,13 @@ func (s *Store) AcceptSubscriberOperation(ctx context.Context, receipt wkdb.Subs
 		return receipt, errors.New("subscriber recovery is disabled")
 	}
 	if receipt.State != "pending" && receipt.State != "complete" {
-		return receipt, errors.New("subscriber operation was not durably accepted")
+		return receipt, fmt.Errorf("subscriber operation is %s", receipt.State)
 	}
+	unlock, _, err := s.recovery.lockWork(ctx, subscriberWorkKey{receipt.ChannelID, receipt.ChannelType, receipt.Version}, true)
+	if err != nil {
+		return receipt, err
+	}
+	defer unlock()
 	slot := s.opts.Slot.GetSlotId(receipt.ChannelID)
 	if s.opts.Slot.SlotLeaderId(slot) != s.opts.NodeId {
 		return receipt, errors.New("subscriber source leader changed before routing fence")
@@ -290,6 +295,11 @@ func (s *Store) AcceptSubscriberOperation(ctx context.Context, receipt wkdb.Subs
 		}
 		return receipt, errors.New("subscriber recovery work not visible")
 	}
+	release, err := s.acquireRecoveryAdmission(ctx, true)
+	if err != nil {
+		return receipt, err
+	}
+	defer release()
 	if err := s.recovery.finalize(ctx, work); err != nil {
 		return receipt, fmt.Errorf("subscriber routing fence: %w", err)
 	}
@@ -304,6 +314,31 @@ func (s *Store) AcceptSubscriberOperation(ctx context.Context, receipt wkdb.Subs
 		return receipt, errors.New("subscriber receipt changed before asynchronous acceptance")
 	}
 	return latest, nil
+}
+
+func (s *Store) acquireRecoveryAdmission(ctx context.Context, foreground bool) (func(), error) {
+	r := s.recovery
+	if foreground {
+		select {
+		case r.foregroundTargetTokens <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	select {
+	case r.targetTokens <- struct{}{}:
+		return func() {
+			<-r.targetTokens
+			if foreground {
+				<-r.foregroundTargetTokens
+			}
+		}, nil
+	case <-ctx.Done():
+		if foreground {
+			<-r.foregroundTargetTokens
+		}
+		return nil, ctx.Err()
+	}
 }
 
 // CompleteSubscriberOperation runs the durable work on the request path. The

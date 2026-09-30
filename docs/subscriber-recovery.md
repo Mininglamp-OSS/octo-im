@@ -11,20 +11,24 @@ is available from the existing operation-status endpoint.
 Turning the flag off affects new requests only. Work already accepted under the
 asynchronous boundary continues to drain from durable source state.
 
-`subscriberRecovery.groupCommit.enabled` is also disabled by default. It groups
-only the first, synchronous target projection stage by physical WKDB shard. It
-does not change source, target, checkpoint, or Raft durability and does not
-provide a cross-shard transaction. The defaults and supported ranges are:
+## Physical-shard group-commit decision
 
-| setting | default | range |
-| --- | ---: | ---: |
-| `window` | `2ms` | `250us`–`5ms` |
-| `maxCount` | `32` | `1`–`128` |
-| `maxBytes` | `1MiB` | `64KiB`–`4MiB` |
-| `oldestAge` | `5ms` | `1ms`–`10ms`, at least `window` |
-| `queueHard` | `256` | at least `maxCount` |
+A recovery-only coordinator was prototyped and tested against direct concurrent
+`Commit(Sync)` with Pebble's existing 20ms WAL sync coalescing. The coordinator
+was removed because it reduced throughput under realistic eight-shard fan-out,
+even after allowing following cohorts to accumulate while Sync commits were in
+flight. The production path therefore remains direct `Commit(Sync)` and no
+inert group-commit configuration key is exposed.
 
-Invalid enabled configurations stop database startup. Runtime status reports
-queue depth, in-flight commits, physical commit count, fragment count, and
-encoded mutation bytes. Disabling group commit restores direct `Commit(Sync)`
-for newly applied entries.
+Reproduction command used during the decision:
+
+```sh
+go test ./pkg/wkdb -run '^$' -bench BenchmarkRecoveryCommit -benchtime=2s -count=3
+```
+
+On Apple M4/darwin-arm64 with 160 parallel workers, eight physical shards and
+eight 200-byte mutations per fragment, direct Sync measured 169–199 us/op while
+the pipelined coordinator measured 206–251 us/op. The earlier single-owner
+coordinator was slower still. This is a local microbenchmark rather than a
+production claim; it is sufficient to reject shipping the regressive optional
+path. Source, target projection, checkpoint and Raft durability remain Sync.
