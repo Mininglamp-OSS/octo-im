@@ -48,6 +48,39 @@ func TestChannelReplicationAfterLeaderConfigChange(t *testing.T) {
 	for id := uint64(1); id <= 3; id++ {
 		require.NoError(t, servers[id].WaitAllSlotReady(ctx, 8))
 	}
+	// WaitAllSlotReady only requires a nonzero leader. Bootstrap can still be
+	// balancing slots or installing roles at that point. This test exercises
+	// channel replication after failover from a settled cluster; do not mix in
+	// a control-plane slot migration interrupted during initial setup.
+	require.Eventually(t, func() bool {
+		slots := servers[1].cfgServer.Slots()
+		if len(slots) != 8 {
+			return false
+		}
+		leaders := make(map[uint64]int)
+		for _, slot := range slots {
+			if slot.Leader == 0 || len(slot.Replicas) != 3 || len(slot.Learners) != 0 ||
+				slot.MigrateFrom != 0 || slot.MigrateTo != 0 {
+				return false
+			}
+			leaders[slot.Leader]++
+			if leaders[slot.Leader] > 3 {
+				return false
+			}
+			for id, peer := range servers {
+				published := peer.cfgServer.Slot(slot.Id)
+				if published == nil || !published.Equal(slot) {
+					return false
+				}
+				state, err := peer.slotServer.ReadLeaderState(ctx, slot.Id)
+				if err != nil || !state.Exists || state.LeaderID != slot.Leader || state.Term != slot.Term ||
+					id == slot.Leader && !state.Ready {
+					return false
+				}
+			}
+		}
+		return len(leaders) == 3
+	}, 10*time.Second, 20*time.Millisecond, "bootstrap slot ownership and runtime roles must converge before failover")
 	var channelID string
 	for i := 0; i < 1000; i++ {
 		candidate := fmt.Sprintf("config-failover-%d", i)
