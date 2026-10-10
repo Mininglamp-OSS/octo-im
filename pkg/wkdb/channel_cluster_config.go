@@ -220,6 +220,9 @@ func (wk *wukongDB) GetChannelClusterConfigVersion(channelId string, channelType
 // }
 
 func (wk *wukongDB) GetChannelClusterConfigs(offsetId uint64, limit int) ([]ChannelClusterConfig, error) {
+	if offsetId == math.MaxUint64 || limit <= 0 {
+		return nil, nil
+	}
 
 	wk.metrics.GetChannelClusterConfigsAdd(1)
 
@@ -647,6 +650,9 @@ func (wk *wukongDB) iteratorChannelClusterConfig(iter *pebble.Iterator, iterFnc 
 			}
 		}
 		hasData = true
+	}
+	if err := iter.Error(); err != nil {
+		return err
 	}
 	if lastNeedAppend && hasData {
 		_ = iterFnc(preChannelClusterConfig)

@@ -130,12 +130,14 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 	trace.GlobalTrace.Metrics.App().SendPacketBytesAdd(sendPacket.GetFrameSize())
 	// 添加消息到频道
 	eventbus.Channel.SendMessage(fakeChannelId, channelType, &eventbus.Event{
-		Type:      eventbus.EventChannelOnSend,
-		Conn:      conn,
-		Frame:     sendPacket,
-		MessageId: event.MessageId,
-		Track:     event.Track,
-		ReqId:     event.ReqId,
+		Type:            eventbus.EventChannelOnSend,
+		ForwardDeadline: event.ForwardDeadline,
+		ForwardHops:     event.ForwardHops,
+		Conn:            conn,
+		Frame:           sendPacket,
+		MessageId:       event.MessageId,
+		Track:           event.Track,
+		ReqId:           event.ReqId,
 	})
 	// 推进
 	eventbus.Channel.Advance(fakeChannelId, channelType)

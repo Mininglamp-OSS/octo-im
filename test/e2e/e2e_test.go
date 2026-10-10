@@ -92,27 +92,14 @@ func setupWukongIMServer() (*wukongIMInstance, error) {
 	}
 	fmt.Printf("Using data directory: %s\n", dataPath)
 
-	// 2. 查找空闲端口
-	apiPort, err := findFreePort()
+	// 2. 一起预留端口，避免逐个释放后 TCP 和 WebSocket 取到相同端口。
+	ports, releasePorts, err := reserveFreePorts(4)
 	if err != nil {
 		_ = os.RemoveAll(dataPath)
-		return nil, fmt.Errorf("failed to find free port for API: %w", err)
+		return nil, fmt.Errorf("failed to reserve server ports: %w", err)
 	}
-	wsPort, err := findFreePort()
-	if err != nil {
-		_ = os.RemoveAll(dataPath)
-		return nil, fmt.Errorf("failed to find free port for WebSocket: %w", err)
-	}
-	clusterPort, err := findFreePort()
-	if err != nil {
-		_ = os.RemoveAll(dataPath)
-		return nil, fmt.Errorf("failed to find free port for Cluster: %w", err)
-	}
-	tcpPort, err := findFreePort()
-	if err != nil {
-		_ = os.RemoveAll(dataPath)
-		return nil, fmt.Errorf("failed to find free port for TCP: %w", err)
-	}
+	defer releasePorts()
+	apiPort, wsPort, clusterPort, tcpPort := ports[0], ports[1], ports[2], ports[3]
 
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", apiPort)
 	wsURL := fmt.Sprintf("ws://127.0.0.1:%d/ws", wsPort)
@@ -201,6 +188,7 @@ func setupWukongIMServer() (*wukongIMInstance, error) {
 	}
 
 	// 5. 启动服务器进程
+	releasePorts()
 	err = cmd.Start()
 	if err != nil {
 		_ = os.RemoveAll(dataPath)
@@ -310,18 +298,26 @@ func teardownWukongIMServer(instance *wukongIMInstance) {
 	fmt.Printf("Teardown finished for instance (PID: %d).\n", instance.cmd.Process.Pid)
 }
 
-// findFreePort 查找一个空闲的 TCP 端口 (保持不变)
-func findFreePort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
+// reserveFreePorts keeps all listeners open until the caller starts its server.
+func reserveFreePorts(count int) ([]int, func(), error) {
+	var listeners []net.Listener
+	release := func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+		listeners = nil
 	}
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return 0, err
+	ports := make([]int, 0, count)
+	for i := 0; i < count; i++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			release()
+			return nil, nil, err
+		}
+		listeners = append(listeners, listener)
+		ports = append(ports, listener.Addr().(*net.TCPAddr).Port)
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+	return ports, release, nil
 }
 
 // isAPIReady 检查 API 是否就绪 (不再接收 t *testing.T)

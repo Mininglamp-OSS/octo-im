@@ -12,7 +12,6 @@ import (
 type electionState struct {
 	electionElapsed           int             // 选举计时器
 	randomizedElectionTimeout int             // 随机选举超时时间
-	voteFor                   uint64          // 投票给了谁
 	votes                     map[uint64]bool // 投票记录,key为节点id，value为是否同意
 }
 
@@ -32,10 +31,15 @@ type Node struct {
 	stepFunc    func(event types.Event) error
 	queue       *queue // 日志队列
 	wklog.Log
-	heartbeatElapsed int          // 心跳计时器
-	cfg              types.Config // 分布式配置
-	electionState                 // 选举状态
-	syncState                     // 同步状态
+	heartbeatElapsed   int          // 心跳计时器
+	cfg                types.Config // 分布式配置
+	voteFor            uint64       // 本任期的投票，不随角色重置
+	persistedHardState types.HardState
+	membershipRequests map[uint64]uint64 // peer -> newer applied config version requested
+	applyFailures      int
+	applyRetryTicks    int // only Tick advances retries; role changes do not reset it
+	electionState          // 选举状态
+	syncState              // 同步状态
 	// 最新的任期对应的开始日志下标
 	lastTermStartIndex types.TermStartIndexInfo
 	onlySync           bool // 是否只同步,不做截断判断
@@ -69,6 +73,11 @@ func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Opti
 	} else {
 		n.cfg.Term = raftState.LastTerm
 	}
+	if raftState.HardState.Term >= n.cfg.Term {
+		n.cfg.Term = raftState.HardState.Term
+		n.voteFor = raftState.HardState.Vote
+	}
+	n.persistedHardState = raftState.HardState
 	// 初始化日志队列
 	n.queue = newQueue(opts.Key, raftState.AppliedIndex, raftState.LastLogIndex)
 
@@ -78,7 +87,7 @@ func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Opti
 	n.resetRandomizedElectionTimeout()
 
 	n.lastTermStartIndex.Index = lastTermStartLogIndex
-	n.lastTermStartIndex.Term = n.cfg.Term
+	n.lastTermStartIndex.Term = raftState.LastTerm
 
 	onlySelf := false
 	if len(n.cfg.Replicas) == 1 {
@@ -122,10 +131,13 @@ func (n *Node) LastTerm() uint32 {
 
 // HasReady 是否有待处理的事件
 func (n *Node) HasReady() bool {
+	if n.hasUnpersistedHardState() {
+		return true
+	}
 	if n.queue.hasNextStoreLogs() {
 		return true
 	}
-	if n.queue.hasNextApplyLogs() {
+	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
 		return true
 	}
 	return len(n.events) > 0
@@ -138,6 +150,17 @@ func (n *Node) Suspend() bool {
 
 // Ready 获取待处理的事件
 func (n *Node) Ready() []types.Event {
+	// Persist before releasing ANY event, including self-votes and log writes.
+	// On failure retain the events and retry on the next tick. No vote response
+	// or leader read may escape with an unrecorded term/vote.
+	if n.hasUnpersistedHardState() {
+		state := n.hardState()
+		if err := n.opts.SaveHardState(state); err != nil {
+			n.Error("persist raft hard state failed", zap.Error(err))
+			return nil
+		}
+		n.persistedHardState = state
+	}
 
 	if n.queue.hasNextStoreLogs() {
 		logs := n.queue.nextStoreLogs(0)
@@ -157,7 +180,7 @@ func (n *Node) Ready() []types.Event {
 		}
 	}
 
-	if n.queue.hasNextApplyLogs() {
+	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
 		start, end := n.queue.nextApplyLogs()
 		if start > 0 {
 			n.sendApplyReq(start, end)

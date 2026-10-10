@@ -7,9 +7,28 @@ import (
 )
 
 func (n *Node) Step(e types.Event) error {
+	// Election membership discovery does not carry a term or cast a vote.
+	// Process it separately so a still-local learner cannot raise our term.
+	if (e.Type == types.ConfigReq || e.Type == types.ConfigResp) && e.Reason == types.ReasonOnlySync {
+		return n.stepElectionMembership(e)
+	}
+	if (e.Type == types.VoteReq || e.Type == types.VoteResp) && n.opts.ElectionOn &&
+		e.ConfigVersion > n.cfg.Version && (n.isVoter(e.From) || n.isLearner(e.From)) {
+		if n.membershipRequests == nil {
+			n.membershipRequests = make(map[uint64]uint64)
+		}
+		n.membershipRequests[e.From] = e.ConfigVersion
+		n.events = append(n.events, types.Event{Type: types.ConfigReq, From: n.opts.NodeId, To: e.From,
+			Reason: types.ReasonOnlySync, ConfigVersion: e.ConfigVersion})
+	}
+	// Non-voters cannot disrupt an election by supplying a higher term.
+	if (e.Type == types.VoteReq || e.Type == types.VoteResp) &&
+		(!n.isVoter(n.opts.NodeId) || !n.isVoter(e.From)) {
+		return nil
+	}
+
 	// Before configuration has installed a role handler, no proposal can be
-	// admitted. Config.Role can still be Unknown after a leader handler is
-	// installed on this release, so the handlers below enforce role rejection.
+	// admitted. The handlers below enforce rejection for non-leader roles.
 	if e.Type == types.Propose && n.stepFunc == nil {
 		return types.ErrNotLeader
 	}
@@ -42,19 +61,19 @@ func (n *Node) Step(e types.Event) error {
 
 	switch e.Type {
 	case types.ConfChange: // 配置变更
-		n.switchConfig(e.Config)
+		return n.switchConfig(e.Config)
 	case types.Campaign:
 		n.campaign()
 	case types.VoteReq: // 投票请求
 		if n.cfg.Role != types.RoleLearner {
 			if n.canVote(e) {
+				n.voteFor = e.From
 				if e.From == n.opts.NodeId {
 					n.sendVoteResp(types.LocalNode, types.ReasonOk)
 				} else {
 					n.sendVoteResp(e.From, types.ReasonOk)
 				}
 
-				n.voteFor = e.From
 				n.electionElapsed = 0
 				if e.From != n.opts.NodeId {
 					n.Info("agree vote", zap.Uint64("voteFor", e.From), zap.Uint32("term", e.Term), zap.Uint64("index", e.Index))
@@ -71,22 +90,17 @@ func (n *Node) Step(e types.Event) error {
 				n.sendVoteResp(e.From, types.ReasonError)
 			}
 		} else {
-			/**
-			如果学习者收到投票请求，则角色转换为follower
-			TODO：这里逻辑感觉不太严谨，
-			主要解决如下情况：
-			 当两个节点时，一个是leader，一个是learner，当learner完成学习后。
-			 leader节点会将learner节点的角色转换为follower时，会导致leader自己本身转换成candidate。
-			 这样learner同步不到配置日志，导致leader节点认为learner成为了follower，但是实际learner还是learner
-			**/
-			n.BecomeFollower(e.Term, e.From)
+			n.sendVoteResp(e.From, types.ReasonError)
 		}
 
 	case types.ApplyResp: // 应用返回
 		if e.Reason == types.ReasonOk {
 			n.queue.appliedTo(e.Index)
+			n.applyFailures = 0
+			n.applyRetryTicks = 0
 		} else {
 			n.queue.applying = false
+			n.backoffApply()
 		}
 	default:
 		if n.stepFunc != nil {
@@ -293,9 +307,7 @@ func (n *Node) stepFollower(e types.Event) error {
 		}
 
 	case types.ConfigResp: // 配置返回
-		// 切换配置
-		e.Config.Term = n.cfg.Term
-		n.switchConfig(e.Config)
+		return n.switchRemoteConfig(e.Config)
 
 	}
 	return nil
@@ -396,9 +408,7 @@ func (n *Node) stepLearner(e types.Event) error {
 		}
 
 	case types.ConfigResp: // 配置返回
-		// 切换配置
-		e.Config.Term = n.cfg.Term
-		n.switchConfig(e.Config)
+		return n.switchRemoteConfig(e.Config)
 
 	}
 	return nil
@@ -406,10 +416,18 @@ func (n *Node) stepLearner(e types.Event) error {
 
 // 统计投票
 func (n *Node) poll(e types.Event) {
+	if n.cfg.Role != types.RoleCandidate || !n.isVoter(n.opts.NodeId) ||
+		!n.isVoter(e.From) || e.Term != n.cfg.Term {
+		return
+	}
+	if _, received := n.votes[e.From]; received {
+		return
+	}
+
 	n.votes[e.From] = e.Reason == types.ReasonOk
 	var granted int
-	for _, v := range n.votes {
-		if v {
+	for id, v := range n.votes {
+		if v && n.isVoter(id) {
 			granted++
 		}
 	}
@@ -427,11 +445,23 @@ func (n *Node) poll(e types.Event) {
 
 // 合法投票数
 func (n *Node) quorum() int {
-	return len(n.cfg.Replicas)/2 + 1 //  n.cfg.Replicas 包含本节点
+	voters := make(map[uint64]struct{}, len(n.cfg.Replicas))
+	for _, id := range n.cfg.Replicas {
+		if n.isVoter(id) {
+			voters[id] = struct{}{}
+		}
+	}
+	return len(voters)/2 + 1
 }
 
+// ConfigVersion is a replication hint, not an election epoch: clusterconfig
+// restores the last applied application index, including non-membership logs.
+// Membership, term, one vote per term and log freshness fence elections.
 // 是否可以投票
 func (n *Node) canVote(e types.Event) bool {
+	if !n.isVoter(n.opts.NodeId) || !n.isVoter(e.From) || n.cfg.Role == types.RoleLearner {
+		return false
+	}
 
 	// 检查候选人日志信息是否存在
 	if len(e.Logs) == 0 {
@@ -499,7 +529,10 @@ func (n *Node) committedIndexForLeader() uint64 {
 	// 获取比指定参数小的最大日志下标
 	getMaxLogIndexLessThanParam := func(maxIndex uint64) uint64 {
 		secondMaxIndex := uint64(0)
-		for _, syncInfo := range n.replicaSync {
+		for id, syncInfo := range n.replicaSync {
+			if id == n.opts.NodeId || !n.isVoter(id) {
+				continue
+			}
 			if syncInfo.StoredIndex < maxIndex || maxIndex == 0 {
 				if secondMaxIndex < syncInfo.StoredIndex {
 					secondMaxIndex = syncInfo.StoredIndex
@@ -526,7 +559,10 @@ func (n *Node) committedIndexForLeader() uint64 {
 		if maxLogIndex > n.queue.storedIndex {
 			continue
 		}
-		for _, syncInfo := range n.replicaSync {
+		for id, syncInfo := range n.replicaSync {
+			if id == n.opts.NodeId || !n.isVoter(id) {
+				continue
+			}
 			if syncInfo.StoredIndex >= maxLogIndex+1 {
 				count++
 			}
@@ -565,6 +601,15 @@ func (n *Node) committedIndexForFollow(leaderCommittedIndex uint64) uint64 {
 }
 
 func (n *Node) roleSwitchIfNeed(e types.Event) {
+	if !n.isLearner(e.From) && !n.isVoter(e.From) {
+		return
+	}
+	// Sync indices include received-but-not-stored logs. Promotion needs the
+	// committed prefix on disk; leadership transfer needs the entire tail.
+	if n.isLearner(e.From) && e.StoredIndex <= n.queue.committedIndex {
+		return
+	}
+
 	// 没有需要切换的配置
 	if n.cfg.MigrateTo == 0 || n.cfg.MigrateFrom == 0 {
 		// 兜底：处理 orphan learner —— 在 Learners 列表中但前次迁移已完成
@@ -583,7 +628,7 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 			// 与正常 learner→follower 分支保持一致：单副本集群必须完全追上
 			// 领导者的日志，否则用 gap-based 判定。
 			if len(n.cfg.Replicas) == 1 {
-				if e.Index > n.queue.lastLogIndex {
+				if e.Index > n.queue.lastLogIndex && e.StoredIndex > n.queue.lastLogIndex {
 					syncInfo.roleSwitching = true
 					n.sendLearnerToFollowerReq(e.From)
 				}
@@ -609,7 +654,7 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 	if isLearner {
 		// 如果迁移的源节点是领导者，那么学习者必须完全追上领导者的日志
 		if n.cfg.MigrateFrom == n.cfg.Leader { // 学习者转领导者
-			if e.Index >= n.queue.lastLogIndex+1 {
+			if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
 				syncInfo.roleSwitching = true // 学习者转让中
 				// 发送学习者转为领导者
 				n.sendLearnerToLeaderReq(e.From)
@@ -619,9 +664,11 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 
 		} else { // 学习者转追随者
 			// 如果learner的日志已经追上了follower的日志，那么将learner转为follower
-			if len(n.cfg.Replicas) == 1 && e.Index > n.queue.lastLogIndex { // 如果只有一个副本,则学习者必须完全追上领导者的日志，才能做转换。（因为转换的这个follower会导致重新选举）
-				syncInfo.roleSwitching = true
-				n.sendLearnerToFollowerReq(e.From)
+			if len(n.cfg.Replicas) == 1 {
+				if e.Index > n.queue.lastLogIndex && e.StoredIndex > n.queue.lastLogIndex {
+					syncInfo.roleSwitching = true
+					n.sendLearnerToFollowerReq(e.From)
+				}
 			} else {
 				if e.Index+n.opts.LearnerToFollowerMinLogGap > n.queue.lastLogIndex {
 					syncInfo.roleSwitching = true
@@ -631,7 +678,7 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 			}
 		}
 	} else if n.cfg.MigrateFrom == n.cfg.Leader && n.cfg.MigrateTo == e.From { // // 追随者转为领导者
-		if e.Index >= n.queue.lastLogIndex+1 {
+		if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
 			syncInfo.roleSwitching = true
 			// 发送追随者转为领导者
 			n.sendFollowToLeaderReq(e.From)

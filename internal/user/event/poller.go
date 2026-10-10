@@ -20,10 +20,12 @@ type poller struct {
 	wklog.Log
 	sync.RWMutex
 
-	tmpHandlers []*userHandler
-	stopper     *syncutil.Stopper
-	handlePool  *ants.Pool
-	index       int
+	// loopHandlers is reused only by loopEvent's serial handleEvents and tick calls.
+	// Concurrent callers, including connection statistics, must use their own slice.
+	loopHandlers []*userHandler
+	stopper      *syncutil.Stopper
+	handlePool   *ants.Pool
+	index        int
 
 	// tick次数
 	tickCount int
@@ -98,14 +100,14 @@ func (p *poller) loopEvent() {
 func (p *poller) tick() {
 	p.tickCount++
 
-	p.waitlist.readHandlers(&p.tmpHandlers)
+	p.waitlist.readHandlers(&p.loopHandlers)
 
-	for _, h := range p.tmpHandlers {
+	for _, h := range p.loopHandlers {
 		h.tick()
 	}
 	if p.tickCount%options.G.Poller.ClearIntervalTick == 0 {
 		p.tickCount = 0
-		for _, h := range p.tmpHandlers {
+		for _, h := range p.loopHandlers {
 			if h.isTimeout() {
 				p.waitlist.remove(h.Uid)
 				if options.G.IsLocalNode(h.leaderId()) {
@@ -115,26 +117,27 @@ func (p *poller) tick() {
 		}
 	}
 
-	p.tmpHandlers = p.tmpHandlers[:0]
+	p.loopHandlers = p.loopHandlers[:0]
 }
 
 func (p *poller) handleEvents() {
-	p.waitlist.readHandlers(&p.tmpHandlers)
+	p.waitlist.readHandlers(&p.loopHandlers)
 	var err error
-	for _, h := range p.tmpHandlers {
-		if h.hasEvent() {
-			events := h.events()
+	for _, h := range p.loopHandlers {
+		if h.hasEvent() && h.processing.CompareAndSwap(false, true) {
 			err = p.handlePool.Submit(func() {
+				events := h.events()
 				h.advanceEvents(events)
 			})
 			if err != nil {
-				p.Error("submit user handle task failed", zap.String("error", err.Error()), zap.Int("events", len(events)))
+				h.processing.Store(false)
+				p.Error("submit user handle task failed", zap.String("error", err.Error()))
 			}
 		}
 	}
-	p.tmpHandlers = p.tmpHandlers[:0]
-	if cap(p.tmpHandlers) > 1024 {
-		p.tmpHandlers = nil
+	p.loopHandlers = p.loopHandlers[:0]
+	if cap(p.loopHandlers) > 1024 {
+		p.loopHandlers = nil
 	}
 }
 
@@ -164,7 +167,7 @@ func (p *poller) connsByUid(uid string) []*eventbus.Conn {
 	if h == nil {
 		return nil
 	}
-	return h.conns.conns
+	return h.conns.allConns()
 }
 func (p *poller) authedConnsByUid(uid string) []*eventbus.Conn {
 	h := p.handler(uid)
@@ -221,17 +224,31 @@ func (p *poller) allConn() []*eventbus.Conn {
 	tmpHandlers := make([]*userHandler, 0)
 	p.waitlist.readHandlers(&tmpHandlers)
 	for _, h := range tmpHandlers {
-		conns = append(conns, h.conns.conns...)
+		conns = append(conns, h.conns.allConns()...)
 	}
 	return conns
 }
 
 func (p *poller) updateConn(conn *eventbus.Conn) {
+	p.Lock()
+	defer p.Unlock()
 	h := p.handler(conn.Uid)
 	if h == nil {
-		return
+		h = newUserHandler(conn.Uid, p)
+		p.waitlist.push(h)
 	}
 	h.conns.addOrUpdateConn(conn)
+}
+
+func (p *poller) updateConnRecovered(conn *eventbus.Conn) {
+	p.Lock()
+	defer p.Unlock()
+	h := p.handler(conn.Uid)
+	if h == nil {
+		h = newUserHandler(conn.Uid, p)
+		p.waitlist.push(h)
+	}
+	h.conns.addOrUpdateRecoveredConn(conn)
 }
 
 func (p *poller) allUserCount() int {
@@ -239,14 +256,13 @@ func (p *poller) allUserCount() int {
 }
 
 func (p *poller) allConnCount() int {
+	// Statistics can run concurrently with the event loop and other readers.
+	// The list's read lock protects collection, not a shared destination slice.
+	var handlers []*userHandler
+	p.waitlist.readHandlers(&handlers)
 	count := 0
-	p.waitlist.readHandlers(&p.tmpHandlers)
-	for _, h := range p.tmpHandlers {
+	for _, h := range handlers {
 		count += h.conns.count()
-	}
-	p.tmpHandlers = p.tmpHandlers[:0]
-	if cap(p.tmpHandlers) > 1024 {
-		p.tmpHandlers = nil
 	}
 	return count
 }

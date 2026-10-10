@@ -39,6 +39,9 @@ type IUser interface {
 
 	// UpdateConn 更新连接
 	UpdateConn(conn *Conn)
+	// UpdateConnRecovered applies a recovered snapshot without replacing a
+	// different live session that has reused the same numeric connection ID.
+	UpdateConnRecovered(conn *Conn)
 	// AllUserCount 所有用户数量
 	AllUserCount() int
 	// AllConnCount 所有连接数量
@@ -52,6 +55,10 @@ type IUser interface {
 
 type userPlus struct {
 	user IUser
+}
+
+type connToucher interface {
+	TouchConn(uid string, nodeId uint64, connId int64) bool
 }
 
 func newUserPlus(user IUser) *userPlus {
@@ -125,9 +132,21 @@ func (u *userPlus) ConnById(uid string, fromNode uint64, id int64) *Conn {
 	return u.user.ConnById(uid, fromNode, id)
 }
 
+// TouchConn refreshes activity on the registered descriptor without replacing
+// session identity or authentication fields received from another node.
+func (u *userPlus) TouchConn(uid string, nodeId uint64, connId int64) bool {
+	toucher, ok := u.user.(connToucher)
+	return ok && toucher.TouchConn(uid, nodeId, connId)
+}
+
 // UpdateConn 更新连接
 func (u *userPlus) UpdateConn(conn *Conn) {
 	u.user.UpdateConn(conn)
+}
+
+// UpdateConnRecovered updates a connection from a recovery snapshot.
+func (u *userPlus) UpdateConnRecovered(conn *Conn) {
+	u.user.UpdateConnRecovered(conn)
 }
 
 // ConnWrite 连接写包
@@ -162,6 +181,20 @@ func (u *userPlus) RemoveConn(conn *Conn) {
 		Conn:         conn,
 		SourceNodeId: options.G.Cluster.NodeId,
 	})
+}
+
+// RemoveConnRecovered removes a stale logical session immediately, then
+// schedules the normal offline notification without invalidating the fresh
+// recovery snapshot that proved the session absent.
+func (u *userPlus) RemoveConnRecovered(conn *Conn) {
+	u.user.RemoveConn(conn)
+	u.user.AddEvent(conn.Uid, &Event{
+		Type:               EventConnRemove,
+		Conn:               conn,
+		SourceNodeId:       options.G.Cluster.NodeId,
+		PresenceReconciled: true,
+	})
+	u.user.Advance(conn.Uid)
 }
 
 // RemoveLeaderConn 移除leader节点中的连接

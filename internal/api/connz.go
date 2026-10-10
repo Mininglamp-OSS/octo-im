@@ -261,7 +261,7 @@ func newConnInfo(connCtx *connzResp) *ConnInfo {
 
 	lastActivity := time.Unix(int64(connCtx.LastActive), 0)
 
-	uptime := time.Unix(int64(connCtx.Uptime), 0)
+	uptime := connUptime(connCtx.Uptime)
 
 	return &ConnInfo{
 		ID:           connCtx.ConnId,
@@ -285,6 +285,15 @@ func newConnInfo(connCtx *connzResp) *ConnInfo {
 		Version:        connCtx.ProtoVersion,
 		NodeId:         connCtx.NodeId,
 	}
+}
+
+func connUptime(value uint64) time.Time {
+	// Presence-enabled nodes use nanoseconds as a legacy session fence; older
+	// descriptors retain the original seconds representation.
+	if value > 1_000_000_000_000 {
+		return time.Unix(0, int64(value))
+	}
+	return time.Unix(int64(value), 0)
 }
 
 func device(connCtx *connzResp) string {
@@ -544,7 +553,7 @@ func (l byInPacketDesc) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.
 type byUptime struct{ Conns []*connzResp }
 
 func (l byUptime) Less(i, j int) bool {
-	return l.Conns[i].Uptime < l.Conns[j].Uptime
+	return connUptime(l.Conns[i].Uptime).Before(connUptime(l.Conns[j].Uptime))
 }
 func (l byUptime) Len() int      { return len(l.Conns) }
 func (l byUptime) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Conns[i] }
@@ -552,7 +561,7 @@ func (l byUptime) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Conns[
 type byUptimeDesc struct{ Conns []*connzResp }
 
 func (l byUptimeDesc) Less(i, j int) bool {
-	return l.Conns[i].Uptime > l.Conns[j].Uptime
+	return connUptime(l.Conns[i].Uptime).After(connUptime(l.Conns[j].Uptime))
 }
 func (l byUptimeDesc) Len() int      { return len(l.Conns) }
 func (l byUptimeDesc) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Conns[i] }

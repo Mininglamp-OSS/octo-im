@@ -60,16 +60,16 @@ func (r *RetryManager) AddRetry(msg *types.RetryMessage) {
 	r.retryQueues[index].startInFlightTimeout(msg)
 }
 
-func (r *RetryManager) RemoveRetry(fromNode uint64, connId int64, messageId int64) error {
+func (r *RetryManager) RemoveRetry(conn *eventbus.Conn, messageId int64) error {
 	index := messageId % int64(len(r.retryQueues))
-	return r.retryQueues[index].finishMessage(fromNode, connId, messageId)
+	return r.retryQueues[index].finishMessage(conn, messageId)
 }
 
 // 获取重试消息
-func (r *RetryManager) RetryMessage(fromNode uint64, connId int64, messageId int64) *types.RetryMessage {
+func (r *RetryManager) RetryMessage(conn *eventbus.Conn, messageId int64) *types.RetryMessage {
 	index := messageId % int64(len(r.retryQueues))
 
-	return r.retryQueues[index].getInFlightMessage(fromNode, connId, messageId)
+	return r.retryQueues[index].getInFlightMessage(conn, messageId)
 }
 
 func (r *RetryManager) retry(msg *types.RetryMessage) {
@@ -97,6 +97,15 @@ func (r *RetryManager) retry(msg *types.RetryMessage) {
 		}
 		return
 	}
+	if !retrySessionMatches(msg, conn) {
+		r.Warn("retry session no longer matches connection",
+			zap.String("uid", msg.Uid),
+			zap.Uint64("fromNode", msg.FromNode),
+			zap.Int64("connId", msg.ConnId),
+			zap.Int64("messageId", msg.MessageId),
+		)
+		return
+	}
 	// 添加到重试队列
 	r.AddRetry(msg)
 
@@ -112,6 +121,21 @@ func (r *RetryManager) retry(msg *types.RetryMessage) {
 
 	eventbus.User.ConnWrite("", conn, msg.RecvPacket)
 
+}
+
+func retrySessionMatches(msg *types.RetryMessage, conn *eventbus.Conn) bool {
+	if msg == nil || conn == nil || msg.Uid != conn.Uid || msg.FromNode != conn.NodeId || msg.ConnId != conn.ConnId {
+		return false
+	}
+	msgHasIdentity := msg.OwnerBootID != "" && msg.SessionID != ""
+	msgIsLegacy := msg.OwnerBootID == "" && msg.SessionID == ""
+	if !msgHasIdentity && !msgIsLegacy || !conn.HasSessionIdentity() && !conn.IsLegacySession() {
+		return false
+	}
+	if msgHasIdentity && conn.HasSessionIdentity() {
+		return msg.OwnerBootID == conn.OwnerBootID && msg.SessionID == conn.SessionID
+	}
+	return msg.Uptime != 0 && msg.Uptime == conn.Uptime
 }
 
 // Schedule 延迟任务

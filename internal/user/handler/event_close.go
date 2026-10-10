@@ -21,6 +21,9 @@ func (h *Handler) closeConn(ctx *eventbus.UserContext) {
 			h.Error("closeConn: conn node id is 0")
 			return
 		}
+		if service.Presence != nil {
+			service.Presence.Forget(conn)
+		}
 		// 移除逻辑连接
 		eventbus.User.DirectRemoveConn(conn)
 
@@ -50,7 +53,12 @@ func (h *Handler) closeConn(ctx *eventbus.UserContext) {
 func (h *Handler) removeConn(ctx *eventbus.UserContext) {
 
 	for _, event := range ctx.Events {
-		eventbus.User.DirectRemoveConn(event.Conn)
+		if !event.PresenceReconciled {
+			if service.Presence != nil {
+				service.Presence.Forget(event.Conn)
+			}
+			eventbus.User.DirectRemoveConn(event.Conn)
+		}
 		if event.Conn.Auth {
 			h.notifyUserOfflineIfNeed(event.Conn)
 		}

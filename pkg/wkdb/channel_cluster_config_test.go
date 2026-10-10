@@ -2,12 +2,51 @@ package wkdb_test
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestChannelClusterConfigRecoveryPagination(t *testing.T) {
+	d := newTestDB(t)
+	require.NoError(t, d.Open())
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+	for i := 0; i < 259; i++ {
+		require.NoError(t, d.SaveChannelClusterConfig(wkdb.ChannelClusterConfig{
+			ChannelId: fmt.Sprintf("scan-%d", i), ChannelType: 2, ConfVersion: 1,
+		}))
+	}
+	seen := make(map[string]bool)
+	var offset uint64
+	for {
+		page, err := d.GetChannelClusterConfigs(offset, 128)
+		require.NoError(t, err)
+		require.LessOrEqual(t, len(page), 128)
+		for _, cfg := range page {
+			require.Greater(t, cfg.Id, offset)
+			require.False(t, seen[cfg.ChannelId])
+			seen[cfg.ChannelId] = true
+			offset = cfg.Id
+		}
+		if len(page) < 128 {
+			break
+		}
+	}
+	require.Len(t, seen, 259)
+	page, err := d.GetChannelClusterConfigs(offset, 128)
+	require.NoError(t, err)
+	require.Empty(t, page)
+	page, err = d.GetChannelClusterConfigs(math.MaxUint64, 128)
+	require.NoError(t, err)
+	require.Empty(t, page, "maximum cursor must not wrap to the first row")
+	page, err = d.GetChannelClusterConfigs(0, 0)
+	require.NoError(t, err)
+	require.Empty(t, page)
+}
 
 func TestSaveChannelClusterConfig(t *testing.T) {
 	d := newTestDB(t)
