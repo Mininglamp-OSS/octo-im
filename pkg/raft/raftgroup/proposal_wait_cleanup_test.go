@@ -174,7 +174,7 @@ type applyDeadlineContext struct {
 func (c *applyDeadlineContext) Done() <-chan struct{} {
 	c.calls++
 	if c.calls == 1 {
-		return nil
+		return c.done
 	}
 	if c.calls == 2 {
 		c.apply()
@@ -183,7 +183,14 @@ func (c *applyDeadlineContext) Done() <-chan struct{} {
 	return c.done
 }
 
-func (*applyDeadlineContext) Err() error { return context.DeadlineExceeded }
+func (c *applyDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
 
 func TestProposeUntilAppliedCompletedAtDeadlineSucceeds(t *testing.T) {
 	g := newWaitTestGroup(t)
