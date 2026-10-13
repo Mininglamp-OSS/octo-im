@@ -34,8 +34,8 @@ func (m *wait) bucketIndex(key string) int {
 	return int(fnv32(key) % uint32(len(m.buckets)))
 }
 
-func (m *wait) put(progress *progress) {
-	m.buckets[m.bucketIndex(progress.key)].put(progress)
+func (m *wait) put(progress *progress) bool {
+	return m.buckets[m.bucketIndex(progress.key)].put(progress)
 }
 
 func fnv32(key string) uint32 {
@@ -144,10 +144,26 @@ func (m *waitBucket) didApply(key string, maxLogIndex uint64) {
 	m.clean()
 }
 
-func (m *waitBucket) put(progress *progress) {
+// Detach under the notification lock before recycling. Admission can fail or
+// the caller can time out while the applied index still has not reached it.
+// Return the completion state observed at this ownership boundary.
+func (m *waitBucket) put(progress *progress) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	done := progress.done
+	for i, pending := range m.progresses {
+		if pending == progress {
+			copy(m.progresses[i:], m.progresses[i+1:])
+			last := len(m.progresses) - 1
+			m.progresses[last] = nil
+			m.progresses = m.progresses[:last]
+			break
+		}
+	}
 	close(progress.waitC)
 	progress.reset()
 	m.progressPool.Put(progress)
+	return done
 }
 
 // 清理已完成的
