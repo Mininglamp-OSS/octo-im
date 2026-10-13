@@ -135,13 +135,11 @@ func TestAsyncProposalForwardsBeforeApply(t *testing.T) {
 
 type demotingNode struct{ *raft.Node }
 
-func (n *demotingNode) Step(event types.Event) error {
-	if event.Type == types.Propose {
-		// Deterministically change role after all ingress checks, on the event
-		// loop itself, rather than racing test-side writes with Raft.
-		n.BecomeFollower(2, 3)
-	}
-	return n.Node.Step(event)
+// Admit deterministically changes role after all ingress checks, on the event
+// loop itself, rather than racing test-side writes with Raft.
+func (n *demotingNode) Admit(logs []types.Log) (types.Admission, error) {
+	n.BecomeFollower(2, 3)
+	return n.Node.Admit(logs)
 }
 
 func TestAsyncProposalRejectsLeaderChangeBeforeStep(t *testing.T) {
@@ -165,8 +163,14 @@ func TestAsyncProposalRejectsLeaderChangeBeforeStep(t *testing.T) {
 			resp, err := group.Propose("slot", 1, []byte("cleanup"))
 			require.Error(t, err)
 			require.Nil(t, resp)
-			if !remote {
+			if remote {
+				// The leader answers ReasonError; that alone does not prove
+				// non-admission on an older leader.
+				require.ErrorIs(t, err, types.ErrForwardRejected)
+				require.NotErrorIs(t, err, types.ErrProposalNotAdmitted)
+			} else {
 				require.ErrorIs(t, err, types.ErrNotLeader)
+				require.ErrorIs(t, err, types.ErrProposalNotAdmitted)
 			}
 		})
 	}
