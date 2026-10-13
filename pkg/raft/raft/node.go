@@ -3,6 +3,7 @@ package raft
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -46,7 +47,7 @@ type Node struct {
 
 	suspend bool // 挂起
 
-	idleTick int // 服务空闲计数
+	idleTick atomic.Int64 // KeepAlive is also called by proposal goroutines
 
 	syncing             bool // 正在同步
 	syncRespTimeoutTick int  // 同步响应超时计数
@@ -218,7 +219,7 @@ func (n *Node) GetReplicaLastLogIndex(replicaId uint64) uint64 {
 }
 
 func (n *Node) KeepAlive() {
-	n.idleTick = 0
+	n.idleTick.Store(0)
 }
 func (n *Node) advance() {
 	if n.opts.Advance != nil {
