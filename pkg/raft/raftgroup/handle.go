@@ -153,9 +153,13 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 	err := rg.goPool.Submit(func() {
 		// 已提交
 		// rg.wait.didCommit(r.Key(), e.EndIndex-1)
-		var lastLogIndex uint64
+		var (
+			lastLogIndex uint64
+			logs         []types.Log
+			err          error
+		)
 		if !rg.opts.NotNeedApplied {
-			logs, err := rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, e.EndIndex, 0)
+			logs, err = rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, e.EndIndex, 0)
 			if err != nil {
 				rg.Error("get logs failed", zap.Error(err))
 				rg.AddEvent(r.Key(), types.Event{
@@ -191,8 +195,8 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			Reason: types.ReasonOk,
 			Index:  lastLogIndex,
 		})
-		// 已应用
-		rg.wait.didApply(r.Key(), lastLogIndex)
+		// 已应用：按回执身份完成等待者（NotNeedApplied 时 logs 为 nil）
+		rg.wait.didApply(r.Key(), lastLogIndex, logs)
 		rg.Advance()
 	})
 	if err != nil {

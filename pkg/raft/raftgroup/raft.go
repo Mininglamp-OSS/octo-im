@@ -11,6 +11,9 @@ type IRaft interface {
 	Ready() []types.Event
 	// Step 处理事件
 	Step(event types.Event) error
+	// Admit assigns indexes and the current term to logs and appends them as
+	// a leader-local proposal. Only the event loop calls it.
+	Admit(logs []types.Log) (types.Admission, error)
 	// Tick 时钟周期
 	Tick()
 	// LeaderId 获得领导者ID

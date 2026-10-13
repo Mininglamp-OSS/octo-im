@@ -33,6 +33,9 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	n.roleChangeIfNeed(oldCfg, newCfg)
 
 	n.cfg = newCfg
+	// The new configuration can name another leader or term without a role
+	// transition.
+	n.fenceProposals(oldCfg.Leader == n.opts.NodeId, oldCfg.Term)
 
 	return nil
 }

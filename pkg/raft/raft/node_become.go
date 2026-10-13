@@ -9,6 +9,7 @@ func (n *Node) BecomeCandidate() {
 	if n.cfg.Role == types.RoleLeader {
 		n.Panic("invalid transition [leader -> candidate]")
 	}
+	defer n.fenceProposals(n.IsLeader(), n.cfg.Term)
 	n.cfg.Term++
 	n.stepFunc = n.stepCandidate
 	n.reset()
@@ -20,6 +21,7 @@ func (n *Node) BecomeCandidate() {
 }
 
 func (n *Node) BecomeFollower(term uint32, leaderId uint64) {
+	defer n.fenceProposals(n.IsLeader(), n.cfg.Term)
 	n.cfg.Term = term
 	n.stepFunc = n.stepFollower
 	n.reset()
@@ -37,6 +39,7 @@ func (n *Node) BecomeFollower(term uint32, leaderId uint64) {
 }
 
 func (n *Node) BecomeLeader(term uint32) {
+	defer n.fenceProposals(n.IsLeader(), n.cfg.Term)
 	n.cfg.Term = term
 	n.stepFunc = n.stepLeader
 	n.reset()
@@ -53,6 +56,7 @@ func (n *Node) BecomeLeader(term uint32) {
 }
 
 func (n *Node) BecomeLearner(term uint32, leaderId uint64) {
+	defer n.fenceProposals(n.IsLeader(), n.cfg.Term)
 	n.cfg.Term = term
 	n.stepFunc = n.stepLearner
 	n.reset()
