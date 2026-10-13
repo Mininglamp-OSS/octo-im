@@ -52,9 +52,33 @@ func (s *Store) applyCMDs(cmds []*CMD, logIndexs []uint64) error {
 	var addOrUpdateUserConversationsCMDs []*CMD
 	var addOrUpdateConversationsBatchIfNotExistCMDs []*CMD
 
-	for i, cmd := range cmds {
+	for i := 0; i < len(cmds); i++ {
+		cmd := cmds[i]
 
 		switch cmd.CmdType {
+		case CMDUpdateChannelInfo:
+			end := i + 1
+			for end < len(cmds) && end-i < 256 && cmds[end].CmdType == CMDUpdateChannelInfo {
+				end++
+			}
+			if end == i+1 {
+				if err := s.applyCMD(cmd, logIndexs[i]); err != nil {
+					return err
+				}
+				continue
+			}
+			infos := make([]wkdb.ChannelInfo, 0, end-i)
+			for _, entry := range cmds[i:end] {
+				info, err := entry.DecodeChannelInfo()
+				if err != nil {
+					return err
+				}
+				infos = append(infos, info)
+			}
+			if err := s.wdb.UpdateChannelInfoBatch(infos); err != nil {
+				return err
+			}
+			i = end - 1
 		case CMDChannelClusterConfigSave: // 保存频道分布式配置
 			channelClusterConfigsCMDs = append(channelClusterConfigsCMDs, cmd)
 			confVersions = append(confVersions, logIndexs[i])
