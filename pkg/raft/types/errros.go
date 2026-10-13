@@ -17,3 +17,31 @@ var (
 	// from the leader's current term. The proposal was not appended.
 	ErrProposalStaleTerm = errors.New("leader-local proposal term is not the current term")
 )
+
+// Proposal outcomes reported by RaftGroup. They are process-local and are
+// usually wrapped together with the cause (context error, ErrGroupStopped,
+// ErrNotLeader, ...), so errors.Is matches both the outcome and the cause.
+var (
+	// ErrProposalNotAdmitted means the proposal definitely did not enter the
+	// log: it was cancelled or rejected before the leader admitted it.
+	ErrProposalNotAdmitted = errors.New("proposal not admitted")
+	// ErrProposalOutcomeUnknown means the proposal was, or may have been,
+	// admitted, but the caller stopped waiting before its outcome was known.
+	// It may still be committed and applied.
+	ErrProposalOutcomeUnknown = errors.New("proposal outcome unknown")
+	// ErrProposalSuperseded means the proposal was admitted, but another
+	// entry was applied at its log index.
+	ErrProposalSuperseded = errors.New("proposal superseded by another log entry")
+	// ErrForwardRejected means the leader answered a forwarded proposal with
+	// an error. A leader running an older release can still have queued the
+	// proposal, so this does not imply ErrProposalNotAdmitted.
+	ErrForwardRejected = errors.New("forwarded proposal rejected by leader")
+)
+
+// Admission is the log range and term the leader assigned to an admitted
+// proposal.
+type Admission struct {
+	Term       uint32
+	FirstIndex uint64
+	LastIndex  uint64
+}

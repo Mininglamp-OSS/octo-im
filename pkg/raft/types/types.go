@@ -106,6 +106,10 @@ const (
 	ConfigResp
 	// Destory 销毁节点
 	Destory
+	// ProposalFence is a local event emitted when this node stops leading a
+	// term. Proposals admitted in that term can no longer be completed from
+	// local log identity. It is never sent to another node.
+	ProposalFence
 )
 
 func (e EventType) String() string {
@@ -168,6 +172,8 @@ func (e EventType) String() string {
 		return "ConfigResp"
 	case Destory:
 		return "Destory"
+	case ProposalFence:
+		return "ProposalFence"
 	default:
 		return "Unknown"
 	}
