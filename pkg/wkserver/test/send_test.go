@@ -4,56 +4,96 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/client"
+	"github.com/WuKongIM/WuKongIM/pkg/wkserver/internal/testfixture"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"github.com/panjf2000/gnet/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
-func TestSendAndRecv(t *testing.T) {
-
-	addr := "tcp://:10001"
-
-	s := wkserver.New(addr, wkserver.WithMessagePoolOn(false))
-
-	var wg sync.WaitGroup
-	s.OnMessage(func(conn gnet.Conn, m *proto.Message) {
-		wg.Done()
+// startServer starts s and waits until its listener accepts connections.
+func startServer(tb testing.TB, s *wkserver.Server, addr string) {
+	tb.Helper()
+	require.NoError(tb, s.Start())
+	tb.Cleanup(func() {
+		s.Stop()
+		assert.NoError(tb, testfixture.WaitAddrReleased(addr, testfixture.DefaultReadyTimeout))
 	})
-	err := s.Start()
-	assert.NoError(t, err)
-	defer s.Stop()
+	testfixture.RequireListening(tb, addr)
+}
 
+// startClient starts a client and waits until it is authenticated. The
+// returned stop function is idempotent and also registered for cleanup.
+func startClient(tb testing.TB, addr string) (*client.Client, func()) {
+	tb.Helper()
 	cli := client.New(addr, client.WithUid("uid"))
-	err = cli.Start()
-	assert.NoError(t, err)
-	defer cli.Stop()
+	require.NoError(tb, cli.Start())
+	var once sync.Once
+	stop := func() { once.Do(cli.Stop) }
+	tb.Cleanup(stop)
+	testfixture.RequireAuthed(tb, cli.IsAuthed)
+	return cli, stop
+}
 
-	time.Sleep(time.Millisecond * 200)
+func TestSendAndRecv(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		poolOn   bool
+		msgCount int
+	}{
+		{name: "direct_dispatch", poolOn: false, msgCount: 100000},
+		// Kept below the default message pool size: the non-blocking pool
+		// drops submissions once saturated, which is not what this test covers.
+		{name: "message_pool", poolOn: true, msgCount: 10000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testSendAndRecv(t, tc.poolOn, tc.msgCount)
+		})
+	}
+}
 
-	msgCount := 100000
-	wg.Add(msgCount)
+func testSendAndRecv(t *testing.T, poolOn bool, msgCount int) {
+	addr := testfixture.FreeAddr(t)
+
+	s := wkserver.New(addr, wkserver.WithMessagePoolOn(poolOn))
+
+	tracker := testfixture.NewTracker()
+	s.OnMessage(func(conn gnet.Conn, m *proto.Message) {
+		tracker.Received(m.Id)
+	})
+	startServer(t, s, addr)
+
+	cli, stopClient := startClient(t, addr)
 
 	for i := 0; i < msgCount; i++ {
-		err = cli.Send(&proto.Message{
-			Id:      uint64(i),
+		id := uint64(i)
+		tracker.Expect(id)
+		err := cli.Send(&proto.Message{
+			Id:      id,
 			MsgType: 112349,
 			Content: []byte("hellohellohellohellohellohellohellohellohellohellohellohellohellohellohello"),
 		})
-		assert.NoError(t, err)
+		if err != nil {
+			// A rejected Send never reaches the server; release its obligation
+			// and stop, rather than waiting for a delivery that cannot happen.
+			tracker.Cancel(id)
+			t.Fatalf("send %d rejected: %v (pending=%d)", id, err, tracker.Pending())
+		}
 	}
 
-	wg.Wait()
+	require.NoError(t, tracker.Wait(testfixture.DefaultDeliveryTimeout))
+	stopClient()
+	require.NoError(t, tracker.Verify())
 }
 
 func TestRequestResp(t *testing.T) {
-	addr := "tcp://127.0.0.1:10001"
+	addr := testfixture.FreeAddr(t)
 	wklog.Configure(&wklog.Options{
 		Level: zap.InfoLevel,
 	})
@@ -61,18 +101,9 @@ func TestRequestResp(t *testing.T) {
 	s.Route("/test", func(c *wkserver.Context) {
 		c.Write([]byte("hello"))
 	})
-	err := s.Start()
-	assert.NoError(t, err)
-	defer s.Stop()
+	startServer(t, s, addr)
 
-	time.Sleep(time.Millisecond * 200)
-
-	cli := client.New(addr, client.WithUid("uid"))
-	err = cli.Start()
-	assert.NoError(t, err)
-	defer cli.Stop()
-
-	time.Sleep(time.Millisecond * 200)
+	cli, _ := startClient(t, addr)
 
 	var count = 10000
 
@@ -82,21 +113,24 @@ func TestRequestResp(t *testing.T) {
 	var tcount atomic.Int64
 	for i := 0; i < count; i++ {
 		go func(ii int) {
+			defer wg.Done()
 			resp, err := cli.Request("/test", []byte(fmt.Sprintf("hi--%d", ii)))
-			assert.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 			assert.Equal(t, []byte("hello"), resp.Body)
 			tcount.Add(1)
-			wg.Done()
-
 		}(i)
 	}
 
+	// Every goroutine finishes within the client's own request timeout, so
+	// this wait is bounded without an extra deadline.
 	wg.Wait()
-
+	assert.Equal(t, int64(count), tcount.Load())
 }
 
 func BenchmarkRequestResp(b *testing.B) {
-	addr := "tcp://127.0.0.1:10001"
+	addr := testfixture.FreeAddr(b)
 	wklog.Configure(&wklog.Options{
 		Level: zap.InfoLevel,
 	})
@@ -104,22 +138,9 @@ func BenchmarkRequestResp(b *testing.B) {
 	s.Route("/test", func(c *wkserver.Context) {
 		c.Write([]byte("hello"))
 	})
-	err := s.Start()
-	if err != nil {
-		b.Fatalf("Server start failed: %v", err)
-	}
-	defer s.Stop()
+	startServer(b, s, addr)
 
-	time.Sleep(time.Millisecond * 200)
-
-	cli := client.New(addr, client.WithUid("uid"))
-	err = cli.Start()
-	if err != nil {
-		b.Fatalf("Client start failed: %v", err)
-	}
-	defer cli.Stop()
-
-	time.Sleep(time.Millisecond * 200)
+	cli, _ := startClient(b, addr)
 
 	b.ReportAllocs()
 
@@ -127,7 +148,9 @@ func BenchmarkRequestResp(b *testing.B) {
 		// 每个并发的测试 goroutine 会运行此代码
 		for pb.Next() {
 			resp, err := cli.Request("/test", []byte("hi"))
-			assert.NoError(b, err)
+			if !assert.NoError(b, err) {
+				continue
+			}
 			assert.Equal(b, []byte("hello"), resp.Body)
 		}
 	})
