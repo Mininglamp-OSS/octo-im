@@ -220,7 +220,7 @@ func (r *Raft) WaitUtilCommit(ctx context.Context, index uint64) error {
 			return ctx.Err()
 		default:
 		}
-		if r.node.queue.committedIndex >= index {
+		if r.view.Load().(nodeView).committed >= index {
 			return nil
 		}
 		time.Sleep(time.Millisecond * 10)
@@ -710,6 +710,7 @@ func (r *Raft) followerToLeader(followerId uint64) (types.Config, error) {
 }
 
 type nodeView struct {
+	committed  uint64
 	leader     uint64
 	term       uint32
 	isLeader   bool
@@ -718,7 +719,7 @@ type nodeView struct {
 
 // Caller routing uses an immutable snapshot, never mutable node fields.
 func (r *Raft) publishView() {
-	v := nodeView{leader: r.node.LeaderId(), term: r.node.cfg.Term, isLeader: r.node.IsLeader(), generation: 1}
+	v := nodeView{committed: r.node.queue.committedIndex, leader: r.node.LeaderId(), term: r.node.cfg.Term, isLeader: r.node.IsLeader(), generation: 1}
 	r.forwardMu.Lock()
 	defer r.forwardMu.Unlock()
 	old := r.view.Load()

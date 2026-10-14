@@ -162,8 +162,11 @@ func (s *Server) initRaft() error {
 // storage I/O can keep that lifecycle pending; WaitStopped exposes its result.
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
-		s.raft.Stop()
 		go func() {
+			// Stop joins the event loop, whose durable hard-state write may
+			// itself be blocked. Include that join in the tracked lifecycle
+			// so WaitStopped's deadline also bounds this ownership boundary.
+			s.raft.Stop()
 			// Keep Storage and dependent server state alive until every worker exits.
 			s.closeErr = s.raft.WaitQuiescence(context.Background())
 			if s.closeErr == nil {

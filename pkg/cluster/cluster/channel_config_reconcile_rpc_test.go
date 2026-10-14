@@ -39,7 +39,7 @@ func newConfigRPCServersWithSlots(t *testing.T, count, slotCount int) ([]*Server
 		s := New(NewOptions(WithAddr("tcp://"+addresses[id]), WithConfigOptions(config), WithDataDir(t.TempDir()),
 			WithDBWKDbShardNum(1), WithDBSlotShardNum(1), WithDBWKDbMemTableSize(1<<20), WithDBSlotMemTableSize(1<<20)))
 		require.NoError(t, s.Start())
-		t.Cleanup(s.Stop)
+		t.Cleanup(func() { require.NoError(t, s.Stop()) })
 		// Control all hints in this test, while leaving the real RPC handlers and
 		// applied metadata barrier running on both TCP peers.
 		s.configReconciler.stop()

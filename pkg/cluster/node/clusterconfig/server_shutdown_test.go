@@ -20,6 +20,7 @@ type ownerStorage struct {
 	once                       sync.Once
 	active, closes, afterClose atomic.Int32
 	closeFailure               error
+	blockHardState             atomic.Bool
 }
 
 func (s *ownerStorage) enter(op string) func() {
@@ -178,4 +179,44 @@ func TestServerShutdownCloseError(t *testing.T) {
 	require.ErrorIs(t, s.WaitStopped(ctx), sentinel)
 	require.EqualValues(t, 1, st.closes.Load())
 	require.NoError(t, s.config.cfgFile.Close())
+}
+
+func (s *ownerStorage) SaveHardState(state types.HardState) error {
+	if s.blockHardState.Load() {
+		defer s.enter("hardstate")()
+	}
+	return s.PebbleShardLogStorage.SaveHardState(state)
+}
+
+func TestServerShutdownBlockedHardStateOwnership(t *testing.T) {
+	s := New(NewOptions(WithNodeId(1), WithInitNodes(map[uint64]string{1: ""}), WithConfigPath(t.TempDir()+"/cluster.json")))
+	st := &ownerStorage{PebbleShardLogStorage: s.storage.(*PebbleShardLogStorage), op: "hardstate", entered: make(chan struct{}), release: make(chan struct{})}
+	s.storage = st
+	require.NoError(t, s.Start())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, s.raft.StepWait(ctx, types.Event{Type: types.ConfChange, Config: types.Config{Replicas: []uint64{1}, Term: 1, Leader: 1}}))
+	var once sync.Once
+	release := func() { once.Do(func() { close(st.release) }) }
+	t.Cleanup(func() {
+		release()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, s.WaitStopped(ctx))
+		require.NoError(t, s.config.cfgFile.Close())
+	})
+	st.blockHardState.Store(true)
+	s.StepRaftEvent(types.Event{Type: types.Ping, From: 2, To: 1, Term: 2})
+	ownerRecv(t, st.entered)
+	bounded, boundedCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer boundedCancel()
+	require.ErrorIs(t, s.WaitStopped(bounded), context.DeadlineExceeded)
+	require.Zero(t, st.closes.Load())
+	require.Positive(t, st.active.Load())
+	release()
+	require.NoError(t, s.WaitStopped(ctx))
+	require.Zero(t, st.active.Load())
+	require.EqualValues(t, 1, st.closes.Load())
+	require.Zero(t, st.afterClose.Load())
+	t.Log("blocked hard-state loop join honors bounded handoff; zero workers before close")
 }

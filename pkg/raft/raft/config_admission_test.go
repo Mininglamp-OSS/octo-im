@@ -70,6 +70,9 @@ func (s *studyStorage) Apply(logs []types.Log) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.applied = append(s.applied, logs...)
+	if len(logs) > 0 {
+		s.appliedIndex = logs[len(logs)-1].Index
+	}
 	return nil
 }
 func (s *studyStorage) snapshot() ([]types.Log, []types.Log) {

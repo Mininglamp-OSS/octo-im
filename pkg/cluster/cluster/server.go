@@ -31,6 +31,10 @@ import (
 )
 
 type Server struct {
+	stopBegin  sync.Once
+	stopFinish sync.Once
+	stopErr    error
+
 	// 分布式配置服务
 	cfgServer *clusterconfig.Server
 	// 分布式事件
@@ -247,18 +251,42 @@ func (s *Server) Start() error {
 	return nil
 }
 
-func (s *Server) Stop() {
-	s.configReconciler.stop()
-	s.stopper.Stop()
-	s.eventServer.Stop()
-	s.cfgServer.Stop()
-	s.slotServer.Stop()
-	s.channelServer.Stop()
-	s.netServer.Stop()
-	s.cancelFnc()
-	s.store.Stop()
-	s.db.Close()
-	s.channelKeyLock.StopCleanLoop()
+// Stop uses the existing request budget for the Config Raft ownership handoff.
+// An error forbids reopening storage; StopWithContext may be called again to
+// await a pending close without repeating dependent teardown.
+func (s *Server) Stop() error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.ReqTimeout)
+	defer cancel()
+	return s.StopWithContext(ctx)
+}
+
+func (s *Server) StopWithContext(ctx context.Context) error {
+	s.stopBegin.Do(func() {
+		s.configReconciler.stop()
+		s.stopper.Stop()
+		s.eventServer.Stop()
+	})
+	return stopConfigOwner(ctx, s.cfgServer, func() error {
+		s.stopFinish.Do(func() {
+			s.slotServer.Stop()
+			s.channelServer.Stop()
+			s.netServer.Stop()
+			s.cancelFnc()
+			s.store.Stop()
+			s.stopErr = s.db.Close()
+			s.channelKeyLock.StopCleanLoop()
+		})
+		return s.stopErr
+	})
+}
+
+// Dependent resources remain owned while Config Raft workers or Close are
+// incomplete. In particular an Apply callback must never observe closed DBs.
+func stopConfigOwner(ctx context.Context, owner interface{ WaitStopped(context.Context) error }, finish func() error) error {
+	if err := owner.WaitStopped(ctx); err != nil {
+		return fmt.Errorf("config raft ownership handoff: %w", err)
+	}
+	return finish()
 }
 
 func (s *Server) NodeStep(event rafttype.Event) {

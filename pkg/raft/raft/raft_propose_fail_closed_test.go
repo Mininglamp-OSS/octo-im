@@ -11,8 +11,10 @@ import (
 )
 
 type memStorage struct {
-	mu   sync.Mutex
-	logs []types.Log
+	mu           sync.Mutex
+	logs         []types.Log
+	hardState    types.HardState
+	appliedIndex uint64
 }
 
 func (s *memStorage) AppendLogs(logs []types.Log, _ *types.TermStartIndexInfo) error {
@@ -21,15 +23,59 @@ func (s *memStorage) AppendLogs(logs []types.Log, _ *types.TermStartIndexInfo) e
 	s.logs = append(s.logs, logs...)
 	return nil
 }
-func (s *memStorage) GetLogs(start, end, limit uint64) ([]types.Log, error)  { return nil, nil }
-func (s *memStorage) GetState() (types.RaftState, error)                     { return types.RaftState{}, nil }
-func (s *memStorage) GetTermStartIndex(uint32) (uint64, error)               { return 0, nil }
-func (s *memStorage) LeaderTermGreaterEqThan(uint32) (uint32, error)         { return 0, nil }
-func (s *memStorage) LeaderLastTerm() (uint32, error)                        { return 0, nil }
-func (s *memStorage) TruncateLogTo(uint64) error                             { return nil }
+func (s *memStorage) GetLogs(start, end, limit uint64) ([]types.Log, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []types.Log
+	for _, log := range s.logs {
+		if log.Index >= start && (end == 0 || log.Index < end) {
+			out = append(out, log)
+		}
+	}
+	return out, nil
+}
+func (s *memStorage) SaveHardState(state types.HardState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hardState = state
+	return nil
+}
+func (s *memStorage) GetState() (types.RaftState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := types.RaftState{HardState: s.hardState, AppliedIndex: s.appliedIndex}
+	if len(s.logs) > 0 {
+		last := s.logs[len(s.logs)-1]
+		state.LastLogIndex, state.LastTerm = last.Index, last.Term
+	}
+	return state, nil
+}
+func (s *memStorage) GetTermStartIndex(uint32) (uint64, error)       { return 0, nil }
+func (s *memStorage) LeaderTermGreaterEqThan(uint32) (uint32, error) { return 0, nil }
+func (s *memStorage) LeaderLastTerm() (uint32, error)                { return 0, nil }
+func (s *memStorage) TruncateLogTo(index uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, log := range s.logs {
+		if log.Index <= index {
+			s.logs[n] = log
+			n++
+		}
+	}
+	s.logs = s.logs[:n]
+	return nil
+}
 func (s *memStorage) DeleteLeaderTermStartIndexGreaterThanTerm(uint32) error { return nil }
-func (s *memStorage) Apply([]types.Log) error                                { return nil }
-func (s *memStorage) SaveConfig(types.Config) error                          { return nil }
+func (s *memStorage) Apply(logs []types.Log) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(logs) > 0 {
+		s.appliedIndex = logs[len(logs)-1].Index
+	}
+	return nil
+}
+func (s *memStorage) SaveConfig(types.Config) error { return nil }
 
 type nopTransport struct{}
 
@@ -81,4 +127,24 @@ func TestConfigRaftStepWaitProposeFailsClosed(t *testing.T) {
 	overlap, stale := r.node.ProposeRejectCounts()
 	require.Equal(t, uint64(1), overlap)
 	require.Equal(t, uint64(1), stale)
+}
+
+func TestConfigFixtureHardStateDurability(t *testing.T) {
+	for _, storage := range []Storage{&memStorage{}, &studyStorage{terms: make(map[uint32]uint64)}, &configBlockedStorage{studyStorage: studyStorage{terms: make(map[uint32]uint64)}}} {
+		state := types.HardState{Term: 7, Vote: 2}
+		require.NoError(t, storage.SaveHardState(state))
+		logs := []types.Log{{Id: 100, Index: 1, Term: 3}}
+		require.NoError(t, storage.AppendLogs(logs, nil))
+		require.NoError(t, storage.Apply(logs))
+		recovered, err := storage.GetState()
+		require.NoError(t, err)
+		require.Equal(t, state, recovered.HardState)
+		require.Equal(t, uint64(1), recovered.LastLogIndex)
+		require.Equal(t, uint32(3), recovered.LastTerm)
+		require.Equal(t, uint64(1), recovered.AppliedIndex)
+		require.NoError(t, storage.TruncateLogTo(0))
+		recovered, err = storage.GetState()
+		require.NoError(t, err)
+		require.Equal(t, state, recovered.HardState, "truncation cannot erase term/vote")
+	}
 }

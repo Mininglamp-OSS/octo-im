@@ -78,6 +78,9 @@ func (m *wait) register(r receipt) (w *receiptWaiter, appliedBefore bool) {
 		b.waiters[r.raftKey] = keyWaiters
 	}
 	keyWaiters[r.seq] = w
+	if b.observe != nil {
+		b.observe(r, "register", nil)
+	}
 	return w, b.applied[r.raftKey] >= r.last
 }
 
@@ -147,6 +150,9 @@ func (m *wait) detach(w *receiptWaiter) (result error, completed bool) {
 	}
 	b.removeLocked(w)
 	w.done = true
+	if b.observe != nil {
+		b.observe(w.receipt, "detach", nil)
+	}
 	return nil, false
 }
 
@@ -243,7 +249,10 @@ func fnv32(key string) uint32 {
 }
 
 type waitBucket struct {
-	mu sync.Mutex
+	// observe is optional and must be installed before the group starts.
+	// It runs under mu and must not reenter wait.
+	observe func(receipt, string, error)
+	mu      sync.Mutex
 	wklog.Log
 
 	waiters map[string]map[uint64]*receiptWaiter
@@ -268,6 +277,9 @@ func (b *waitBucket) completeLocked(w *receiptWaiter, err error) {
 	}
 	w.done = true
 	w.err = err
+	if b.observe != nil {
+		b.observe(w.receipt, "publish", err)
+	}
 	b.removeLocked(w)
 	w.doneC <- err
 }

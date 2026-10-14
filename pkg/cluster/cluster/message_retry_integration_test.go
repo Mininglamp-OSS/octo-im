@@ -34,7 +34,7 @@ func TestMessageRetryRPC(t *testing.T) {
 		cfg := newTestOptions(t, id, addresses, clusterconfig.WithSlotCount(2), clusterconfig.WithSlotMaxReplicaCount(2))
 		s := New(NewOptions(WithAddr("tcp://"+addresses[id]), WithConfigOptions(cfg), WithDataDir(t.TempDir()), WithDBWKDbShardNum(1), WithDBSlotShardNum(1)))
 		require.NoError(t, s.Start())
-		t.Cleanup(s.Stop)
+		t.Cleanup(func() { require.NoError(t, s.Stop()) })
 		nodes[i] = s
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

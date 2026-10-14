@@ -25,21 +25,16 @@ func (rg *RaftGroup) ProposeAfterRead(ctx context.Context, key string, before Re
 		return 0, ErrReadStateChanged
 	}
 	// Use the same reservation as generic proposals, with bounded acquisition.
-	locker, ok := r.(interface{ TryLock() bool })
-	if !ok {
-		return 0, ErrReadStateChanged
+	sem := rg.admissionSem(key)
+	select {
+	case sem <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-rg.stopper.ShouldStop():
+		return 0, ErrGroupStopped
 	}
 	poll := time.NewTicker(time.Millisecond)
 	defer poll.Stop()
-	for !locker.TryLock() {
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-rg.stopper.ShouldStop():
-			return 0, ErrGroupStopped
-		case <-poll.C:
-		}
-	}
 	checkOwner := func(current IRaft) error {
 		if current != r || !before.Exists || !before.Ready || !r.IsLeader() ||
 			r.LeaderId() != before.LeaderID || r.Config().Term != before.Term ||
@@ -52,7 +47,7 @@ func (rg *RaftGroup) ProposeAfterRead(ctx context.Context, key string, before Re
 		return nil
 	}
 	index, err := func() (uint64, error) {
-		defer r.Unlock()
+		defer func() { <-sem }()
 		var target uint64
 		if err := rg.Do(ctx, key, func(current IRaft) error {
 			if err := checkOwner(current); err != nil {

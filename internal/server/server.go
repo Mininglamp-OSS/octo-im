@@ -385,7 +385,9 @@ func (s *Server) Stop() error {
 		s.conversationManager.Stop()
 	}
 
-	s.clusterServer.Stop()
+	if err := s.clusterServer.Stop(); err != nil {
+		return err
+	}
 
 	if s.opts.Demo.On {
 		s.demoServer.Stop()

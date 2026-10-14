@@ -35,7 +35,7 @@ func skipUnlessApplyWaitStress(t *testing.T) {
 // applied each proposal id, so callers can compare results with reality.
 type stressStorage struct {
 	group      *RaftGroup
-	receipts   map[uint64]*receiptWaiter
+	traces     map[uint64][]stressReceiptEvent
 	mu         sync.Mutex
 	logs       map[string][]types.Log
 	termStarts map[string]types.TermStartIndexInfo
@@ -45,7 +45,7 @@ type stressStorage struct {
 
 func newStressStorage(applyDelay func() time.Duration) *stressStorage {
 	return &stressStorage{
-		receipts:   make(map[uint64]*receiptWaiter),
+		traces:     make(map[uint64][]stressReceiptEvent),
 		logs:       make(map[string][]types.Log),
 		termStarts: make(map[string]types.TermStartIndexInfo),
 		appliedAt:  make(map[uint64]time.Time),
@@ -117,14 +117,6 @@ func (s *stressStorage) GetLogs(key string, start, end, maxSize uint64) ([]types
 }
 
 func (s *stressStorage) Apply(key string, logs []types.Log) error {
-	b := s.group.wait.bucket(key)
-	b.mu.Lock()
-	s.mu.Lock()
-	for _, w := range b.waiters[key] {
-		s.receipts[w.lastLogId] = w
-	}
-	s.mu.Unlock()
-	b.mu.Unlock()
 	if s.applyDelay != nil {
 		time.Sleep(s.applyDelay())
 	}
@@ -203,8 +195,9 @@ func (n *stressNode) Step(e types.Event) error {
 // under the same wrapper lock used by Register and Trigger.
 type stressForwardWait struct {
 	wt.Wait
-	mu  sync.Mutex
-	ids map[string]bool
+	mu     sync.Mutex
+	ids    map[string]bool
+	events map[string][]stressForwardEvent
 }
 
 func (w *stressForwardWait) Register(id string) <-chan interface{} {
@@ -212,11 +205,13 @@ func (w *stressForwardWait) Register(id string) <-chan interface{} {
 	defer w.mu.Unlock()
 	ch := w.Wait.Register(id)
 	w.ids[id] = true
+	w.events[id] = append(w.events[id], stressForwardEvent{"register", time.Now(), ""})
 	return ch
 }
 func (w *stressForwardWait) Trigger(id string, value interface{}) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.events[id] = append(w.events[id], stressForwardEvent{"trigger", time.Now(), fmt.Sprintf("%T", value)})
 	w.Wait.Trigger(id, value)
 	delete(w.ids, id)
 }
@@ -311,8 +306,11 @@ func newStressCluster(t *testing.T, keyCount int, applyDelay func() time.Duratio
 	for _, id := range nodeIDs {
 		store := newStressStorage(applyDelay)
 		g := New(NewOptions(WithTransport(tr), WithStorage(store), WithTickInterval(10*time.Millisecond), WithLogPrefix(fmt.Sprintf("stress-%d", id))))
-		g.fowardProposeWait = &stressForwardWait{Wait: wt.New(), ids: make(map[string]bool)}
+		g.fowardProposeWait = &stressForwardWait{Wait: wt.New(), ids: make(map[string]bool), events: make(map[string][]stressForwardEvent)}
 		store.group = g
+		for _, bucket := range g.wait.buckets {
+			bucket.observe = store.observeReceipt
+		}
 		tr.groups[id] = g
 		c.groups = append(c.groups, g)
 		c.stores = append(c.stores, store)
@@ -414,6 +412,7 @@ type stressStats struct {
 	businessAppliedUnpublished, businessAppliedPublished, businessAppliedNoReceipt int64
 	// Business Apply precedes expiry; this alone does not prove receipt completion.
 	appliedBeforeExpiryButFailed int64
+	unexplainedCorrelation       int64
 	// Success was returned although this node had not applied the batch yet.
 	okButNotApplied int64
 	// The call returned more than 500ms after its context expired.
@@ -595,23 +594,44 @@ func (c *stressCluster) run(t *testing.T, load stressLoad) *stressStats {
 					if err != nil && applied && !expired.IsZero() && appliedAt.Before(expired) {
 						atomic.AddInt64(&stats.appliedBeforeExpiryButFailed, 1)
 						store.mu.Lock()
-						w := store.receipts[lastID]
+						trace := append([]stressReceiptEvent(nil), store.traces[lastID]...)
 						store.mu.Unlock()
-						if w == nil {
-							atomic.AddInt64(&stats.businessAppliedNoReceipt, 1)
-						} else {
-							b := g.wait.bucket(key)
-							b.mu.Lock()
-							// On an error return, successful publication would have won detach.
-							// A detached waiter has done=true, nil err, and no published channel value.
-							published := w.done && (w.err != nil || len(w.doneC) > 0)
-							b.mu.Unlock()
-							if published {
-								atomic.AddInt64(&stats.businessAppliedPublished, 1)
-							} else {
-								atomic.AddInt64(&stats.businessAppliedUnpublished, 1)
+						registered, published, detached := false, false, false
+						invalid := false
+						for _, event := range trace {
+							if event.at.After(returned) {
+								invalid = true
+							}
+							switch event.phase {
+							case "register":
+								invalid = invalid || registered || event.receipt.forwarded != (uint64(node+1) != c.leaders[key])
+								registered = true
+							case "publish":
+								invalid = invalid || !registered || published || detached || event.err == nil
+								published = true
+							case "detach":
+								invalid = invalid || !registered || published || detached
+								detached = true
 							}
 						}
+						forwarded := uint64(node+1) != c.leaders[key]
+						if !registered {
+							// Forwarding can settle before this node registers a receipt.
+							if !forwarded || !errors.Is(err, types.ErrProposalOutcomeUnknown) {
+								invalid = true
+							}
+							atomic.AddInt64(&stats.businessAppliedNoReceipt, 1)
+						} else if published {
+							atomic.AddInt64(&stats.businessAppliedPublished, 1)
+						} else {
+							invalid = invalid || !detached
+							atomic.AddInt64(&stats.businessAppliedUnpublished, 1)
+						}
+						if invalid {
+							atomic.AddInt64(&stats.unexplainedCorrelation, 1)
+						}
+						fwdEvents := g.fowardProposeWait.(*stressForwardWait).timeline(fmt.Sprint(reqs[0].Id))
+						t.Logf("receipt timeline node=%d key=%s id=%d forwarded=%t start=%s apply=%s expiry=%s outcome=%s err=%v events=%+v explained=%t firstID=%d forwarding=%+v", node+1, key, lastID, forwarded, start.Format(time.RFC3339Nano), appliedAt.Format(time.RFC3339Nano), expired.Format(time.RFC3339Nano), returned.Format(time.RFC3339Nano), err, trace, !invalid, reqs[0].Id, fwdEvents)
 					}
 				}
 			}(node, int64(node*1000+w+1))
@@ -843,7 +863,38 @@ func (s *stressStats) assert(t *testing.T, deadlines bool) {
 	if deadlines && (s.leaderOK == 0 || s.forwardedOK == 0 || s.deadline == 0 || s.canceled == 0 || s.deadlineCalls == 0 || s.cancelCalls == 0) {
 		t.Errorf("missing expiry/cancellation coverage: %s", s)
 	}
+	t.Logf("unexplained receipt correlations=%d", s.unexplainedCorrelation)
+	if s.unexplainedCorrelation != 0 {
+		t.Errorf("unexplained receipt correlations: %d", s.unexplainedCorrelation)
+	}
 	if s.appliedBeforeExpiryButFailed != s.businessAppliedUnpublished+s.businessAppliedPublished+s.businessAppliedNoReceipt {
 		t.Errorf("business apply correlation did not conserve: %s", s)
 	}
+}
+
+// Events are immutable copies recorded at the same lock boundary as the
+// transition. A consumed channel value cannot erase publication evidence.
+type stressReceiptEvent struct {
+	phase   string
+	at      time.Time
+	receipt receipt
+	err     error
+}
+
+func (s *stressStorage) observeReceipt(r receipt, phase string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.traces[r.lastLogId] = append(s.traces[r.lastLogId], stressReceiptEvent{phase, time.Now(), r, err})
+}
+
+type stressForwardEvent struct {
+	phase     string
+	at        time.Time
+	valueType string
+}
+
+func (w *stressForwardWait) timeline(id string) []stressForwardEvent {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]stressForwardEvent(nil), w.events[id]...)
 }
