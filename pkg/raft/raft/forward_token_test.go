@@ -24,8 +24,10 @@ type forwardRouter struct {
 	rejectTr  *studyTransport
 	rejecting atomic.Bool
 	legacy    atomic.Bool
-	done      chan struct{}
-	exited    chan struct{}
+	// handlerRejects counts rejections routed while rejecting.
+	handlerRejects atomic.Int64
+	done           chan struct{}
+	exited         chan struct{}
 }
 
 func newForwardRouter(t *testing.T) *forwardRouter {
@@ -55,7 +57,13 @@ func (rt *forwardRouter) loop() {
 		select {
 		case e := <-rt.c.tr.c:
 			if e.Type == types.SendPropose && e.To == 1 && rt.rejecting.Load() {
-				rt.rejector.handleSendPropose(e)
+				// The production handler answers the first rejections; later ones
+				// are echoed directly to keep error logging off the hot loop.
+				if rt.handlerRejects.Add(1) <= 1000 {
+					rt.rejector.handleSendPropose(e)
+				} else {
+					rt.c.rr[e.From-1].Step(rejectEcho(e))
+				}
 				continue
 			}
 			if e.Type == types.SendProposeResp && rt.legacy.Load() {
@@ -71,6 +79,23 @@ func (rt *forwardRouter) loop() {
 			return
 		}
 	}
+}
+
+// rejectEcho mirrors sendProposeRespError without its error log.
+func rejectEcho(e types.Event) types.Event {
+	var reqs types.ProposeReqSet
+	if err := reqs.Unmarshal(e.Logs[0].Data); err != nil {
+		panic(err)
+	}
+	resps := types.ProposeRespSet{}
+	for _, req := range reqs {
+		resps = append(resps, &types.ProposeResp{Id: req.Id})
+	}
+	data, err := resps.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return types.Event{Type: types.SendProposeResp, From: 1, To: e.From, Reason: types.ReasonError, Logs: []types.Log{echoForwardToken(e, data)}}
 }
 
 func requireForwardQuiescent(t *testing.T, r *Raft) ForwardIdentityStats {

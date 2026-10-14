@@ -123,19 +123,20 @@ func (rg *RaftGroup) Start() error {
 	return nil
 }
 
-// Stop fences pool submission, joins the event loop and settles receipts. It
+// Stop joins the event loop, fences pool submission and settles receipts. It
 // does not wait for pool tasks already inside Storage; see WaitQuiescence.
 func (rg *RaftGroup) Stop() {
 	rg.stopOnce.Do(func() {
+		// The loop exits first so it never sees its own storage work refused.
+		rg.stopper.Stop()
 		rg.verificationMu.Lock()
 		rg.verificationStopped = true
 		if rg.poolTasks == 0 {
 			close(rg.poolIdle)
 		}
 		rg.verificationMu.Unlock()
-		rg.stopper.Stop()
-		// The loop has exited. Proposals still queued are abandoned by their
-		// callers; receipts of admitted ones can no longer complete.
+		// Proposals still queued are abandoned by their callers; receipts of
+		// admitted ones can no longer complete.
 		rg.wait.completeAll(proposalOutcomeUnknown(ErrGroupStopped))
 	})
 }

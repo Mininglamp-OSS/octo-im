@@ -121,7 +121,9 @@ func TestServerShutdownStorageOwner(t *testing.T) {
 					if e.Type == types.SendPropose {
 						response, err := types.ProposeRespSet{&types.ProposeResp{Id: 1700, Index: 1}}.Marshal()
 						require.NoError(t, err)
-						s.StepRaftEvent(types.Event{Type: types.SendProposeResp, From: 2, Reason: types.ReasonOk, Logs: []types.Log{{Data: response}}})
+						// Echo the forwarding token header as an upgraded leader does.
+						echo := types.Log{Id: e.Logs[0].Id, Index: e.Logs[0].Index, Term: e.Logs[0].Term, Data: response}
+						s.StepRaftEvent(types.Event{Type: types.SendProposeResp, From: 2, Reason: types.ReasonOk, Logs: []types.Log{echo}})
 						break
 					}
 				}
