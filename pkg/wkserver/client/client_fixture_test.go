@@ -2,6 +2,7 @@ package client
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -44,41 +45,55 @@ func (o *dialObserver) OnTick() (time.Duration, gnet.Action) {
 	return o.clientEvent.OnTick()
 }
 
+// newClient creates a client and registers its teardown before anything else
+// can fail, so the client is torn down on every path, including when it is
+// never started. Teardown is idempotent: Stop closes the gnet poller and its
+// descriptor first, then the ants pool is released. The returned function runs
+// the same teardown explicitly.
+func newClient(tb testing.TB, addr string, opts ...Option) (*Client, func()) {
+	tb.Helper()
+	c := New(addr, opts...)
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			c.Stop()
+			c.pool.Release()
+		})
+	}
+	tb.Cleanup(stop)
+	return c, stop
+}
+
 // newObservedClient creates a client whose event handler is wrapped by a
 // dialObserver. The client is not started.
-func newObservedClient(t *testing.T, addr string) (*Client, *dialObserver) {
+func newObservedClient(t *testing.T, addr string) (*Client, *dialObserver, func()) {
 	t.Helper()
-	c := New(addr, WithUid("uid"))
+	c, stop := newClient(t, addr, WithUid("uid"))
 	obs := &dialObserver{clientEvent: c.event, failedDial: make(chan struct{})}
 	unused := c.cli
 	gc, err := gnet.NewClient(obs, gnet.WithTicker(true), gnet.WithMulticore(true))
 	require.NoError(t, err)
 	c.cli = gc
 	require.NoError(t, unused.Stop()) // release the never-started poller
-	t.Cleanup(c.pool.Release)
-	return c, obs
+	return c, obs, stop
 }
 
-func startClient(t *testing.T, c *Client) func() {
-	t.Helper()
-	require.NoError(t, c.Start())
-	var once sync.Once
-	stop := func() { once.Do(c.Stop) }
-	t.Cleanup(stop)
-	return stop
+func startClient(tb testing.TB, c *Client) {
+	tb.Helper()
+	require.NoError(tb, c.Start())
 }
 
 type testServer struct {
 	*wkserver.Server
-	addr    string
-	tracker *testfixture.Tracker
+	addr     string
+	tracker  *testfixture.Tracker
+	stopOnce sync.Once
 
 	connMu sync.Mutex
 	conn   gnet.Conn
 }
 
-func newTestServer(t *testing.T, addr string, poolOn bool) *testServer {
-	t.Helper()
+func newTestServer(addr string, poolOn bool) *testServer {
 	ts := &testServer{
 		Server:  wkserver.New(addr, wkserver.WithMessagePoolOn(poolOn)),
 		addr:    addr,
@@ -93,14 +108,21 @@ func newTestServer(t *testing.T, addr string, poolOn bool) *testServer {
 	return ts
 }
 
-func (ts *testServer) start(t *testing.T) {
-	t.Helper()
-	require.NoError(t, ts.Start())
-	t.Cleanup(func() {
-		ts.Stop()
-		assert.NoError(t, testfixture.WaitAddrReleased(ts.addr, testfixture.DefaultReadyTimeout))
+// start starts the server and registers its teardown before waiting for the
+// listener, so the server is stopped even if readiness fails.
+func (ts *testServer) start(tb testing.TB) {
+	tb.Helper()
+	require.NoError(tb, ts.Start())
+	tb.Cleanup(func() {
+		ts.stop()
+		assert.NoError(tb, testfixture.WaitAddrReleased(ts.addr, testfixture.DefaultReadyTimeout))
 	})
-	testfixture.RequireListening(t, ts.addr)
+	testfixture.RequireListening(tb, ts.addr)
+}
+
+// stop is idempotent so explicit shutdown and cleanup can both call it.
+func (ts *testServer) stop() {
+	ts.stopOnce.Do(ts.Stop)
 }
 
 func (ts *testServer) lastConn() gnet.Conn {
@@ -119,10 +141,10 @@ func send(c *Client, tr *testfixture.Tracker, id uint64) error {
 	return err
 }
 
-func requireSent(t *testing.T, c *Client, tr *testfixture.Tracker, id uint64) {
-	t.Helper()
+func requireSent(tb testing.TB, c *Client, tr *testfixture.Tracker, id uint64) {
+	tb.Helper()
 	if err := send(c, tr, id); err != nil {
-		t.Fatalf("send %d rejected: %v (pending=%d)", id, err, tr.Pending())
+		tb.Fatalf("send %d rejected: %v (pending=%d)", id, err, tr.Pending())
 	}
 }
 
@@ -138,8 +160,8 @@ func TestFixtureFailedFirstDialThenAuth(t *testing.T) {
 	for _, poolOn := range []bool{true, false} {
 		t.Run(fmt.Sprintf("pool_%v", poolOn), func(t *testing.T) {
 			addr := testfixture.FreeAddr(t)
-			c, obs := newObservedClient(t, addr)
-			stop := startClient(t, c)
+			c, obs, stop := newObservedClient(t, addr)
+			startClient(t, c)
 
 			// No listener exists yet, so the first dial must fail.
 			_, err := testfixture.Receive(obs.failedDial, testfixture.DefaultReadyTimeout)
@@ -147,7 +169,7 @@ func TestFixtureFailedFirstDialThenAuth(t *testing.T) {
 			require.False(t, c.IsAuthed())
 
 			// The schedule that hung the legacy fixtures: Send before auth.
-			ts := newTestServer(t, addr, poolOn)
+			ts := newTestServer(addr, poolOn)
 			requireRejected(t, c, ts.tracker, 0, "connect is not connected")
 
 			ts.start(t)
@@ -188,13 +210,12 @@ func newConnGate(ts *testServer, mode string) *connGate {
 
 func TestFixtureAuthWithheldThenReleased(t *testing.T) {
 	addr := testfixture.FreeAddr(t)
-	ts := newTestServer(t, addr, false)
+	ts := newTestServer(addr, false)
 	gate := newConnGate(ts, "withhold")
 	ts.start(t)
 
-	c := New(addr, WithUid("uid"))
-	t.Cleanup(c.pool.Release)
-	stop := startClient(t, c)
+	c, stop := newClient(t, addr, WithUid("uid"))
+	startClient(t, c)
 
 	_, err := testfixture.Receive(gate.attempts, testfixture.DefaultReadyTimeout)
 	require.NoError(t, err, "CONNECT never reached the server")
@@ -215,13 +236,12 @@ func TestFixtureAuthWithheldThenReleased(t *testing.T) {
 
 func TestFixtureAuthFailedThenAccepted(t *testing.T) {
 	addr := testfixture.FreeAddr(t)
-	ts := newTestServer(t, addr, false)
+	ts := newTestServer(addr, false)
 	gate := newConnGate(ts, "reject")
 	ts.start(t)
 
-	c := New(addr, WithUid("uid"))
-	t.Cleanup(c.pool.Release)
-	stop := startClient(t, c)
+	c, stop := newClient(t, addr, WithUid("uid"))
+	startClient(t, c)
 
 	// Two rejected CONNECTs prove the client stays unauthenticated and retries.
 	for i := 0; i < 2; i++ {
@@ -240,9 +260,8 @@ func TestFixtureAuthFailedThenAccepted(t *testing.T) {
 }
 
 func TestFixtureRejectedSendLeavesNoObligation(t *testing.T) {
-	c := New(testfixture.FreeAddr(t))
-	defer c.cancel()
-	defer c.pool.Release()
+	// Never started: teardown still closes the poller and releases the pool.
+	c, _ := newClient(t, testfixture.FreeAddr(t))
 
 	tr := testfixture.NewTracker()
 	for id := uint64(0); id < 100; id++ {
@@ -260,9 +279,8 @@ func TestFixtureRejectedSendLeavesNoObligation(t *testing.T) {
 }
 
 func TestFixtureSendWriteError(t *testing.T) {
-	c := New(testfixture.FreeAddr(t))
-	defer c.cancel()
-	defer c.pool.Release()
+	// Never started: teardown still closes the poller and releases the pool.
+	c, _ := newClient(t, testfixture.FreeAddr(t))
 
 	// Authenticated status but no transport: the write path rejects.
 	c.conn().status.Store(authed)
@@ -275,12 +293,11 @@ func TestFixtureSendAfterClose(t *testing.T) {
 	for _, poolOn := range []bool{true, false} {
 		t.Run(fmt.Sprintf("pool_%v", poolOn), func(t *testing.T) {
 			addr := testfixture.FreeAddr(t)
-			ts := newTestServer(t, addr, poolOn)
+			ts := newTestServer(addr, poolOn)
 			ts.start(t)
 
-			c := New(addr, WithUid("uid"))
-			t.Cleanup(c.pool.Release)
-			stop := startClient(t, c)
+			c, stop := newClient(t, addr, WithUid("uid"))
+			startClient(t, c)
 			testfixture.RequireAuthed(t, c.IsAuthed)
 
 			requireSent(t, c, ts.tracker, 1)
@@ -317,12 +334,11 @@ func TestFixtureConcurrentTopology(t *testing.T) {
 		t.Run(fmt.Sprintf("pair_%d_pool_%v", i, poolOn), func(t *testing.T) {
 			t.Parallel()
 			addr := testfixture.FreeAddr(t)
-			ts := newTestServer(t, addr, poolOn)
+			ts := newTestServer(addr, poolOn)
 			ts.start(t)
 
-			c := New(addr, WithUid("uid"))
-			t.Cleanup(c.pool.Release)
-			stop := startClient(t, c)
+			c, stop := newClient(t, addr, WithUid("uid"))
+			startClient(t, c)
 			testfixture.RequireAuthed(t, c.IsAuthed)
 
 			for id := uint64(0); id < msgCount; id++ {
@@ -350,26 +366,22 @@ func gnetGoroutines() int {
 	return n
 }
 
-func TestFixtureCleanup(t *testing.T) {
-	addr := testfixture.FreeAddr(t)
+// openFDs counts this process's open file descriptors.
+func openFDs(t *testing.T) int {
+	t.Helper()
+	d, err := os.Open("/dev/fd")
+	require.NoError(t, err, "cannot count open descriptors")
+	defer d.Close()
+	// Names only: stat-ing each entry would trip over transient descriptors.
+	names, err := d.Readdirnames(-1)
+	require.NoError(t, err, "cannot count open descriptors")
+	return len(names)
+}
 
-	func() {
-		ts := newTestServer(t, addr, true)
-		require.NoError(t, ts.Start())
-		testfixture.RequireListening(t, addr)
-
-		c := New(addr, WithUid("uid"))
-		defer c.pool.Release()
-		require.NoError(t, c.Start())
-		testfixture.RequireAuthed(t, c.IsAuthed)
-		requireSent(t, c, ts.tracker, 1)
-		require.NoError(t, ts.tracker.Wait(testfixture.DefaultDeliveryTimeout))
-
-		c.Stop()
-		ts.Stop()
-		require.NoError(t, ts.tracker.Verify())
-	}()
-
+// requireNoLiveResources checks that addr is released, no gnet goroutine is
+// left and the descriptor count is back to at most before plus slack.
+func requireNoLiveResources(t *testing.T, addr string, fdsBefore, slack int) {
+	t.Helper()
 	require.NoError(t, testfixture.WaitAddrReleased(addr, testfixture.DefaultReadyTimeout))
 	var live int
 	err := testfixture.WaitFor(func() bool {
@@ -377,4 +389,171 @@ func TestFixtureCleanup(t *testing.T) {
 		return live == 0
 	}, testfixture.DefaultReadyTimeout)
 	require.NoError(t, err, "%d gnet goroutines still running after stop", live)
+	var fds int
+	err = testfixture.WaitFor(func() bool {
+		fds = openFDs(t)
+		return fds <= fdsBefore+slack
+	}, testfixture.DefaultReadyTimeout)
+	require.NoError(t, err, "open descriptors grew from %d to %d", fdsBefore, fds)
+}
+
+// Stages at which cleanupScenario can be forced to fail.
+const (
+	failNone      = ""
+	failReadiness = "readiness"
+	failSend      = "send"
+	failDelivery  = "delivery"
+)
+
+// cleanupScenario runs one client/server exchange. Client and server teardown
+// is registered on tb as soon as each is constructed or started, so it runs
+// even when a readiness, Send or delivery assertion ends the test early.
+// failAt makes one of those assertions fail deterministically; with failNone
+// the scenario shuts both down explicitly and returns normally.
+func cleanupScenario(tb testing.TB, addr string, failAt string) {
+	ts := newTestServer(addr, true)
+	gate := newConnGate(ts, "accept")
+	if failAt == failReadiness {
+		gate.mode.Store("withhold")
+	}
+	ts.start(tb)
+
+	c, stopClient := newClient(tb, addr, WithUid("uid"))
+	startClient(tb, c)
+
+	readyTimeout := testfixture.DefaultReadyTimeout
+	if failAt == failReadiness {
+		readyTimeout = shortWait
+	}
+	if err := testfixture.WaitAuthed(c.IsAuthed, readyTimeout); err != nil {
+		tb.Fatal(err)
+	}
+
+	if failAt == failSend {
+		// Reconnects are never acknowledged, so Send stays rejected.
+		gate.mode.Store("withhold")
+		c.CloseConn()
+	}
+	requireSent(tb, c, ts.tracker, 1)
+
+	deliveryTimeout := testfixture.DefaultDeliveryTimeout
+	if failAt == failDelivery {
+		// An obligation for an ID that is never sent cannot complete.
+		ts.tracker.Expect(2)
+		deliveryTimeout = shortWait
+	}
+	require.NoError(tb, ts.tracker.Wait(deliveryTimeout))
+
+	stopClient()
+	ts.stop()
+	require.NoError(tb, ts.tracker.Verify())
+}
+
+func TestFixtureCleanup(t *testing.T) {
+	addr := testfixture.FreeAddr(t)
+	fdsBefore := openFDs(t)
+
+	// Explicit shutdown inside the scenario must release everything before
+	// any registered cleanup runs.
+	t.Run("explicit", func(t *testing.T) {
+		cleanupScenario(t, addr, failNone)
+		requireNoLiveResources(t, addr, fdsBefore, 4)
+	})
+	requireNoLiveResources(t, addr, fdsBefore, 4)
+}
+
+// recordingTB lets a scenario fail without failing the enclosing test. It
+// records failures and cleanups; the embedded TB serves everything else.
+type recordingTB struct {
+	testing.TB
+
+	mu       sync.Mutex
+	failures []string
+	cleanups []func()
+}
+
+func (r *recordingTB) Helper() {}
+
+func (r *recordingTB) Cleanup(f func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cleanups = append(r.cleanups, f)
+}
+
+func (r *recordingTB) Errorf(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failures = append(r.failures, fmt.Sprintf(format, args...))
+}
+
+func (r *recordingTB) Error(args ...any) { r.Errorf("%s", fmt.Sprint(args...)) }
+func (r *recordingTB) Fatal(args ...any) { r.Error(args...); r.FailNow() }
+func (r *recordingTB) FailNow()          { runtime.Goexit() }
+
+func (r *recordingTB) Fatalf(format string, args ...any) {
+	r.Errorf(format, args...)
+	r.FailNow()
+}
+
+func (r *recordingTB) Failed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.failures) > 0
+}
+
+// run executes fn like a test body and then its cleanups in reverse order.
+func (r *recordingTB) run(t *testing.T, fn func(tb testing.TB)) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn(r)
+	}()
+	_, err := testfixture.Receive(done, testfixture.DefaultDeliveryTimeout)
+	require.NoError(t, err, "scenario did not finish")
+	for i := len(r.cleanups) - 1; i >= 0; i-- {
+		r.cleanups[i]()
+	}
+}
+
+func TestFixtureCleanupOnFailure(t *testing.T) {
+	cases := []struct {
+		failAt string
+		want   string
+	}{
+		{failReadiness, fmt.Sprintf("client not authenticated within %s", shortWait)},
+		{failSend, "send 1 rejected: connect is not connected"},
+		{failDelivery, "missing=1 [2]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.failAt, func(t *testing.T) {
+			addr := testfixture.FreeAddr(t)
+			fdsBefore := openFDs(t)
+
+			r := &recordingTB{TB: t}
+			r.run(t, func(tb testing.TB) { cleanupScenario(tb, addr, tc.failAt) })
+
+			// Exactly the forced failure; teardown itself reported nothing.
+			require.Len(t, r.failures, 1, "failures: %q", r.failures)
+			require.Contains(t, r.failures[0], tc.want)
+			// Client teardown and server teardown were both registered.
+			require.Len(t, r.cleanups, 2)
+			requireNoLiveResources(t, addr, fdsBefore, 4)
+		})
+	}
+}
+
+// Never-started clients must not leak their gnet poller. Each leaked poller
+// holds one descriptor, so repeating the never-started fixtures exposes a
+// leak as descriptor growth.
+func TestFixtureNeverStartedClientsReleaseDescriptors(t *testing.T) {
+	const rounds = 50
+	before := openFDs(t)
+	for i := 0; i < rounds; i++ {
+		t.Run("rejected_send", TestFixtureRejectedSendLeavesNoObligation)
+		t.Run("write_error", TestFixtureSendWriteError)
+	}
+	after := openFDs(t)
+	require.LessOrEqual(t, after-before, 4,
+		"open descriptors grew from %d to %d over %d rounds", before, after, rounds)
 }
