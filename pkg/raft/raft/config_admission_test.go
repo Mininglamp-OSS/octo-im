@@ -314,7 +314,12 @@ func TestConfigQueuedCancellation(t *testing.T) {
 				c.step(0, req)
 			}
 			cancel()
-			require.ErrorIs(t, studyRecv(t, out).err, context.Canceled)
+			result := studyRecv(t, out)
+			require.ErrorIs(t, result.err, context.Canceled)
+			if os.Getenv("CONFIG_MISPLACE_BARRIER") != "1" {
+				require.ErrorIs(t, result.err, types.ErrProposalNotAdmitted)
+				require.NotErrorIs(t, result.err, types.ErrProposalOutcomeUnknown)
+			}
 			require.Zero(t, studyCount(r), "cancel must detach owned wait")
 			if os.Getenv("CONFIG_MISPLACE_BARRIER") != "1" {
 				c.step(0, req)
@@ -342,7 +347,10 @@ func TestConfigCancelAdmitted(t *testing.T) {
 	out := studyCall(r, ctx, 300)
 	c.step(0, studyRecv(t, r.stepC))
 	cancel()
-	require.ErrorIs(t, studyRecv(t, out).err, context.Canceled)
+	result := studyRecv(t, out)
+	require.ErrorIs(t, result.err, context.Canceled)
+	require.ErrorIs(t, result.err, types.ErrProposalOutcomeUnknown)
+	require.NotErrorIs(t, result.err, types.ErrProposalNotAdmitted)
 	require.Zero(t, studyCount(r), "admitted cancellation must detach owned wait")
 	c.settle(1)
 	stored, applied := c.ss[0].snapshot()
@@ -398,7 +406,13 @@ func TestConfigStop(t *testing.T) {
 				c.step(0, req)
 			}
 			r.Stop()
-			require.ErrorIs(t, studyRecv(t, out).err, types.ErrStopped)
+			result := studyRecv(t, out)
+			require.ErrorIs(t, result.err, types.ErrStopped)
+			if pending {
+				require.ErrorIs(t, result.err, types.ErrProposalOutcomeUnknown)
+			} else {
+				require.ErrorIs(t, result.err, types.ErrProposalNotAdmitted)
+			}
 			require.Zero(t, studyCount(r))
 			if !pending {
 				c.step(0, req)
