@@ -35,10 +35,14 @@ type RaftGroup struct {
 
 	fowardProposeWait wt.Wait // 转发提按给领导等待领导的回应
 
-	proposalSeq         atomic.Uint64 // receipt identity, unique within the group
-	admissionSems       sync.Map      // raftKey -> chan struct{}, see admissionSem
-	proposalStats       proposalStats
-	stopOnce            sync.Once
+	proposalSeq   atomic.Uint64 // receipt identity, unique within the group
+	admissionSems sync.Map      // raftKey -> chan struct{}, see admissionSem
+	proposalStats proposalStats
+	stopOnce      sync.Once
+	stopBegun     atomic.Bool
+	// loopDone closes once the shutdown lifecycle joined the event loop,
+	// fenced pool submission and settled receipts.
+	loopDone            chan struct{}
 	verificationMu      sync.Mutex
 	verificationStopped bool
 	verificationWorkers atomic.Int64
@@ -63,6 +67,7 @@ func New(opts *Options) *RaftGroup {
 		mq:                NewEventQueue(opts.ReceiveQueueLength, false, 0, 0),
 		fowardProposeWait: wt.New(),
 		poolIdle:          make(chan struct{}),
+		loopDone:          make(chan struct{}),
 	}
 	rg.wait = newWait(rg.readLog)
 	var err error
@@ -123,21 +128,35 @@ func (rg *RaftGroup) Start() error {
 	return nil
 }
 
-// Stop joins the event loop, fences pool submission and settles receipts. It
-// does not wait for pool tasks already inside Storage; see WaitQuiescence.
+// Stop runs the shutdown lifecycle and waits until it joined the event loop,
+// fenced pool submission and settled receipts. It does not wait for pool tasks
+// already inside Storage; see WaitQuiescence.
 func (rg *RaftGroup) Stop() {
+	rg.BeginStop()
+	<-rg.loopDone
+}
+
+// BeginStop starts the single shutdown lifecycle without waiting for it.
+// Callers blocked on the group observe the stop signal immediately; the event
+// loop may still be inside synchronous Storage I/O such as SaveHardState, so
+// its join runs on the lifecycle goroutine and WaitQuiescence bounds it.
+func (rg *RaftGroup) BeginStop() {
 	rg.stopOnce.Do(func() {
-		// The loop exits first so it never sees its own storage work refused.
-		rg.stopper.Stop()
-		rg.verificationMu.Lock()
-		rg.verificationStopped = true
-		if rg.poolTasks == 0 {
-			close(rg.poolIdle)
-		}
-		rg.verificationMu.Unlock()
-		// Proposals still queued are abandoned by their callers; receipts of
-		// admitted ones can no longer complete.
-		rg.wait.completeAll(proposalOutcomeUnknown(ErrGroupStopped))
+		rg.stopBegun.Store(true)
+		go func() {
+			// The loop exits first so it never sees its own storage work refused.
+			rg.stopper.Stop()
+			rg.verificationMu.Lock()
+			rg.verificationStopped = true
+			if rg.poolTasks == 0 {
+				close(rg.poolIdle)
+			}
+			rg.verificationMu.Unlock()
+			// Proposals still queued are abandoned by their callers; receipts of
+			// admitted ones can no longer complete.
+			rg.wait.completeAll(proposalOutcomeUnknown(ErrGroupStopped))
+			close(rg.loopDone)
+		}()
 	})
 }
 

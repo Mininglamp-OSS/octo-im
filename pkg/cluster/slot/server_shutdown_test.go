@@ -2,6 +2,7 @@ package slot
 
 import (
 	"context"
+	"path"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -226,4 +227,83 @@ func TestSlotServerStopJoinsVerificationBeforeClose(t *testing.T) {
 	ok, notAdmitted, unknown, superseded := follower.raftGroup.ProposalOutcomeCounts()
 	require.Equal(t, []uint64{0, 0, 1, 0}, []uint64{ok, notAdmitted, unknown, superseded}, "the late read cannot replace the outcome")
 	t.Logf("cleanup: inflight storage calls=0 verification reads=%d caller=%v", gate.reads.Load(), r.err)
+}
+
+// hardStateGate blocks the first hard-state write of a node on the event loop,
+// the synchronous storage write that is not a pool task.
+type hardStateGate struct {
+	entered, release chan struct{}
+	calls            atomic.Int64
+}
+
+func newHardStateGate() *hardStateGate {
+	return &hardStateGate{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *hardStateGate) wrap(save func(types.HardState) error) func(types.HardState) error {
+	return func(st types.HardState) error {
+		if g.calls.Add(1) == 1 {
+			close(g.entered)
+			<-g.release
+		}
+		return save(st)
+	}
+}
+
+// The production slot owner with its event loop blocked in a Pebble hard-state
+// write: a 30 ms handoff returns at its deadline and keeps Pebble open and
+// owned; after the write returns, a later call finishes the same lifecycle,
+// which closes Pebble exactly once with the write persisted.
+func TestSlotServerStopBoundsBlockedHardState(t *testing.T) {
+	dir := t.TempDir()
+	s := NewServer(NewOptions(WithNodeId(1), WithDataDir(dir), WithSlotDbShardNum(1)))
+	require.NoError(t, s.storage.Open())
+	gate := newHardStateGate()
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate.release) }) }
+	t.Cleanup(release)
+	save := gate.wrap(func(st types.HardState) error { return s.storage.SaveHardState("1", st) })
+	node := raft.NewNode(0, types.RaftState{}, raft.NewOptions(raft.WithKey("1"), raft.WithNodeId(1), raft.WithReplicas([]uint64{1}), raft.WithSaveHardState(save)))
+	s.raftGroup.AddRaft(node)
+	require.NoError(t, s.raftGroup.Start())
+	select {
+	case <-gate.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hard-state write not reached")
+	}
+
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		started := time.Now()
+		err := s.StopWithContext(ctx)
+		elapsed := time.Since(started)
+		cancel()
+		require.ErrorIs(t, err, raftgroup.ErrIncompleteQuiescence)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Less(t, elapsed, time.Second, "the handoff must return at its deadline, not when the write returns")
+		t.Logf("bounded handoff %d returned after %s: %v", i+1, elapsed, err)
+	}
+	// Ownership is retained: storage is still open and usable.
+	_, err := s.storage.GetState("1")
+	require.NoError(t, err)
+	select {
+	case <-s.stopDone:
+		t.Fatal("storage closed while the event loop was inside it")
+	default:
+	}
+
+	release()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, s.StopWithContext(ctx))
+	require.NoError(t, s.StopWithContext(ctx), "repeated handoff keeps its result")
+	require.EqualValues(t, 1, gate.calls.Load())
+
+	// Close released the Pebble lock, and the blocked write was persisted.
+	reopened := NewPebbleShardLogStorage(s, path.Join(dir, "logdb"), 1)
+	require.NoError(t, reopened.Open())
+	defer func() { require.NoError(t, reopened.Close()) }()
+	st, err := reopened.hardState("1")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, st.Term)
 }

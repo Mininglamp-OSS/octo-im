@@ -2,6 +2,7 @@ package slot
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"strconv"
 	"sync"
@@ -26,14 +27,16 @@ type Server struct {
 	genLogId *snowflake.Node
 
 	slotUpdateLock sync.Mutex
-	closeOnce      sync.Once
-	closeErr       error
+	stopOnce       sync.Once
+	stopDone       chan struct{}
+	stopErr        error
 }
 
 func NewServer(opts *Options) *Server {
 	s := &Server{
-		opts: opts,
-		Log:  wklog.NewWKLog("slot.Server"),
+		opts:     opts,
+		Log:      wklog.NewWKLog("slot.Server"),
+		stopDone: make(chan struct{}),
 	}
 	s.storage = NewPebbleShardLogStorage(s, path.Join(opts.DataDir, "logdb"), uint32(opts.SlotDbShardNum))
 	s.raftGroup = raftgroup.New(raftgroup.NewOptions(raftgroup.WithLogPrefix("slot"), raftgroup.WithStorage(s.storage), raftgroup.WithTransport(opts.Transport)))
@@ -65,21 +68,38 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// StopWithContext closes storage only after every RaftGroup pool task that
-// may read or write it has exited. On error storage stays open and owned, and
-// the call may be repeated to await the pending handoff.
+// StopWithContext starts the single shutdown lifecycle and waits for it within
+// ctx. The lifecycle joins the RaftGroup event loop and every pool task that
+// may read or write storage, then closes storage once. On a deadline storage
+// stays open and owned by the pending lifecycle; a later call awaits the same
+// handoff. Once the lifecycle has finished, every call returns its result.
 func (s *Server) StopWithContext(ctx context.Context) error {
-	s.raftGroup.Stop()
-	if err := s.raftGroup.WaitQuiescence(ctx); err != nil {
-		return err
-	}
-	s.closeOnce.Do(func() {
-		s.closeErr = s.storage.Close()
-		if s.closeErr != nil {
-			s.Error("storage close failed", zap.Error(s.closeErr))
-		}
+	s.stopOnce.Do(func() {
+		s.raftGroup.BeginStop()
+		go func() {
+			defer close(s.stopDone)
+			// The lifecycle owns storage, so it waits without a deadline.
+			if err := s.raftGroup.WaitQuiescence(context.Background()); err != nil {
+				s.stopErr = err
+				return
+			}
+			s.stopErr = s.storage.Close()
+			if s.stopErr != nil {
+				s.Error("storage close failed", zap.Error(s.stopErr))
+			}
+		}()
 	})
-	return s.closeErr
+	select {
+	case <-s.stopDone:
+		return s.stopErr
+	default:
+	}
+	select {
+	case <-s.stopDone:
+		return s.stopErr
+	case <-ctx.Done():
+		return fmt.Errorf("slot storage handoff: %w: %w", raftgroup.ErrIncompleteQuiescence, ctx.Err())
+	}
 }
 
 func (s *Server) AddEvent(shardNo string, event types.Event) {

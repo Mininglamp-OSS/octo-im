@@ -8,6 +8,11 @@ import (
 
 var errGroupNotStopped = errors.New("raftgroup: not stopped")
 
+// ErrIncompleteQuiescence means the shutdown lifecycle has not yet joined the
+// event loop or every accepted pool task. Storage remains owned by the caller
+// and must stay open.
+var ErrIncompleteQuiescence = errors.New("raftgroup: storage quiescence incomplete")
+
 // submit runs fn on the bounded nonblocking pool. Every pool task may touch
 // Storage, so each accepted task is counted until it exits and submission is
 // fenced by Stop. WaitQuiescence joins the counted tasks.
@@ -38,21 +43,31 @@ func (rg *RaftGroup) poolTaskDone() {
 	}
 }
 
-// WaitQuiescence waits, after Stop, until no pool task can touch Storage.
-// Storage I/O cannot be interrupted: on error the owner must keep Storage
-// open and may call WaitQuiescence again.
+// WaitQuiescence waits, after Stop or BeginStop, until the event loop has
+// exited and no pool task can touch Storage. Storage I/O cannot be
+// interrupted: on error the owner must keep Storage open and may call
+// WaitQuiescence again.
 func (rg *RaftGroup) WaitQuiescence(ctx context.Context) error {
-	rg.verificationMu.Lock()
-	stopped := rg.verificationStopped
-	rg.verificationMu.Unlock()
-	if !stopped {
+	if !rg.stopBegun.Load() {
 		return errGroupNotStopped
+	}
+	// poolIdle closes only after the loop has been joined. Completion that
+	// has already happened wins over an expired context.
+	select {
+	case <-rg.poolIdle:
+		return nil
+	default:
 	}
 	select {
 	case <-rg.poolIdle:
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("raftgroup: storage workers still running: %w", ctx.Err())
+	}
+	select {
+	case <-rg.loopDone:
+		return fmt.Errorf("%w: storage workers still running: %w", ErrIncompleteQuiescence, ctx.Err())
+	default:
+		return fmt.Errorf("%w: event loop still running: %w", ErrIncompleteQuiescence, ctx.Err())
 	}
 }
 
