@@ -11,13 +11,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The XIN-2020 index-reuse cases with C0-1 expectations. The event loop is not
+// The XIN-2020 index-reuse cases with C0-2 expectations. The event loop is not
 // started until both proposals are queued, which deterministically models a
-// slow loop: A is admitted to the queue but its caller times out, then B
-// allocates the same index range from the unchanged LastLogIndex.
+// slow loop: A is queued but its caller times out, then B proposes.
 //
-// C0-1 only guarantees B fails closed. A's queued ("ghost") entry is still
-// applied even though A's caller saw a timeout; removing that is C0-2.
+// Before C0-2, B computed the same index range from the unchanged
+// LastLogIndex and A's queued ("ghost") entry was still applied. Now the loop
+// assigns indexes at admission and skips A, whose caller abandoned it before
+// admission: A is reported as not admitted and is never applied, and B gets
+// its own range. Cases where A was already admitting are in
+// proposal_admission_test.go.
 
 func failClosedSetup(t *testing.T) (*raftgroup.RaftGroup, *raft.Node, *testStorage) {
 	storage := newTestStorage()
@@ -78,6 +81,7 @@ func runStaleSecondProposal(t *testing.T, ghost, second []uint64) (*raftgroup.Ra
 	time.Sleep(5 * time.Millisecond)
 	_, errA := failClosedPropose(g, expired, ghost...)
 	require.ErrorIs(t, errA, context.DeadlineExceeded)
+	require.ErrorIs(t, errA, types.ErrProposalNotAdmitted)
 
 	bC := make(chan error, 1)
 	go func() {
@@ -89,7 +93,7 @@ func runStaleSecondProposal(t *testing.T, ghost, second []uint64) (*raftgroup.Ra
 		}
 		bC <- err
 	}()
-	time.Sleep(50 * time.Millisecond) // B has read LastLogIndex()==0 and queued index 1
+	time.Sleep(50 * time.Millisecond) // B is queued behind abandoned A
 	require.NoError(t, g.Start())
 	return g, node, storage, <-bC
 }
@@ -98,38 +102,38 @@ func runStaleSecondProposal(t *testing.T, ghost, second []uint64) (*raftgroup.Ra
 func TestProposalFailClosedDuplicateIndex(t *testing.T) {
 	g, node, storage, errB := runStaleSecondProposal(t, []uint64{100}, []uint64{200})
 	defer g.Stop()
-	require.ErrorIs(t, errB, types.ErrLeaderLocalOverlap, "B must not report success")
-	require.Equal(t, []uint64{100}, appliedIDs(storage, 1), "ghost A applied at index 1; B never applied")
-	require.Equal(t, []uint64{100}, storedIDs(storage))
+	require.NoError(t, errB)
+	require.Equal(t, []uint64{200}, appliedIDs(storage, 1), "abandoned A is never applied")
+	require.Equal(t, []uint64{200}, storedIDs(storage))
 	overlap, _ := node.ProposeRejectCounts()
-	require.Equal(t, uint64(1), overlap)
+	require.Zero(t, overlap, "the loop allocates indexes, so nothing overlaps")
 }
 
-// R2: partial overlap (A one entry, B two entries) no longer truncates A.
+// R2: partial overlap (A one entry, B two entries): B's whole batch is applied.
 func TestProposalFailClosedPartialOverlap(t *testing.T) {
 	g, _, storage, errB := runStaleSecondProposal(t, []uint64{100}, []uint64{200, 201})
 	defer g.Stop()
-	require.ErrorIs(t, errB, types.ErrLeaderLocalOverlap)
-	require.Equal(t, []uint64{100}, appliedIDs(storage, 1), "A's entry is not truncated and B is not appended")
-	require.Equal(t, []uint64{100}, storedIDs(storage))
+	require.NoError(t, errB)
+	require.Equal(t, []uint64{200, 201}, appliedIDs(storage, 2))
+	require.Equal(t, []uint64{200, 201}, storedIDs(storage))
 }
 
-// R3: a shorter second batch no longer succeeds on the first batch's data.
+// R3: a shorter second batch is applied as its own entry.
 func TestProposalFailClosedShorterSecondBatch(t *testing.T) {
 	g, _, storage, errB := runStaleSecondProposal(t, []uint64{100, 101}, []uint64{200})
 	defer g.Stop()
-	require.ErrorIs(t, errB, types.ErrLeaderLocalOverlap, "B must not be told index 1 holds its entry")
-	require.Equal(t, []uint64{100, 101}, appliedIDs(storage, 2))
-	require.Equal(t, []uint64{100, 101}, storedIDs(storage))
+	require.NoError(t, errB)
+	require.Equal(t, []uint64{200}, appliedIDs(storage, 1))
+	require.Equal(t, []uint64{200}, storedIDs(storage))
 }
 
-// After a rejection the next proposal is admitted at the correct index and its
-// response maps to its own entry.
+// The next proposal is admitted right after B and its response maps to its
+// own entry.
 func TestProposalFailClosedNextProposalSucceeds(t *testing.T) {
 	g, _, storage, errB := runStaleSecondProposal(t, []uint64{100}, []uint64{200})
 	defer g.Stop()
-	require.ErrorIs(t, errB, types.ErrLeaderLocalOverlap)
-	require.Equal(t, []uint64{100}, appliedIDs(storage, 1))
+	require.NoError(t, errB)
+	require.Equal(t, []uint64{200}, appliedIDs(storage, 1))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -138,5 +142,5 @@ func TestProposalFailClosedNextProposalSucceeds(t *testing.T) {
 	require.Equal(t, uint64(2), resps[0].Index)
 	require.Equal(t, uint64(300), resps[0].Id)
 	require.Equal(t, []uint64{300}, appliedIDs(storage, 1))
-	require.Equal(t, []uint64{100, 300}, storedIDs(storage))
+	require.Equal(t, []uint64{200, 300}, storedIDs(storage))
 }

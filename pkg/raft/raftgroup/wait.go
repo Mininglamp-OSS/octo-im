@@ -4,17 +4,53 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
-type wait struct {
-	buckets []*waitBucket
+// receipt identifies one admitted proposal. seq is unique within a RaftGroup
+// and is the waiter identity; term and the index range were assigned by the
+// event loop; lastLogId is checked against the entry applied at last.
+type receipt struct {
+	raftKey   string
+	seq       uint64
+	term      uint32
+	first     uint64
+	last      uint64
+	lastLogId uint64
+	// forwarded receipts come from another node's admission. Their term is not
+	// known here, so they are verified by Id only and are not fenced.
+	forwarded bool
 }
 
-func newWait() *wait {
+func (r receipt) String() string {
+	return fmt.Sprintf("key:%s seq:%d term:%d range:[%d,%d] forwarded:%v", r.raftKey, r.seq, r.term, r.first, r.last, r.forwarded)
+}
+
+// receiptWaiter is completed exactly once, under its bucket lock, either by
+// apply, fence, Stop/RemoveRaft or by the caller detaching it. doneC has
+// capacity 1 and receives the single result; it is never closed.
+type receiptWaiter struct {
+	receipt
+	doneC chan error
+	done  bool
+	err   error
+}
+
+// readLogFunc reads the stored log at index for raftKey; ok is false when the
+// log does not exist.
+type readLogFunc func(raftKey string, index uint64) (log types.Log, ok bool, err error)
+
+type wait struct {
+	buckets []*waitBucket
+	readLog readLogFunc
+}
+
+func newWait(readLog readLogFunc) *wait {
 	count := 100
 	w := &wait{
 		buckets: make([]*waitBucket, count),
+		readLog: readLog,
 	}
 	for i := 0; i < count; i++ {
 		w.buckets[i] = newWaitBucket(i)
@@ -22,20 +58,175 @@ func newWait() *wait {
 	return w
 }
 
-func (m *wait) waitApply(key string, maxIndex uint64) *progress {
-	return m.buckets[m.bucketIndex(key)].waitApply(key, maxIndex)
+func (m *wait) bucket(key string) *waitBucket {
+	return m.buckets[int(fnv32(key)%uint32(len(m.buckets)))]
 }
 
-func (m *wait) didApply(key string, maxLogIndex uint64) {
-	m.buckets[m.bucketIndex(key)].didApply(key, maxLogIndex)
+// register adds a pending waiter for r. appliedBefore reports that apply had
+// already reached r.last when it was registered; didApply will not visit the
+// waiter for that range, so the caller must verify it with verifyStored. The
+// event loop registers leader-local receipts before their range can be
+// applied, so this only happens to forwarded receipts.
+func (m *wait) register(r receipt) (w *receiptWaiter, appliedBefore bool) {
+	w = &receiptWaiter{receipt: r, doneC: make(chan error, 1)}
+	b := m.bucket(r.raftKey)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	keyWaiters := b.waiters[r.raftKey]
+	if keyWaiters == nil {
+		keyWaiters = make(map[uint64]*receiptWaiter)
+		b.waiters[r.raftKey] = keyWaiters
+	}
+	keyWaiters[r.seq] = w
+	return w, b.applied[r.raftKey] >= r.last
 }
 
-func (m *wait) bucketIndex(key string) int {
-	return int(fnv32(key) % uint32(len(m.buckets)))
+// didApply completes the waiters of key whose last index is covered by
+// appliedIndex. logs are the entries just applied, or nil when the group does
+// not read logs at apply time (NotNeedApplied).
+func (m *wait) didApply(key string, appliedIndex uint64, logs []types.Log) {
+	b := m.bucket(key)
+	var unverified []*receiptWaiter
+	b.mu.Lock()
+	if appliedIndex > b.applied[key] {
+		b.applied[key] = appliedIndex
+	}
+	for _, w := range b.waiters[key] {
+		if w.last > appliedIndex {
+			continue
+		}
+		if log, ok := logAt(logs, w.last); ok {
+			b.completeLocked(w, verifyReceipt(w.receipt, log))
+			continue
+		}
+		if logs == nil && !w.forwarded {
+			// Leader-local receipt without logs: only this proposal was
+			// admitted at (term, last), and a fence completes the receipt
+			// before any other entry can replace it.
+			b.completeLocked(w, nil)
+			continue
+		}
+		unverified = append(unverified, w)
+	}
+	b.mu.Unlock()
+	// Read the stored entry outside the bucket lock, then complete the waiter
+	// only if nobody else completed or detached it meanwhile.
+	for _, w := range unverified {
+		m.verifyStored(w)
+	}
 }
 
-func (m *wait) put(progress *progress) bool {
-	return m.buckets[m.bucketIndex(progress.key)].put(progress)
+// verifyStored completes w from the stored entry at w.last. It is used when
+// the applied entry is not available, e.g. a forwarded receipt registered
+// after its index was applied.
+func (m *wait) verifyStored(w *receiptWaiter) {
+	result := proposalOutcomeUnknown(fmt.Errorf("applied log %d is not readable", w.last))
+	if m.readLog != nil {
+		log, ok, err := m.readLog(w.raftKey, w.last)
+		switch {
+		case err != nil:
+			result = proposalOutcomeUnknown(err)
+		case ok:
+			result = verifyReceipt(w.receipt, log)
+		}
+	}
+	b := m.bucket(w.raftKey)
+	b.mu.Lock()
+	b.completeLocked(w, result)
+	b.mu.Unlock()
+}
+
+// detach removes w on behalf of a caller that stops waiting. If w was already
+// completed, its result is returned with completed=true.
+func (m *wait) detach(w *receiptWaiter) (result error, completed bool) {
+	b := m.bucket(w.raftKey)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if w.done {
+		return w.err, true
+	}
+	b.removeLocked(w)
+	w.done = true
+	return nil, false
+}
+
+// fence completes every pending leader-local receipt of key admitted in term
+// or earlier as ErrProposalOutcomeUnknown: the node no longer leads that term,
+// so a later entry at the same index must not complete it.
+func (m *wait) fence(key string, term uint32) {
+	b := m.bucket(key)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, w := range b.waiters[key] {
+		if !w.forwarded && w.term <= term {
+			b.completeLocked(w, proposalOutcomeUnknown(fmt.Errorf("leadership of term %d ended", term)))
+		}
+	}
+}
+
+// complete completes w with err unless it already completed or detached.
+func (m *wait) complete(w *receiptWaiter, err error) {
+	b := m.bucket(w.raftKey)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.completeLocked(w, err)
+}
+
+// removeKey completes every pending receipt of key with err and forgets the
+// key's applied index.
+func (m *wait) removeKey(key string, err error) {
+	b := m.bucket(key)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, w := range b.waiters[key] {
+		b.completeLocked(w, err)
+	}
+	delete(b.applied, key)
+}
+
+// completeAll completes every pending receipt with err.
+func (m *wait) completeAll(err error) {
+	for _, b := range m.buckets {
+		b.mu.Lock()
+		for _, keyWaiters := range b.waiters {
+			for _, w := range keyWaiters {
+				b.completeLocked(w, err)
+			}
+		}
+		b.mu.Unlock()
+	}
+}
+
+// pending returns the number of registered, not yet completed receipts.
+func (m *wait) pending() int {
+	n := 0
+	for _, b := range m.buckets {
+		b.mu.Lock()
+		for _, keyWaiters := range b.waiters {
+			n += len(keyWaiters)
+		}
+		b.mu.Unlock()
+	}
+	return n
+}
+
+func logAt(logs []types.Log, index uint64) (types.Log, bool) {
+	if len(logs) == 0 || index < logs[0].Index || index > logs[len(logs)-1].Index {
+		return types.Log{}, false
+	}
+	log := logs[index-logs[0].Index]
+	return log, log.Index == index
+}
+
+// verifyReceipt checks that log, the entry at r.last, is the one r admitted.
+// A batch is appended by one admission, so the identity of its last entry
+// implies the identity of the whole range.
+func verifyReceipt(r receipt, log types.Log) error {
+	if log.Index != r.last || log.Id != r.lastLogId || (!r.forwarded && log.Term != r.term) {
+		return fmt.Errorf("%w: index %d holds id %d term %d, receipt %s, id %d",
+			types.ErrProposalSuperseded, log.Index, log.Id, log.Term, r, r.lastLogId)
+	}
+	return nil
 }
 
 func fnv32(key string) uint32 {
@@ -52,153 +243,42 @@ func fnv32(key string) uint32 {
 }
 
 type waitBucket struct {
-	mu sync.RWMutex
+	mu sync.Mutex
 	wklog.Log
 
-	progresses []*progress
-
-	progressPool sync.Pool
+	waiters map[string]map[uint64]*receiptWaiter
+	// applied is the highest index didApply reported per key, read and
+	// written under mu so registration and apply cannot miss each other.
+	applied map[string]uint64
 }
 
 func newWaitBucket(i int) *waitBucket {
 	return &waitBucket{
-		Log:        wklog.NewWKLog(fmt.Sprintf("applyWait[%d]", i)),
-		progresses: make([]*progress, 0),
-		progressPool: sync.Pool{
-			New: func() interface{} {
-				return &progress{}
-			},
-		},
+		Log:     wklog.NewWKLog(fmt.Sprintf("applyWait[%d]", i)),
+		waiters: make(map[string]map[uint64]*receiptWaiter),
+		applied: make(map[string]uint64),
 	}
 }
 
-func (m *waitBucket) waitApply(key string, maxIndex uint64) *progress {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	progress := m.progressPool.Get().(*progress)
-	progress.key = key
-	progress.maxIndex = maxIndex
-	progress.waitApplied = true
-	progress.done = false
-	progress.waitC = make(chan struct{}, 1)
-	m.progresses = append(m.progresses, progress)
-	return progress
-
-}
-
-// func (m *waitBucket) waitCommit(key string, maxIndex uint64) *progress {
-// 	m.mu.Lock()
-// 	defer m.mu.Unlock()
-// 	progress := newCommitProgress(key, maxIndex)
-// 	m.progresses = append(m.progresses, progress)
-// 	return progress
-// }
-
-// // didCommit 提交 maxLogIndex已提交的最大日志下标
-// func (m *waitBucket) didCommit(key string, maxLogIndex uint64) {
-// 	m.mu.Lock()
-// 	defer m.mu.Unlock()
-// 	hasDone := false
-// 	for _, progress := range m.progresses {
-
-// 		if progress.done || !progress.waitCommittied {
-// 			continue
-// 		}
-// 		if progress.key != key {
-// 			continue
-// 		}
-
-// 		if maxLogIndex >= progress.maxIndex {
-// 			hasDone = true
-// 			progress.done = true
-// 			progress.waitC <- struct{}{}
-// 			close(progress.waitC)
-// 		}
-// 	}
-// 	// 清理已完成的
-// 	if hasDone {
-// 		m.clean()
-// 	}
-// }
-
-func (m *waitBucket) didApply(key string, maxLogIndex uint64) {
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, progress := range m.progresses {
-
-		if progress.key != key {
-			continue
-		}
-
-		if progress.done || !progress.waitApplied {
-			continue
-		}
-		if maxLogIndex >= progress.maxIndex && progress.waitC != nil {
-			progress.done = true
-			progress.waitC <- struct{}{}
-		}
+// completeLocked publishes err as w's only result and unregisters it. doneC
+// has capacity 1 and is written once, so this never blocks.
+func (b *waitBucket) completeLocked(w *receiptWaiter, err error) {
+	if w.done {
+		return
 	}
-	// 清理
-	m.clean()
+	w.done = true
+	w.err = err
+	b.removeLocked(w)
+	w.doneC <- err
 }
 
-// Detach under the notification lock before recycling. Admission can fail or
-// the caller can time out while the applied index still has not reached it.
-// Return the completion state observed at this ownership boundary.
-func (m *waitBucket) put(progress *progress) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	done := progress.done
-	for i, pending := range m.progresses {
-		if pending == progress {
-			copy(m.progresses[i:], m.progresses[i+1:])
-			last := len(m.progresses) - 1
-			m.progresses[last] = nil
-			m.progresses = m.progresses[:last]
-			break
-		}
+func (b *waitBucket) removeLocked(w *receiptWaiter) {
+	keyWaiters := b.waiters[w.raftKey]
+	if keyWaiters[w.seq] != w {
+		return
 	}
-	close(progress.waitC)
-	progress.reset()
-	m.progressPool.Put(progress)
-	return done
-}
-
-// 清理已完成的
-func (m *waitBucket) clean() {
-	for i := 0; i < len(m.progresses); {
-		if m.progresses[i].done {
-			m.progresses = append(m.progresses[:i], m.progresses[i+1:]...)
-		} else {
-			i++
-		}
+	delete(keyWaiters, w.seq)
+	if len(keyWaiters) == 0 {
+		delete(b.waiters, w.raftKey)
 	}
-}
-
-type progress struct {
-	maxIndex uint64
-
-	waitC chan struct{}
-
-	// 等待应用
-	waitApplied bool
-
-	done bool
-
-	key string
-}
-
-func (p *progress) reset() {
-	p.done = false
-	p.maxIndex = 0
-	p.waitApplied = false
-	p.key = ""
-	p.waitC = nil
-
-}
-
-func (p *progress) String() string {
-	return fmt.Sprintf("key:%s, maxIndex:%d, waitApplied:%v, done:%v", p.key, p.maxIndex, p.waitApplied, p.done)
 }

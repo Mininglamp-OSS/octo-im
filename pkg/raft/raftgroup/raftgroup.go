@@ -2,6 +2,8 @@ package raftgroup
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/track"
@@ -32,6 +34,13 @@ type RaftGroup struct {
 	wait *wait
 
 	fowardProposeWait wt.Wait // 转发提按给领导等待领导的回应
+
+	proposalSeq   atomic.Uint64 // receipt identity, unique within the group
+	admissionSems sync.Map      // raftKey -> chan struct{}, see admissionSem
+	proposalStats proposalStats
+	// beforeAdmit, if set by a test, runs on the event loop after a proposal
+	// left pending and before it is admitted.
+	beforeAdmit func(seq uint64)
 }
 
 func New(opts *Options) *RaftGroup {
@@ -44,9 +53,9 @@ func New(opts *Options) *RaftGroup {
 		ownerC:            make(chan ownerRequest),
 		Log:               wklog.NewWKLog(fmt.Sprintf("RaftGroup[%s]", opts.LogPrefix)),
 		mq:                NewEventQueue(opts.ReceiveQueueLength, false, 0, 0),
-		wait:              newWait(),
 		fowardProposeWait: wt.New(),
 	}
+	rg.wait = newWait(rg.readLog)
 	var err error
 	rg.goPool, err = ants.NewPool(opts.GoPoolSize, ants.WithNonblocking(true), ants.WithPanicHandler(func(i interface{}) {
 		rg.Panic("raftgroup:go pool panic", zap.Any("panic", i), zap.Stack("stack"))
@@ -70,6 +79,9 @@ func (rg *RaftGroup) AddRaft(r IRaft) {
 
 func (rg *RaftGroup) RemoveRaft(r IRaft) {
 	rg.raftList.remove(r.Key())
+	// Nothing will apply or fence this raft's receipts any more.
+	rg.wait.removeKey(r.Key(), proposalOutcomeUnknown(ErrRaftNotExist))
+	rg.admissionSems.Delete(r.Key())
 	if rg.opts.Event != nil {
 		rg.opts.Event.OnRemoveRaft(r)
 	}
@@ -103,6 +115,23 @@ func (rg *RaftGroup) Start() error {
 
 func (rg *RaftGroup) Stop() {
 	rg.stopper.Stop()
+	// The loop has exited. Proposals still queued are abandoned by their
+	// callers; receipts of admitted ones can no longer complete.
+	rg.wait.completeAll(proposalOutcomeUnknown(ErrGroupStopped))
+}
+
+// readLog point-reads one stored log for receipt verification.
+func (rg *RaftGroup) readLog(raftKey string, index uint64) (types.Log, bool, error) {
+	logs, err := rg.opts.Storage.GetLogs(raftKey, index, index+1, 0)
+	if err != nil {
+		return types.Log{}, false, err
+	}
+	for _, log := range logs {
+		if log.Index == index {
+			return log, true, nil
+		}
+	}
+	return types.Log{}, false, nil
 }
 
 func (rg *RaftGroup) Advance() {
@@ -209,6 +238,14 @@ func (rg *RaftGroup) handleReceivedEvents() bool {
 	hasEvent := false
 	for _, e := range events {
 		raft := rg.raftList.get(e.RaftKey)
+		if e.Proposal != nil {
+			if raft == nil {
+				rg.Warn("raft not found", zap.String("raftKey", e.RaftKey), zap.String("event", e.Event.Type.String()))
+			}
+			rg.admitProposal(raft, e)
+			hasEvent = true
+			continue
+		}
 		if raft == nil {
 			rg.Warn("raft not found", zap.String("raftKey", e.RaftKey), zap.String("event", e.Event.Type.String()))
 			if e.WaitC != nil {
@@ -282,6 +319,9 @@ func (rg *RaftGroup) handleReady(r IRaft) bool {
 			continue
 		case types.Destory: // 处理销毁请求
 			rg.handleDestory(r)
+			continue
+		case types.ProposalFence: // 领导任期结束，旧回执不能再按本地日志身份完成
+			rg.wait.fence(r.Key(), e.Term)
 			continue
 
 			// 角色转换
