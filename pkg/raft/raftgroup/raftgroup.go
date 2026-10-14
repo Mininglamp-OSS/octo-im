@@ -38,9 +38,14 @@ type RaftGroup struct {
 	proposalSeq         atomic.Uint64 // receipt identity, unique within the group
 	admissionSems       sync.Map      // raftKey -> chan struct{}, see admissionSem
 	proposalStats       proposalStats
+	stopOnce            sync.Once
 	verificationMu      sync.Mutex
 	verificationStopped bool
 	verificationWorkers atomic.Int64
+	// poolTasks counts accepted pool tasks, all of which may touch Storage.
+	// poolIdle closes once Stop has fenced submission and the count is zero.
+	poolTasks int
+	poolIdle  chan struct{}
 	// beforeAdmit, if set by a test, runs on the event loop after a proposal
 	// left pending and before it is admitted.
 	beforeAdmit func(seq uint64)
@@ -57,6 +62,7 @@ func New(opts *Options) *RaftGroup {
 		Log:               wklog.NewWKLog(fmt.Sprintf("RaftGroup[%s]", opts.LogPrefix)),
 		mq:                NewEventQueue(opts.ReceiveQueueLength, false, 0, 0),
 		fowardProposeWait: wt.New(),
+		poolIdle:          make(chan struct{}),
 	}
 	rg.wait = newWait(rg.readLog)
 	var err error
@@ -117,14 +123,21 @@ func (rg *RaftGroup) Start() error {
 	return nil
 }
 
+// Stop fences pool submission, joins the event loop and settles receipts. It
+// does not wait for pool tasks already inside Storage; see WaitQuiescence.
 func (rg *RaftGroup) Stop() {
-	rg.verificationMu.Lock()
-	rg.verificationStopped = true
-	rg.verificationMu.Unlock()
-	rg.stopper.Stop()
-	// The loop has exited. Proposals still queued are abandoned by their
-	// callers; receipts of admitted ones can no longer complete.
-	rg.wait.completeAll(proposalOutcomeUnknown(ErrGroupStopped))
+	rg.stopOnce.Do(func() {
+		rg.verificationMu.Lock()
+		rg.verificationStopped = true
+		if rg.poolTasks == 0 {
+			close(rg.poolIdle)
+		}
+		rg.verificationMu.Unlock()
+		rg.stopper.Stop()
+		// The loop has exited. Proposals still queued are abandoned by their
+		// callers; receipts of admitted ones can no longer complete.
+		rg.wait.completeAll(proposalOutcomeUnknown(ErrGroupStopped))
+	})
 }
 
 // readLog point-reads one stored log for receipt verification.
@@ -152,7 +165,7 @@ func (rg *RaftGroup) Advance() {
 func (rg *RaftGroup) AddEvent(raftKey string, e types.Event) {
 
 	if e.Type == types.SendPropose {
-		err := rg.goPool.Submit(func() {
+		err := rg.submit(func() {
 			rg.handleSendPropose(raftKey, e)
 		})
 		if err != nil {

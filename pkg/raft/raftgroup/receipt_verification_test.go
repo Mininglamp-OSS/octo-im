@@ -236,3 +236,45 @@ func stopVerificationGroup(g *RaftGroup) {
 		g.Stop()
 	}
 }
+
+// Every pool task is tracked: Stop fences submission, WaitQuiescence is
+// bounded while a task is inside Storage and succeeds, repeatedly, after it exits.
+func TestGroupWaitQuiescence(t *testing.T) {
+	g := New(NewOptions(WithGoPoolSize(2)))
+	defer g.goPool.Release()
+	require.ErrorIs(t, g.WaitQuiescence(context.Background()), errGroupNotStopped)
+	entered, release := make(chan struct{}), make(chan struct{})
+	exited := make(chan struct{})
+	require.NoError(t, g.submit(func() { close(entered); <-release; close(exited) }))
+	<-entered
+	g.Stop()
+	g.Stop() // idempotent
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		require.ErrorIs(t, g.WaitQuiescence(ctx), context.DeadlineExceeded)
+		cancel()
+	}
+	var ran atomic.Bool
+	require.ErrorIs(t, g.submit(func() { ran.Store(true) }), ErrGroupStopped)
+	var reads atomic.Int64
+	g.wait.readLog = func(string, uint64) (types.Log, bool, error) { reads.Add(1); return types.Log{}, false, nil }
+	w, _ := g.wait.register(receipt{raftKey: admKey, seq: 1, last: 1, lastLogId: 7, forwarded: true})
+	g.verifyReceiptAsync(w)
+	select {
+	case err := <-w.doneC:
+		require.ErrorIs(t, err, ErrGroupStopped)
+		require.ErrorIs(t, err, types.ErrProposalOutcomeUnknown)
+	case <-time.After(time.Second):
+		t.Fatal("verification after Stop did not settle")
+	}
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, g.WaitQuiescence(ctx))
+	require.NoError(t, g.WaitQuiescence(ctx))
+	<-exited
+	require.False(t, ran.Load())
+	require.Zero(t, reads.Load())
+	require.Zero(t, g.verificationWorkers.Load())
+	require.Zero(t, g.wait.pending())
+}

@@ -26,6 +26,8 @@ type Server struct {
 	genLogId *snowflake.Node
 
 	slotUpdateLock sync.Mutex
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 func NewServer(opts *Options) *Server {
@@ -63,13 +65,21 @@ func (s *Server) Start() error {
 	return nil
 }
 
-func (s *Server) Stop() {
+// StopWithContext closes storage only after every RaftGroup pool task that
+// may read or write it has exited. On error storage stays open and owned, and
+// the call may be repeated to await the pending handoff.
+func (s *Server) StopWithContext(ctx context.Context) error {
 	s.raftGroup.Stop()
-
-	err := s.storage.Close()
-	if err != nil {
-		s.Error("storage close failed", zap.Error(err))
+	if err := s.raftGroup.WaitQuiescence(ctx); err != nil {
+		return err
 	}
+	s.closeOnce.Do(func() {
+		s.closeErr = s.storage.Close()
+		if s.closeErr != nil {
+			s.Error("storage close failed", zap.Error(s.closeErr))
+		}
+	})
+	return s.closeErr
 }
 
 func (s *Server) AddEvent(shardNo string, event types.Event) {

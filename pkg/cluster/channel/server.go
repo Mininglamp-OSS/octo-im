@@ -70,10 +70,19 @@ func (s *Server) Start() error {
 	return nil
 }
 
-func (s *Server) Stop() {
+// StopWithContext stops every RaftGroup and waits until none of their pool
+// tasks can touch the shared DB. On error the DB must stay open; the call may
+// be repeated.
+func (s *Server) StopWithContext(ctx context.Context) error {
 	for _, rg := range s.raftGroups {
 		rg.Stop()
 	}
+	for _, rg := range s.raftGroups {
+		if err := rg.WaitQuiescence(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // 唤醒频道领导

@@ -267,9 +267,15 @@ func (s *Server) StopWithContext(ctx context.Context) error {
 		s.eventServer.Stop()
 	})
 	return stopConfigOwner(ctx, s.cfgServer, func() error {
+		// Slot and channel RaftGroup tasks read storage asynchronously. Slot
+		// storage and the shared DB close only after they quiesce.
+		if err := s.slotServer.StopWithContext(ctx); err != nil {
+			return fmt.Errorf("slot storage ownership handoff: %w", err)
+		}
+		if err := s.channelServer.StopWithContext(ctx); err != nil {
+			return fmt.Errorf("channel storage ownership handoff: %w", err)
+		}
 		s.stopFinish.Do(func() {
-			s.slotServer.Stop()
-			s.channelServer.Stop()
 			s.netServer.Stop()
 			s.cancelFnc()
 			s.store.Stop()
