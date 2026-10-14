@@ -32,9 +32,10 @@ func (r receipt) String() string {
 // capacity 1 and receives the single result; it is never closed.
 type receiptWaiter struct {
 	receipt
-	doneC chan error
-	done  bool
-	err   error
+	doneC     chan error
+	done      bool
+	verifying bool
+	err       error
 }
 
 // readLogFunc reads the stored log at index for raftKey; ok is false when the
@@ -42,8 +43,9 @@ type receiptWaiter struct {
 type readLogFunc func(raftKey string, index uint64) (log types.Log, ok bool, err error)
 
 type wait struct {
-	buckets []*waitBucket
-	readLog readLogFunc
+	buckets              []*waitBucket
+	readLog              readLogFunc
+	dispatchVerification func(*receiptWaiter)
 }
 
 func newWait(readLog readLogFunc) *wait {
@@ -112,8 +114,8 @@ func (m *wait) didApply(key string, appliedIndex uint64, logs []types.Log) {
 		unverified = append(unverified, w)
 	}
 	b.mu.Unlock()
-	// Read the stored entry outside the bucket lock, then complete the waiter
-	// only if nobody else completed or detached it meanwhile.
+	// Dispatch identity reads outside the bucket lock and apply path. The
+	// bucket serializes dispatch, completion and terminal detachment.
 	for _, w := range unverified {
 		m.verifyStored(w)
 	}
@@ -123,6 +125,22 @@ func (m *wait) didApply(key string, appliedIndex uint64, logs []types.Log) {
 // the applied entry is not available, e.g. a forwarded receipt registered
 // after its index was applied.
 func (m *wait) verifyStored(w *receiptWaiter) {
+	b := m.bucket(w.raftKey)
+	b.mu.Lock()
+	if w.done || w.verifying {
+		b.mu.Unlock()
+		return
+	}
+	w.verifying = true
+	b.mu.Unlock()
+	if m.dispatchVerification != nil {
+		m.dispatchVerification(w)
+		return
+	}
+	m.readReceipt(w)
+}
+
+func (m *wait) readReceipt(w *receiptWaiter) {
 	result := proposalOutcomeUnknown(fmt.Errorf("applied log %d is not readable", w.last))
 	if m.readLog != nil {
 		log, ok, err := m.readLog(w.raftKey, w.last)

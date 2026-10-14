@@ -195,7 +195,7 @@ func (r *Raft) handleSendProposeResp(e types.Event) {
 	}
 	delete(r.forwardPending, key)
 	if e.Reason != types.ReasonOk {
-		r.fowardProposeWait.Trigger(key, proposalUnknown(errors.New("raft: forwarded proposal rejected")))
+		r.fowardProposeWait.Trigger(key, proposalUnknown(types.ErrForwardRejected))
 		return
 	}
 	r.fowardProposeWait.Trigger(key, resps)

@@ -60,7 +60,9 @@ func (rg *RaftGroup) ProposeTimeout(ctx context.Context, raftKey string, id uint
 // the log. Once the leader admitted it, a local caller gets success even if
 // ctx expires meanwhile; a forwarding caller whose ctx expires gets
 // ErrProposalOutcomeUnknown. Callers must not blindly replay such proposals.
-func (rg *RaftGroup) ProposeBatchTimeout(ctx context.Context, raftKey string, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+func (rg *RaftGroup) ProposeBatchTimeout(ctx context.Context, raftKey string, reqs types.ProposeReqSet) (resps types.ProposeRespSet, err error) {
+	var r receipt
+	defer func() { rg.recordOutcome(raftKey, r, err) }()
 	if err := ctx.Err(); err != nil {
 		return nil, proposalNotAdmitted(err)
 	}
@@ -74,12 +76,11 @@ func (rg *RaftGroup) ProposeBatchTimeout(ctx context.Context, raftKey string, re
 		return nil, fmt.Errorf("raft not found, key:%s", raftKey)
 	}
 	if !raft.IsLeader() {
+		r.forwarded = true
 		resps, err := rg.fowardPropose(ctx, raft, reqs)
-		rg.recordOutcome(raftKey, receipt{forwarded: true}, err)
 		return resps, err
 	}
-	resps, _, err := rg.proposeBatchTimeout(ctx, raft, reqs, false)
-	rg.recordOutcome(raftKey, receipt{}, err)
+	resps, _, err = rg.proposeBatchTimeout(ctx, raft, reqs, false)
 	return resps, err
 }
 
@@ -89,12 +90,10 @@ func (rg *RaftGroup) ProposeBatchTimeout(ctx context.Context, raftKey string, re
 // proposal's entries. ErrProposalNotAdmitted means they were never admitted;
 // ErrProposalOutcomeUnknown and ErrProposalSuperseded are returned for
 // admitted proposals whose application could not be confirmed.
-func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKey string, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
-	var (
-		resps  []*types.ProposeResp
-		waiter *receiptWaiter
-		err    error
-	)
+func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKey string, reqs types.ProposeReqSet) (resps types.ProposeRespSet, err error) {
+	var r receipt
+	defer func() { rg.recordOutcome(raftKey, r, err) }()
+	var waiter *receiptWaiter
 	raft := rg.raftList.get(raftKey)
 	if raft == nil {
 		return nil, fmt.Errorf("raft not found, key:%s", raftKey)
@@ -104,9 +103,9 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 
 	if !raft.IsLeader() {
 		// 如果不是leader，则转发给leader
+		r.forwarded = true
 		resps, err = rg.fowardPropose(ctx, raft, reqs)
 		if err != nil {
-			rg.recordOutcome(raftKey, receipt{forwarded: true}, err)
 			return nil, err
 		}
 		var appliedBefore bool
@@ -126,7 +125,6 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 	} else {
 		resps, waiter, err = rg.proposeBatchTimeout(ctx, raft, reqs, true)
 		if err != nil {
-			rg.recordOutcome(raftKey, receipt{}, err)
 			return nil, err
 		}
 	}
@@ -138,7 +136,7 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 	case <-rg.stopper.ShouldStop():
 		err = rg.detachWaiter(waiter, ErrGroupStopped)
 	}
-	rg.recordOutcome(raftKey, waiter.receipt, err)
+	r = waiter.receipt
 	if err != nil {
 		return nil, err
 	}
@@ -383,7 +381,6 @@ func (rg *RaftGroup) handleSendPropose(raftKey string, e types.Event) {
 	// An admitted proposal is answered with its indexes even if timeoutCtx
 	// expired meanwhile; ReasonError always means it was not admitted.
 	resps, _, err := rg.proposeBatchTimeout(timeoutCtx, raft, reqs, false)
-	rg.recordOutcome(raftKey, receipt{}, err)
 	if err != nil {
 		rg.Error("handleSendPropose: propose batch failed", zap.Error(err))
 		rg.sendProposeRespError(raft, reqs, e.From)
@@ -449,7 +446,7 @@ func (rg *RaftGroup) handleSendProposeResp(e types.Event) {
 
 	if e.Reason == types.ReasonError {
 		rg.Error("handleSendProposeResp: receive propose resp error", zap.Uint64("from", e.From))
-		rg.fowardProposeWait.Trigger(key, types.ErrForwardRejected)
+		rg.fowardProposeWait.Trigger(key, proposalOutcomeUnknown(types.ErrForwardRejected))
 		return
 	}
 	rg.fowardProposeWait.Trigger(key, resps)

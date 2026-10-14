@@ -84,7 +84,11 @@ func newForwardPair(t *testing.T, leaderProposeTimeout time.Duration) *forwardPa
 		g.AddRaft(node)
 		fp.transport.groups[id] = g
 		t.Cleanup(func() {
-			g.Stop()
+			select {
+			case <-g.stopper.ShouldStop():
+			default:
+				g.Stop()
+			}
 			g.goPool.Release()
 		})
 		return g
@@ -211,8 +215,10 @@ func TestForwardedLeaderDeadlineBeforeAdmission(t *testing.T) {
 	defer cancel()
 	_, err := fp.follower.ProposeBatchTimeout(ctx, admKey, types.ProposeReqSet{{Id: 200}})
 	require.ErrorIs(t, err, types.ErrForwardRejected)
+	ok, notAdmitted, unknown, superseded := fp.follower.ProposalOutcomeCounts()
+	require.Equal(t, []uint64{0, 0, 1, 0}, []uint64{ok, notAdmitted, unknown, superseded})
 	require.NotErrorIs(t, err, types.ErrProposalNotAdmitted)
-	require.NotErrorIs(t, err, types.ErrProposalOutcomeUnknown)
+	require.ErrorIs(t, err, types.ErrProposalOutcomeUnknown)
 	close(release)
 	require.NoError(t, <-localC)
 	require.Equal(t, []uint64{100}, fp.leaderStorage.waitApplied(t, 1), "the rejected proposal is never applied")

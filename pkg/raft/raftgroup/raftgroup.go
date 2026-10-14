@@ -35,9 +35,12 @@ type RaftGroup struct {
 
 	fowardProposeWait wt.Wait // 转发提按给领导等待领导的回应
 
-	proposalSeq   atomic.Uint64 // receipt identity, unique within the group
-	admissionSems sync.Map      // raftKey -> chan struct{}, see admissionSem
-	proposalStats proposalStats
+	proposalSeq         atomic.Uint64 // receipt identity, unique within the group
+	admissionSems       sync.Map      // raftKey -> chan struct{}, see admissionSem
+	proposalStats       proposalStats
+	verificationMu      sync.Mutex
+	verificationStopped bool
+	verificationWorkers atomic.Int64
 	// beforeAdmit, if set by a test, runs on the event loop after a proposal
 	// left pending and before it is admitted.
 	beforeAdmit func(seq uint64)
@@ -63,6 +66,7 @@ func New(opts *Options) *RaftGroup {
 	if err != nil {
 		rg.Panic("create go pool failed", zap.Error(err))
 	}
+	rg.wait.dispatchVerification = rg.verifyReceiptAsync
 	return rg
 }
 
@@ -114,6 +118,9 @@ func (rg *RaftGroup) Start() error {
 }
 
 func (rg *RaftGroup) Stop() {
+	rg.verificationMu.Lock()
+	rg.verificationStopped = true
+	rg.verificationMu.Unlock()
 	rg.stopper.Stop()
 	// The loop has exited. Proposals still queued are abandoned by their
 	// callers; receipts of admitted ones can no longer complete.

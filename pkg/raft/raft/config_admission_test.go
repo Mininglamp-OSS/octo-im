@@ -747,7 +747,12 @@ func TestConfigForwardResponseValidation(t *testing.T) {
 				require.True(t, r.fowardProposeWait.IsRegistered("1200"))
 				cancel()
 			}
-			require.ErrorIs(t, studyRecv(t, out).err, types.ErrProposalOutcomeUnknown)
+			result := studyRecv(t, out)
+			require.ErrorIs(t, result.err, types.ErrProposalOutcomeUnknown)
+			if invalid == "reject" {
+				require.ErrorIs(t, result.err, types.ErrForwardRejected)
+				require.Equal(t, ProposalOutcomes{Unknown: 1}, r.ProposalOutcomes())
+			}
 			require.False(t, r.fowardProposeWait.IsRegistered("1200"))
 			require.Zero(t, studyCount(r))
 		})

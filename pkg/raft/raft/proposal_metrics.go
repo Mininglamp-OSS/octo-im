@@ -26,10 +26,12 @@ func (r *Raft) recordProposalOutcome(err error) {
 	switch {
 	case err == nil:
 		r.outcomes.ok.Add(1)
-	case errors.Is(err, types.ErrProposalSuperseded), errors.Is(err, types.ErrNotLeader), errors.Is(err, types.ErrProposalDropped):
-		r.outcomes.rejected.Add(1)
 	case errors.Is(err, types.ErrProposalNotAdmitted):
 		r.outcomes.notAdmitted.Add(1)
+	case errors.Is(err, types.ErrProposalOutcomeUnknown):
+		r.outcomes.unknown.Add(1)
+	case errors.Is(err, types.ErrProposalSuperseded), errors.Is(err, types.ErrNotLeader), errors.Is(err, types.ErrProposalDropped):
+		r.outcomes.rejected.Add(1)
 	default:
 		r.outcomes.unknown.Add(1)
 	}

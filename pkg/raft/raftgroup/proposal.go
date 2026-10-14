@@ -87,10 +87,8 @@ func (rg *RaftGroup) recordOutcome(raftKey string, r receipt, err error) {
 		return
 	case errors.Is(err, types.ErrProposalSuperseded):
 		s.superseded.Add(1)
-	case errors.Is(err, types.ErrProposalOutcomeUnknown):
-		s.unknown.Add(1)
 	default:
-		return
+		s.unknown.Add(1)
 	}
 	now := time.Now().UnixNano()
 	last := s.lastLogAt.Load()

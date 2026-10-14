@@ -160,8 +160,9 @@ func TestConfigStoppedCompatibility(t *testing.T) {
 		r.BecomeFollower(1, 0)
 		_, err := r.ProposeUntilAppliedTimeout(context.Background(), 1500, nil)
 		require.ErrorIs(t, err, types.ErrNotLeader)
+		require.ErrorIs(t, err, types.ErrProposalNotAdmitted)
 		require.NotErrorIs(t, err, types.ErrStopped)
-		require.Equal(t, ProposalOutcomes{RejectedOrSuperseded: 1}, r.ProposalOutcomes())
+		require.Equal(t, ProposalOutcomes{NotAdmitted: 1}, r.ProposalOutcomes())
 	})
 }
 
@@ -185,10 +186,12 @@ func TestConfigOutcomeCounters(t *testing.T) {
 	r.node.stopPropose = true
 	out = studyCall(r, context.Background(), 1603)
 	c.step(0, studyRecv(t, r.stepC))
-	require.ErrorIs(t, studyRecv(t, out).err, types.ErrProposalDropped)
-	require.Equal(t, ProposalOutcomes{OK: 1, NotAdmitted: 1, Unknown: 1, RejectedOrSuperseded: 1}, r.ProposalOutcomes())
+	result := studyRecv(t, out)
+	require.ErrorIs(t, result.err, types.ErrProposalDropped)
+	require.ErrorIs(t, result.err, types.ErrProposalNotAdmitted)
+	require.Equal(t, ProposalOutcomes{OK: 1, NotAdmitted: 2, Unknown: 1}, r.ProposalOutcomes())
 	r.Stop()
-	require.Equal(t, ProposalOutcomes{OK: 1, NotAdmitted: 1, Unknown: 1, RejectedOrSuperseded: 1}, r.ProposalOutcomes())
+	require.Equal(t, ProposalOutcomes{OK: 1, NotAdmitted: 2, Unknown: 1}, r.ProposalOutcomes())
 }
 
 func TestConfigShutdownSaturatedWorkers(t *testing.T) {
