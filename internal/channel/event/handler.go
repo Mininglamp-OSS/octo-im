@@ -95,7 +95,7 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 	err := c.checkAndUpdateLeaderIdChange()
 	if err != nil {
 		c.Error("advanceEvents: checkAndUpdateLeaderIdChange failed", zap.Error(err))
-		return
+		c.slotLeaderId = 0
 	}
 
 	// 按类型分组

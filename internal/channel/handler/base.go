@@ -5,6 +5,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/common"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/forward"
 	"github.com/WuKongIM/WuKongIM/internal/ingress"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
@@ -15,15 +16,22 @@ import (
 
 type Handler struct {
 	wklog.Log
-	client        *ingress.Client
-	commonService *common.Service
+	client              *ingress.Client
+	commonService       *common.Service
+	forwardCapabilities forward.CapabilityCache
+	forwardGate         *forward.Gate
 }
 
 func NewHandler() *Handler {
+	workerCount := 1
+	if options.G != nil {
+		workerCount = options.G.Poller.ChannelGoroutine
+	}
 	h := &Handler{
 		Log:           wklog.NewWKLog("handler"),
 		client:        ingress.NewClient(),
 		commonService: common.NewService(),
+		forwardGate:   forward.NewGate(workerCount),
 	}
 	h.routes()
 	return h
@@ -54,12 +62,7 @@ func (h *Handler) OnEvent(ctx *eventbus.ChannelContext) {
 		// 执行本地事件 ,频道永远在自己的槽领导节点上执行逻辑。
 		eventbus.ExecuteChannelEvent(ctx)
 	} else {
-		if ctx.SlotLeaderId != 0 {
-			// 转发到leader节点
-			h.forwardsToNode(ctx.SlotLeaderId, ctx.ChannelId, ctx.ChannelType, ctx.Events)
-		} else {
-			h.Error("channel: OnEvent: leaderId is 0", zap.String("channelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-		}
+		h.forwardsToNode(ctx.SlotLeaderId, ctx.ChannelId, ctx.ChannelType, ctx.Events)
 	}
 }
 
@@ -85,16 +88,42 @@ func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType ui
 	data, err := req.encode()
 	if err != nil {
 		h.Error("forwardToLeader: encode failed", zap.Error(err))
+		forward.Fail(events, err)
 		return
 	}
-	msg := &proto.Message{
-		MsgType: uint32(msgForwardChannelEvent),
-		Content: data,
+	legacy := func(targetNode uint64) error {
+		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardChannelEvent), Content: data})
 	}
-	err = h.sendToNode(nodeId, msg)
+	if !forward.OnlyRetryableSends(events) {
+		// Distribution and webhook work has no client-side retry path. Keep it
+		// out of the v1 ambiguity window and retain it in the base transport.
+		if err = legacy(nodeId); err != nil {
+			h.Error("channel forwarding through retained transport failed", zap.Error(err), zap.String("channelId", channelId))
+			forward.Fail(events, err)
+		}
+		return
+	}
+	if !h.forwardGate.TryAcquire() {
+		err = forward.ErrUnavailable
+		h.Error("channel forwarding concurrency limit reached", zap.Error(err), zap.String("channelId", channelId))
+		forward.Fail(events, err)
+		return
+	}
+	defer h.forwardGate.Release()
+	target := func() uint64 {
+		if len(events) > 0 && h.notForwardToLeader(events[0].Type) {
+			return nodeId
+		}
+		leader, err := service.Cluster.SlotLeaderIdOfChannel(channelId, channelType)
+		if err != nil {
+			return 0
+		}
+		return leader
+	}
+	err = forward.RequestCompatible(forward.ChannelPath, data, events, target, options.G.Cluster.NodeId, h.acceptForward, &h.forwardCapabilities, legacy)
 	if err != nil {
-		h.Error("channel: forwardToLeader: send failed", zap.Error(err), zap.Uint64("nodeId", nodeId), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
-		return
+		h.Error("channel forwarding failed", zap.Error(err), zap.String("channelId", channelId))
+		forward.Fail(events, err)
 	}
 }
 

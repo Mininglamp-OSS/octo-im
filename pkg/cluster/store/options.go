@@ -15,6 +15,10 @@ type Options struct {
 	Channel icluster.Channel
 
 	IsCmdChannel func(channel string) bool
+
+	// Called only after a successful metadata write. Must not wait or do I/O;
+	// slot AppliedIndex may not yet include this write when the callback runs.
+	OnChannelConfigSaved func(string, uint8)
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -26,6 +30,10 @@ func NewOptions(opt ...Option) *Options {
 }
 
 type Option func(*Options)
+
+func WithOnChannelConfigSaved(fn func(string, uint8)) Option {
+	return func(o *Options) { o.OnChannelConfigSaved = fn }
+}
 
 func WithNodeId(nodeId uint64) Option {
 	return func(o *Options) {

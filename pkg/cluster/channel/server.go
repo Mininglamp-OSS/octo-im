@@ -1,7 +1,9 @@
 package channel
 
 import (
+	"context"
 	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/fasthash"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
@@ -12,6 +14,12 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
 )
+
+// ReadLeaderState observes an existing channel without waking or creating it.
+func (s *Server) ReadLeaderState(ctx context.Context, channelID string, channelType uint8) (raftgroup.ReadState, error) {
+	key := wkutil.ChannelToKey(channelID, channelType)
+	return s.getRaftGroup(key).ReadLeaderState(ctx, key)
+}
 
 type Server struct {
 	raftGroups []*raftgroup.RaftGroup
@@ -39,7 +47,7 @@ func NewServer(opts *Options) *Server {
 		rg := raftgroup.New(
 			raftgroup.NewOptions(
 				raftgroup.WithLogPrefix("channel"),
-				raftgroup.WithNotNeedApplied(true),
+				raftgroup.WithNotNeedApplied(false),
 				raftgroup.WithTransport(opts.Transport),
 				raftgroup.WithStorage(s.storage),
 				raftgroup.WithEvent(s)),
@@ -80,26 +88,15 @@ func (s *Server) WakeLeaderIfNeed(clusterConfig wkdb.ChannelClusterConfig) error
 	raft := rg.GetRaft(channelKey)
 	if raft != nil {
 		ch := raft.(*Channel)
-		if ch.needUpdate(clusterConfig) {
-			return ch.switchConfig(channelConfigToRaftConfig(s.opts.NodeId, clusterConfig))
-		}
-		return nil
+		return ch.switchConfig(channelConfigToRaftConfig(s.opts.NodeId, clusterConfig))
 	}
 
 	if clusterConfig.LeaderId != s.opts.NodeId {
 		return nil
 	}
-	ch, err := createChannel(clusterConfig, s, rg)
-	if err != nil {
-		return err
-	}
-	rg.AddRaft(ch)
-
-	err = ch.switchConfig(channelConfigToRaftConfig(s.opts.NodeId, clusterConfig))
-	if err != nil {
-		return err
-	}
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.createAndApplyConfig(ctx, clusterConfig)
 }
 
 func (s *Server) WakeFollowerfNeed(channelId string, channelType uint8) error {
@@ -107,6 +104,8 @@ func (s *Server) WakeFollowerfNeed(channelId string, channelType uint8) error {
 	if err != nil {
 		return err
 	}
+	s.wakeLeaderLock.Lock(channelId)
+	defer s.wakeLeaderLock.Unlock(channelId)
 	isReplica := false
 	for _, nodeId := range clusterConfig.Replicas {
 		if nodeId == s.opts.NodeId {
@@ -126,22 +125,18 @@ func (s *Server) WakeFollowerfNeed(channelId string, channelType uint8) error {
 	channelKey := wkutil.ChannelToKey(clusterConfig.ChannelId, clusterConfig.ChannelType)
 	rg := s.getRaftGroup(channelKey)
 	if isReplica {
-		ch, err := createChannel(clusterConfig, s, rg)
-		if err != nil {
-			return err
-		}
-		rg.AddRaft(ch)
-
-		err = ch.switchConfig(channelConfigToRaftConfig(s.opts.NodeId, clusterConfig))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err = s.createAndApplyConfig(ctx, clusterConfig)
 		if err != nil {
 			return err
 		}
 
 		// 立马同步
-		ch.rg.AddEvent(channelKey, rafttype.Event{
+		rg.AddEvent(channelKey, rafttype.Event{
 			Type: rafttype.NotifySync,
 		})
-		ch.rg.Advance()
+		rg.Advance()
 	}
 	return nil
 }
@@ -170,6 +165,11 @@ func (s *Server) wakeFollowerIfNeedAsync(channelId string, channelType uint8) {
 }
 
 func (s *Server) AddEvent(channelKey string, e rafttype.Event) {
+	// Legacy generic proposals bypass message idempotency and cannot carry the
+	// canonical result. Require the versioned channel RPC for forwarded writes.
+	if e.Type == rafttype.SendPropose || e.Type == rafttype.Propose {
+		return
+	}
 
 	// 添加事件到对应的频道
 	channelId, channelType := wkutil.ChannelFromlKey(channelKey)

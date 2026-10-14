@@ -1,0 +1,472 @@
+package presence
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
+	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	"golang.org/x/sync/errgroup"
+)
+
+// v2 replaces raw prepared-session identities with non-authenticating digests.
+// Do not serve v1: an old reader would mistake a digest for a different session
+// and evict a live logical connection while its CONNACK is in flight.
+const snapshotPath = "/wk/presence/snapshot/v2"
+const touchPath = "/wk/presence/touch/v1"
+const maxPresenceRequestBody = 64 << 10
+
+type snapshotResponse struct {
+	Boot             string
+	Sessions         [][]byte
+	PreparedSessions [][]byte
+}
+
+type snapshotState struct {
+	sessions []*eventbus.Conn
+	prepared []*eventbus.Conn
+}
+
+func (m *Manager) SetRoutes() {
+	service.Cluster.Route(snapshotPath, func(c *wkserver.Context) {
+		var uids []string
+		if len(c.Body()) > maxPresenceRequestBody || json.Unmarshal(c.Body(), &uids) != nil {
+			c.WriteErr(ErrNotReady)
+			return
+		}
+		if err := m.authorizeSnapshot(c.PeerUID(), uids); err != nil {
+			c.WriteErr(err)
+			return
+		}
+		response, err := m.snapshot(uids)
+		if err != nil {
+			c.WriteErr(err)
+			return
+		}
+		data, err := json.Marshal(response)
+		if err != nil {
+			c.WriteErr(err)
+			return
+		}
+		c.Write(data)
+	})
+	service.Cluster.Route(touchPath, func(c *wkserver.Context) {
+		var uids []string
+		if len(c.Body()) > maxPresenceRequestBody || json.Unmarshal(c.Body(), &uids) != nil || len(uids) > 128 {
+			c.WriteErr(ErrNotReady)
+			return
+		}
+		if m.peerNode(c.PeerUID()) == 0 {
+			c.WriteErr(ErrNotReady)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		// A touch carries no authentication assertion. Pull current physical
+		// snapshots, so replaying an old touch cannot resurrect a closed socket.
+		if err := m.Recover(ctx, uids); err != nil {
+			c.WriteErr(err)
+			return
+		}
+		c.WriteOk()
+	})
+}
+
+// These checks narrow access within the trusted cluster network. The transport
+// UID is self-declared, so membership/authority checks do not replace peer auth.
+func (m *Manager) peerNode(peerUID string) uint64 {
+	node, err := strconv.ParseUint(peerUID, 10, 64)
+	if err != nil || node == 0 || strconv.FormatUint(node, 10) != peerUID || service.Cluster == nil {
+		return 0
+	}
+	for _, member := range service.Cluster.Nodes() {
+		if member != nil && member.Id == node {
+			return node
+		}
+	}
+	return 0
+}
+
+func (m *Manager) authorizeSnapshot(peerUID string, uids []string) error {
+	caller := m.peerNode(peerUID)
+	if caller == 0 || len(uids) == 0 || len(uids) > 128 {
+		return ErrNotReady
+	}
+	for _, uid := range uids {
+		if uid == "" || service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid)) != caller {
+			return ErrNotReady
+		}
+	}
+	return nil
+}
+
+func (m *Manager) read(ctx context.Context, node uint64, uids []string) (snapshotState, error) {
+	var response snapshotResponse
+	if node == m.node {
+		var err error
+		response, err = m.snapshot(uids)
+		if err != nil {
+			return snapshotState{}, err
+		}
+	} else {
+		body, _ := json.Marshal(uids)
+		resp, err := service.Cluster.RequestWithContext(ctx, node, snapshotPath, body)
+		if err != nil {
+			return snapshotState{}, err
+		}
+		if resp == nil || resp.Status != proto.StatusOK {
+			return snapshotState{}, ErrNotReady
+		}
+		if err = json.Unmarshal(resp.Body, &response); err != nil {
+			return snapshotState{}, err
+		}
+	}
+	if response.Boot == "" {
+		return snapshotState{}, ErrNotReady
+	}
+	requested := map[string]bool{}
+	for _, uid := range uids {
+		requested[uid] = true
+	}
+	state := snapshotState{}
+	seen := map[string]bool{}
+	decode := func(encoded [][]byte, authenticated bool) ([]*eventbus.Conn, error) {
+		conns := make([]*eventbus.Conn, 0, len(encoded))
+		for _, data := range encoded {
+			conn := &eventbus.Conn{}
+			if err := conn.Decode(data); err != nil {
+				return nil, err
+			}
+			if conn.Auth != authenticated || !requested[conn.Uid] || conn.NodeId != node || conn.OwnerBootID != response.Boot || conn.SessionID == "" {
+				return nil, ErrNotReady
+			}
+			if seen[conn.SessionID] {
+				return nil, ErrNotReady
+			}
+			seen[conn.SessionID] = true
+			conn.LastActive = uint64(time.Now().Unix())
+			conns = append(conns, conn)
+		}
+		return conns, nil
+	}
+	var err error
+	state.sessions, err = decode(response.Sessions, true)
+	if err != nil {
+		return snapshotState{}, err
+	}
+	state.prepared, err = decode(response.PreparedSessions, false)
+	if err != nil {
+		return snapshotState{}, err
+	}
+	return state, nil
+}
+
+func (m *Manager) Verify(ctx context.Context, expected *eventbus.Conn) (*eventbus.Conn, error) {
+	if expected != nil && expected.IsLegacySession() {
+		// Missing identity is not an owner snapshot proving absence. Keep the
+		// fail-closed SEND policy, but do not poison the stale-session cache.
+		return nil, ErrNotReady
+	}
+	if expected == nil || expected.SessionID == "" || expected.OwnerBootID == "" {
+		return nil, service.ErrPresenceSessionNotFound
+	}
+	state, err := m.read(ctx, expected.NodeId, []string{expected.Uid})
+	if err != nil {
+		return nil, err
+	}
+	for _, conn := range state.sessions {
+		if conn.SameSession(expected) {
+			// The snapshot proves only boot/session liveness. Keep the caller's
+			// descriptor so connection crypto never has to cross the snapshot route.
+			return expected, nil
+		}
+	}
+	return nil, service.ErrPresenceSessionNotFound
+}
+
+func (m *Manager) Recover(parent context.Context, uids []string) error {
+	missing := m.filterMissing(uids)
+	if len(missing) == 0 {
+		return nil
+	}
+	if err := m.lockRecovery(parent); err != nil {
+		return err
+	}
+	defer func() { <-m.gate }()
+	// Another recovery may have completed while this call waited for capacity.
+	missing = m.filterMissing(missing)
+	if len(missing) == 0 {
+		return nil
+	}
+	batchCount := (len(missing) + 127) / 128
+	recoveryErrors := make([]error, batchCount)
+	group := errgroup.Group{}
+	group.SetLimit(4)
+	for batchIndex, offset := 0, 0; offset < len(missing); batchIndex, offset = batchIndex+1, offset+128 {
+		batchIndex := batchIndex
+		batch := append([]string(nil), missing[offset:min(offset+128, len(missing))]...)
+		group.Go(func() error {
+			recoveryErrors[batchIndex] = m.recoverBatchWithRetry(parent, batch)
+			return nil
+		})
+	}
+	_ = group.Wait()
+	return errors.Join(recoveryErrors...)
+}
+
+func (m *Manager) recoverBatchWithRetry(parent context.Context, batch []string) error {
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = m.recoverBatch(ctx, batch)
+		if err == nil {
+			return nil
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func (m *Manager) filterMissing(uids []string) []string {
+	seen := make(map[string]bool, len(uids))
+	missing := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		if uid == "" || seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		if !m.IsReady(uid) {
+			missing = append(missing, uid)
+		}
+	}
+	return missing
+}
+
+func (m *Manager) recoverBatch(ctx context.Context, uids []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	version := service.Cluster.NodeVersion()
+	states := map[string]*readiness{}
+	generations := map[string]uint64{}
+	var missing []string
+	now := time.Now()
+	logical := make(map[string]bool, len(uids))
+	for _, uid := range uids {
+		logical[uid] = len(eventbus.User.ConnsByUid(uid)) > 0
+	}
+	var invalidUID bool
+	m.mu.Lock()
+	m.ensureReadyCapacityLocked(len(uids), now)
+	for _, uid := range uids {
+		if uid == "" {
+			continue
+		}
+		if service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid)) != m.node {
+			invalidUID = true
+			continue
+		}
+		r := m.ready[uid]
+		if r == nil {
+			r = &readiness{lastUsed: now}
+			m.ready[uid] = r
+		}
+		if r.version == version && now.Before(r.until) && (!r.online || logical[uid]) {
+			r.lastUsed = now
+			continue
+		}
+		if states[uid] != nil {
+			continue
+		}
+		states[uid] = r
+		generations[uid] = r.generation
+		missing = append(missing, uid)
+	}
+	m.mu.Unlock()
+	if len(missing) == 0 {
+		if invalidUID {
+			return ErrNotReady
+		}
+		return nil
+	}
+	nodes := service.Cluster.Nodes()
+	var owners []uint64
+	var membershipIncomplete bool
+	foundLocal := false
+	for _, node := range nodes {
+		if node.Id == m.node {
+			foundLocal = true
+		}
+		if node.Online || node.Id == m.node {
+			owners = append(owners, node.Id)
+		} else {
+			// An offline membership record is not proof that the node has no live
+			// client sockets. Excluding it makes this snapshot incomplete.
+			membershipIncomplete = true
+		}
+	}
+	if !foundLocal {
+		return ErrNotReady
+	}
+	results := make([]snapshotState, len(owners))
+	readErrors := make([]error, len(owners))
+	group := errgroup.Group{}
+	group.SetLimit(4)
+	for i, node := range owners {
+		i, node := i, node
+		group.Go(func() error {
+			requestCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			state, err := m.read(requestCtx, node, missing)
+			if err != nil {
+				readErrors[i] = err
+				return nil
+			}
+			results[i] = state
+			return nil
+		})
+	}
+	_ = group.Wait()
+	complete := !membershipIncomplete
+	var ownerErrors []error
+	for _, err := range readErrors {
+		if err != nil {
+			complete = false
+			ownerErrors = append(ownerErrors, err)
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if service.Cluster.NodeVersion() != version {
+		return ErrNotReady
+	}
+	for uid, r := range states {
+		if m.ready[uid] != r || r.generation != generations[uid] || service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid)) != m.node {
+			delete(states, uid)
+			invalidUID = true
+		}
+	}
+	byUID := make(map[string][]*eventbus.Conn)
+	preparedByUID := make(map[string][]*eventbus.Conn)
+	for _, result := range results {
+		for _, conn := range result.sessions {
+			byUID[conn.Uid] = append(byUID[conn.Uid], conn)
+		}
+		for _, conn := range result.prepared {
+			preparedByUID[conn.Uid] = append(preparedByUID[conn.Uid], conn)
+		}
+	}
+	completedAt := time.Now()
+	for uid, r := range states {
+		// Every accepted recovery result is a commit for this UID. Advance the
+		// generation before mutating the logical view so an older snapshot that
+		// was read concurrently cannot commit after this one and resurrect an
+		// evicted session.
+		r.generation++
+		r.until = time.Time{}
+		current := byUID[uid]
+		if complete {
+			for _, old := range eventbus.User.ConnsByUid(uid) {
+				if !old.Auth {
+					continue
+				}
+				found := false
+				for _, conn := range current {
+					if old.SameSession(conn) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					for _, conn := range preparedByUID[uid] {
+						if preparedSessionMatches(old, conn) {
+							found = true
+							break
+						}
+					}
+				}
+				if !found {
+					eventbus.User.RemoveConnRecovered(old)
+				}
+			}
+		}
+		for _, conn := range current {
+			eventbus.User.UpdateConnRecovered(conn)
+		}
+		if complete {
+			r.version = version
+			r.online = len(current) > 0
+			r.lastUsed = completedAt
+			if r.online {
+				r.until = completedAt.Add(5 * time.Second)
+			} else {
+				r.until = completedAt.Add(time.Second)
+			}
+		}
+	}
+	if !complete {
+		if ownerErr := errors.Join(ownerErrors...); ownerErr != nil {
+			return fmt.Errorf("%w: %v", ErrNotReady, ownerErr)
+		}
+		return ErrNotReady
+	}
+	if invalidUID {
+		return ErrNotReady
+	}
+	return nil
+}
+
+func (m *Manager) Run(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			groups := map[uint64][]string{}
+			for _, uid := range m.liveUIDs() {
+				leader := service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid))
+				if leader != 0 {
+					groups[leader] = append(groups[leader], uid)
+				}
+			}
+			g, gctx := errgroup.WithContext(ctx)
+			g.SetLimit(4)
+			for node, uids := range groups {
+				node, uids := node, uids
+				g.Go(func() error {
+					for offset := 0; offset < len(uids); offset += 128 {
+						batch := uids[offset:min(offset+128, len(uids))]
+						touchCtx, cancel := context.WithTimeout(gctx, 2*time.Second)
+						if node == m.node {
+							_ = m.Recover(touchCtx, batch)
+						} else {
+							body, _ := json.Marshal(batch)
+							_, _ = service.Cluster.RequestWithContext(touchCtx, node, touchPath, body)
+						}
+						cancel()
+						if gctx.Err() != nil {
+							return gctx.Err()
+						}
+					}
+					return nil
+				})
+			}
+			_ = g.Wait()
+		}
+	}
+}

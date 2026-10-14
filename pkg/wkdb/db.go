@@ -1,6 +1,13 @@
 package wkdb
 
+import (
+	"context"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
+)
+
 type DB interface {
+	SaveRaftHardState(shardNo string, state types.HardState) error
+	RaftHardState(shardNo string) (types.HardState, error)
 	Open() error
 	Close() error
 	// 获取下一个主键
@@ -112,6 +119,7 @@ type MessageDB interface {
 
 	// LoadMsgByClientMsgNo 通过 clientMsgNo 加载消息
 	LoadMsgByClientMsgNo(channelId string, channelType uint8, clientMsgNo string) (Message, error)
+	LoadMsgBySenderClientMsgNo(ctx context.Context, channelId string, channelType uint8, fromUID, clientMsgNo string) (Message, error)
 
 	// GetUserLastMsgSeq 获取用户在指定频道内发送的最新一条消息的seq
 	GetUserLastMsgSeq(fromUid string, channelId string, channelType uint8) (uint64, error)

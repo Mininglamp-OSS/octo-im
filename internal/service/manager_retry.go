@@ -1,6 +1,9 @@
 package service
 
-import "github.com/WuKongIM/WuKongIM/internal/types"
+import (
+	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/types"
+)
 
 var RetryManager RetryMgr
 
@@ -9,8 +12,8 @@ type RetryMgr interface {
 	RetryMessageCount() int
 	// AddRetry 添加重试消息
 	AddRetry(msg *types.RetryMessage)
-	// RemoveRetry 移除重试消息
-	RemoveRetry(fromNode uint64, connId int64, messageId int64) error
-	// 获取重试消息
-	RetryMessage(fromNode uint64, connId int64, messageId int64) *types.RetryMessage
+	// RemoveRetry 移除当前物理会话的重试消息
+	RemoveRetry(conn *eventbus.Conn, messageId int64) error
+	// 获取当前物理会话的重试消息
+	RetryMessage(conn *eventbus.Conn, messageId int64) *types.RetryMessage
 }

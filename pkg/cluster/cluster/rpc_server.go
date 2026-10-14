@@ -2,15 +2,25 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
+	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
+)
+
+const (
+	channelProposalUnavailable    proto.Status = 3
+	channelProposalOutcomeUnknown proto.Status = 4
 )
 
 type rpcServer struct {
@@ -26,8 +36,13 @@ func newRpcServer(s *Server) *rpcServer {
 }
 
 func (r *rpcServer) setRoutes() {
+	r.s.netServer.Route(channelConfigTransitionPath, r.handleChannelConfigTransition)
+	r.s.netServer.Route(channelConfigReconcilePath, r.handleChannelConfigReconcile)
+	r.s.netServer.Route(conversationConfigPath, func(c *wkserver.Context) { r.handleConversationRead(c, true) })
+	r.s.netServer.Route(conversationBoundaryPath, func(c *wkserver.Context) { r.handleConversationRead(c, false) })
 	// 频道提案
-	r.s.netServer.Route("/rpc/channel/propose", r.handleChannelPropose)
+	r.s.netServer.Route("/rpc/channel/propose", func(c *wkserver.Context) { c.WriteErr(errors.New("channel proposal RPC v2 required")) })
+	r.s.netServer.Route("/rpc/channel/propose/v2", r.handleChannelPropose)
 
 	// 槽提案
 	r.s.netServer.Route("/rpc/slot/propose", r.handleSlotPropose)
@@ -68,16 +83,31 @@ func (r *rpcServer) handleChannelPropose(c *wkserver.Context) {
 	resps, err := r.s.channelServer.ProposeBatchUntilAppliedTimeoutForLocal(timeoutCtx, req.channelId, req.channelType, req.reqs)
 	if err != nil {
 		r.Error("channel propose failed", zap.Error(err), zap.String("channelId", req.channelId), zap.Uint8("channelType", req.channelType), zap.Uint64("nodeId", r.s.opts.ConfigOptions.NodeId))
-		c.WriteErr(err)
+		status := channelProposalFailureStatus(err)
+		if status == proto.StatusError {
+			c.WriteErr(err)
+		} else {
+			c.WriteErrorAndStatus(err, status)
+		}
 		return
 	}
-	data, err := resps.Marshal()
+	data, err := json.Marshal(channelProposeResponse{Version: 2, Results: resps})
 	if err != nil {
 		r.Error("channel propose marshal failed", zap.Error(err))
 		c.WriteErr(err)
 		return
 	}
 	c.Write(data)
+}
+
+func channelProposalFailureStatus(err error) proto.Status {
+	if errors.Is(err, channel.ErrSendOutcomeUnknown) {
+		return channelProposalOutcomeUnknown
+	}
+	if channel.IsRetryableSendError(err) {
+		return channelProposalUnavailable
+	}
+	return proto.StatusError
 }
 
 func (r *rpcServer) handleSlotPropose(c *wkserver.Context) {
@@ -283,7 +313,9 @@ func (r *rpcServer) handleChannelLastLogInfo(c *wkserver.Context) {
 		return
 	}
 
-	resp, err := r.s.getChannelLastLogInfo(req.channelId, req.channelType)
+	ctx, cancel := context.WithTimeout(r.s.cancelCtx, 4*time.Second)
+	defer cancel()
+	resp, err := r.s.getChannelLastLogInfo(ctx, req.channelId, req.channelType)
 	if err != nil {
 		r.Error("get channel last log info failed", zap.Error(err))
 		c.WriteErr(err)
@@ -300,7 +332,10 @@ func (r *rpcServer) handleChannelLastLogInfo(c *wkserver.Context) {
 	c.Write(data)
 }
 
-func (s *Server) getChannelLastLogInfo(channelId string, channelType uint8) (*ChannelLastLogInfoResponse, error) {
+func (s *Server) getChannelLastLogInfo(ctx context.Context, channelId string, channelType uint8) (*ChannelLastLogInfoResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	lastLogTerm, lastLogIndex, err := s.channelServer.LastLogIndexAndTerm(channelId, channelType)
 	if err != nil {
 		return nil, err
@@ -311,10 +346,18 @@ func (s *Server) getChannelLastLogInfo(channelId string, channelType uint8) (*Ch
 		return nil, err
 	}
 
+	hard, err := s.db.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return nil, err
+	}
+	state, err := s.channelServer.ReadLeaderState(ctx, channelId, channelType)
+	if err != nil {
+		return nil, err
+	}
 	resp := &ChannelLastLogInfoResponse{
 		LogTerm:  lastLogTerm,
 		LogIndex: lastLogIndex,
-		Term:     cfg.Term,
+		Term:     max(cfg.Term, hard.Term, state.Term),
 	}
 	return resp, nil
 }
@@ -427,4 +470,10 @@ func (r *rpcServer) handleClusterLogs(c *wkserver.Context) {
 		return
 	}
 	c.Write(data)
+}
+
+// Versioned response preserves request correlation and canonical message IDs.
+type channelProposeResponse struct {
+	Version int                      `json:"version"`
+	Results rafttypes.ProposeRespSet `json:"results"`
 }

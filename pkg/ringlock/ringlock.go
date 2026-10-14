@@ -1,18 +1,21 @@
 package ringlock
 
 import (
-	"sync"
+	"context"
 
 	"github.com/WuKongIM/WuKongIM/pkg/fasthash"
 )
 
 type RingLock struct {
-	locker []sync.Mutex
+	locker []chan struct{}
 	size   uint32 // 环的大小
 }
 
 func NewRingLock(size int) *RingLock {
-	locker := make([]sync.Mutex, size)
+	locker := make([]chan struct{}, size)
+	for i := range locker {
+		locker[i] = make(chan struct{}, 1)
+	}
 	return &RingLock{
 		locker: locker,
 		size:   uint32(size),
@@ -29,11 +32,24 @@ func (r *RingLock) lockPosition(key string) int {
 // 获取环型哈希锁
 func (r *RingLock) Lock(key string) {
 	position := r.lockPosition(key)
-	r.locker[position].Lock()
+	r.locker[position] <- struct{}{}
+}
+
+// LockContext bounds waiting for a stripe without spawning a waiter goroutine.
+func (r *RingLock) LockContext(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case r.locker[r.lockPosition(key)] <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // 释放环型哈希锁
 func (r *RingLock) Unlock(key string) {
 	position := r.lockPosition(key)
-	r.locker[position].Unlock()
+	<-r.locker[position]
 }

@@ -9,7 +9,8 @@ import (
 )
 
 type queue struct {
-	logs []types.Log
+	logs     []types.Log
+	revision uint64 // owner-only generation of appended/replaced/truncated log content
 	wklog.Log
 
 	// 存储日志偏移下标，比如日志 1 2 3 4 5 6 7 8 9，存储的日志偏移是6 表示1 2 3 4 5 6已经存储
@@ -34,6 +35,9 @@ func newQueue(key string, appliedLogIndex, lastLogIndex uint64) *queue {
 }
 
 func (r *queue) append(incomingLogs ...types.Log) error {
+	if len(incomingLogs) > 0 {
+		r.revision++
+	}
 	// 1. 参数验证：检查是否有日志需要追加
 	if len(incomingLogs) == 0 {
 		r.Debug("append operation skipped: no logs provided")
@@ -218,6 +222,7 @@ func (r *queue) appliedTo(index uint64) {
 
 // truncateLogTo 截取日志到指定日志下标，比如truncateLogTo(6)，如果日志是1 2 3 4 5 6 7 8 9，截取后是1 2 3 4 5 6
 func (r *queue) truncateLogTo(logIndex uint64) {
+	r.revision++
 
 	if logIndex > r.lastLogIndex {
 		r.Panic("truncate log index is out of bound", zap.Uint64("logIndex", logIndex), zap.Uint64("lastLogIndex", r.lastLogIndex))

@@ -220,17 +220,19 @@ type Options struct {
 	}
 
 	Cluster struct {
-		NodeId              uint64        // 节点ID,节点Id，必须小于或等于1023 （https://github.com/bwmarrin/snowflake 雪花算法的限制）
-		Addr                string        // 节点监听地址 例如：tcp://0.0.0.0:11110
-		ServerAddr          string        // 节点之间能访问到的内网通讯地址 例如 127.0.0.1:11110
-		APIUrl              string        // 节点之间可访问的api地址
-		ReqTimeout          time.Duration // 请求超时时间
-		Role                Role          // 节点角色 replica, proxy
-		Seed                string        // 种子节点
-		SlotReplicaCount    int           // 每个槽的副本数量
-		ChannelReplicaCount int           // 每个频道的副本数量
-		SlotCount           int           // 槽数量
-		InitNodes           []*Node       // 集群初始节点地址
+		NodeId                uint64        // 节点ID,节点Id，必须小于或等于1023 （https://github.com/bwmarrin/snowflake 雪花算法的限制）
+		Addr                  string        // 节点监听地址 例如：tcp://0.0.0.0:11110
+		ServerAddr            string        // 节点之间能访问到的内网通讯地址 例如 127.0.0.1:11110
+		APIUrl                string        // 节点之间可访问的api地址
+		ReqTimeout            time.Duration // 请求超时时间
+		RecentReadMaxChannels int           // 单次最近消息读取的频道数量上限
+		RecentReadMaxTimeout  time.Duration // 最近消息读取总预算上限
+		Role                  Role          // 节点角色 replica, proxy
+		Seed                  string        // 种子节点
+		SlotReplicaCount      int           // 每个槽的副本数量
+		ChannelReplicaCount   int           // 每个频道的副本数量
+		SlotCount             int           // 槽数量
+		InitNodes             []*Node       // 集群初始节点地址
 
 		TickInterval time.Duration // 分布式tick间隔
 
@@ -563,6 +565,8 @@ func New(op ...Option) *Options {
 			ServerAddr                  string
 			APIUrl                      string
 			ReqTimeout                  time.Duration
+			RecentReadMaxChannels       int
+			RecentReadMaxTimeout        time.Duration
 			Role                        Role
 			Seed                        string
 			SlotReplicaCount            int
@@ -581,6 +585,8 @@ func New(op ...Option) *Options {
 			Addr:                        "tcp://0.0.0.0:11110",
 			ServerAddr:                  "",
 			ReqTimeout:                  time.Second * 10,
+			RecentReadMaxChannels:       10000,
+			RecentReadMaxTimeout:        time.Minute,
 			Role:                        RoleReplica,
 			SlotCount:                   64,
 			SlotReplicaCount:            3,
@@ -967,6 +973,8 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.Cluster.PongMaxTick = o.getInt("cluster.pongMaxTick", o.Cluster.PongMaxTick)
 
 	o.Cluster.ReqTimeout = o.getDuration("cluster.reqTimeout", o.Cluster.ReqTimeout)
+	o.Cluster.RecentReadMaxChannels = o.getInt("cluster.recentReadMaxChannels", o.Cluster.RecentReadMaxChannels)
+	o.Cluster.RecentReadMaxTimeout = o.getDuration("cluster.recentReadMaxTimeout", o.Cluster.RecentReadMaxTimeout)
 	o.Cluster.Seed = o.getString("cluster.seed", o.Cluster.Seed)
 	o.Cluster.SlotCount = o.getInt("cluster.slotCount", o.Cluster.SlotCount)
 	nodes := o.getStringSlice("cluster.initNodes") // 格式为： nodeID@addr 例如 1@localhost:11110

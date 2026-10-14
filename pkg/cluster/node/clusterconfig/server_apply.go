@@ -2,6 +2,8 @@ package clusterconfig
 
 import (
 	"encoding/binary"
+	"fmt"
+	"slices"
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -20,29 +22,52 @@ func (s *Server) applyLogs(logs []types.Log) error {
 }
 
 func (s *Server) applyLog(log types.Log) error {
-	cmd := &CMD{}
-	err := cmd.Unmarshal(log.Data)
-	if err != nil {
-		s.Error("unmarshal cmd err", zap.Error(err), zap.Uint64("index", log.Index), zap.ByteString("data", log.Data))
-		return err
+	// A batch may be retried after saveConfig or membership delivery fails.
+	// The full application config already includes earlier logs in that batch;
+	// do not repeat side effects (e.g. OfflineCount), but retry persistence and
+	// pending Raft delivery before allowing the applied marker to advance.
+	if log.Index > s.config.version() {
+		cmd := &CMD{}
+		err := cmd.Unmarshal(log.Data)
+		if err != nil {
+			s.Error("unmarshal cmd err", zap.Error(err), zap.Uint64("index", log.Index), zap.ByteString("data", log.Data))
+			return err
+		}
+
+		before := s.configToRaftConfig(s.config).Clone()
+		err = s.handleCmd(cmd)
+		if err != nil {
+			s.Error("handle cmd failed", zap.Error(err))
+			return err
+		}
+		after := s.configToRaftConfig(s.config)
+		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
+		s.config.cfg.Term = log.Term
+		s.config.cfg.Version = log.Index
+		s.configSavePending = true
+		s.configNotifyPending = true
 	}
 
-	err = s.handleCmd(cmd)
-	if err != nil {
-		s.Panic("handle cmd failed", zap.Error(err))
-		return err
+	if s.configSavePending {
+		if err := s.config.saveConfig(); err != nil {
+			s.Error("save config err", zap.Error(err))
+			return err
+		}
+		s.configSavePending = false
 	}
-	s.config.cfg.Term = log.Term
-	s.config.cfg.Version = log.Index
-
-	// fmt.Println("apply log", log.Index, log.Term, cmd.CmdType.String())
-	err = s.config.saveConfig()
-	if err != nil {
-		s.Error("save config err", zap.Error(err))
-		return err
+	// Membership becomes visible to Raft only after its version and saved
+	// application config are updated. Learners must not promote on VoteReq.
+	if s.membershipPending {
+		if err := s.switchConfig(s.config); err != nil {
+			s.Error("apply raft membership failed", zap.Error(err), zap.Uint64("index", log.Index))
+			return err
+		}
+		s.membershipPending = false
 	}
-	// 配置发送变化
-	s.NotifyConfigChangeEvent()
+	if s.configNotifyPending {
+		s.NotifyConfigChangeEvent()
+		s.configNotifyPending = false
+	}
 	return nil
 }
 
@@ -132,14 +157,15 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 		s.config.cfg.MigrateFrom = newNode.Id
 		s.config.cfg.MigrateTo = newNode.Id
 	}
-	s.switchConfig(s.config)
 	return nil
 }
 
 func (s *Server) handleNodeJoining(cmd *CMD) error {
+	if len(cmd.Data) != 8 {
+		return fmt.Errorf("invalid node joining payload length: %d", len(cmd.Data))
+	}
 	nodeId := binary.BigEndian.Uint64(cmd.Data)
 	s.config.updateNodeJoining(nodeId)
-	s.switchConfig(s.config)
 	return nil
 }
 
@@ -150,7 +176,6 @@ func (s *Server) handleNodeJoined(cmd *CMD) error {
 		return err
 	}
 	s.config.updateNodeJoined(nodeId, slots)
-	s.switchConfig(s.config)
 	return nil
 }
 
@@ -172,4 +197,17 @@ func (s *Server) handleSlotStatusChange(cmd *CMD) error {
 	}
 	s.config.updateSlotStatus(slotId, status)
 	return nil
+}
+
+// Ignore application-only versions/metadata; compare all Raft membership fields
+// so new command types cannot silently bypass membership delivery.
+func sameRaftMembership(a, b types.Config) bool {
+	sameSet := func(x, y []uint64) bool {
+		x, y = slices.Clone(x), slices.Clone(y)
+		slices.Sort(x)
+		slices.Sort(y)
+		return slices.Equal(slices.Compact(x), slices.Compact(y))
+	}
+	return sameSet(a.Replicas, b.Replicas) && sameSet(a.Learners, b.Learners) &&
+		a.MigrateFrom == b.MigrateFrom && a.MigrateTo == b.MigrateTo
 }

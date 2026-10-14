@@ -2,7 +2,9 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -23,7 +25,7 @@ func newRpcClient(s *Server) *rpcClient {
 }
 
 // RequestChannelProposeBatchUntilApplied 向指定节点请求频道提案
-func (r *rpcClient) RequestChannelProposeBatchUntilApplied(nodeId uint64, channelId string, channelType uint8, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+func (r *rpcClient) RequestChannelProposeBatchUntilApplied(ctx context.Context, nodeId uint64, channelId string, channelType uint8, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
 
 	req := &channelProposeReq{
 		channelId:   channelId,
@@ -34,16 +36,39 @@ func (r *rpcClient) RequestChannelProposeBatchUntilApplied(nodeId uint64, channe
 	if err != nil {
 		return nil, err
 	}
-	body, err := r.request(nodeId, "/rpc/channel/propose", data)
+	resp, err := r.s.RequestWithContext(ctx, nodeId, "/rpc/channel/propose/v2", data)
 	if err != nil {
+		return nil, fmt.Errorf("%w: %w", channel.ErrSendUnavailable, err)
+	}
+	if err := channelProposalResponseError(resp); err != nil {
 		return nil, err
 	}
+	body := resp.Body
 
-	resps := types.ProposeRespSet{}
-	if err := resps.Unmarshal(body); err != nil {
+	var response channelProposeResponse
+	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, err
 	}
-	return resps, nil
+	if response.Version != 2 {
+		return nil, fmt.Errorf("unsupported channel proposal response")
+	}
+	if err := channel.ValidateMessageResults(reqs, response.Results); err != nil {
+		return nil, err
+	}
+	return response.Results, nil
+}
+
+func channelProposalResponseError(resp *proto.Response) error {
+	if resp == nil || resp.Status == channelProposalOutcomeUnknown {
+		return channel.ErrSendOutcomeUnknown
+	}
+	if resp.Status == channelProposalUnavailable {
+		return channel.ErrSendUnavailable
+	}
+	if resp.Status != proto.StatusOK {
+		return fmt.Errorf("channel proposal rejected")
+	}
+	return nil
 }
 
 // RequestSlotProposeBatchUntilApplied 向指定节点请求槽提案
@@ -153,7 +178,7 @@ func (r *rpcClient) RequestChannelSwitchConfig(nodeId uint64, config wkdb.Channe
 }
 
 // RequestChannelLastLogInfo 请求频道最后日志信息
-func (r *rpcClient) RequestChannelLastLogInfo(nodeId uint64, channelId string, channelType uint8) (*ChannelLastLogInfoResponse, error) {
+func (r *rpcClient) RequestChannelLastLogInfo(ctx context.Context, nodeId uint64, channelId string, channelType uint8) (*ChannelLastLogInfoResponse, error) {
 	req := &channelReq{
 		channelId:   channelId,
 		channelType: channelType,
@@ -162,13 +187,16 @@ func (r *rpcClient) RequestChannelLastLogInfo(nodeId uint64, channelId string, c
 	if err != nil {
 		return nil, err
 	}
-	body, err := r.request(nodeId, "/rpc/channel/lastLogInfo", data)
+	result, err := r.s.RequestWithContext(ctx, nodeId, "/rpc/channel/lastLogInfo", data)
 	if err != nil {
 		return nil, err
 	}
 
+	if result == nil || result.Status != proto.StatusOK {
+		return nil, ErrConversationReadRetry
+	}
 	resp := &ChannelLastLogInfoResponse{}
-	if err := resp.Unmarshal(body); err != nil {
+	if err := resp.Unmarshal(result.Body); err != nil {
 		return nil, err
 	}
 	return resp, nil

@@ -471,6 +471,10 @@ func (s *Store) handleChannelClusterConfigSaves(reqs []*channelCfgReq) error {
 	err := s.wdb.SaveChannelClusterConfigs(cfgs)
 	if err != nil {
 		s.Error("save channel cluster config err", zap.Error(err))
+	} else if s.opts.OnChannelConfigSaved != nil {
+		for _, cfg := range cfgs {
+			s.opts.OnChannelConfigSaved(cfg.ChannelId, cfg.ChannelType)
+		}
 	}
 	for _, req := range reqs {
 		if req.errCh == nil {

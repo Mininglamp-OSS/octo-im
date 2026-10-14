@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -50,7 +51,11 @@ func (tp *TimerPool) Put(timer *time.Timer) {
 var globalTimerPool = NewTimerPool()
 
 // AdaptiveSendQueue 自适应发送队列，支持动态扩容和优先级
+var ErrQueueClosed = errors.New("send queue closed")
+
 type AdaptiveSendQueue struct {
+	closed bool
+	done   chan struct{}
 	// 基础配置
 	baseCapacity    int
 	maxCapacity     int
@@ -92,6 +97,7 @@ func NewAdaptiveSendQueue(baseCapacity, maxCapacity int, maxSize uint64) *Adapti
 	}
 
 	return &AdaptiveSendQueue{
+		done:            make(chan struct{}),
 		baseCapacity:    baseCapacity,
 		maxCapacity:     maxCapacity,
 		currentCapacity: baseCapacity,
@@ -115,8 +121,13 @@ func (asq *AdaptiveSendQueue) EnablePriority(highPriorityCapacity int) {
 
 // Send 发送消息，支持自动扩容和优先级
 func (asq *AdaptiveSendQueue) Send(msg *proto.Message, priority bool) error {
+	asq.mu.Lock()
+	defer asq.mu.Unlock()
+	if asq.closed {
+		return ErrQueueClosed
+	}
 	// 检查限流
-	if asq.rl.RateLimited() {
+	if asq.rl.maxSize > 0 && uint64(msg.Size()) > asq.rl.maxSize-min(asq.rl.Get(), asq.rl.maxSize) {
 		asq.Error("Rate limited")
 		return ErrRateLimited
 	}
@@ -143,7 +154,7 @@ func (asq *AdaptiveSendQueue) Send(msg *proto.Message, priority bool) error {
 		return nil
 	default:
 		// 队列满，尝试扩容
-		if asq.tryExpand() {
+		if asq.tryExpandLocked() {
 			// 扩容成功，重试发送
 			select {
 			case asq.queue <- msg:
@@ -164,22 +175,15 @@ func (asq *AdaptiveSendQueue) Send(msg *proto.Message, priority bool) error {
 }
 
 // tryExpand 尝试扩容队列
-func (asq *AdaptiveSendQueue) tryExpand() bool {
-	asq.mu.Lock()
-	defer asq.mu.Unlock()
+func (asq *AdaptiveSendQueue) tryExpandLocked() bool {
 
 	// 检查是否可以扩容
 	if asq.currentCapacity >= asq.maxCapacity {
 		return false
 	}
 
-	// 检查扩容频率限制（避免频繁扩容）
-	if time.Since(asq.lastExpandTime) < time.Second {
-		return false
-	}
-
 	// 计算新容量（每次扩容50%）
-	newCapacity := asq.currentCapacity + asq.currentCapacity/2
+	newCapacity := asq.currentCapacity + max(1, asq.currentCapacity/2)
 	if newCapacity > asq.maxCapacity {
 		newCapacity = asq.maxCapacity
 	}
@@ -224,111 +228,72 @@ func (asq *AdaptiveSendQueue) handleDrop(msg *proto.Message) {
 }
 
 // Receive 接收消息，优先处理高优先级消息
-func (asq *AdaptiveSendQueue) Receive(ctx context.Context) (*proto.Message, bool) {
-	// 优先处理高优先级消息
+func (asq *AdaptiveSendQueue) pop() (*proto.Message, bool) {
+	asq.mu.Lock()
+	defer asq.mu.Unlock()
+	if asq.closed {
+		return nil, false
+	}
+	var msg *proto.Message
 	if asq.priorityEnabled {
 		select {
-		case msg := <-asq.highPriorityQueue:
-			if msg != nil {
-				asq.rl.Decrease(uint64(msg.Size()))
-			}
-			return msg, true
+		case msg = <-asq.highPriorityQueue:
 		default:
-			// 高优先级队列为空，继续处理普通消息
 		}
 	}
-
-	// 处理普通消息
-	select {
-	case msg := <-asq.queue:
-		if msg != nil {
-			asq.rl.Decrease(uint64(msg.Size()))
+	if msg == nil {
+		select {
+		case msg = <-asq.queue:
+		default:
 		}
-		return msg, true
-	case <-ctx.Done():
+	}
+	if msg == nil {
 		return nil, false
+	}
+	asq.rl.Decrease(uint64(msg.Size()))
+	return msg, true
+}
+
+func (asq *AdaptiveSendQueue) Receive(ctx context.Context) (*proto.Message, bool) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, false
+		}
+		if msg, ok := asq.pop(); ok {
+			return msg, true
+		}
+		select {
+		case <-asq.messageNotify:
+		case <-asq.done:
+			return nil, false
+		case <-ctx.Done():
+			return nil, false
+		}
 	}
 }
 
-// BatchReceive 批量接收消息（带超时机制）
 func (asq *AdaptiveSendQueue) BatchReceive(ctx context.Context, maxBatchSize int, maxBatchBytes uint64) ([]*proto.Message, bool) {
-	msgs := make([]*proto.Message, 0, maxBatchSize)
-	totalBytes := uint64(0)
-
-	// 设置批量接收超时时间 - 使用 Timer 池优化
-	batchTimeout := time.Millisecond * 100 // 100ms 超时
-	timer := asq.timerPool.Get(batchTimeout)
-	defer asq.timerPool.Put(timer)
-
-	// 至少尝试获取一个消息（带超时）
-	msg, ok := asq.ReceiveWithTimeout(ctx, batchTimeout)
+	msg, ok := asq.ReceiveWithTimeout(ctx, 100*time.Millisecond)
 	if !ok {
 		return nil, false
 	}
-
-	msgs = append(msgs, msg)
-	if msg != nil {
-		totalBytes += uint64(msg.Size())
-	}
-
-	// 尝试获取更多消息（非阻塞）
-	for len(msgs) < maxBatchSize && totalBytes < maxBatchBytes {
-		select {
-		case msg := <-asq.queue:
-			if msg != nil {
-				asq.rl.Decrease(uint64(msg.Size()))
-				msgs = append(msgs, msg)
-				totalBytes += uint64(msg.Size())
-			}
-		case msg := <-asq.highPriorityQueue:
-			if asq.priorityEnabled && msg != nil {
-				asq.rl.Decrease(uint64(msg.Size()))
-				msgs = append(msgs, msg)
-				totalBytes += uint64(msg.Size())
-			}
-		case <-timer.C:
-			// 超时，返回当前批次
-			return msgs, true
-		default:
-			// 没有更多消息，返回当前批次
-			return msgs, true
+	msgs := []*proto.Message{msg}
+	bytes := uint64(msg.Size())
+	for len(msgs) < maxBatchSize && bytes < maxBatchBytes {
+		msg, ok = asq.pop()
+		if !ok {
+			break
 		}
+		msgs = append(msgs, msg)
+		bytes += uint64(msg.Size())
 	}
-
 	return msgs, true
 }
 
-// ReceiveWithTimeout 带超时的接收消息（优化版本，避免 time.After 资源泄漏）
 func (asq *AdaptiveSendQueue) ReceiveWithTimeout(ctx context.Context, timeout time.Duration) (*proto.Message, bool) {
-	// 优先处理高优先级消息（非阻塞）
-	if asq.priorityEnabled {
-		select {
-		case msg := <-asq.highPriorityQueue:
-			if msg != nil {
-				asq.rl.Decrease(uint64(msg.Size()))
-			}
-			return msg, true
-		default:
-			// 高优先级队列为空，继续处理普通消息
-		}
-	}
-
-	// 处理普通消息（带超时）- 使用 Timer 池优化
-	timer := asq.timerPool.Get(timeout)
-	defer asq.timerPool.Put(timer) // 将 timer 放回池中复用
-
-	select {
-	case msg := <-asq.queue:
-		if msg != nil {
-			asq.rl.Decrease(uint64(msg.Size()))
-		}
-		return msg, true
-	case <-timer.C:
-		// 超时，返回空
-		return nil, false
-	case <-ctx.Done():
-		return nil, false
-	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return asq.Receive(ctx)
 }
 
 // GetStats 获取队列统计信息
@@ -374,7 +339,7 @@ func (asq *AdaptiveSendQueue) ShouldShrink() bool {
 	defer asq.mu.RUnlock()
 
 	// 只有当前容量大于基础容量且利用率低于25%时才考虑缩容
-	if asq.currentCapacity <= asq.baseCapacity {
+	if asq.closed || asq.currentCapacity <= asq.baseCapacity {
 		return false
 	}
 
@@ -387,7 +352,7 @@ func (asq *AdaptiveSendQueue) Shrink() {
 	asq.mu.Lock()
 	defer asq.mu.Unlock()
 
-	if asq.currentCapacity <= asq.baseCapacity {
+	if asq.closed || asq.currentCapacity <= asq.baseCapacity {
 		return
 	}
 
@@ -424,9 +389,20 @@ func (asq *AdaptiveSendQueue) Close() {
 	asq.mu.Lock()
 	defer asq.mu.Unlock()
 
+	if asq.closed {
+		return
+	}
+	asq.closed = true
+	close(asq.done)
 	close(asq.queue)
+	for msg := range asq.queue {
+		asq.rl.Decrease(uint64(msg.Size()))
+	}
 	if asq.priorityEnabled {
 		close(asq.highPriorityQueue)
+		for msg := range asq.highPriorityQueue {
+			asq.rl.Decrease(uint64(msg.Size()))
+		}
 	}
 
 	asq.Info("Adaptive send queue closed")
@@ -450,6 +426,8 @@ func (asq *AdaptiveSendQueue) WaitForMessage(ctx context.Context, timeout time.D
 	select {
 	case <-asq.messageNotify:
 		return true
+	case <-asq.done:
+		return false
 	case <-timer.C:
 		return false
 	case <-ctx.Done():

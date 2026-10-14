@@ -116,12 +116,13 @@ func (p *poller) handleEvents() {
 	p.waitlist.readHandlers(&p.tmpHandlers)
 	var err error
 	for _, h := range p.tmpHandlers {
-		if h.hasEvent() {
-			events := h.events()
+		if h.hasEvent() && h.processing.CompareAndSwap(false, true) {
 			err = p.handlePool.Submit(func() {
+				events := h.events()
 				h.advanceEvents(events)
 			})
 			if err != nil {
+				h.processing.Store(false)
 				p.Error("submit channel handle task failed", zap.String("error", err.Error()))
 			}
 		}

@@ -7,7 +7,6 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/common"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
-	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -89,6 +88,11 @@ func (e *EventPool) ConnCountByDeviceFlag(uid string, deviceFlag wkproto.DeviceF
 func (e *EventPool) ConnById(uid string, nodeId uint64, id int64) *eventbus.Conn {
 	return e.pollerByUid(uid).connById(uid, nodeId, id)
 }
+func (e *EventPool) TouchConn(uid string, nodeId uint64, id int64) bool {
+	p := e.pollerByUid(uid)
+	h := p.handler(uid)
+	return h != nil && h.conns.touch(nodeId, id)
+}
 func (e *EventPool) LocalConnById(uid string, id int64) *eventbus.Conn {
 	return e.pollerByUid(uid).localConnById(uid, id)
 }
@@ -108,6 +112,10 @@ func (e *EventPool) UpdateConn(conn *eventbus.Conn) {
 	e.pollerByUid(conn.Uid).updateConn(conn)
 }
 
+func (e *EventPool) UpdateConnRecovered(conn *eventbus.Conn) {
+	e.pollerByUid(conn.Uid).updateConnRecovered(conn)
+}
+
 func (e *EventPool) AllUserCount() int {
 	count := 0
 	for _, p := range e.pollers {
@@ -125,10 +133,8 @@ func (e *EventPool) AllConnCount() int {
 
 func (e *EventPool) RemoveConn(conn *eventbus.Conn) {
 	e.pollerByUid(conn.Uid).removeConn(conn)
-	realConn := service.ConnManager.GetConn(conn.ConnId)
-	if realConn != nil {
-		service.ConnManager.RemoveConn(realConn)
-	}
+	// This is a logical routing view; a remote session may reuse the numeric
+	// ID of an unrelated local socket. Physical removal belongs to onClose.
 }
 
 func (e *EventPool) WriteLocalData(conn *eventbus.Conn, data []byte) error {

@@ -35,8 +35,8 @@ func TestLocalProposalAdmissionByRole(t *testing.T) {
 
 func TestLocalProposalAfterImplicitLeaderConfiguration(t *testing.T) {
 	n := NewNode(0, types.RaftState{}, NewOptions(WithNodeId(1), WithAdvance(func() {})))
-	// Cluster-config bootstrap supplies a leader without an explicit Role. This
-	// release installs stepLeader but retains RoleUnknown in the copied config.
+	// Cluster-config bootstrap can supply a leader without an explicit Role.
+	// It must still install a leader handler that accepts local proposals.
 	require.NoError(t, n.Step(types.Event{Type: types.ConfChange, Config: types.Config{
 		Replicas: []uint64{1}, Leader: 1, Term: 1,
 	}}))

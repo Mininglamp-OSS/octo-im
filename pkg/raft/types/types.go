@@ -749,6 +749,7 @@ func (t *TermStartIndexInfo) Clone() *TermStartIndexInfo {
 const LocalNode = math.MaxUint64
 
 type RaftState struct {
+	HardState HardState
 	// LastLogIndex 最后一个日志的下标
 	LastLogIndex uint64
 	// LastTerm 最后一个日志的任期
@@ -761,6 +762,10 @@ type RaftState struct {
 type ProposeResp struct {
 	Id    uint64
 	Index uint64
+	// Channel-only metadata, transported by the versioned channel RPC. Id stays
+	// the request correlation ID; generic Raft's binary codec is unchanged.
+	CanonicalID uint64 `json:",omitempty"`
+	Duplicate   bool   `json:",omitempty"`
 }
 
 type ProposeRespSet []*ProposeResp

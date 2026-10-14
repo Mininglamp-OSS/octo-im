@@ -74,7 +74,6 @@ func (s *Server) channelMigrate(c *wkhttp.Context) {
 	// 保存配置
 	newClusterConfig.MigrateFrom = req.MigrateFrom
 	newClusterConfig.MigrateTo = req.MigrateTo
-	newClusterConfig.ConfVersion = uint64(time.Now().UnixNano())
 
 	if !wkutil.ArrayContainsUint64(clusterConfig.Replicas, req.MigrateTo) {
 		// 将要目标节点加入学习者中
@@ -82,7 +81,7 @@ func (s *Server) channelMigrate(c *wkhttp.Context) {
 	}
 
 	// 提案保存配置
-	version, err := s.store.SaveChannelClusterConfig(newClusterConfig)
+	version, err := s.saveChannelConfigTimeout(newClusterConfig)
 	if err != nil {
 		s.Error("channelMigrate: Save error", zap.Error(err))
 		c.ResponseError(err)

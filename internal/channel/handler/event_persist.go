@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"fmt"
+	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -9,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
@@ -28,62 +31,30 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 		timeoutCtx, cancel := h.WithTimeout()
 		defer cancel()
-		reasonCode := wkproto.ReasonSuccess
-
 		results, err := service.Store.AppendMessages(timeoutCtx, ctx.ChannelId, ctx.ChannelType, persists)
 		if err != nil {
 			h.Error("store message failed", zap.Error(err), zap.Int("events", len(persists)), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-			reasonCode = wkproto.ReasonSystemError
+			markPersistFailure(events, err)
 		}
 
-		// 填充messageSeq
-		if reasonCode == wkproto.ReasonSuccess {
-			for _, e := range events {
-				for _, result := range results {
-					if result.Id == uint64(e.MessageId) {
-						e.MessageSeq = result.Index
-						break
-					}
-				}
+		if err == nil {
+			err = applyPersistResults(events, persists, results)
+			if err != nil {
+				h.Error("invalid persistence response", zap.Error(err))
+				markPersistFailure(events, err)
 			}
-
-			for i, m := range persists {
-				for _, result := range results {
-					if result.Id == uint64(m.MessageID) {
-						persists[i].MessageSeq = uint32(result.Index)
-						break
-					}
-				}
-			}
-
-			// 通知插件
-			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, persists)
+		}
+		if err == nil {
+			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, newlyPersistedMessages(events, persists))
 		}
 
-		// 修改原因码
-		for _, event := range events {
-			for _, msg := range persists {
-				if event.MessageId == msg.MessageID {
-					event.ReasonCode = reasonCode
-					break
-				}
-			}
-			if options.G.Logger.TraceOn {
+	}
 
-				msgTip := "消息保存成功..."
-				if reasonCode != wkproto.ReasonSuccess {
-					msgTip = "消息保存失败..."
-				}
-				h.Trace(msgTip,
-					"persist",
-					zap.Int64("messageId", event.MessageId),
-					zap.Uint64("messageSeq", event.MessageSeq),
-					zap.String("from", event.Conn.Uid),
-					zap.String("channelId", ctx.ChannelId),
-					zap.Uint8("channelType", ctx.ChannelType),
-					zap.String("resson", reasonCode.String()),
-				)
-			}
+	if options.G.Logger.TraceOn {
+		for _, e := range events {
+			h.Trace("message persistence result", "persist", zap.Int64("messageId", e.MessageId),
+				zap.Uint64("messageSeq", e.MessageSeq), zap.String("channelId", ctx.ChannelId),
+				zap.Uint8("channelType", ctx.ChannelType), zap.String("reason", e.ReasonCode.String()))
 		}
 	}
 
@@ -91,8 +62,9 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	if options.G.WebhookOn(types.EventMsgNotify) {
 		for _, e := range events {
 			sendPacket := e.Frame.(*wkproto.SendPacket)
-			if e.ReasonCode == wkproto.ReasonSuccess && !sendPacket.NoPersist {
+			if shouldRunPersistSideEffects(e) && !sendPacket.NoPersist {
 				cloneEvent := e.Clone()
+				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 				cloneEvent.Type = eventbus.EventChannelWebhook
 				eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 			}
@@ -101,10 +73,11 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 	// ========== 分发 ==========
 	for _, e := range events {
-		if e.ReasonCode != wkproto.ReasonSuccess {
+		if !shouldDistributePersistResult(e) {
 			continue
 		}
 		cloneEvent := e.Clone()
+		cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 		cloneEvent.Type = eventbus.EventChannelDistribute
 		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 	}
@@ -113,7 +86,42 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 }
 
+func markPersistFailure(events []*eventbus.Event, err error) {
+	retryable := channel.IsRetryableSendError(err)
+	ambiguous := channel.IsAmbiguousSendError(err)
+	for _, event := range events {
+		packet, ok := event.Frame.(*wkproto.SendPacket)
+		if !ok || packet == nil || packet.NoPersist || event.ReasonCode != wkproto.ReasonSuccess {
+			continue
+		}
+		event.ReasonCode = wkproto.ReasonSystemError
+		if !retryable {
+			continue
+		}
+		if ambiguous && packet.ClientMsgNo == "" {
+			event.PersistenceOutcomeUnknown = true
+			continue
+		}
+		event.ReasonCode = wkproto.ReasonNodeNotMatch
+	}
+}
+
+func shouldRunPersistSideEffects(event *eventbus.Event) bool {
+	return event.ReasonCode == wkproto.ReasonSuccess && !event.PersistedDuplicate
+}
+
+func shouldDistributePersistResult(event *eventbus.Event) bool {
+	// Duplicate proves persistence, not that the earlier process reached the
+	// in-memory distribution stage. Redistribute the canonical message so a
+	// commit followed by a crash cannot strand it; recipients deduplicate by
+	// the canonical message identity.
+	return event.ReasonCode == wkproto.ReasonSuccess
+}
+
 func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, msgs []wkdb.Message) {
+	if len(msgs) == 0 {
+		return
+	}
 	plugins := service.PluginManager.Plugins(types.PluginPersistAfter)
 	if len(plugins) == 0 {
 		return
@@ -158,6 +166,22 @@ func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, 
 
 	// 当前节点非频道领导节点，转发请求到领导节点执行
 	h.forwardPersistAfterToLeader(leaderId, channelId, channelType, msgBatch)
+}
+
+func newlyPersistedMessages(events []*eventbus.Event, messages []wkdb.Message) []wkdb.Message {
+	result := make([]wkdb.Message, 0, len(messages))
+	messageIndex := 0
+	for _, e := range events {
+		packet, ok := e.Frame.(*wkproto.SendPacket)
+		if !ok || packet == nil || packet.NoPersist || e.ReasonCode != wkproto.ReasonSuccess {
+			continue
+		}
+		if !e.PersistedDuplicate {
+			result = append(result, messages[messageIndex])
+		}
+		messageIndex++
+	}
+	return result
 }
 
 // executePluginPersistAfterLocal 在本地执行插件PersistAfter调用
@@ -228,4 +252,35 @@ func (h *Handler) toPersistMessages(channelId string, channelType uint8, events 
 		persists = append(persists, msg)
 	}
 	return persists
+}
+
+// applyPersistResults validates the entire response before changing an event.
+// Positional mapping supports several attempts of the same logical message in
+// one batch while leaving non-persistent and permission-denied events alone.
+func applyPersistResults(events []*eventbus.Event, messages []wkdb.Message, results rafttypes.ProposeRespSet) error {
+	if len(messages) != len(results) {
+		return fmt.Errorf("incomplete persistence result")
+	}
+	eligible := make([]*eventbus.Event, 0, len(messages))
+	for _, e := range events {
+		if packet, ok := e.Frame.(*wkproto.SendPacket); ok && packet != nil && !packet.NoPersist && e.ReasonCode == wkproto.ReasonSuccess {
+			eligible = append(eligible, e)
+		}
+	}
+	if len(eligible) != len(results) {
+		return fmt.Errorf("persistence event count mismatch")
+	}
+	for i, r := range results {
+		if r == nil || r.Id != uint64(eligible[i].MessageId) || r.Id != uint64(messages[i].MessageID) || r.CanonicalID == 0 || r.Index == 0 || r.Index > uint64(^uint32(0)) {
+			return fmt.Errorf("invalid persistence result")
+		}
+	}
+	for i, r := range results {
+		eligible[i].MessageId = int64(r.CanonicalID)
+		eligible[i].MessageSeq = r.Index
+		eligible[i].PersistedDuplicate = r.Duplicate
+		messages[i].MessageID = int64(r.CanonicalID)
+		messages[i].MessageSeq = uint32(r.Index)
+	}
+	return nil
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/pkg/fasttime"
 	"github.com/WuKongIM/WuKongIM/pkg/jsonrpc"
@@ -276,6 +277,9 @@ func (s *Server) handleUnauthenticatedConn(conn wknet.Conn, buff []byte, isJson 
 		ProtoVersion: connectPacket.Version,
 		Uptime:       fasttime.UnixTimestamp(),
 		IsJsonRpc:    isJson,
+	}
+	if service.Presence != nil {
+		service.Presence.Prepare(conn, connCtx)
 	}
 	conn.SetContext(connCtx)
 

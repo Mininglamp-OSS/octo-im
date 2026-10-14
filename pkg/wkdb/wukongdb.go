@@ -542,6 +542,8 @@ func (b *Batch) Commit() error {
 }
 
 func (b *Batch) CommitWait() error {
+	// The worker clears b.waitC when releasing the batch. Retain the channel
+	// before publishing b so the completion read cannot race that release.
 	waitC := make(chan error, 1)
 	b.waitC = waitC
 	b.db.batchChan <- b

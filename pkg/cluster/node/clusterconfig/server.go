@@ -7,6 +7,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -19,12 +20,17 @@ import (
 )
 
 type Server struct {
-	opts      *Options
-	raft      *raft.Raft             // raft算法
-	config    *Config                // 分布式配置对象
-	storage   *PebbleShardLogStorage // 配置日志存储
-	cfgGenId  *snowflake.Node        // 配置ID生成器
-	listeners []IEvent               // 事件监听器
+	opts     *Options
+	raft     *raft.Raft             // raft算法
+	config   *Config                // 分布式配置对象
+	storage  *PebbleShardLogStorage // 配置日志存储
+	cfgGenId *snowflake.Node        // 配置ID生成器
+	// Apply-worker-only progress. On restart the persisted snapshot and
+	// initRaft reconstruct membership; these flags cover in-process retries.
+	membershipPending   bool
+	configSavePending   bool
+	configNotifyPending bool
+	listeners           []IEvent // 事件监听器
 	wklog.Log
 }
 
@@ -187,15 +193,24 @@ func (s *Server) StepRaftEvent(e rafttypes.Event) {
 	s.raft.Step(e)
 }
 
-func (s *Server) switchConfig(cfg *Config) {
+func (s *Server) switchConfig(cfg *Config) error {
 	if s.raft == nil {
-		return
+		return nil
 	}
 
-	s.raft.Step(rafttypes.Event{
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := s.raft.StepWait(ctx, rafttypes.Event{
 		Type:   rafttypes.ConfChange,
 		Config: s.configToRaftConfig(cfg),
 	})
+	// A leader's ConfigResp can arrive before the corresponding local apply.
+	// Replaying an older committed entry must not roll Raft back or stop apply.
+	if errors.Is(err, raft.ErrConfigVersionStale) {
+		s.Debug("raft already has newer membership", zap.Uint64("appliedVersion", cfg.version()))
+		return nil
+	}
+	return err
 }
 
 func (s *Server) IsLeader() bool {
@@ -333,6 +348,7 @@ func (s *Server) configToRaftConfig(cfg *Config) rafttypes.Config {
 	}
 
 	return rafttypes.Config{
+		Version:     cfg.version(),
 		Replicas:    replicas,
 		MigrateFrom: cfg.cfg.MigrateFrom,
 		MigrateTo:   cfg.cfg.MigrateTo,
