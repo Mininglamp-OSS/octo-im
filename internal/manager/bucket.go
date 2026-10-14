@@ -76,7 +76,7 @@ func (b *tagBlucket) checkExpireTags() {
 	// tag过期检查
 	var removeTags []string // 需要移除的tagKey
 	for _, tag := range b.tag.m {
-		if time.Since(tag.LastGetTime) > b.expire {
+		if time.Since(tag.LastGet()) > b.expire {
 			if removeTags == nil {
 				removeTags = make([]string, 0, 20)
 			}

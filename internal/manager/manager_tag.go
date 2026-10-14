@@ -80,6 +80,7 @@ func (t *TagManager) MakeTagNotCacheWithTagKey(tagKey string, uids []string) (*t
 		return nil, err
 	}
 	tag.Nodes = nodes
+	tag.Touch()
 
 	return tag, nil
 }
@@ -93,18 +94,51 @@ func (t *TagManager) AddUsers(tagKey string, uids []string) error {
 	if tag == nil {
 		return errors.TagNotExist(tagKey)
 	}
-	// 去除已经存在的用户
-	t.removeExistUidsInTag(tag, uids)
-
 	// 计算用户所在的节点
 	nodes, err := t.calcUsersInNode(uids)
 	if err != nil {
 		return err
 	}
+	// 在副本上修改：发布出去的tag可能正在被分发遍历
+	newTag := copyTag(tag)
+	newTag.Nodes = cloneNodes(tag.Nodes)
+	// 去除已经存在的用户
+	t.removeExistUidsInTag(newTag, uids)
 	// 合并节点
-	t.mergeNodes(tag, nodes)
+	t.mergeNodes(newTag, nodes)
+	t.setTag(newTag)
 
 	return nil
+}
+
+// copyTag returns an unpublished copy of tag. It shares the published nodes,
+// so callers that change membership must replace Nodes with cloneNodes first.
+func copyTag(tag *types.Tag) *types.Tag {
+	c := &types.Tag{
+		Key:         tag.Key,
+		ChannelId:   tag.ChannelId,
+		ChannelType: tag.ChannelType,
+		Nodes:       tag.Nodes,
+		CreatedAt:   tag.CreatedAt,
+		LastGetTime: tag.LastGetTime,
+		NodeVersion: tag.NodeVersion,
+	}
+	c.GetCount.Store(tag.GetCount.Load())
+	c.Touch()
+	return c
+}
+
+// cloneNodes deep-copies nodes so the copy can be modified in place.
+func cloneNodes(nodes []*types.Node) []*types.Node {
+	out := make([]*types.Node, 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, &types.Node{
+			LeaderId: node.LeaderId,
+			Uids:     append([]string(nil), node.Uids...),
+			SlotIds:  append([]uint32(nil), node.SlotIds...),
+		})
+	}
+	return out
 }
 
 func (t *TagManager) removeExistUidsInTag(tag *types.Tag, uids []string) {
@@ -130,13 +164,16 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 		return errors.TagNotExist(tagKey)
 	}
 
+	// 在副本上修改：发布出去的tag可能正在被分发遍历
+	newTag := copyTag(tag)
+	newTag.Nodes = cloneNodes(tag.Nodes)
 	for _, uid := range uids {
 		slotId := service.Cluster.GetSlotId(uid)
 		leaderId := service.Cluster.SlotLeaderId(slotId)
 		if leaderId == 0 {
 			return errors.TagSlotLeaderIsZero
 		}
-		for _, node := range tag.Nodes {
+		for _, node := range newTag.Nodes {
 			if node.LeaderId == leaderId {
 				for i, nodeUid := range node.Uids {
 					if nodeUid == uid {
@@ -148,10 +185,15 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 			}
 		}
 	}
+	t.setTag(newTag)
 	return nil
 }
 
 func (t *TagManager) RemoveTag(tagKey string) {
+	// Serialized with copy-and-replace updates so they cannot republish a
+	// tag that was just removed.
+	t.Lock()
+	defer t.Unlock()
 	t.removeTag(tagKey)
 }
 
@@ -176,7 +218,7 @@ func (t *TagManager) Get(tagKey string) *types.Tag {
 		t.Warn("tag is expired, tagNodeVersion < currentNodeVersion ", zap.String("tagKey", tagKey), zap.Uint64("tagNodeVersion", tag.NodeVersion), zap.Uint64("currentNodeVersion", t.nodeVersion()))
 		return nil
 	}
-	tag.LastGetTime = time.Now()
+	tag.Touch()
 	tag.GetCount.Inc()
 	return tag
 }
@@ -186,13 +228,16 @@ func (t *TagManager) Exist(tagKey string) bool {
 }
 
 func (t *TagManager) RenameTag(oldTagKey, newTagKey string) error {
+	t.Lock()
+	defer t.Unlock()
+
 	tag := t.getTag(oldTagKey)
 	if tag == nil {
 		return errors.TagNotExist(oldTagKey)
 	}
-	tag.Key = newTagKey
-	tag.LastGetTime = time.Now()
-	t.setTag(tag)
+	newTag := copyTag(tag)
+	newTag.Key = newTagKey
+	t.setTag(newTag)
 	t.removeTag(oldTagKey)
 	return nil
 }
@@ -200,10 +245,15 @@ func (t *TagManager) RenameTag(oldTagKey, newTagKey string) error {
 func (t *TagManager) SetChannelTag(fakeChannelId string, channelType uint8, tagKey string) {
 	blucket := t.getBlucketByChannel(fakeChannelId, channelType)
 	blucket.setChannelTag(fakeChannelId, channelType, tagKey)
+
+	t.Lock()
+	defer t.Unlock()
 	tag := t.getTag(tagKey)
-	if tag != nil {
-		tag.ChannelId = fakeChannelId
-		tag.ChannelType = channelType
+	if tag != nil && (tag.ChannelId != fakeChannelId || tag.ChannelType != channelType) {
+		newTag := copyTag(tag)
+		newTag.ChannelId = fakeChannelId
+		newTag.ChannelType = channelType
+		t.setTag(newTag)
 	}
 }
 
