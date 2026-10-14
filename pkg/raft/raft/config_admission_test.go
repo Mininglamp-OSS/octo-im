@@ -126,7 +126,9 @@ func studyNew(t *testing.T, multi bool) *studyCluster {
 			default:
 				r.Stop()
 			}
-			require.NoError(t, r.pool.ReleaseTimeout(5*time.Second))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			require.NoError(t, r.WaitQuiescence(ctx))
+			cancel()
 			require.Zero(t, r.pool.Running())
 		}
 	})

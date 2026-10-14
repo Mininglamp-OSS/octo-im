@@ -51,7 +51,12 @@ func (r *Raft) ProposeBatchTimeout(ctx context.Context, reqs []types.ProposeReq)
 }
 
 // ProposeBatchUntilAppliedTimeout 批量提案（等待应用）
-func (r *Raft) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []types.ProposeReq) ([]*types.ProposeResp, error) {
+func (r *Raft) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []types.ProposeReq) (resps []*types.ProposeResp, err error) {
+	defer func() { r.recordProposalOutcome(err) }()
+	return r.proposeUntilApplied(ctx, reqs)
+}
+
+func (r *Raft) proposeUntilApplied(ctx context.Context, reqs []types.ProposeReq) ([]*types.ProposeResp, error) {
 	if r.IsLeader() {
 		return r.submitProposal(ctx, reqs, true, nil)
 	}
@@ -87,7 +92,8 @@ func (r *Raft) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []types
 	}
 }
 
-func (r *Raft) proposeBatch(ctx context.Context, reqs types.ProposeReqSet, before func([]types.Log)) ([]*types.ProposeResp, error) {
+func (r *Raft) proposeBatch(ctx context.Context, reqs types.ProposeReqSet, before func([]types.Log)) (resps []*types.ProposeResp, err error) {
+	defer func() { r.recordProposalOutcome(err) }()
 	return r.submitProposal(ctx, reqs, false, before)
 }
 
@@ -207,7 +213,11 @@ func (r *Raft) fowardPropose(ctx context.Context, reqs types.ProposeReqSet) ([]*
 	key := fmt.Sprintf("%d", reqs[len(reqs)-1].Id)
 	r.forwardMu.Lock()
 	v := r.view.Load().(nodeView)
-	if r.stopped.Load() || v.leader == 0 {
+	if r.stopped.Load() {
+		r.forwardMu.Unlock()
+		return nil, proposalNotAdmitted(types.ErrStopped)
+	}
+	if v.leader == 0 {
 		r.forwardMu.Unlock()
 		return nil, proposalNotAdmitted(types.ErrNotLeader)
 	}

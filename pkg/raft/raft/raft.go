@@ -33,6 +33,8 @@ type Raft struct {
 	fowardProposeWait wt.Wait // 转发提按给领导等待领导的回应
 
 	pool           *ants.Pool
+	workerMu       sync.Mutex
+	outcomes       proposalCounters
 	started        syncatomic.Bool
 	stopped        syncatomic.Bool
 	stopOnce       sync.Once
@@ -77,7 +79,7 @@ func New(opts *Options) *Raft {
 	r.wait.applied = raftState.AppliedIndex
 	r.wait.readLogs = opts.Storage.GetLogs
 	r.wait.verifyStored = func(p *progress) {
-		if err := r.pool.Submit(func() { r.wait.readReceipt(p) }); err != nil {
+		if err := r.submitWorker(func() { r.wait.readReceipt(p) }); err != nil {
 			r.wait.complete(p, proposalUnknown(err))
 		}
 	}
@@ -88,7 +90,14 @@ func New(opts *Options) *Raft {
 }
 
 func (r *Raft) Start() error {
-	r.started.Store(true)
+	r.workerMu.Lock()
+	defer r.workerMu.Unlock()
+	if r.stopped.Load() {
+		return types.ErrStopped
+	}
+	if !r.started.CompareAndSwap(false, true) {
+		return nil
+	}
 	r.stopper.RunWorker(r.loop)
 
 	return nil
@@ -96,7 +105,10 @@ func (r *Raft) Start() error {
 
 func (r *Raft) Stop() {
 	r.stopOnce.Do(func() {
+		r.workerMu.Lock()
 		r.stopped.Store(true)
+		r.pool.Release()
+		r.workerMu.Unlock()
 		r.wait.stop()
 		r.forwardMu.Lock()
 		for key := range r.forwardPending {
@@ -106,6 +118,7 @@ func (r *Raft) Stop() {
 		r.forwardMu.Unlock()
 		r.Resume()
 		r.stopper.Stop()
+		r.drainStoppedQueue()
 	})
 }
 
@@ -307,7 +320,7 @@ func (r *Raft) readyEvents() {
 
 func (r *Raft) handleStoreReq(e types.Event) {
 
-	err := r.pool.Submit(func() {
+	err := r.submitWorker(func() {
 		// 追加消息
 		err := r.opts.Storage.AppendLogs(e.Logs, e.TermStartIndexInfo)
 		if err != nil {
@@ -339,7 +352,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 
 	var leaderLastLogTerm = r.node.lastTermStartIndex.Term
 
-	err := r.pool.Submit(func() {
+	err := r.submitWorker(func() {
 		// 获取裁断日志下标
 		var (
 			trunctIndex uint64
@@ -401,7 +414,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 }
 
 func (r *Raft) handleTruncateReq(e types.Event) {
-	err := r.pool.Submit(func() {
+	err := r.submitWorker(func() {
 		r.Info("truncate log to index", zap.Uint64("index", e.Index))
 		err := r.opts.Storage.TruncateLogTo(e.Index)
 		if err != nil {
@@ -438,7 +451,7 @@ func (r *Raft) handleTruncateReq(e types.Event) {
 }
 
 func (r *Raft) handleApplyReq(e types.Event) {
-	err := r.pool.Submit(func() {
+	err := r.submitWorker(func() {
 
 		// 已提交
 		r.wait.didCommit(e.EndIndex - 1)
@@ -556,7 +569,7 @@ func (r *Raft) advance() {
 
 func (r *Raft) handleRoleChangeReq(e types.Event) {
 
-	err := r.pool.Submit(func() {
+	err := r.submitWorker(func() {
 
 		var (
 			newCfg        types.Config
