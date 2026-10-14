@@ -61,10 +61,8 @@ func TestConfigShutdownBlockedStorage(t *testing.T) {
 				s.logs = []types.Log{want}
 				r.wait.appliedLogs([]types.Log{want})
 				out = studyCall(r, context.Background(), 1400)
-				studyRecv(t, tr.c)
-				data, err := types.ProposeRespSet{&types.ProposeResp{Id: 1400, Index: 1}}.Marshal()
-				require.NoError(t, err)
-				r.Step(types.Event{Type: types.SendProposeResp, From: 2, Reason: types.ReasonOk, Logs: []types.Log{{Data: data}}})
+				request := studyRecv(t, tr.c)
+				r.Step(studyResponse(t, request, 2, types.ReasonOk, types.ProposeRespSet{&types.ProposeResp{Id: 1400, Index: 1}}))
 			} else {
 				out = studyCall(r, context.Background(), 1400)
 				r.handleStep(studyRecv(t, r.stepC))

@@ -159,6 +159,16 @@ func studyCount(r *Raft) int {
 	defer r.wait.mu.RUnlock()
 	return len(r.wait.progresses)
 }
+
+// studyResponse builds a forwarding response echoing the request's token.
+func studyResponse(t *testing.T, request types.Event, from uint64, reason types.Reason, resps types.ProposeRespSet) types.Event {
+	t.Helper()
+	require.Equal(t, types.SendPropose, request.Type)
+	data, err := resps.Marshal()
+	require.NoError(t, err)
+	return types.Event{Type: types.SendProposeResp, From: from, Reason: reason, Logs: []types.Log{echoForwardToken(request, data)}}
+}
+
 func studyCall(r *Raft, c context.Context, id uint64) <-chan studyResult {
 	out := make(chan studyResult, 1)
 	go func() {
@@ -450,11 +460,10 @@ func TestConfigForward(t *testing.T) {
 				require.ErrorIs(t, studyRecv(t, out).err, types.ErrProposalOutcomeUnknown)
 				require.False(t, r.fowardProposeWait.IsRegistered("500"))
 				require.Zero(t, studyCount(r))
-				// A delayed response cannot resurrect a detached wait.
-				resp := types.ProposeRespSet{&types.ProposeResp{Id: 500, Index: 1}}
-				data, _ := resp.Marshal()
-				r.Step(types.Event{Type: types.SendProposeResp, From: 1, Reason: types.ReasonOk, Logs: []types.Log{{Data: data}}})
+				// A delayed response with the retired token cannot resurrect a detached wait.
+				r.Step(studyResponse(t, request, 1, types.ReasonOk, types.ProposeRespSet{&types.ProposeResp{Id: 500, Index: 1}}))
 				require.Zero(t, studyCount(r))
+				require.False(t, r.fowardProposeWait.IsRegistered("500"))
 				return
 			}
 			c.rr[0].Step(request)
@@ -565,25 +574,40 @@ func TestConfigDuplicateForwardID(t *testing.T) {
 	r := c.rr[1]
 	ctx, cancel := context.WithCancel(context.Background())
 	out := studyCall(r, ctx, 900)
-	studyRecv(t, c.tr.c)
+	first := studyRecv(t, c.tr.c)
 	duplicate := studyCall(r, context.Background(), 900)
-	require.ErrorIs(t, studyRecv(t, duplicate).err, types.ErrProposalNotAdmitted)
+	require.ErrorIs(t, studyRecv(t, duplicate).err, types.ErrProposalNotAdmitted, "a live duplicate must be rejected")
+	require.True(t, r.fowardProposeWait.IsRegistered("900"), "the live registration must survive the duplicate")
 	cancel()
 	require.ErrorIs(t, studyRecv(t, out).err, context.Canceled)
-	duplicate = studyCall(r, context.Background(), 900)
-	require.ErrorIs(t, studyRecv(t, duplicate).err, types.ErrProposalNotAdmitted)
-	// An old response for 900 must not satisfy the different live registration.
+	// Settlement retired the first token; the ID may be registered again under a new one.
+	againCtx, againCancel := context.WithCancel(context.Background())
+	defer againCancel()
+	again := studyCall(r, againCtx, 900)
+	second := studyRecv(t, c.tr.c)
+	require.NotEqual(t, first.Logs[0].Id, second.Logs[0].Id)
+	// The delayed response for the retired attempt must not satisfy the newer registration.
+	r.Step(studyResponse(t, first, 1, types.ReasonOk, types.ProposeRespSet{&types.ProposeResp{Id: 900, Index: 1}}))
+	require.True(t, r.fowardProposeWait.IsRegistered("900"))
+	require.EqualValues(t, 1, r.ForwardIdentityStats().StaleResponses)
+	// An old response for 900 must not satisfy the different live registration either.
 	freshCtx, freshCancel := context.WithCancel(context.Background())
 	defer freshCancel()
 	fresh := studyCall(r, freshCtx, 901)
 	studyRecv(t, c.tr.c)
-	data, _ := types.ProposeRespSet{&types.ProposeResp{Id: 900, Index: 1}}.Marshal()
-	r.Step(types.Event{Type: types.SendProposeResp, From: 1, Reason: types.ReasonOk, Logs: []types.Log{{Data: data}}})
+	r.Step(studyResponse(t, first, 1, types.ReasonOk, types.ProposeRespSet{&types.ProposeResp{Id: 901, Index: 1}}))
 	require.True(t, r.fowardProposeWait.IsRegistered("901"))
 	freshCancel()
 	require.ErrorIs(t, studyRecv(t, fresh).err, context.Canceled)
+	againCancel()
+	require.ErrorIs(t, studyRecv(t, again).err, context.Canceled)
 	require.False(t, r.fowardProposeWait.IsRegistered("900"))
 	require.False(t, r.fowardProposeWait.IsRegistered("901"))
+	st := r.ForwardIdentityStats()
+	require.Zero(t, st.Pending)
+	require.EqualValues(t, 3, st.Registered)
+	require.EqualValues(t, 3, st.Retired)
+	require.EqualValues(t, 1, st.DuplicateRejected)
 }
 
 func TestConfigRealLoop(t *testing.T) {
@@ -715,17 +739,20 @@ func TestConfigForwardResponseValidation(t *testing.T) {
 			c := studyNew(t, true)
 			r := c.rr[1]
 			if invalid == "capacity" {
-				for i := 0; i < configForwardIdentityLimit; i++ {
-					r.forwardUsed[fmt.Sprint(i)] = struct{}{}
+				r.forwardMu.Lock()
+				for i := 0; i < configForwardLiveLimit; i++ {
+					r.forwardPending[fmt.Sprint(i)] = forwardRegistration{leader: 1}
 				}
+				r.forwardMu.Unlock()
 				require.ErrorIs(t, studyRecv(t, studyCall(r, context.Background(), 99999)).err, types.ErrProposalNotAdmitted)
-				require.Empty(t, r.forwardPending)
+				require.Len(t, r.forwardPending, configForwardLiveLimit)
+				require.EqualValues(t, 1, r.ForwardIdentityStats().LimitRejected)
 				return
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			out := studyCall(r, ctx, 1200)
-			studyRecv(t, c.tr.c)
+			request := studyRecv(t, c.tr.c)
 			resps := types.ProposeRespSet{&types.ProposeResp{Id: 1200, Index: 1}}
 			reason := types.ReasonOk
 			from := uint64(1)
@@ -741,8 +768,7 @@ func TestConfigForwardResponseValidation(t *testing.T) {
 			case "reject":
 				reason = types.ReasonError
 			}
-			data, _ := resps.Marshal()
-			r.Step(types.Event{Type: types.SendProposeResp, From: from, Reason: reason, Logs: []types.Log{{Data: data}}})
+			r.Step(studyResponse(t, request, from, reason, resps))
 			if invalid == "sender" || invalid == "id" {
 				require.True(t, r.fowardProposeWait.IsRegistered("1200"))
 				cancel()

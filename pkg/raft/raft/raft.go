@@ -41,8 +41,9 @@ type Raft struct {
 	stopBegin      sync.Once
 	view           syncatomic.Value
 	forwardMu      sync.Mutex
-	forwardUsed    map[string]struct{}
-	forwardPending map[string]uint64
+	forwardPending map[string]forwardRegistration
+	forwardToken   forwardTokenSource
+	forwardStats   forwardStats
 }
 
 func New(opts *Options) *Raft {
@@ -74,8 +75,8 @@ func New(opts *Options) *Raft {
 		wait:              newWait("raft"),
 		fowardProposeWait: wt.New(),
 		pool:              pool,
-		forwardUsed:       make(map[string]struct{}),
-		forwardPending:    make(map[string]uint64),
+		forwardPending:    make(map[string]forwardRegistration),
+		forwardToken:      newForwardTokenSource(),
 	}
 	r.wait.applied = raftState.AppliedIndex
 	r.wait.readLogs = opts.Storage.GetLogs
@@ -115,10 +116,7 @@ func (r *Raft) BeginStop() {
 		r.workerMu.Unlock()
 		r.wait.stop()
 		r.forwardMu.Lock()
-		for key := range r.forwardPending {
-			r.fowardProposeWait.Trigger(key, proposalUnknown(types.ErrStopped))
-			delete(r.forwardPending, key)
-		}
+		r.settleForwardsLocked(proposalUnknown(types.ErrStopped))
 		r.forwardMu.Unlock()
 		r.Resume()
 	})
@@ -739,10 +737,7 @@ func (r *Raft) publishView() {
 	if old != nil && (old.(nodeView).leader != v.leader || old.(nodeView).term != v.term || old.(nodeView).isLeader != v.isLeader) {
 		v.generation++
 		r.wait.fenceForward()
-		for key := range r.forwardPending {
-			r.fowardProposeWait.Trigger(key, proposalUnknown(types.ErrNotLeader))
-			delete(r.forwardPending, key)
-		}
+		r.settleForwardsLocked(proposalUnknown(types.ErrNotLeader))
 	}
 	r.view.Store(v)
 }

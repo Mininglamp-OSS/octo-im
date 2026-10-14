@@ -107,7 +107,7 @@ func (r *Raft) handleSendPropose(e types.Event) {
 	err := reqs.Unmarshal(e.Logs[0].Data)
 	if err != nil {
 		r.Error("unmarshal propose req failed", zap.Error(err))
-		r.sendProposeRespError(reqs, e.From)
+		r.sendProposeRespError(reqs, e)
 		return
 	}
 	if len(reqs) == 0 {
@@ -115,7 +115,7 @@ func (r *Raft) handleSendPropose(e types.Event) {
 	}
 	if !r.IsLeader() {
 		r.Error("handleSendPropose: node is leader, but receive propose from other node", zap.Uint64("leaderId", r.LeaderId()), zap.Uint64("from", e.From))
-		r.sendProposeRespError(reqs, e.From)
+		r.sendProposeRespError(reqs, e)
 		return
 	}
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), r.opts.ProposeTimeout)
@@ -123,13 +123,13 @@ func (r *Raft) handleSendPropose(e types.Event) {
 	resps, err := r.submitProposal(timeoutCtx, reqs, true, nil)
 	if err != nil {
 		r.Error("handleSendPropose: propose batch failed", zap.Error(err))
-		r.sendProposeRespError(reqs, e.From)
+		r.sendProposeRespError(reqs, e)
 		return
 	}
 	data, err := types.ProposeRespSet(resps).Marshal()
 	if err != nil {
 		r.Error("marshal propose resp failed", zap.Error(err))
-		r.sendProposeRespError(reqs, e.From)
+		r.sendProposeRespError(reqs, e)
 		return
 	}
 
@@ -138,15 +138,13 @@ func (r *Raft) handleSendPropose(e types.Event) {
 		To:   e.From,
 		Type: types.SendProposeResp,
 		Logs: []types.Log{
-			{
-				Data: data,
-			},
+			echoForwardToken(e, data),
 		},
 		Reason: types.ReasonOk,
 	})
 }
 
-func (r *Raft) sendProposeRespError(reqs types.ProposeReqSet, to uint64) {
+func (r *Raft) sendProposeRespError(reqs types.ProposeReqSet, req types.Event) {
 	resps := types.ProposeRespSet{}
 	for _, req := range reqs {
 		resps = append(resps, &types.ProposeResp{
@@ -161,22 +159,14 @@ func (r *Raft) sendProposeRespError(reqs types.ProposeReqSet, to uint64) {
 	}
 	r.opts.Transport.Send(types.Event{
 		From:   r.opts.NodeId,
-		To:     to,
+		To:     req.From,
 		Type:   types.SendProposeResp,
 		Reason: types.ReasonError,
 		Logs: []types.Log{
-			{
-				Data: data,
-			},
+			echoForwardToken(req, data),
 		},
 	})
 }
-
-// The unchanged wire response carries only request IDs and indexes. Forwarded
-// correlation keys therefore cannot be reused while delayed packets may exist.
-// Keep bounded lifetime tombstones and fail closed at exhaustion; never evict
-// them and allow an old packet to complete a new registration.
-const configForwardIdentityLimit = 65536
 
 func (r *Raft) handleSendProposeResp(e types.Event) {
 	if len(e.Logs) != 1 {
@@ -189,16 +179,26 @@ func (r *Raft) handleSendProposeResp(e types.Event) {
 	key := fmt.Sprintf("%d", resps[len(resps)-1].Id)
 	r.forwardMu.Lock()
 	defer r.forwardMu.Unlock()
-	leader, ok := r.forwardPending[key]
-	if !ok || leader != e.From {
+	if e.Logs[0].Term != forwardTokenVersion {
+		// Unattributable legacy response; see forward_token.go.
+		r.forwardStats.unechoed++
 		return
 	}
-	delete(r.forwardPending, key)
+	token := forwardToken{incarnation: e.Logs[0].Index, attempt: e.Logs[0].Id}
+	reg, ok := r.forwardPending[key]
+	if !ok || reg.token != token {
+		r.forwardStats.stale++
+		return
+	}
+	if reg.leader != e.From {
+		r.forwardStats.senderMismatch++
+		return
+	}
 	if e.Reason != types.ReasonOk {
-		r.fowardProposeWait.Trigger(key, proposalUnknown(types.ErrForwardRejected))
+		r.retireForwardLocked(key, proposalUnknown(types.ErrForwardRejected))
 		return
 	}
-	r.fowardProposeWait.Trigger(key, resps)
+	r.retireForwardLocked(key, resps)
 }
 
 func (r *Raft) fowardPropose(ctx context.Context, reqs types.ProposeReqSet) ([]*types.ProposeResp, error) {
@@ -223,27 +223,36 @@ func (r *Raft) fowardPropose(ctx context.Context, reqs types.ProposeReqSet) ([]*
 		r.forwardMu.Unlock()
 		return nil, proposalNotAdmitted(types.ErrNotLeader)
 	}
-	if _, used := r.forwardUsed[key]; used {
+	if _, live := r.forwardPending[key]; live {
+		r.forwardStats.duplicateRejected++
 		r.forwardMu.Unlock()
-		return nil, proposalNotAdmitted(errors.New("raft: forwarded request ID already used"))
+		return nil, proposalNotAdmitted(errors.New("raft: forwarded request ID already pending"))
 	}
-	if len(r.forwardUsed) >= configForwardIdentityLimit {
+	if len(r.forwardPending) >= configForwardLiveLimit {
+		r.forwardStats.limitRejected++
 		r.forwardMu.Unlock()
-		return nil, proposalNotAdmitted(errors.New("raft: forwarding identity capacity exhausted"))
+		return nil, proposalNotAdmitted(errors.New("raft: forwarded registration limit reached"))
 	}
-	r.forwardUsed[key] = struct{}{}
-	r.forwardPending[key] = v.leader
+	token, ok := r.forwardToken.issue()
+	if !ok {
+		r.forwardStats.limitRejected++
+		r.forwardMu.Unlock()
+		return nil, proposalNotAdmitted(errors.New("raft: forwarding attempt space exhausted"))
+	}
+	r.forwardPending[key] = forwardRegistration{leader: v.leader, token: token}
+	r.forwardStats.registered++
+	r.forwardStats.highWater = max(r.forwardStats.highWater, len(r.forwardPending))
 	waitC := r.fowardProposeWait.Register(key)
 	r.forwardMu.Unlock()
 	defer func() {
 		r.forwardMu.Lock()
 		defer r.forwardMu.Unlock()
-		if _, ok := r.forwardPending[key]; ok {
-			delete(r.forwardPending, key)
-			r.fowardProposeWait.Trigger(key, nil)
+		// The key may already belong to a newer registration.
+		if reg, ok := r.forwardPending[key]; ok && reg.token == token {
+			r.retireForwardLocked(key, nil)
 		}
 	}()
-	r.opts.Transport.Send(types.Event{From: r.opts.NodeId, To: v.leader, Type: types.SendPropose, Logs: []types.Log{{Data: data}}})
+	r.opts.Transport.Send(types.Event{From: r.opts.NodeId, To: v.leader, Type: types.SendPropose, Logs: []types.Log{token.log(data)}})
 	select {
 	case result := <-waitC:
 		if err, ok := result.(error); ok {

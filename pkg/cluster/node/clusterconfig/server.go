@@ -239,6 +239,11 @@ func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []raf
 	return s.raft.ProposeBatchUntilAppliedTimeout(ctx, reqs)
 }
 
+// ForwardIdentityStats exposes forwarded proposal correlation pressure.
+func (s *Server) ForwardIdentityStats() raft.ForwardIdentityStats {
+	return s.raft.ForwardIdentityStats()
+}
+
 func (s *Server) StepRaftEvent(e rafttypes.Event) {
 	if s.raft == nil {
 		return
