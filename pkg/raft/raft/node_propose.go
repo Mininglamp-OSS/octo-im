@@ -72,3 +72,33 @@ func (n *Node) logProposeReject(err error, logs []types.Log, logTerm uint32) {
 		zap.Uint64("staleTermTotal", staleTerm),
 		zap.Uint64("suppressed", suppressed))
 }
+
+// Admit assigns the next contiguous log indexes and the current term to logs
+// and appends them through the strict leader-local path. It is the only place
+// where RaftGroup proposals get their indexes, and it must be called on the
+// goroutine that steps this node, so concurrent proposals can never be given
+// the same range. The returned admission identifies the appended range.
+func (n *Node) Admit(logs []types.Log) (types.Admission, error) {
+	if len(logs) == 0 {
+		return types.Admission{}, errors.New("raft: empty proposal")
+	}
+	term, first := n.cfg.Term, n.queue.lastLogIndex+1
+	for i := range logs {
+		logs[i].Index = first + uint64(i)
+		logs[i].Term = term
+	}
+	// Step applies the existing role, stopPropose and strict-append checks.
+	if err := n.Step(types.Event{Type: types.Propose, Logs: logs}); err != nil {
+		return types.Admission{}, err
+	}
+	return types.Admission{Term: term, FirstIndex: first, LastIndex: first + uint64(len(logs)) - 1}, nil
+}
+
+// fenceProposals emits a ProposalFence when this node led term and no longer
+// leads it. It is called after every role or configuration change.
+func (n *Node) fenceProposals(wasLeader bool, term uint32) {
+	if !wasLeader || (n.IsLeader() && n.cfg.Term == term) {
+		return
+	}
+	n.events = append(n.events, types.Event{Type: types.ProposalFence, Term: term})
+}

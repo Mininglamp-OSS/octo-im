@@ -243,6 +243,8 @@ func (r *Raft) readyEvents() {
 			types.FollowerToLeaderReq:
 			r.handleRoleChangeReq(e)
 			continue
+		case types.ProposalFence: // config Raft keeps no proposal receipts
+			continue
 		}
 
 		if e.To == None {
