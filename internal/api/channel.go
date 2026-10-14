@@ -302,31 +302,11 @@ func (ch *channel) addSubscribers(channelId string, channelType uint8, members [
 func (ch *channel) updateTagBySubscribers(channelId string, channelType uint8, subscribers []string, remove bool) error {
 
 	updateTag := func(chId string, chType uint8) {
-		tagKey := service.TagManager.GetChannelTag(chId, chType)
-		if tagKey != "" {
-			if service.TagManager.Exist(tagKey) {
-				newTagKey := wkutil.GenUUID()
-				if remove {
-					err := service.TagManager.RemoveUsers(tagKey, subscribers)
-					if err != nil {
-						ch.Error("updateTagByAddSubscribers: removeUsers failed", zap.Error(err))
-						return
-					}
-				} else {
-					err := service.TagManager.AddUsers(tagKey, subscribers)
-					if err != nil {
-						ch.Error("updateTagByAddSubscribers: addUsers failed", zap.Error(err))
-						return
-					}
-				}
-
-				err := service.TagManager.RenameTag(tagKey, newTagKey)
-				if err != nil {
-					ch.Error("updateTagByAddSubscribers: renameTag failed", zap.Error(err))
-					return
-				}
-				service.TagManager.SetChannelTag(chId, chType, newTagKey)
-			}
+		// The cached tag is dropped on failure and rebuilt from the store, so
+		// the subscriber change itself still succeeds.
+		err := service.TagManager.UpdateChannelTagUsers(chId, chType, subscribers, remove)
+		if err != nil {
+			ch.Error("updateTagBySubscribers: update channel tag failed, dropped the cached tag", zap.Error(err), zap.String("channelId", chId), zap.Uint8("channelType", chType))
 		}
 	}
 

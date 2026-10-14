@@ -12,6 +12,9 @@ type ITagManager interface {
 	RemoveTag(tagKey string)
 	// RenameTag 重命名tag
 	RenameTag(oldTagKey, newTagKey string) error
+	// UpdateChannelTagUsers 原子地更新频道当前tag的用户并换新tagKey；
+	// 没有缓存的tag时不做任何事，更新失败时丢弃缓存的tag（下条消息从存储重建）
+	UpdateChannelTagUsers(fakeChannelId string, channelType uint8, uids []string, remove bool) error
 	// MakeTag 创建tag
 	MakeTag(uids []string) (*types.Tag, error)
 	// MakeTagWithTagKey 创建tag并指定tagKey

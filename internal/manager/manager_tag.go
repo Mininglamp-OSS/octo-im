@@ -93,14 +93,18 @@ func (t *TagManager) AddUsers(tagKey string, uids []string) error {
 	if tag == nil {
 		return errors.TagNotExist(tagKey)
 	}
-	// 去除已经存在的用户
-	t.removeExistUidsInTag(tag, uids)
+	return t.addUsersLocked(tag, uids)
+}
 
-	// 计算用户所在的节点
+// addUsersLocked adds uids to tag; the caller holds the manager lock.
+func (t *TagManager) addUsersLocked(tag *types.Tag, uids []string) error {
+	// 计算用户所在的节点（先计算，失败时不改动tag）
 	nodes, err := t.calcUsersInNode(uids)
 	if err != nil {
 		return err
 	}
+	// 去除已经存在的用户
+	t.removeExistUidsInTag(tag, uids)
 	// 合并节点
 	t.mergeNodes(tag, nodes)
 
@@ -129,13 +133,21 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 	if tag == nil {
 		return errors.TagNotExist(tagKey)
 	}
+	return t.removeUsersLocked(tag, uids)
+}
 
-	for _, uid := range uids {
-		slotId := service.Cluster.GetSlotId(uid)
-		leaderId := service.Cluster.SlotLeaderId(slotId)
-		if leaderId == 0 {
+// removeUsersLocked removes uids from tag; the caller holds the manager lock.
+func (t *TagManager) removeUsersLocked(tag *types.Tag, uids []string) error {
+	// 先确定所有用户所在的节点，失败时不改动tag
+	leaderIds := make([]uint64, len(uids))
+	for i, uid := range uids {
+		leaderIds[i] = service.Cluster.SlotLeaderId(service.Cluster.GetSlotId(uid))
+		if leaderIds[i] == 0 {
 			return errors.TagSlotLeaderIsZero
 		}
+	}
+	for i, uid := range uids {
+		leaderId := leaderIds[i]
 		for _, node := range tag.Nodes {
 			if node.LeaderId == leaderId {
 				for i, nodeUid := range node.Uids {
@@ -186,18 +198,71 @@ func (t *TagManager) Exist(tagKey string) bool {
 }
 
 func (t *TagManager) RenameTag(oldTagKey, newTagKey string) error {
+	t.Lock()
+	defer t.Unlock()
+
 	tag := t.getTag(oldTagKey)
 	if tag == nil {
 		return errors.TagNotExist(oldTagKey)
 	}
+	t.renameTagLocked(tag, newTagKey)
+	return nil
+}
+
+// renameTagLocked moves tag to newTagKey; the caller holds the manager lock.
+func (t *TagManager) renameTagLocked(tag *types.Tag, newTagKey string) {
+	oldTagKey := tag.Key
 	tag.Key = newTagKey
 	tag.LastGetTime = time.Now()
 	t.setTag(tag)
 	t.removeTag(oldTagKey)
+}
+
+// UpdateChannelTagUsers applies a subscriber change to the channel's cached
+// tag. Reading the channel's tag key, changing its users, renaming it and
+// pointing the channel at the new key happen under one lock: when two
+// requests changed the same channel at once, the slower one used to find its
+// key renamed away, logged "tag not exist" and dropped its change, leaving a
+// joined member without messages or a removed one still receiving them.
+//
+// Without a cached tag nothing is done: the next message builds the tag from
+// the store, which already holds the change. If the cached tag cannot be
+// updated it is dropped for the same reason.
+func (t *TagManager) UpdateChannelTagUsers(fakeChannelId string, channelType uint8, uids []string, remove bool) error {
+	t.Lock()
+	defer t.Unlock()
+
+	tagKey := t.GetChannelTag(fakeChannelId, channelType)
+	if tagKey == "" {
+		return nil
+	}
+	tag := t.getTag(tagKey)
+	if tag == nil {
+		t.RemoveChannelTag(fakeChannelId, channelType)
+		return nil
+	}
+	var err error
+	if remove {
+		err = t.removeUsersLocked(tag, uids)
+	} else {
+		err = t.addUsersLocked(tag, uids)
+	}
+	if err != nil {
+		t.removeTag(tagKey)
+		t.RemoveChannelTag(fakeChannelId, channelType)
+		return err
+	}
+	newTagKey := wkutil.GenUUID()
+	t.renameTagLocked(tag, newTagKey)
+	t.setChannelTagLocked(fakeChannelId, channelType, newTagKey)
 	return nil
 }
 
 func (t *TagManager) SetChannelTag(fakeChannelId string, channelType uint8, tagKey string) {
+	t.setChannelTagLocked(fakeChannelId, channelType, tagKey)
+}
+
+func (t *TagManager) setChannelTagLocked(fakeChannelId string, channelType uint8, tagKey string) {
 	blucket := t.getBlucketByChannel(fakeChannelId, channelType)
 	blucket.setChannelTag(fakeChannelId, channelType, tagKey)
 	tag := t.getTag(tagKey)

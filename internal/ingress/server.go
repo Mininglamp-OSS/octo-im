@@ -180,6 +180,16 @@ func (i *Ingress) handleUpdateTag(c *wkserver.Context) {
 	// 	realFakeChannelId = options.G.CmdChannelConvertOrginalChannel(req.ChannelId)
 	// }
 
+	// A channel's tag is changed atomically; see TagManager.UpdateChannelTagUsers.
+	if req.TagKey == "" && req.ChannelTag {
+		err = service.TagManager.UpdateChannelTagUsers(req.ChannelId, req.ChannelType, req.Uids, req.Remove)
+		if err != nil {
+			i.Warn("handleUpdateTag: update channel tag failed, dropped the cached tag", zap.Error(err))
+		}
+		c.WriteOk()
+		return
+	}
+
 	tagKey := req.TagKey
 	if tagKey == "" {
 		if req.ChannelId != "" {
