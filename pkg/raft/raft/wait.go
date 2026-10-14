@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -88,15 +89,17 @@ func (m *wait) didApply(maxLogIndex uint64) {
 	m.clean()
 }
 
-// 清理已完成的
+// clean removes completed progresses in one pass. Completion only marks a
+// progress done, so a batch of completions is compacted once.
 func (m *wait) clean() {
-	for i := 0; i < len(m.progresses); {
-		if m.progresses[i].done {
-			m.progresses = append(m.progresses[:i], m.progresses[i+1:]...)
-		} else {
-			i++
+	kept := m.progresses[:0]
+	for _, p := range m.progresses {
+		if !p.done {
+			kept = append(kept, p)
 		}
 	}
+	clear(m.progresses[len(kept):])
+	m.progresses = kept
 }
 
 type progress struct {
@@ -140,6 +143,7 @@ func (m *wait) registerReceipt(logs []types.Log, forwarded bool) *progress {
 	p.forwarded = forwarded
 	m.mu.Lock()
 	if m.stopped {
+		// p was never added to progresses; nothing to compact.
 		m.completeLocked(p, proposalUnknown(types.ErrStopped))
 		m.mu.Unlock()
 		return p
@@ -154,20 +158,27 @@ func (m *wait) registerReceipt(logs []types.Log, forwarded bool) *progress {
 }
 
 // verifyLogs checks every entry in the admitted batch, not just its last index.
+// Both slices are in ascending index order (an admitted batch and a stored or
+// applied range), so a binary search finds the batch start and one merge pass
+// compares it: an applied batch shared by many receipts is not rescanned per
+// receipt. An entry missing from logs, including one hidden by unordered
+// input, is reported as unavailable.
 func verifyLogs(wantLogs, logs []types.Log) error {
+	if len(wantLogs) == 0 {
+		return nil
+	}
+	first := wantLogs[0].Index
+	j := sort.Search(len(logs), func(i int) bool { return logs[i].Index >= first })
 	for _, want := range wantLogs {
-		found := false
-		for _, got := range logs {
-			if got.Index == want.Index {
-				found = true
-				if got.Id != want.Id || (want.Term != 0 && got.Term != want.Term) || !bytes.Equal(got.Data, want.Data) {
-					return types.ErrProposalSuperseded
-				}
-				break
-			}
+		for j < len(logs) && logs[j].Index < want.Index {
+			j++
 		}
-		if !found {
+		if j == len(logs) || logs[j].Index != want.Index {
 			return proposalUnknown(fmt.Errorf("raft: applied log %d unavailable", want.Index))
+		}
+		got := logs[j]
+		if got.Id != want.Id || (want.Term != 0 && got.Term != want.Term) || !bytes.Equal(got.Data, want.Data) {
+			return types.ErrProposalSuperseded
 		}
 	}
 	return nil
@@ -187,16 +198,21 @@ func (m *wait) readReceipt(p *progress) {
 func (m *wait) complete(p *progress, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.completeLocked(p, err)
+	if m.completeLocked(p, err) {
+		m.clean()
+	}
 }
-func (m *wait) completeLocked(p *progress, err error) {
+
+// completeLocked publishes p's only result. It does not compact progresses;
+// the caller compacts once after its batch.
+func (m *wait) completeLocked(p *progress, err error) bool {
 	if p.done {
-		return
+		return false
 	}
 	p.done = true
 	p.err = err
 	close(p.waitC)
-	m.clean()
+	return true
 }
 func (m *wait) appliedLogs(logs []types.Log) {
 	var unverified []*progress
@@ -205,8 +221,7 @@ func (m *wait) appliedLogs(logs []types.Log) {
 	if last > m.applied {
 		m.applied = last
 	}
-	// Completion removes from progresses, so iterate a copy.
-	for _, p := range append([]*progress(nil), m.progresses...) {
+	for _, p := range m.progresses {
 		if !p.done && p.waitApplied && p.maxIndex <= m.applied {
 			if len(p.logs) == 0 {
 				m.completeLocked(p, nil)
@@ -217,6 +232,7 @@ func (m *wait) appliedLogs(logs []types.Log) {
 			}
 		}
 	}
+	m.clean()
 	m.mu.Unlock()
 	for _, p := range unverified {
 		m.verifyStored(p)
@@ -229,32 +245,36 @@ func (m *wait) detach(p *progress) (error, bool) {
 		return p.err, true
 	}
 	m.completeLocked(p, proposalUnknown(context.Canceled))
+	m.clean()
 	return nil, false
 }
 func (m *wait) fence(term uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, p := range append([]*progress(nil), m.progresses...) {
+	for _, p := range m.progresses {
 		if len(p.logs) > 0 && !p.forwarded && p.logs[0].Term <= term {
 			m.completeLocked(p, proposalUnknown(types.ErrNotLeader))
 		}
 	}
+	m.clean()
 }
 func (m *wait) stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stopped = true
-	for _, p := range append([]*progress(nil), m.progresses...) {
+	for _, p := range m.progresses {
 		m.completeLocked(p, proposalUnknown(types.ErrStopped))
 	}
+	m.clean()
 }
 
 func (m *wait) fenceForward() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, p := range append([]*progress(nil), m.progresses...) {
+	for _, p := range m.progresses {
 		if p.forwarded {
 			m.completeLocked(p, proposalUnknown(types.ErrNotLeader))
 		}
 	}
+	m.clean()
 }
