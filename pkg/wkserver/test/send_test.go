@@ -5,7 +5,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/client"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/internal/testfixture"
@@ -14,7 +13,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
-	"go.uber.org/zap"
 )
 
 // startServer starts s and waits until its listener accepts connections.
@@ -94,9 +92,6 @@ func testSendAndRecv(t *testing.T, poolOn bool, msgCount int) {
 
 func TestRequestResp(t *testing.T) {
 	addr := testfixture.FreeAddr(t)
-	wklog.Configure(&wklog.Options{
-		Level: zap.InfoLevel,
-	})
 	s := wkserver.New(addr)
 	s.Route("/test", func(c *wkserver.Context) {
 		c.Write([]byte("hello"))
@@ -131,9 +126,6 @@ func TestRequestResp(t *testing.T) {
 
 func BenchmarkRequestResp(b *testing.B) {
 	addr := testfixture.FreeAddr(b)
-	wklog.Configure(&wklog.Options{
-		Level: zap.InfoLevel,
-	})
 	s := wkserver.New(addr)
 	s.Route("/test", func(c *wkserver.Context) {
 		c.Write([]byte("hello"))
