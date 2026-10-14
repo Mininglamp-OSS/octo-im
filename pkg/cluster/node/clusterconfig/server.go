@@ -3,10 +3,12 @@ package clusterconfig
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -19,18 +21,32 @@ import (
 	"go.uber.org/zap"
 )
 
+// serverStorage keeps the resource lifecycle at its owner without changing Raft Storage.
+type serverStorage interface {
+	raft.Storage
+	Open() error
+	Close() error
+	GetLogsByLimit(uint64, uint64, int) ([]rafttypes.Log, error)
+	GetLogsInReverseOrder(uint64, uint64, int) ([]rafttypes.Log, error)
+	AppliedIndex() (uint64, error)
+	LastIndex() (uint64, error)
+}
+
 type Server struct {
-	opts     *Options
-	raft     *raft.Raft             // raft算法
-	config   *Config                // 分布式配置对象
-	storage  *PebbleShardLogStorage // 配置日志存储
-	cfgGenId *snowflake.Node        // 配置ID生成器
+	stopOnce  sync.Once
+	closeDone chan struct{}
+	closeErr  error
+	opts      *Options
+	raft      *raft.Raft      // raft算法
+	config    *Config         // 分布式配置对象
+	storage   serverStorage   // 配置日志存储
+	cfgGenId  *snowflake.Node // 配置ID生成器
+	listeners []IEvent        // 事件监听器
 	// Apply-worker-only progress. On restart the persisted snapshot and
 	// initRaft reconstruct membership; these flags cover in-process retries.
 	membershipPending   bool
 	configSavePending   bool
 	configNotifyPending bool
-	listeners           []IEvent // 事件监听器
 	wklog.Log
 }
 
@@ -46,9 +62,10 @@ func New(opts *Options) *Server {
 	}
 
 	s := &Server{
-		opts:   opts,
-		config: NewConfig(opts),
-		Log:    wklog.NewWKLog("node"),
+		opts:      opts,
+		closeDone: make(chan struct{}),
+		config:    NewConfig(opts),
+		Log:       wklog.NewWKLog("node"),
 	}
 
 	s.storage = NewPebbleShardLogStorage(path.Join(dataDir, "cfglogdb"), s)
@@ -141,9 +158,41 @@ func (s *Server) initRaft() error {
 	return nil
 }
 
+// Stop settles callers and starts one tracked resource-close lifecycle. Synchronous
+// storage I/O can keep that lifecycle pending; WaitStopped exposes its result.
 func (s *Server) Stop() {
-	s.raft.Stop()
-	s.storage.Close()
+	s.stopOnce.Do(func() {
+		s.raft.Stop()
+		go func() {
+			// Keep Storage and dependent server state alive until every worker exits.
+			s.closeErr = s.raft.WaitQuiescence(context.Background())
+			if s.closeErr == nil {
+				s.closeErr = s.storage.Close()
+			}
+			if s.closeErr != nil {
+				s.Error("clusterconfig shutdown failed", zap.Error(s.closeErr))
+			}
+			close(s.closeDone)
+		}()
+	})
+}
+
+// WaitStopped initiates Stop and waits for actual quiescence and Storage close.
+// A deadline leaves the single close lifecycle pending and retains Storage.
+// Nil means all workers exited and Close succeeded; repeated calls retain errors.
+func (s *Server) WaitStopped(ctx context.Context) error {
+	s.Stop()
+	select {
+	case <-s.closeDone:
+		return s.closeErr
+	default:
+	}
+	select {
+	case <-s.closeDone:
+		return s.closeErr
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", raft.ErrIncompleteQuiescence, ctx.Err())
+	}
 }
 
 func (s *Server) AddEventListener(listener IEvent) {
