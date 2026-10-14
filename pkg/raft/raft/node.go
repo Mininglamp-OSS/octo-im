@@ -53,6 +53,8 @@ type Node struct {
 
 	idleTick atomic.Int64 // KeepAlive is also called by proposal goroutines
 
+	proposeRejects proposeRejectStats // 被拒绝的本地提案
+
 	syncing             bool // 正在同步
 	syncRespTimeoutTick int  // 同步响应超时计数
 }

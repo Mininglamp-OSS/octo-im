@@ -120,8 +120,7 @@ func (n *Node) stepLeader(e types.Event) error {
 			return types.ErrProposalDropped
 		}
 		n.idleTick.Store(0)
-		err := n.queue.append(e.Logs...)
-		if err != nil {
+		if err := n.appendLeaderLocal(e.Logs); err != nil {
 			return err
 		}
 		// if n.Key() == "2&ch1" {

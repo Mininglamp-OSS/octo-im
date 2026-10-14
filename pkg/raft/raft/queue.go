@@ -156,6 +156,29 @@ func (r *queue) append(incomingLogs ...types.Log) error {
 		r.lastLogIndex, incomingFirstIndex, incomingLastIndex, incomingLogCount)
 }
 
+// appendLeaderLocal appends logs proposed by this leader. Unlike append, which
+// serves follower/learner catch-up, it never resolves overlap by truncation:
+// the logs must start exactly at lastLogIndex+1 and be contiguous, otherwise
+// ErrLeaderLocalOverlap is returned and the queue is left unchanged.
+func (r *queue) appendLeaderLocal(logs ...types.Log) error {
+	if len(logs) == 0 {
+		return nil
+	}
+	if logs[0].Index != r.lastLogIndex+1 {
+		return fmt.Errorf("%w: expected first index %d, got %d..%d",
+			types.ErrLeaderLocalOverlap, r.lastLogIndex+1, logs[0].Index, logs[len(logs)-1].Index)
+	}
+	for i := 1; i < len(logs); i++ {
+		if logs[i].Index != logs[i-1].Index+1 {
+			return fmt.Errorf("%w: index %d follows %d at position %d",
+				types.ErrLeaderLocalOverlap, logs[i].Index, logs[i-1].Index, i)
+		}
+	}
+	// The range is exactly the next one, so append takes its plain
+	// contiguous path and never its overlap/truncate branch.
+	return r.append(logs...)
+}
+
 func (r *queue) hasNextStoreLogs() bool {
 	if r.appending {
 		return false
