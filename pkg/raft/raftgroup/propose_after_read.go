@@ -33,8 +33,6 @@ func (rg *RaftGroup) ProposeAfterRead(ctx context.Context, key string, before Re
 	case <-rg.stopper.ShouldStop():
 		return 0, ErrGroupStopped
 	}
-	poll := time.NewTicker(time.Millisecond)
-	defer poll.Stop()
 	checkOwner := func(current IRaft) error {
 		if current != r || !before.Exists || !before.Ready || !r.IsLeader() ||
 			r.LeaderId() != before.LeaderID || r.Config().Term != before.Term ||
@@ -58,6 +56,8 @@ func (rg *RaftGroup) ProposeAfterRead(ctx context.Context, key string, before Re
 		}); err != nil {
 			return 0, err
 		}
+		// The drain polls Apply progress; the ticker exists only if it waits.
+		var poll *time.Ticker
 		for {
 			state, err := rg.ReadLeaderState(ctx, key)
 			if err != nil {
@@ -69,6 +69,10 @@ func (rg *RaftGroup) ProposeAfterRead(ctx context.Context, key string, before Re
 			}
 			if state.AppliedIndex >= target {
 				break
+			}
+			if poll == nil {
+				poll = time.NewTicker(time.Millisecond)
+				defer poll.Stop()
 			}
 			select {
 			case <-ctx.Done():
