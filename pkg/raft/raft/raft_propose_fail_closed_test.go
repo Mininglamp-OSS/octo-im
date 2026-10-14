@@ -35,10 +35,8 @@ type nopTransport struct{}
 
 func (nopTransport) Send(types.Event) {}
 
-// Config Raft proposes through Raft.proposeBatch -> StepWait. A caller whose
-// index was allocated from a stale view must receive the Node's fail-closed
-// error instead of success. The loop starts only after both proposals are
-// queued, which deterministically models a slow event loop.
+// Queue cancellation is now definitive before admission; allocation happens
+// on the real loop. Direct StepWait proposals retain the C0-1 strict checks.
 func TestConfigRaftStepWaitProposeFailsClosed(t *testing.T) {
 	storage := &memStorage{}
 	r := New(NewOptions(WithNodeId(1), WithReplicas([]uint64{1}), WithStorage(storage), WithTransport(nopTransport{})))
@@ -58,14 +56,14 @@ func TestConfigRaftStepWaitProposeFailsClosed(t *testing.T) {
 		_, err := r.proposeBatch(ctx, reqs(200), func(logs []types.Log) { allocated <- logs[0].Index })
 		bC <- err
 	}()
-	require.Equal(t, uint64(1), <-allocated, "B allocated A's index from a stale view")
-	time.Sleep(20 * time.Millisecond) // let B's event reach stepC behind A's
+
 	require.NoError(t, r.Start())
 	var stopOnce sync.Once
 	stop := func() { stopOnce.Do(r.Stop) }
 	defer stop()
 
-	require.ErrorIs(t, <-bC, types.ErrLeaderLocalOverlap, "B must not report success for A's index")
+	require.NoError(t, <-bC)
+	require.Equal(t, uint64(1), <-allocated, "B owns the first admitted index")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -74,13 +72,13 @@ func TestConfigRaftStepWaitProposeFailsClosed(t *testing.T) {
 	require.ErrorIs(t, r.StepWait(ctx, types.Event{Type: types.Propose, Logs: []types.Log{{Id: 301, Term: 1, Index: 1}}}),
 		types.ErrLeaderLocalOverlap)
 
-	// The queued ghost A keeps index 1; the next valid proposal gets index 2.
+	// A was not admitted; B owns index 1 and the next proposal gets index 2.
 	resps, err := r.proposeBatch(ctx, reqs(400), nil)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), resps[0].Index)
 	stop()
 	require.Equal(t, uint64(2), r.node.queue.lastLogIndex)
 	overlap, stale := r.node.ProposeRejectCounts()
-	require.Equal(t, uint64(2), overlap)
+	require.Equal(t, uint64(1), overlap)
 	require.Equal(t, uint64(1), stale)
 }

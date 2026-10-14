@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	syncatomic "sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -31,7 +32,14 @@ type Raft struct {
 
 	fowardProposeWait wt.Wait // 转发提按给领导等待领导的回应
 
-	pool *ants.Pool
+	pool           *ants.Pool
+	started        syncatomic.Bool
+	stopped        syncatomic.Bool
+	stopOnce       sync.Once
+	view           syncatomic.Value
+	forwardMu      sync.Mutex
+	forwardUsed    map[string]struct{}
+	forwardPending map[string]uint64
 }
 
 func New(opts *Options) *Raft {
@@ -63,20 +71,42 @@ func New(opts *Options) *Raft {
 		wait:              newWait("raft"),
 		fowardProposeWait: wt.New(),
 		pool:              pool,
+		forwardUsed:       make(map[string]struct{}),
+		forwardPending:    make(map[string]uint64),
 	}
+	r.wait.applied = raftState.AppliedIndex
+	r.wait.readLogs = opts.Storage.GetLogs
+	r.wait.verifyStored = func(p *progress) {
+		if err := r.pool.Submit(func() { r.wait.readReceipt(p) }); err != nil {
+			r.wait.complete(p, proposalUnknown(err))
+		}
+	}
+	r.publishView()
 	opts.Advance = r.advance
 
 	return r
 }
 
 func (r *Raft) Start() error {
+	r.started.Store(true)
 	r.stopper.RunWorker(r.loop)
 
 	return nil
 }
 
 func (r *Raft) Stop() {
-	r.stopper.Stop()
+	r.stopOnce.Do(func() {
+		r.stopped.Store(true)
+		r.wait.stop()
+		r.forwardMu.Lock()
+		for key := range r.forwardPending {
+			r.fowardProposeWait.Trigger(key, proposalUnknown(types.ErrStopped))
+			delete(r.forwardPending, key)
+		}
+		r.forwardMu.Unlock()
+		r.Resume()
+		r.stopper.Stop()
+	})
 }
 
 // Pause 暂停服务
@@ -96,12 +126,15 @@ func (r *Raft) Resume() {
 }
 
 func (r *Raft) Step(e types.Event) {
+	if r.stopped.Load() {
+		return
+	}
 	if r.pause.Load() {
 		r.Info("raft is paused, ignore event", zap.String("event", e.String()))
 		return
 	}
 	if e.Type == types.SendPropose {
-		go r.handleSendPropose(e)
+		r.stopper.RunWorker(func() { r.handleSendPropose(e) })
 		return
 	} else if e.Type == types.SendProposeResp {
 		r.handleSendProposeResp(e)
@@ -115,6 +148,9 @@ func (r *Raft) Step(e types.Event) {
 }
 
 func (r *Raft) StepWait(ctx context.Context, e types.Event) error {
+	if r.stopped.Load() {
+		return types.ErrStopped
+	}
 	if r.pause.Load() {
 		r.Info("raft is paused, ignore event", zap.String("event", e.String()))
 		return types.ErrPaused
@@ -148,11 +184,11 @@ func (r *Raft) StepWait(ctx context.Context, e types.Event) error {
 }
 
 func (r *Raft) IsLeader() bool {
-	return r.node.IsLeader()
+	return r.view.Load().(nodeView).isLeader
 }
 
 func (r *Raft) LeaderId() uint64 {
-	return r.node.LeaderId()
+	return r.view.Load().(nodeView).leader
 }
 
 func (r *Raft) GetReplicaLastLogIndex(replicaId uint64) uint64 {
@@ -179,11 +215,11 @@ func (r *Raft) WaitUtilCommit(ctx context.Context, index uint64) error {
 }
 
 func (r *Raft) BecomeLeader(term uint32) {
-	r.node.BecomeLeader(term)
+	r.changeRole(func() { r.node.BecomeLeader(term) })
 }
 
 func (r *Raft) BecomeFollower(term uint32, leader uint64) {
-	r.node.BecomeFollower(term, leader)
+	r.changeRole(func() { r.node.BecomeFollower(term, leader) })
 }
 
 func (r *Raft) KeepAlive() {
@@ -192,11 +228,17 @@ func (r *Raft) KeepAlive() {
 
 func (r *Raft) loop() {
 	tk := time.NewTicker(r.opts.TickInterval)
+	defer tk.Stop()
 	for {
 		if r.pause.Load() {
 			r.pauseCond.L.Lock()
-			r.pauseCond.Wait() // 会在某个条件满足时被唤醒
+			for r.pause.Load() && !r.stopped.Load() {
+				r.pauseCond.Wait()
+			}
 			r.pauseCond.L.Unlock()
+			if r.stopped.Load() {
+				return
+			}
 			continue
 		}
 
@@ -205,12 +247,10 @@ func (r *Raft) loop() {
 		select {
 		case <-tk.C:
 			r.node.Tick()
+			r.publishView()
 		case <-r.advanceC:
 		case req := <-r.stepC:
-			err := r.node.Step(req.event)
-			if req.resp != nil {
-				req.resp <- err
-			}
+			r.handleStep(req)
 		case <-r.stopper.ShouldStop():
 			return
 		}
@@ -243,7 +283,8 @@ func (r *Raft) readyEvents() {
 			types.FollowerToLeaderReq:
 			r.handleRoleChangeReq(e)
 			continue
-		case types.ProposalFence: // config Raft keeps no proposal receipts
+		case types.ProposalFence:
+			r.wait.fence(e.Term)
 			continue
 		}
 
@@ -254,6 +295,7 @@ func (r *Raft) readyEvents() {
 
 		if e.To == types.LocalNode || e.To == r.opts.NodeId {
 			err := r.node.Step(e)
+			r.publishView()
 			if err != nil {
 				r.node.Error("step error", zap.Error(err))
 			}
@@ -275,20 +317,20 @@ func (r *Raft) handleStoreReq(e types.Event) {
 		if err != nil {
 			reason = types.ReasonError
 		}
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			Type:   types.StoreResp,
 			Index:  e.Logs[len(e.Logs)-1].Index,
 			Logs:   e.Logs,
 			Reason: reason,
-		}}
+		})
 	})
 
 	if err != nil {
 		r.Error("submit append logs failed", zap.Error(err))
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			Type:   types.StoreResp,
 			Reason: types.ReasonError,
-		}}
+		})
 	}
 
 }
@@ -306,24 +348,24 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 			var treason types.Reason
 			trunctIndex, treason = r.getTrunctLogIndex(e, leaderLastLogTerm)
 			if treason != types.ReasonOk {
-				r.stepC <- stepReq{event: types.Event{
+				r.enqueue(types.Event{
 					To:     e.From,
 					Type:   types.GetLogsResp,
 					Index:  e.Index,
 					Reason: treason,
-				}}
+				})
 				return
 			}
 		}
 
 		// 需要裁剪
 		if trunctIndex > 0 {
-			r.stepC <- stepReq{event: types.Event{
+			r.enqueue(types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
 				Index:  trunctIndex,
 				Reason: types.ReasonTruncate,
-			}}
+			})
 			return
 		}
 
@@ -331,30 +373,30 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		logs, err := r.opts.Storage.GetLogs(e.Index, e.StoredIndex+1, r.opts.MaxLogCountPerBatch)
 		if err != nil {
 			r.node.Error("get logs failed", zap.Error(err))
-			r.stepC <- stepReq{event: types.Event{
+			r.enqueue(types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
 				Index:  e.Index,
 				Reason: types.ReasonError,
-			}}
+			})
 			return
 		}
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
 			Index:  e.Index,
 			Logs:   logs,
 			Reason: types.ReasonOk,
-		}}
+		})
 	})
 	if err != nil {
 		r.Error("submit get logs failed", zap.Error(err))
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
 			Index:  e.Index,
 			Reason: types.ReasonError,
-		}}
+		})
 	}
 }
 
@@ -364,34 +406,34 @@ func (r *Raft) handleTruncateReq(e types.Event) {
 		err := r.opts.Storage.TruncateLogTo(e.Index)
 		if err != nil {
 			r.Error("truncate logs failed", zap.Error(err))
-			r.stepC <- stepReq{event: types.Event{
+			r.enqueue(types.Event{
 				Type:   types.TruncateResp,
 				Reason: types.ReasonError,
-			}}
+			})
 			return
 		}
 		// 删除本地的leader term start index
 		err = r.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(e.LastLogTerm)
 		if err != nil {
 			r.Error("delete leader term start index failed", zap.Error(err), zap.Uint32("LastLogTerm", e.LastLogTerm))
-			r.stepC <- stepReq{event: types.Event{
+			r.enqueue(types.Event{
 				Type:   types.TruncateResp,
 				Reason: types.ReasonError,
-			}}
+			})
 			return
 		}
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			Type:   types.TruncateResp,
 			Index:  e.Index,
 			Reason: types.ReasonOk,
-		}}
+		})
 	})
 	if err != nil {
 		r.Error("submit truncate logs failed", zap.Error(err))
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			Type:   types.TruncateResp,
 			Reason: types.ReasonError,
-		}}
+		})
 	}
 }
 
@@ -404,44 +446,44 @@ func (r *Raft) handleApplyReq(e types.Event) {
 		logs, err := r.opts.Storage.GetLogs(e.StartIndex, e.EndIndex, 0)
 		if err != nil {
 			r.Error("apply logs failed", zap.Error(err))
-			r.stepC <- stepReq{event: types.Event{
+			r.enqueue(types.Event{
 				Type:   types.ApplyResp,
 				Reason: types.ReasonError,
-			}}
+			})
 			return
 		}
 		if len(logs) == 0 {
 			r.Error("logs is empty", zap.Uint64("startIndex", e.StartIndex), zap.Uint64("endIndex", e.EndIndex))
-			r.stepC <- stepReq{event: types.Event{
+			r.enqueue(types.Event{
 				Type:   types.ApplyResp,
 				Reason: types.ReasonError,
-			}}
+			})
 			return
 		}
 		err = r.opts.Storage.Apply(logs)
 		if err != nil {
 			r.Error("apply logs failed", zap.Error(err))
-			r.stepC <- stepReq{event: types.Event{
+			r.enqueue(types.Event{
 				Type:   types.ApplyResp,
 				Reason: types.ReasonError,
-			}}
+			})
 			return
 		}
 		lastLogIndex := logs[len(logs)-1].Index
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			Type:   types.ApplyResp,
 			Reason: types.ReasonOk,
 			Index:  lastLogIndex,
-		}}
-		// 已应用
-		r.wait.didApply(lastLogIndex)
+		})
+		// Successful apply publishes identity and frontier under one lock.
+		r.wait.appliedLogs(logs)
 	})
 	if err != nil {
 		r.Error("submit apply logs failed", zap.Error(err))
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			Type:   types.ApplyResp,
 			Reason: types.ReasonError,
-		}}
+		})
 	}
 }
 
@@ -545,30 +587,30 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 
 		if err != nil {
 
-			r.stepC <- stepReq{event: types.Event{
+			r.enqueue(types.Event{
 				Type:   respEventType,
 				From:   e.From,
 				Reason: types.ReasonError,
-			}}
+			})
 			return
 		}
 
 		err = r.opts.Storage.SaveConfig(newCfg)
 		if err != nil {
 			r.Error("change role failed", zap.Error(err))
-			r.stepC <- stepReq{event: types.Event{
+			r.enqueue(types.Event{
 				Type:   respEventType,
 				From:   e.From,
 				Reason: types.ReasonError,
-			}}
+			})
 			return
 		}
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			Type:   respEventType,
 			From:   e.From,
 			Reason: types.ReasonOk,
 			Config: newCfg,
-		}}
+		})
 	})
 	if err != nil {
 		r.Error("submit role change req failed", zap.Error(err))
@@ -583,11 +625,11 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 		case types.FollowerToLeaderReq:
 			respEventType = types.FollowerToLeaderResp
 		}
-		r.stepC <- stepReq{event: types.Event{
+		r.enqueue(types.Event{
 			Type:   respEventType,
 			From:   e.From,
 			Reason: types.ReasonError,
-		}}
+		})
 	}
 }
 
@@ -626,7 +668,7 @@ func (r *Raft) learnTo(learnerId uint64) (types.Config, error) {
 			cfg.Replicas = wkutil.RemoveUint64(cfg.Replicas, cfg.MigrateFrom)
 		}
 
-		if cfg.MigrateFrom == r.LeaderId() { // 学习者转领导
+		if cfg.MigrateFrom == cfg.Leader { // 学习者转领导
 			cfg.Leader = cfg.MigrateTo
 		}
 	}
@@ -652,4 +694,87 @@ func (r *Raft) followerToLeader(followerId uint64) (types.Config, error) {
 
 	return cfg, nil
 
+}
+
+type nodeView struct {
+	leader     uint64
+	term       uint32
+	isLeader   bool
+	generation uint64
+}
+
+// Caller routing uses an immutable snapshot, never mutable node fields.
+func (r *Raft) publishView() {
+	v := nodeView{leader: r.node.LeaderId(), term: r.node.cfg.Term, isLeader: r.node.IsLeader(), generation: 1}
+	r.forwardMu.Lock()
+	defer r.forwardMu.Unlock()
+	old := r.view.Load()
+	if old != nil {
+		v.generation = old.(nodeView).generation
+	}
+	if old != nil && (old.(nodeView).leader != v.leader || old.(nodeView).term != v.term || old.(nodeView).isLeader != v.isLeader) {
+		v.generation++
+		r.wait.fenceForward()
+		for key := range r.forwardPending {
+			r.fowardProposeWait.Trigger(key, proposalUnknown(types.ErrNotLeader))
+			delete(r.forwardPending, key)
+		}
+	}
+	r.view.Store(v)
+}
+func (r *Raft) changeRole(change func()) {
+	if !r.started.Load() {
+		change()
+		r.publishView()
+		r.readyFences()
+		return
+	}
+	resp := make(chan error, 1)
+	select {
+	case r.stepC <- stepReq{change: change, resp: resp}:
+	case <-r.stopper.ShouldStop():
+		return
+	}
+	select {
+	case <-resp:
+	case <-r.stopper.ShouldStop():
+	}
+}
+
+// Direct role setters before Start are initialization/test-only. Consume their
+// fences immediately without dispatching storage work.
+func (r *Raft) readyFences() {
+	for _, e := range r.node.events {
+		if e.Type == types.ProposalFence {
+			r.wait.fence(e.Term)
+		}
+	}
+}
+func (r *Raft) handleStep(req stepReq) error {
+	var err error
+	if req.proposal != nil {
+		r.handleProposal(req.proposal)
+	} else if req.change != nil {
+		req.change()
+	} else {
+		err = r.node.Step(req.event)
+	}
+	r.publishView()
+	r.readyFences()
+	if req.resp != nil {
+		req.resp <- err
+	}
+	return err
+}
+
+// Worker replies must survive Pause and must not block forever after the loop
+// stops consuming. Network Step retains its existing pause policy.
+func (r *Raft) enqueue(e types.Event) {
+	if r.stopped.Load() {
+		return
+	}
+	select {
+	case r.stepC <- stepReq{event: e}:
+	case <-r.stopper.ShouldStop():
+	}
 }

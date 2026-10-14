@@ -52,103 +52,49 @@ func (r *Raft) ProposeBatchTimeout(ctx context.Context, reqs []types.ProposeReq)
 
 // ProposeBatchUntilAppliedTimeout 批量提案（等待应用）
 func (r *Raft) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []types.ProposeReq) ([]*types.ProposeResp, error) {
-	// 等待应用
-	var (
-		applyProcess *progress
-		resps        []*types.ProposeResp
-		err          error
-		needWait     = true
-	)
-
-	if r.node.LeaderId() == 0 {
-		return nil, types.ErrNotLeader
+	if r.IsLeader() {
+		return r.submitProposal(ctx, reqs, true, nil)
 	}
-
-	if !r.node.IsLeader() {
-		// 如果不是leader，则转发给leader
-		resps, err = r.fowardPropose(ctx, reqs)
-		if err != nil {
-			return nil, err
-		}
-		maxLogIndex := resps[len(resps)-1].Index
-		// 如果最大的日志下标大于已应用的日志下标，则不需要等待
-		if r.node.queue.appliedIndex >= maxLogIndex {
-			needWait = false
-		}
-		if needWait {
-			applyProcess = r.wait.waitApply(maxLogIndex)
-		}
-	} else {
-		resps, err = r.proposeBatch(ctx, reqs, func(logs []types.Log) {
-			maxLogIndex := logs[len(logs)-1].Index
-			// 如果最大的日志下标大于已应用的日志下标，则不需要等待
-			if r.node.queue.appliedIndex >= maxLogIndex {
-				needWait = false
-			}
-			if needWait {
-				applyProcess = r.wait.waitApply(maxLogIndex)
-			}
-
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if needWait {
-		select {
-		case <-applyProcess.waitC:
-			return resps, nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-r.stopper.ShouldStop():
-			return nil, types.ErrStopped
-		}
-	} else {
-		return resps, nil
-	}
-}
-
-func (r *Raft) proposeBatch(ctx context.Context, reqs types.ProposeReqSet, stepBefore func(logs []types.Log)) ([]*types.ProposeResp, error) {
-
-	r.node.Lock()
-	defer r.node.Unlock()
-	lastLogIndex := r.node.queue.lastLogIndex
-	logs := make([]types.Log, 0, len(reqs))
-	for i, req := range reqs {
-		logIndex := lastLogIndex + 1 + uint64(i)
-		logs = append(logs, types.Log{
-			Id:    req.Id,
-			Term:  r.node.cfg.Term,
-			Index: logIndex,
-			Data:  req.Data,
-		})
-	}
-
-	if stepBefore != nil {
-		stepBefore(logs)
-	}
-
-	err := r.StepWait(ctx, types.Event{
-		Type: types.Propose,
-		Logs: logs,
-	})
+	route := r.view.Load().(nodeView)
+	resps, err := r.fowardPropose(ctx, reqs)
 	if err != nil {
 		return nil, err
 	}
-
-	resps := make([]*types.ProposeResp, 0, len(reqs))
+	logs := make([]types.Log, len(reqs))
 	for i, req := range reqs {
-		logIndex := lastLogIndex + 1 + uint64(i)
-		resps = append(resps, &types.ProposeResp{
-			Id:    req.Id,
-			Index: logIndex,
-		})
+		logs[i] = types.Log{Id: req.Id, Index: resps[i].Index, Term: route.term, Data: append([]byte(nil), req.Data...)}
 	}
-	return resps, nil
+	r.forwardMu.Lock()
+	if route != r.view.Load().(nodeView) {
+		r.forwardMu.Unlock()
+		return nil, proposalUnknown(types.ErrNotLeader)
+	}
+	p := r.wait.registerReceipt(logs, true)
+	r.forwardMu.Unlock()
+	select {
+	case <-p.waitC:
+		return resps, p.err
+	case <-ctx.Done():
+		if err, done := r.wait.detach(p); done {
+			return resps, err
+		}
+		return nil, proposalUnknown(ctx.Err())
+	case <-r.stopper.ShouldStop():
+		if err, done := r.wait.detach(p); done {
+			return resps, err
+		}
+		return nil, proposalUnknown(types.ErrStopped)
+	}
+}
+
+func (r *Raft) proposeBatch(ctx context.Context, reqs types.ProposeReqSet, before func([]types.Log)) ([]*types.ProposeResp, error) {
+	return r.submitProposal(ctx, reqs, false, before)
 }
 
 func (r *Raft) handleSendPropose(e types.Event) {
+	if len(e.Logs) != 1 {
+		return
+	}
 	var reqs types.ProposeReqSet
 	err := reqs.Unmarshal(e.Logs[0].Data)
 	if err != nil {
@@ -156,14 +102,17 @@ func (r *Raft) handleSendPropose(e types.Event) {
 		r.sendProposeRespError(reqs, e.From)
 		return
 	}
-	if !r.node.IsLeader() {
-		r.Error("handleSendPropose: node is leader, but receive propose from other node", zap.Uint64("leaderId", r.node.LeaderId()), zap.Uint64("from", e.From))
+	if len(reqs) == 0 {
+		return
+	}
+	if !r.IsLeader() {
+		r.Error("handleSendPropose: node is leader, but receive propose from other node", zap.Uint64("leaderId", r.LeaderId()), zap.Uint64("from", e.From))
 		r.sendProposeRespError(reqs, e.From)
 		return
 	}
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), r.opts.ProposeTimeout)
 	defer cancel()
-	resps, err := r.ProposeBatchUntilAppliedTimeout(timeoutCtx, reqs)
+	resps, err := r.submitProposal(timeoutCtx, reqs, true, nil)
 	if err != nil {
 		r.Error("handleSendPropose: propose batch failed", zap.Error(err))
 		r.sendProposeRespError(reqs, e.From)
@@ -215,57 +164,92 @@ func (r *Raft) sendProposeRespError(reqs types.ProposeReqSet, to uint64) {
 	})
 }
 
-func (r *Raft) handleSendProposeResp(e types.Event) {
+// The unchanged wire response carries only request IDs and indexes. Forwarded
+// correlation keys therefore cannot be reused while delayed packets may exist.
+// Keep bounded lifetime tombstones and fail closed at exhaustion; never evict
+// them and allow an old packet to complete a new registration.
+const configForwardIdentityLimit = 65536
 
-	var resps types.ProposeRespSet
-	err := resps.Unmarshal(e.Logs[0].Data)
-	if err != nil {
-		r.Error("unmarshal propose resp failed", zap.Error(err))
+func (r *Raft) handleSendProposeResp(e types.Event) {
+	if len(e.Logs) != 1 {
 		return
 	}
-
+	var resps types.ProposeRespSet
+	if err := resps.Unmarshal(e.Logs[0].Data); err != nil || len(resps) == 0 {
+		return
+	}
 	key := fmt.Sprintf("%d", resps[len(resps)-1].Id)
-	if e.Reason == types.ReasonError {
-		r.Error("handleSendProposeResp: receive propose resp error", zap.Uint64("from", e.From))
-		r.fowardProposeWait.Trigger(key, errors.New("receive propose resp error"))
+	r.forwardMu.Lock()
+	defer r.forwardMu.Unlock()
+	leader, ok := r.forwardPending[key]
+	if !ok || leader != e.From {
+		return
+	}
+	delete(r.forwardPending, key)
+	if e.Reason != types.ReasonOk {
+		r.fowardProposeWait.Trigger(key, proposalUnknown(errors.New("raft: forwarded proposal rejected")))
 		return
 	}
 	r.fowardProposeWait.Trigger(key, resps)
 }
 
 func (r *Raft) fowardPropose(ctx context.Context, reqs types.ProposeReqSet) ([]*types.ProposeResp, error) {
+	if len(reqs) == 0 {
+		return nil, proposalNotAdmitted(errors.New("raft: empty proposal"))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, proposalNotAdmitted(err)
+	}
 	data, err := reqs.Marshal()
 	if err != nil {
-		return nil, err
+		return nil, proposalNotAdmitted(err)
 	}
-
 	key := fmt.Sprintf("%d", reqs[len(reqs)-1].Id)
+	r.forwardMu.Lock()
+	v := r.view.Load().(nodeView)
+	if r.stopped.Load() || v.leader == 0 {
+		r.forwardMu.Unlock()
+		return nil, proposalNotAdmitted(types.ErrNotLeader)
+	}
+	if _, used := r.forwardUsed[key]; used {
+		r.forwardMu.Unlock()
+		return nil, proposalNotAdmitted(errors.New("raft: forwarded request ID already used"))
+	}
+	if len(r.forwardUsed) >= configForwardIdentityLimit {
+		r.forwardMu.Unlock()
+		return nil, proposalNotAdmitted(errors.New("raft: forwarding identity capacity exhausted"))
+	}
+	r.forwardUsed[key] = struct{}{}
+	r.forwardPending[key] = v.leader
 	waitC := r.fowardProposeWait.Register(key)
-
-	r.opts.Transport.Send(types.Event{
-		From: r.node.opts.NodeId,
-		To:   r.node.LeaderId(),
-		Type: types.SendPropose,
-		Logs: []types.Log{
-			{
-				Data: data,
-			},
-		},
-	})
-
+	r.forwardMu.Unlock()
+	defer func() {
+		r.forwardMu.Lock()
+		defer r.forwardMu.Unlock()
+		if _, ok := r.forwardPending[key]; ok {
+			delete(r.forwardPending, key)
+			r.fowardProposeWait.Trigger(key, nil)
+		}
+	}()
+	r.opts.Transport.Send(types.Event{From: r.opts.NodeId, To: v.leader, Type: types.SendPropose, Logs: []types.Log{{Data: data}}})
 	select {
 	case result := <-waitC:
-		if result == nil {
-			return nil, errors.New("foward propose failed")
-		}
-		err, ok := result.(error)
-		if ok {
+		if err, ok := result.(error); ok {
 			return nil, err
 		}
-		return result.(types.ProposeRespSet), nil
+		resps, ok := result.(types.ProposeRespSet)
+		if !ok || len(resps) != len(reqs) {
+			return nil, proposalUnknown(errors.New("raft: invalid forwarded response"))
+		}
+		for i, resp := range resps {
+			if resp == nil || resp.Id != reqs[i].Id || resp.Index == 0 || (i > 0 && resp.Index != resps[i-1].Index+1) {
+				return nil, proposalUnknown(errors.New("raft: mismatched forwarded response"))
+			}
+		}
+		return resps, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, proposalUnknown(ctx.Err())
 	case <-r.stopper.ShouldStop():
-		return nil, types.ErrStopped
+		return nil, proposalUnknown(types.ErrStopped)
 	}
 }
