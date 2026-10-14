@@ -63,8 +63,8 @@ func TestRestartedVoterCanElectWithLivePeer(t *testing.T) {
 		opts[id] = newTestOptions(t, id, map[uint64]string{1: "", 2: "", 3: ""}, clusterconfig.WithTransport(tr))
 		s := clusterconfig.New(opts[id])
 		nodes[id] = s
-		tr.set(id, s)
 		require.NoError(t, s.Start())
+		tr.set(id, s)
 		active[id] = true
 	}
 	var leaderID uint64
@@ -99,8 +99,8 @@ func TestRestartedVoterCanElectWithLivePeer(t *testing.T) {
 	active[restartID] = false
 	restarted := clusterconfig.New(opts[restartID])
 	nodes[restartID] = restarted
-	tr.set(restartID, restarted)
 	require.NoError(t, restarted.Start())
+	tr.set(restartID, restarted)
 	active[restartID] = true
 	require.Eventually(t, func() bool { return restarted.LeaderId() == leaderID }, 5*time.Second, 20*time.Millisecond)
 	tr.mu.Lock()

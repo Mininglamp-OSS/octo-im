@@ -630,7 +630,7 @@ func (c *stressCluster) run(t *testing.T, load stressLoad) *stressStats {
 						if invalid {
 							atomic.AddInt64(&stats.unexplainedCorrelation, 1)
 						}
-						fwdEvents := g.fowardProposeWait.(*stressForwardWait).timeline(fmt.Sprint(reqs[0].Id))
+						fwdEvents := g.fowardProposeWait.(*stressForwardWait).timeline(fmt.Sprint(lastID))
 						t.Logf("receipt timeline node=%d key=%s id=%d forwarded=%t start=%s apply=%s expiry=%s outcome=%s err=%v events=%+v explained=%t firstID=%d forwarding=%+v", node+1, key, lastID, forwarded, start.Format(time.RFC3339Nano), appliedAt.Format(time.RFC3339Nano), expired.Format(time.RFC3339Nano), returned.Format(time.RFC3339Nano), err, trace, !invalid, reqs[0].Id, fwdEvents)
 					}
 				}

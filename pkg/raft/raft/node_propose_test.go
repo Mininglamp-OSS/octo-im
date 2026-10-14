@@ -10,7 +10,7 @@ import (
 
 func newLeaderNode(t *testing.T, term uint32) *Node {
 	t.Helper()
-	n := NewNode(0, types.RaftState{}, NewOptions(WithNodeId(1), WithAdvance(func() {})))
+	n := NewNode(0, types.RaftState{}, NewOptions(WithNodeId(1), WithReplicas([]uint64{1, 2}), WithAdvance(func() {})))
 	n.BecomeLeader(term)
 	require.True(t, n.IsLeader())
 	return n

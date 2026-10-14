@@ -38,6 +38,7 @@ type Raft struct {
 	started        syncatomic.Bool
 	stopped        syncatomic.Bool
 	stopOnce       sync.Once
+	stopBegin      sync.Once
 	view           syncatomic.Value
 	forwardMu      sync.Mutex
 	forwardUsed    map[string]struct{}
@@ -103,8 +104,11 @@ func (r *Raft) Start() error {
 	return nil
 }
 
-func (r *Raft) Stop() {
-	r.stopOnce.Do(func() {
+// BeginStop synchronously fences admission and settles owned receipts without
+// joining an event loop that may be inside durable storage I/O. Storage must
+// remain open until Stop and WaitQuiescence finish.
+func (r *Raft) BeginStop() {
+	r.stopBegin.Do(func() {
 		r.workerMu.Lock()
 		r.stopped.Store(true)
 		r.pool.Release()
@@ -117,6 +121,12 @@ func (r *Raft) Stop() {
 		}
 		r.forwardMu.Unlock()
 		r.Resume()
+	})
+}
+
+func (r *Raft) Stop() {
+	r.BeginStop()
+	r.stopOnce.Do(func() {
 		r.stopper.Stop()
 		r.drainStoppedQueue()
 	})

@@ -162,6 +162,7 @@ func (s *Server) initRaft() error {
 // storage I/O can keep that lifecycle pending; WaitStopped exposes its result.
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
+		s.raft.BeginStop()
 		go func() {
 			// Stop joins the event loop, whose durable hard-state write may
 			// itself be blocked. Include that join in the tracked lifecycle

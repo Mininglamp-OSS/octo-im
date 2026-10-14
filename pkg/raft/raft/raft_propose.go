@@ -70,7 +70,9 @@ func (r *Raft) proposeUntilApplied(ctx context.Context, reqs []types.ProposeReq)
 		logs[i] = types.Log{Id: req.Id, Index: resps[i].Index, Term: route.term, Data: append([]byte(nil), req.Data...)}
 	}
 	r.forwardMu.Lock()
-	if route != r.view.Load().(nodeView) {
+	// Commit progress is not a routing change. Generation changes only
+	// when leader, term or local role changes.
+	if route.generation != r.view.Load().(nodeView).generation {
 		r.forwardMu.Unlock()
 		return nil, proposalUnknown(types.ErrNotLeader)
 	}
