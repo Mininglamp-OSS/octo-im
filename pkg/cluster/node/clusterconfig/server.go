@@ -24,6 +24,7 @@ import (
 // serverStorage keeps the resource lifecycle at its owner without changing Raft Storage.
 type serverStorage interface {
 	raft.Storage
+	incarnationStore
 	Open() error
 	Close() error
 	GetLogsByLimit(uint64, uint64, int) ([]rafttypes.Log, error)
@@ -41,7 +42,9 @@ type Server struct {
 	config    *Config         // 分布式配置对象
 	storage   serverStorage   // 配置日志存储
 	cfgGenId  *snowflake.Node // 配置ID生成器
-	listeners []IEvent        // 事件监听器
+	// Durably reserved by Start before Raft exists; zero until then.
+	senderIncarnation uint64
+	listeners         []IEvent // 事件监听器
 	// Apply-worker-only progress. On restart the persisted snapshot and
 	// initRaft reconstruct membership; these flags cover in-process retries.
 	membershipPending   bool
@@ -94,11 +97,22 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
-	err = s.initRaft()
+	// Reserve the forwarding incarnation under the directory lock before Raft
+	// exists, so nothing can forward without it. Failures are fatal to Start.
+	s.senderIncarnation, err = reserveSenderIncarnation(s.storage)
+	if err == nil {
+		err = s.initRaft()
+	}
 	if err != nil {
-		return err
+		// No Raft was constructed; release Storage so Start owns nothing.
+		return errors.Join(err, s.storage.Close())
 	}
 	return s.raft.Start()
+}
+
+// SenderIncarnation returns the incarnation reserved by Start, or zero.
+func (s *Server) SenderIncarnation() uint64 {
+	return s.senderIncarnation
 }
 
 func (s *Server) Options() *Options {
@@ -149,6 +163,7 @@ func (s *Server) initRaft() error {
 		raft.WithTransport(newRaftTransport(s)),
 		raft.WithStorage(s.storage),
 		raft.WithElectionOn(true),
+		raft.WithForwardIncarnation(s.senderIncarnation),
 	))
 	s.raft.Step(rafttypes.Event{
 		Type:   rafttypes.ConfChange,
@@ -162,6 +177,11 @@ func (s *Server) initRaft() error {
 // storage I/O can keep that lifecycle pending; WaitStopped exposes its result.
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
+		if s.raft == nil {
+			// Start never succeeded and owns no Storage.
+			close(s.closeDone)
+			return
+		}
 		s.raft.BeginStop()
 		go func() {
 			// Stop joins the event loop, whose durable hard-state write may

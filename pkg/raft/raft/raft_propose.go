@@ -233,11 +233,15 @@ func (r *Raft) fowardPropose(ctx context.Context, reqs types.ProposeReqSet) ([]*
 		r.forwardMu.Unlock()
 		return nil, proposalNotAdmitted(errors.New("raft: forwarded registration limit reached"))
 	}
-	token, ok := r.forwardToken.issue()
-	if !ok {
-		r.forwardStats.limitRejected++
+	token, err := r.forwardToken.issue()
+	if err != nil {
+		if errors.Is(err, errForwardIncarnationUnset) {
+			r.forwardStats.unreservedRejected++
+		} else {
+			r.forwardStats.limitRejected++
+		}
 		r.forwardMu.Unlock()
-		return nil, proposalNotAdmitted(errors.New("raft: forwarding attempt space exhausted"))
+		return nil, proposalNotAdmitted(err)
 	}
 	r.forwardPending[key] = forwardRegistration{leader: v.leader, token: token}
 	r.forwardStats.registered++

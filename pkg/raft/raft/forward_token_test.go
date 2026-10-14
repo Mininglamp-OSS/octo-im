@@ -34,7 +34,7 @@ func newForwardRouter(t *testing.T) *forwardRouter {
 	c := studyNew(t, true)
 	rt := &forwardRouter{c: c, rejectTr: &studyTransport{c: make(chan types.Event, 4096)}, done: make(chan struct{}), exited: make(chan struct{})}
 	s := &studyStorage{terms: make(map[uint32]uint64)}
-	rt.rejector = New(NewOptions(WithNodeId(1), WithReplicas([]uint64{1, 2, 3}), WithStorage(s), WithTransport(rt.rejectTr)))
+	rt.rejector = New(NewOptions(WithNodeId(1), WithReplicas([]uint64{1, 2, 3}), WithStorage(s), WithTransport(rt.rejectTr), withTestIncarnation()))
 	rt.rejector.BecomeFollower(1, 3)
 	for _, r := range c.rr {
 		require.NoError(t, r.Start())
@@ -96,6 +96,14 @@ func rejectEcho(e types.Event) types.Event {
 		panic(err)
 	}
 	return types.Event{Type: types.SendProposeResp, From: 1, To: e.From, Reason: types.ReasonError, Logs: []types.Log{echoForwardToken(e, data)}}
+}
+
+var testIncarnations atomic.Uint64
+
+// withTestIncarnation gives each instance its own reserved incarnation, as the
+// Config Raft owner does durably in production.
+func withTestIncarnation() Option {
+	return WithForwardIncarnation(testIncarnations.Add(1))
 }
 
 func requireForwardQuiescent(t *testing.T, r *Raft) ForwardIdentityStats {
@@ -183,7 +191,7 @@ func errorsIsAll(err error, targets ...error) bool {
 func TestConfigForwardTokenMismatch(t *testing.T) {
 	c := studyNew(t, true)
 	r := c.rr[1]
-	other := New(NewOptions(WithNodeId(2), WithReplicas([]uint64{1, 2, 3}), WithStorage(&studyStorage{terms: make(map[uint32]uint64)}), WithTransport(c.tr)))
+	other := New(NewOptions(WithNodeId(2), WithReplicas([]uint64{1, 2, 3}), WithStorage(&studyStorage{terms: make(map[uint32]uint64)}), WithTransport(c.tr), withTestIncarnation()))
 	require.NotEqual(t, r.forwardToken.incarnation, other.forwardToken.incarnation, "a second instance with the same NodeId has its own incarnation")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -298,18 +306,20 @@ func TestConfigForwardAttemptExhaustion(t *testing.T) {
 	require.EqualValues(t, 1, st.LimitRejected)
 }
 
-// A restarted instance on the same storage draws a new incarnation, so an
-// in-flight response for the previous incarnation completes nothing even when
-// request ID and attempt number collide.
+// A restarted instance on the same storage runs under the next reserved
+// incarnation N+1, so an in-flight response for incarnation N completes nothing
+// even when request ID and attempt number collide.
 func TestConfigForwardRestartIncarnation(t *testing.T) {
 	c := studyNew(t, true)
 	old := c.rr[1]
+	n := old.forwardToken.incarnation
 	out := studyCall(old, context.Background(), 1800)
 	stale := studyRecv(t, c.tr.c)
+	require.Equal(t, n, stale.Logs[0].Index)
 	old.Stop()
 	require.ErrorIs(t, studyRecv(t, out).err, types.ErrProposalOutcomeUnknown)
 
-	restarted := New(NewOptions(WithNodeId(2), WithReplicas([]uint64{1, 2, 3}), WithStorage(c.ss[1]), WithTransport(c.tr)))
+	restarted := New(NewOptions(WithNodeId(2), WithReplicas([]uint64{1, 2, 3}), WithStorage(c.ss[1]), WithTransport(c.tr), WithForwardIncarnation(n+1)))
 	restarted.BecomeFollower(1, 1)
 	defer restarted.Stop()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -317,13 +327,30 @@ func TestConfigForwardRestartIncarnation(t *testing.T) {
 	live := studyCall(restarted, ctx, 1800)
 	request := studyRecv(t, c.tr.c)
 	require.Equal(t, stale.Logs[0].Id, request.Logs[0].Id, "attempt numbers restart")
-	require.NotEqual(t, stale.Logs[0].Index, request.Logs[0].Index, "incarnations differ")
+	require.Equal(t, n+1, request.Logs[0].Index, "the restart forwards under incarnation N+1")
 	restarted.Step(studyResponse(t, stale, 1, types.ReasonOk, types.ProposeRespSet{&types.ProposeResp{Id: 1800, Index: 1}}))
 	require.True(t, restarted.fowardProposeWait.IsRegistered("1800"))
 	require.EqualValues(t, 1, restarted.ForwardIdentityStats().StaleResponses)
 	cancel()
 	require.ErrorIs(t, studyRecv(t, live).err, types.ErrProposalOutcomeUnknown)
 	requireForwardQuiescent(t, restarted)
+}
+
+// Without a reserved incarnation a Raft never forwards: the call is rejected
+// as not admitted before registration and nothing reaches the transport.
+func TestConfigForwardRequiresReservedIncarnation(t *testing.T) {
+	tr := &studyTransport{c: make(chan types.Event, 8)}
+	r := New(NewOptions(WithNodeId(2), WithReplicas([]uint64{1, 2, 3}), WithStorage(&studyStorage{terms: make(map[uint32]uint64)}), WithTransport(tr)))
+	defer r.Stop()
+	r.BecomeFollower(1, 1)
+	err := studyRecv(t, studyCall(r, context.Background(), 1750)).err
+	require.ErrorIs(t, err, types.ErrProposalNotAdmitted)
+	require.ErrorIs(t, err, errForwardIncarnationUnset)
+	require.Empty(t, tr.c)
+	st := requireForwardQuiescent(t, r)
+	require.Zero(t, st.Registered)
+	require.EqualValues(t, 1, st.UnreservedRejected)
+	require.Zero(t, st.LimitRejected)
 }
 
 // Mixed versions: an upgraded follower facing a legacy leader never reports a

@@ -45,7 +45,7 @@ func TestConfigShutdownBlockedStorage(t *testing.T) {
 			s := &configBlockedStorage{operation: op, entered: make(chan struct{}), release: make(chan struct{})}
 			s.terms = make(map[uint32]uint64)
 			tr := &studyTransport{c: make(chan types.Event, 64)}
-			r := New(NewOptions(WithNodeId(1), WithReplicas([]uint64{1}), WithStorage(s), WithTransport(tr)))
+			r := New(NewOptions(WithNodeId(1), WithReplicas([]uint64{1}), WithStorage(s), WithTransport(tr), withTestIncarnation()))
 			var releaseOnce sync.Once
 			release := func() { releaseOnce.Do(func() { close(s.release) }) }
 			t.Cleanup(func() {
@@ -83,7 +83,7 @@ func TestConfigShutdownBlockedStorage(t *testing.T) {
 				queued = studyCall(r, context.Background(), 1401)
 				studyRecv(t, r.stepC)
 			}
-			forwardRaft := New(NewOptions(WithNodeId(3), WithReplicas([]uint64{1, 2, 3}), WithStorage(&studyStorage{terms: make(map[uint32]uint64)}), WithTransport(tr)))
+			forwardRaft := New(NewOptions(WithNodeId(3), WithReplicas([]uint64{1, 2, 3}), WithStorage(&studyStorage{terms: make(map[uint32]uint64)}), WithTransport(tr), withTestIncarnation()))
 			forwardRaft.BecomeFollower(1, 2)
 			forwarded := studyCall(forwardRaft, context.Background(), 1402)
 			studyRecv(t, tr.c)

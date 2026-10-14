@@ -1,8 +1,7 @@
 package raft
 
 import (
-	"crypto/rand"
-	"encoding/binary"
+	"errors"
 	"math"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -17,12 +16,16 @@ import (
 // are unchanged, so every peer version decodes every packet.
 //
 // Settlement and retirement require the echoed token to equal the live
-// registration's token. Tokens are never reissued: the incarnation is 64 bits
-// from crypto/rand drawn once per Raft instance, and the attempt is a per
-// instance counter that refuses to wrap. A delayed response therefore only
-// matches the registration it was produced for. A registration retires on its
-// first settlement (response, cancellation, route change or Stop) and its
-// request ID may be registered again under a new token.
+// registration's token. Tokens are never reissued: the incarnation is supplied
+// by the owner through Options.ForwardIncarnation and must be durably reserved
+// and strictly larger than every earlier incarnation of the node (the Config
+// Raft owner reserves it in its storage before constructing Raft), and the
+// attempt is a per instance counter that refuses to wrap. A delayed response
+// therefore only matches the registration it was produced for. Without a
+// reserved incarnation (zero) forwarding is refused before anything is sent.
+// A registration retires on its first settlement (response, cancellation,
+// route change or Stop) and its request ID may be registered again under a new
+// token.
 //
 // Mixed versions: a leader that predates the token answers with zero header
 // fields. Such a response cannot be attributed to an attempt, so it never
@@ -59,29 +62,25 @@ type forwardTokenSource struct {
 	next        uint64
 }
 
-func newForwardTokenSource() forwardTokenSource {
-	return forwardTokenSource{incarnation: randomIncarnation(), next: 1}
+var (
+	errForwardIncarnationUnset  = errors.New("raft: forwarding incarnation not reserved")
+	errForwardAttemptsExhausted = errors.New("raft: forwarding attempt space exhausted")
+)
+
+func newForwardTokenSource(incarnation uint64) forwardTokenSource {
+	return forwardTokenSource{incarnation: incarnation, next: 1}
 }
 
-func randomIncarnation() uint64 {
-	var b [8]byte
-	for {
-		if _, err := rand.Read(b[:]); err != nil {
-			panic("raft: read forwarding incarnation: " + err.Error())
-		}
-		if v := binary.BigEndian.Uint64(b[:]); v != 0 {
-			return v
-		}
+func (s *forwardTokenSource) issue() (forwardToken, error) {
+	if s.incarnation == 0 {
+		return forwardToken{}, errForwardIncarnationUnset
 	}
-}
-
-func (s *forwardTokenSource) issue() (forwardToken, bool) {
 	if s.next == math.MaxUint64 {
-		return forwardToken{}, false
+		return forwardToken{}, errForwardAttemptsExhausted
 	}
 	t := forwardToken{incarnation: s.incarnation, attempt: s.next}
 	s.next++
-	return t, true
+	return t, nil
 }
 
 type forwardRegistration struct {
@@ -95,6 +94,8 @@ type forwardRegistration struct {
 type ForwardIdentityStats struct {
 	Pending, PendingHighWater                             uint64
 	Registered, Retired, DuplicateRejected, LimitRejected uint64
+	// Forwarding refused because no sender incarnation was reserved.
+	UnreservedRejected uint64
 	// Responses ignored because they cannot settle a live registration.
 	UnechoedResponses, StaleResponses, SenderMismatches uint64
 }
@@ -103,6 +104,7 @@ type ForwardIdentityStats struct {
 type forwardStats struct {
 	highWater                                             int
 	registered, retired, duplicateRejected, limitRejected uint64
+	unreservedRejected                                    uint64
 	unechoed, stale, senderMismatch                       uint64
 }
 
@@ -111,15 +113,16 @@ func (r *Raft) ForwardIdentityStats() ForwardIdentityStats {
 	defer r.forwardMu.Unlock()
 	st := r.forwardStats
 	return ForwardIdentityStats{
-		Pending:           uint64(len(r.forwardPending)),
-		PendingHighWater:  uint64(st.highWater),
-		Registered:        st.registered,
-		Retired:           st.retired,
-		DuplicateRejected: st.duplicateRejected,
-		LimitRejected:     st.limitRejected,
-		UnechoedResponses: st.unechoed,
-		StaleResponses:    st.stale,
-		SenderMismatches:  st.senderMismatch,
+		Pending:            uint64(len(r.forwardPending)),
+		PendingHighWater:   uint64(st.highWater),
+		Registered:         st.registered,
+		Retired:            st.retired,
+		DuplicateRejected:  st.duplicateRejected,
+		LimitRejected:      st.limitRejected,
+		UnreservedRejected: st.unreservedRejected,
+		UnechoedResponses:  st.unechoed,
+		StaleResponses:     st.stale,
+		SenderMismatches:   st.senderMismatch,
 	}
 }
 

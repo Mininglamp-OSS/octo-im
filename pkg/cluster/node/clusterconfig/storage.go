@@ -487,6 +487,22 @@ func (p *PebbleShardLogStorage) SaveHardState(state types.HardState) error {
 	return p.db.Set(key.NewHardStateKey(), state.Marshal(), pebble.Sync)
 }
 
+func (p *PebbleShardLogStorage) senderIncarnation() ([]byte, bool, error) {
+	data, closer, err := p.db.Get(key.NewSenderIncarnationKey())
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	defer closer.Close()
+	return append([]byte(nil), data...), true, nil
+}
+
+func (p *PebbleShardLogStorage) saveSenderIncarnation(data []byte) error {
+	return p.db.Set(key.NewSenderIncarnationKey(), data, pebble.Sync)
+}
+
 func (p *PebbleShardLogStorage) hardState() (types.HardState, error) {
 	var state types.HardState
 	data, closer, err := p.db.Get(key.NewHardStateKey())

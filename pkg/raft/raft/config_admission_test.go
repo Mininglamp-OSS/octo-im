@@ -102,7 +102,7 @@ func studyNew(t *testing.T, multi bool) *studyCluster {
 	}
 	for _, id := range replicas {
 		s := &studyStorage{terms: make(map[uint32]uint64)}
-		r := New(NewOptions(WithNodeId(id), WithReplicas(replicas), WithStorage(s), WithTransport(c.tr)))
+		r := New(NewOptions(WithNodeId(id), WithReplicas(replicas), WithStorage(s), WithTransport(c.tr), withTestIncarnation()))
 		if multi {
 			if id == 1 {
 				r.BecomeLeader(1)

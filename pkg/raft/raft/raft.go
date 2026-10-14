@@ -76,7 +76,7 @@ func New(opts *Options) *Raft {
 		fowardProposeWait: wt.New(),
 		pool:              pool,
 		forwardPending:    make(map[string]forwardRegistration),
-		forwardToken:      newForwardTokenSource(),
+		forwardToken:      newForwardTokenSource(opts.ForwardIncarnation),
 	}
 	r.wait.applied = raftState.AppliedIndex
 	r.wait.readLogs = opts.Storage.GetLogs

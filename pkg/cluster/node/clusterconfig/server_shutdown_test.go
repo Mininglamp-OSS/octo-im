@@ -95,6 +95,8 @@ func TestServerShutdownStorageOwner(t *testing.T) {
 				require.NoError(t, st.PebbleShardLogStorage.AppendLogs([]types.Log{{Id: 1700, Index: 1, Term: 1, Data: data}}, nil))
 				require.NoError(t, st.setAppliedIndex(1))
 			}
+			s.senderIncarnation, err = reserveSenderIncarnation(st)
+			require.NoError(t, err)
 			require.NoError(t, s.initRaft())
 			require.NoError(t, s.raft.Start())
 			leader := uint64(1)
