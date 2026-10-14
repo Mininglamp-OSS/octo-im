@@ -58,7 +58,9 @@ func newWaitTestGroup(t *testing.T, options ...Option) *RaftGroup {
 		default:
 			g.Stop()
 		}
-		g.goPool.Release()
+		if err := g.goPool.ReleaseTimeout(time.Second); err != nil {
+			t.Errorf("pool join: %v", err)
+		}
 	})
 	return g
 }
@@ -105,9 +107,29 @@ func TestProposeUntilAppliedForwardedCompletionAndDeadline(t *testing.T) {
 				transport.group = g
 				g.RemoveRaft(g.GetRaft("slot"))
 				g.AddRaft(&waitTestFollower{waitTestRaft: &waitTestRaft{}, applied: applied})
+				published := make(chan struct{}, 1)
+				bucket := g.wait.bucket("slot")
+				bucket.observe = func(_ receipt, phase string, _ error) {
+					if phase == "publish" {
+						published <- struct{}{}
+					}
+				}
 				for iteration := 0; iteration < 100; iteration++ {
+					// Exercise actual apply-before-registration and registration-before-
+					// apply schedules. An apply notification now dispatches verification;
+					// it is publication, rather than dispatch, that must precede expiry.
+					bucket.mu.Lock()
+					bucket.applied["slot"] = applied
+					bucket.mu.Unlock()
 					ctx := &applyDeadlineContext{Context: context.Background(), done: make(chan struct{}), at: 2,
-						apply: func() { g.wait.didApply("slot", 1, nil) }}
+						apply: func() {
+							g.wait.didApply("slot", 1, nil)
+							select {
+							case <-published:
+							case <-time.After(time.Second):
+								t.Fatal("verification did not publish before expiry")
+							}
+						}}
 					responses, err := g.ProposeBatchUntilAppliedTimeout(ctx, "slot", types.ProposeReqSet{{Id: 1}})
 					if storedID == 1 && (err != nil || len(responses) != 1 || responses[0].Index != 1) {
 						t.Fatalf("forwarded completion lost: responses=%v err=%v", responses, err)
