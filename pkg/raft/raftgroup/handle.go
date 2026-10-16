@@ -12,7 +12,7 @@ import (
 // 处理存储请求
 func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 		err := rg.opts.Storage.AppendLogs(r.Key(), e.Logs, e.TermStartIndexInfo)
 		if err != nil {
 			rg.Panic("append logs failed", zap.Error(err))
@@ -43,7 +43,7 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 	// Capture mutable Raft state on its owner before launching storage work.
 	lastIndex := r.LastLogIndex()
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 		// 获取裁断日志下标
 		var (
 			trunctIndex uint64
@@ -116,7 +116,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 		err := rg.opts.Storage.TruncateLogTo(r.Key(), e.Index)
 		if err != nil {
 			rg.Error("truncate logs failed", zap.Error(err))
@@ -152,10 +152,14 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 		// 已提交
 		// rg.wait.didCommit(r.Key(), e.EndIndex-1)
-		var lastLogIndex uint64
+		var (
+			lastLogIndex uint64
+			logs         []types.Log
+			err          error
+		)
 		if storage, ok := rg.opts.Storage.(CommittedRangeApplier); ok && !rg.opts.NotNeedApplied {
 			if err := storage.ApplyCommittedRange(r.Key(), e.StartIndex, e.EndIndex); err != nil {
 				rg.Error("apply committed range failed", zap.Error(err))
@@ -164,7 +168,7 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			}
 			lastLogIndex = e.EndIndex - 1
 		} else if !rg.opts.NotNeedApplied {
-			logs, err := rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, min(e.EndIndex, e.StartIndex+1000), rg.opts.MaxLogSizePerBatch)
+			logs, err = rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, min(e.EndIndex, e.StartIndex+1000), rg.opts.MaxLogSizePerBatch)
 			if err != nil {
 				rg.Error("get logs failed", zap.Error(err))
 				rg.AddEvent(r.Key(), types.Event{
@@ -200,8 +204,8 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			Reason: types.ReasonOk,
 			Index:  lastLogIndex,
 		})
-		// 已应用
-		rg.wait.didApply(r.Key(), lastLogIndex)
+		// 已应用：按回执身份完成等待者（NotNeedApplied 时 logs 为 nil）
+		rg.wait.didApply(r.Key(), lastLogIndex, logs)
 		rg.Advance()
 	})
 	if err != nil {
@@ -269,7 +273,7 @@ func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Eve
 
 func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 
 		var (
 			newCfg        types.Config

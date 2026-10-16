@@ -31,7 +31,7 @@ func newConversationConsistencyServer(t *testing.T, decorate func(*Server)) (*Se
 		decorate(s)
 	}
 	require.NoError(t, s.Start())
-	t.Cleanup(s.Stop)
+	t.Cleanup(func() { require.NoError(t, s.Stop()) })
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 	require.NoError(t, s.WaitAllSlotReady(ctx, 1))

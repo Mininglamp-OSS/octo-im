@@ -12,6 +12,7 @@ func (n *Node) BecomeCandidate() {
 	if n.cfg.Role == types.RoleLeader {
 		n.Panic("invalid transition [leader -> candidate]")
 	}
+	defer n.fenceProposals(n.IsLeader(), n.cfg.Term)
 	n.setTerm(n.cfg.Term + 1)
 	n.stepFunc = n.stepCandidate
 	n.reset()
@@ -26,6 +27,7 @@ func (n *Node) BecomeFollower(term uint32, leaderId uint64) {
 	if term < n.cfg.Term {
 		return
 	}
+	defer n.fenceProposals(n.IsLeader(), n.cfg.Term)
 	n.setTerm(term)
 	n.stepFunc = n.stepFollower
 	n.reset()
@@ -45,6 +47,7 @@ func (n *Node) BecomeLeader(term uint32) {
 	if term < n.cfg.Term {
 		return
 	}
+	defer n.fenceProposals(n.IsLeader(), n.cfg.Term)
 	n.setTerm(term)
 	n.stepFunc = n.stepLeader
 	n.reset()
@@ -64,6 +67,7 @@ func (n *Node) BecomeLearner(term uint32, leaderId uint64) {
 	if term < n.cfg.Term {
 		return
 	}
+	defer n.fenceProposals(n.IsLeader(), n.cfg.Term)
 	n.setTerm(term)
 	n.stepFunc = n.stepLearner
 	n.reset()
@@ -85,6 +89,7 @@ func (n *Node) reset() {
 		votes: make(map[uint64]bool),
 	}
 	n.stopPropose = false
+	n.dropDeferredTruncate()
 	n.syncState.replicaSync = make(map[uint64]*SyncInfo)
 	n.onlySync = false
 	n.suspend = false

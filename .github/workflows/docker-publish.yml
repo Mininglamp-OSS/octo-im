@@ -1,0 +1,179 @@
+name: Docker Publish (PR preview)
+run-name: PR70 image ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional tag; must equal test-pr70- followed by the first 12 characters of the dispatched commit SHA.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr70-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/mininglamp-oss/octo-im
+
+jobs:
+  validate:
+    name: Validate preview source and tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      revision: ${{ steps.meta.outputs.revision }}
+      commit_date: ${{ steps.meta.outputs.commit_date }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate immutable test image identity
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/fix/config-raft-admission-c0-3" ]; then
+            echo '::error::This preview workflow is restricted to the PR70 source branch.'
+            exit 1
+          fi
+          revision="$(git rev-parse HEAD)"
+          if [ "$revision" != "$GITHUB_SHA" ] || [ -n "$(git status --porcelain)" ]; then
+            echo '::error::Checkout must be the dispatched commit with a clean source tree.'
+            exit 1
+          fi
+          tag="test-pr70-${GITHUB_SHA:0:12}"
+          if [ -n "$INPUT_TAG" ] && [ "$INPUT_TAG" != "$tag" ]; then
+            echo "::error::Only the source-specific tag '$tag' is permitted."
+            exit 1
+          fi
+          printf 'tag=%s\nrevision=%s\ncommit_date=%s\n' "$tag" "$revision" "$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+          printf 'Source: `%s`\n\nImage: `%s:%s`\n' "$revision" "$IMAGE_NAME" "$tag" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build native ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up exact Go version for contract tests
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.23.0'
+      - name: Verify image build contracts
+        env:
+          GOTOOLCHAIN: local
+        run: go test ./test/ci -count=1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to this repository's GHCR package
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push preview by digest
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: ./Dockerfile.pr
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            SOURCE_REVISION=${{ needs.validate.outputs.revision }}
+            SOURCE_DATE=${{ needs.validate.outputs.commit_date }}
+            SOURCE_VERSION=${{ needs.validate.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/Mininglamp-OSS/octo-im
+            org.opencontainers.image.revision=${{ needs.validate.outputs.revision }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.tag }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=pr70-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=pr70-${{ matrix.arch }}
+          provenance: false
+      - name: Export platform digest
+        env:
+          BUILD_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Build returned an invalid digest.'
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${BUILD_DIGEST#sha256:}"
+      - name: Upload platform digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr70-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 7
+
+  merge:
+    name: Publish two-platform preview manifest
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: pr70-digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish only the source-specific preview tag
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for file in *; do
+            if [[ ! "$file" =~ ^[0-9a-f]{64}$ ]]; then
+              echo '::error::Invalid digest artifact.'
+              exit 1
+            fi
+            sources+=("${IMAGE_NAME}@sha256:${file}")
+          done
+          if [ "${#sources[@]}" -ne 2 ]; then
+            echo '::error::Both native platform digests are required.'
+            exit 1
+          fi
+          docker buildx imagetools create -t "${IMAGE_NAME}:${TAG}" "${sources[@]}"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}"
+          docker buildx imagetools inspect --raw "${IMAGE_NAME}:${TAG}" > "$RUNNER_TEMP/manifest.json"
+          jq -e '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]' "$RUNNER_TEMP/manifest.json"
+          printf 'Published `%s:%s`\n\n' "$IMAGE_NAME" "$TAG" >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}" >> "$GITHUB_STEP_SUMMARY"

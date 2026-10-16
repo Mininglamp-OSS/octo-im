@@ -385,7 +385,9 @@ func (s *Server) Stop() error {
 		s.conversationManager.Stop()
 	}
 
-	s.clusterServer.Stop()
+	// A cluster storage ownership error keeps that storage open, but must not
+	// skip the storage-independent teardown below. It is returned afterwards.
+	clusterErr := s.clusterServer.Stop()
 
 	if s.opts.Demo.On {
 		s.demoServer.Stop()
@@ -400,6 +402,10 @@ func (s *Server) Stop() error {
 	s.tagManager.Stop()
 
 	s.webhook.Stop()
+
+	if clusterErr != nil {
+		return fmt.Errorf("cluster stop: %w", clusterErr)
+	}
 
 	s.Info("Server is stopped")
 

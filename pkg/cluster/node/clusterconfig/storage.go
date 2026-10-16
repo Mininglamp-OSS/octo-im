@@ -16,6 +16,7 @@ import (
 
 type PebbleShardLogStorage struct {
 	db     *pebble.DB
+	closed bool
 	path   string
 	wo     *pebble.WriteOptions
 	noSync *pebble.WriteOptions
@@ -33,22 +34,34 @@ func NewPebbleShardLogStorage(path string, s *Server) *PebbleShardLogStorage {
 	}
 }
 
+// Open and Close are serialized by the owning Server's lifecycle. A failed
+// Open leaves the current handle untouched.
 func (p *PebbleShardLogStorage) Open() error {
-	var err error
-	p.db, err = pebble.Open(p.path, &pebble.Options{
+	if p.db != nil && !p.closed {
+		return errors.New("config storage already open")
+	}
+	db, err := pebble.Open(p.path, &pebble.Options{
 		FormatMajorVersion: pebble.FormatNewest,
 	})
 	if err != nil {
 		return err
 	}
+	p.db = db
+	p.closed = false
 	return nil
 }
 
+// Close is idempotent and a no-op on storage that was never opened. The
+// handle is kept so late misuse fails inside Pebble rather than on nil.
 func (p *PebbleShardLogStorage) Close() error {
+	if p.db == nil || p.closed {
+		return nil
+	}
 	err := p.db.Close()
 	if err != nil {
 		return err
 	}
+	p.closed = true
 	return nil
 }
 
@@ -485,6 +498,22 @@ func (p *PebbleShardLogStorage) saveMaxIndexWithWriter(index uint64, w pebble.Wr
 
 func (p *PebbleShardLogStorage) SaveHardState(state types.HardState) error {
 	return p.db.Set(key.NewHardStateKey(), state.Marshal(), pebble.Sync)
+}
+
+func (p *PebbleShardLogStorage) senderIncarnation() ([]byte, bool, error) {
+	data, closer, err := p.db.Get(key.NewSenderIncarnationKey())
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	defer closer.Close()
+	return append([]byte(nil), data...), true, nil
+}
+
+func (p *PebbleShardLogStorage) saveSenderIncarnation(data []byte) error {
+	return p.db.Set(key.NewSenderIncarnationKey(), data, pebble.Sync)
 }
 
 func (p *PebbleShardLogStorage) hardState() (types.HardState, error) {

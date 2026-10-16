@@ -61,3 +61,6 @@ func NewAppliedIndexKey() []byte {
 }
 
 func NewHardStateKey() []byte { return []byte{0x5, 0x5, 0, 0} }
+
+// NewSenderIncarnationKey holds the last reserved forwarding sender incarnation.
+func NewSenderIncarnationKey() []byte { return []byte{0x6, 0x6, 0, 0} }

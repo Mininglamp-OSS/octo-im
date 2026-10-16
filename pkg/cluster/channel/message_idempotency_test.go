@@ -81,7 +81,7 @@ func retryServer(t *testing.T, id uint64, db wkdb.DB, replicas []uint64, tr *ret
 	t.Helper()
 	s := NewServer(NewOptions(WithNodeId(id), WithDB(db), WithGroupCount(1), WithTransport(tr)))
 	require.NoError(t, s.Start())
-	t.Cleanup(s.Stop)
+	t.Cleanup(func() { stopServer(t, s) })
 	tr.mu.Lock()
 	tr.nodes[id] = s
 	tr.mu.Unlock()
