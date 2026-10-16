@@ -196,6 +196,9 @@ func (s *Server) initRaft() error {
 	return nil
 }
 
+// quiescenceWarnInterval paces the warning while Stop waits for workers.
+var quiescenceWarnInterval = 10 * time.Second
+
 // Stop settles callers and starts one tracked resource-close lifecycle. Synchronous
 // storage I/O can keep that lifecycle pending; WaitStopped exposes its result.
 func (s *Server) Stop() {
@@ -217,7 +220,9 @@ func (s *Server) Stop() {
 			// so WaitStopped's deadline also bounds this ownership boundary.
 			r.Stop()
 			// Keep Storage and dependent server state alive until every worker exits.
-			s.closeErr = r.WaitQuiescence(context.Background())
+			s.closeErr = wkutil.WaitReportingSlow(r.WaitQuiescence, quiescenceWarnInterval, func(elapsed time.Duration) {
+				s.Warn("clusterconfig shutdown still waiting for workers to quiesce; storage stays open", zap.Duration("elapsed", elapsed))
+			})
 			if s.closeErr == nil {
 				s.closeErr = s.storage.Close()
 			}

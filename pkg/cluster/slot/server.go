@@ -6,6 +6,7 @@ import (
 	"path"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -68,6 +69,9 @@ func (s *Server) Start() error {
 	return nil
 }
 
+// quiescenceWarnInterval paces the warning while Stop waits for workers.
+var quiescenceWarnInterval = 10 * time.Second
+
 // StopWithContext starts the single shutdown lifecycle and waits for it within
 // ctx. The lifecycle joins the RaftGroup event loop and every pool task that
 // may read or write storage, then closes storage once. On a deadline storage
@@ -79,7 +83,10 @@ func (s *Server) StopWithContext(ctx context.Context) error {
 		go func() {
 			defer close(s.stopDone)
 			// The lifecycle owns storage, so it waits without a deadline.
-			if err := s.raftGroup.WaitQuiescence(context.Background()); err != nil {
+			err := wkutil.WaitReportingSlow(s.raftGroup.WaitQuiescence, quiescenceWarnInterval, func(elapsed time.Duration) {
+				s.Warn("slot shutdown still waiting for workers to quiesce; storage stays open", zap.Duration("elapsed", elapsed))
+			})
+			if err != nil {
 				s.stopErr = err
 				return
 			}
