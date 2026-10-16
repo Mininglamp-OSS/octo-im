@@ -33,7 +33,23 @@ type serverStorage interface {
 	LastIndex() (uint64, error)
 }
 
+type lifecycleState uint8
+
+const (
+	lifecycleNew lifecycleState = iota
+	lifecycleStarted
+	lifecycleStopped
+)
+
+// A Server runs at most one lifecycle: New, Start, Stop. Stop closes Storage
+// asynchronously once workers quiesce, so the same instance cannot safely
+// reopen it; Start after Start or Stop returns ErrServerLifecycle. Restart by
+// constructing a new Server on the same directory.
 type Server struct {
+	// lifecycleMu serializes Start against Stop's handoff of s.raft.
+	lifecycleMu sync.Mutex
+	lifecycle   lifecycleState
+
 	stopOnce  sync.Once
 	closeDone chan struct{}
 	closeErr  error
@@ -92,6 +108,13 @@ func mkDirAll(p string) error {
 }
 
 func (s *Server) Start() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.lifecycle != lifecycleNew {
+		return ErrServerLifecycle
+	}
+	// A failed Start still consumes the lifecycle; it owns nothing afterwards.
+	s.lifecycle = lifecycleStarted
 
 	err := s.storage.Open()
 	if err != nil {
@@ -177,19 +200,24 @@ func (s *Server) initRaft() error {
 // storage I/O can keep that lifecycle pending; WaitStopped exposes its result.
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
-		if s.raft == nil {
+		// Waits for an in-progress Start; any later Start is refused.
+		s.lifecycleMu.Lock()
+		s.lifecycle = lifecycleStopped
+		r := s.raft
+		s.lifecycleMu.Unlock()
+		if r == nil {
 			// Start never succeeded and owns no Storage.
 			close(s.closeDone)
 			return
 		}
-		s.raft.BeginStop()
+		r.BeginStop()
 		go func() {
 			// Stop joins the event loop, whose durable hard-state write may
 			// itself be blocked. Include that join in the tracked lifecycle
 			// so WaitStopped's deadline also bounds this ownership boundary.
-			s.raft.Stop()
+			r.Stop()
 			// Keep Storage and dependent server state alive until every worker exits.
-			s.closeErr = s.raft.WaitQuiescence(context.Background())
+			s.closeErr = r.WaitQuiescence(context.Background())
 			if s.closeErr == nil {
 				s.closeErr = s.storage.Close()
 			}
