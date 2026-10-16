@@ -278,8 +278,7 @@ func (n *Node) stepFollower(e types.Event) error {
 			if n.truncating {
 				return nil
 			}
-			n.truncating = true
-			n.sendTruncateReq(e.Index)
+			n.requestTruncate(e.Index)
 			n.advance()
 		default:
 			n.Error("sync error", zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.String("reason", e.Reason.String()))
@@ -304,6 +303,7 @@ func (n *Node) stepFollower(e types.Event) error {
 			n.sendSyncReq()
 			n.advance()
 		}
+		n.releaseDeferredTruncate()
 
 	case types.ConfigResp: // 配置返回
 		return n.switchRemoteConfig(e.Config)
@@ -380,8 +380,7 @@ func (n *Node) stepLearner(e types.Event) error {
 			if n.truncating {
 				return nil
 			}
-			n.truncating = true
-			n.sendTruncateReq(e.Index)
+			n.requestTruncate(e.Index)
 			n.advance()
 		} else {
 			n.Error("sync error", zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.String("reason", e.Reason.String()))
@@ -405,6 +404,7 @@ func (n *Node) stepLearner(e types.Event) error {
 			n.sendSyncReq()
 			n.advance()
 		}
+		n.releaseDeferredTruncate()
 
 	case types.ConfigResp: // 配置返回
 		return n.switchRemoteConfig(e.Config)
@@ -685,4 +685,48 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 			n.stopPropose = true // 停止提案
 		}
 	}
+}
+
+// requestTruncate starts a follower or learner truncation. Storage runs the
+// store and the truncation as independent tasks, so a truncation dispatched
+// while a store is in flight can complete first: the late store then writes
+// the discarded entries back, and its StoreResp reports an index the queue no
+// longer holds. Such a truncation therefore waits for the in-flight store.
+// truncating stays set meanwhile, so no sync or new store starts.
+func (n *Node) requestTruncate(index uint64) {
+	n.truncating = true
+	if n.queue.appending {
+		n.deferredTruncate = index
+		n.hasDeferredTruncate = true
+		return
+	}
+	n.sendTruncateReq(index)
+}
+
+// storeHeldForTruncate reports that a follower or learner truncation is
+// pending, deferred or dispatched; no store may start until it completes.
+// Leaders never truncate their own log and are not held.
+func (n *Node) storeHeldForTruncate() bool {
+	return n.truncating && !n.IsLeader()
+}
+
+// dropDeferredTruncate forgets a truncation that never reached storage. It
+// runs on every role change: the new leader asks for a truncation again if one
+// is still needed.
+func (n *Node) dropDeferredTruncate() {
+	if n.hasDeferredTruncate {
+		n.hasDeferredTruncate = false
+		n.truncating = false
+	}
+}
+
+// releaseDeferredTruncate dispatches a truncation that waited for the store
+// that just returned, whatever its outcome.
+func (n *Node) releaseDeferredTruncate() {
+	if !n.hasDeferredTruncate || n.queue.appending {
+		return
+	}
+	n.hasDeferredTruncate = false
+	n.sendTruncateReq(n.deferredTruncate)
+	n.advance()
 }
