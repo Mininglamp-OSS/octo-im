@@ -186,8 +186,9 @@ func errorsIsAll(err error, targets ...error) bool {
 	return true
 }
 
-// Stale, foreign, unechoed and wrong-sender responses never settle or retire a
-// live registration; only the exact echoed token from the routed leader does.
+// Stale, foreign, unechoed (from a token-aware leader) and wrong-sender
+// responses never settle or retire a live registration; only the exact echoed
+// token from the routed leader does.
 func TestConfigForwardTokenMismatch(t *testing.T) {
 	c := studyNew(t, true)
 	r := c.rr[1]
@@ -214,10 +215,12 @@ func TestConfigForwardTokenMismatch(t *testing.T) {
 	foreign.Logs[0].Index = other.forwardToken.incarnation
 	versioned := studyResponse(t, live, 1, types.ReasonOk, resps)
 	versioned.Logs[0].Term = forwardTokenVersion + 1
+	// An echoed token, even a stale one, shows the leader is token-aware in
+	// this term, so a zero-header response from it is unattributable.
+	r.Step(studyResponse(t, older, 1, types.ReasonOk, resps))
 	for name, e := range map[string]types.Event{
 		"unechoed":       unechoed,
 		"unknownVersion": versioned,
-		"olderAttempt":   studyResponse(t, older, 1, types.ReasonOk, resps),
 		"otherInstance":  foreign,
 		"wrongSender":    studyResponse(t, live, 3, types.ReasonOk, resps),
 		"rejectedOlder":  studyResponse(t, older, 1, types.ReasonError, resps),
@@ -353,23 +356,10 @@ func TestConfigForwardRequiresReservedIncarnation(t *testing.T) {
 	require.Zero(t, st.LimitRejected)
 }
 
-// Mixed versions: an upgraded follower facing a legacy leader never reports a
-// false outcome and ends at its deadline; a legacy follower facing an upgraded
-// leader receives the zero header it sent.
+// Mixed versions: a legacy follower facing an upgraded leader receives the
+// zero header it sent. The upgraded follower facing a legacy leader is covered
+// in forward_compat_test.go.
 func TestConfigForwardMixedVersion(t *testing.T) {
-	t.Run("legacy_leader", func(t *testing.T) {
-		rt := newForwardRouter(t)
-		rt.legacy.Store(true)
-		r := rt.c.rr[1]
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-		defer cancel()
-		_, err := r.ProposeBatchUntilAppliedTimeout(ctx, types.ProposeReqSet{{Id: 1900, Data: []byte("mixed")}})
-		require.ErrorIs(t, err, types.ErrProposalOutcomeUnknown)
-		require.ErrorIs(t, err, context.DeadlineExceeded)
-		st := requireForwardQuiescent(t, r)
-		require.EqualValues(t, 1, st.UnechoedResponses)
-		require.Equal(t, ProposalOutcomes{Unknown: 1}, r.ProposalOutcomes())
-	})
 	t.Run("legacy_follower", func(t *testing.T) {
 		c := studyNew(t, true)
 		leader := c.rr[0]

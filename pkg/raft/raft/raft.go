@@ -44,6 +44,7 @@ type Raft struct {
 	forwardPending map[string]forwardRegistration
 	forwardToken   forwardTokenSource
 	forwardStats   forwardStats
+	forwardPeers   map[uint64]forwardPeer
 }
 
 func New(opts *Options) *Raft {
@@ -76,6 +77,7 @@ func New(opts *Options) *Raft {
 		fowardProposeWait: wt.New(),
 		pool:              pool,
 		forwardPending:    make(map[string]forwardRegistration),
+		forwardPeers:      make(map[uint64]forwardPeer),
 		forwardToken:      newForwardTokenSource(opts.ForwardIncarnation),
 	}
 	r.wait.applied = raftState.AppliedIndex

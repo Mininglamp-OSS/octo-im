@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	"go.uber.org/zap"
 )
 
 // Forwarded proposal correlation (attempt token, version 1).
@@ -27,12 +28,24 @@ import (
 // route change or Stop) and its request ID may be registered again under a new
 // token.
 //
-// Mixed versions: a leader that predates the token answers with zero header
-// fields. Such a response cannot be attributed to an attempt, so it never
-// settles or retires a registration; the caller ends at its own deadline as
-// outcome-unknown. Older followers send zero tokens and ignore the echo, so
-// their behaviour is unchanged. Forwarded Config proposals from upgraded
-// followers need an upgraded leader to complete.
+// Mixed versions (rolling upgrade or rollback, in any order):
+//   - Older followers send zero headers and ignore the echo; an upgraded
+//     leader echoes the zero header, so their behaviour is unchanged.
+//   - A leader that predates the token answers with zero header fields. The
+//     follower then falls back to the previous release's correlation: the
+//     response settles the live registration for its request ID if it came
+//     from that registration's leader. fowardPropose still checks the response
+//     IDs and indexes, and the receipt still verifies Id, Index and Data of the
+//     applied entry, so a misattributed response can end as unknown or
+//     superseded but never as a false success. A rejection settles as
+//     outcome-unknown immediately instead of at the caller's deadline. The
+//     first such response per leader and term is logged at WARN and every one
+//     is counted (LegacyResponses, LegacySettled).
+//   - A leader that echoed a token while this node's view is in term T is
+//     token-aware for T, and a zero-header response attributed to it in T is
+//     dropped as unattributable (UnechoedResponses). A restarted or rolled-back
+//     leader can only lead again in a later term, which clears the observation.
+//   - A response with any other header version is dropped and logged.
 const forwardTokenVersion uint32 = 1
 
 // configForwardLiveLimit bounds simultaneously live forwarded registrations.
@@ -98,6 +111,9 @@ type ForwardIdentityStats struct {
 	UnreservedRejected uint64
 	// Responses ignored because they cannot settle a live registration.
 	UnechoedResponses, StaleResponses, SenderMismatches uint64
+	// Zero-header responses from leaders that predate the token, and those
+	// that settled a registration by request ID.
+	LegacyResponses, LegacySettled uint64
 }
 
 // forwardStats is guarded by Raft.forwardMu.
@@ -106,6 +122,77 @@ type forwardStats struct {
 	registered, retired, duplicateRejected, limitRejected uint64
 	unreservedRejected                                    uint64
 	unechoed, stale, senderMismatch                       uint64
+	legacy, legacySettled                                 uint64
+}
+
+// forwardPeer is per-leader compatibility state, guarded by Raft.forwardMu.
+type forwardPeer struct {
+	aware     bool   // echoed a token in awareTerm
+	awareTerm uint32 // this node's view term at the time
+	warnTerm  uint32
+	warned    uint8 // forwardWarn classes logged in warnTerm
+}
+
+type forwardWarn uint8
+
+const (
+	warnLegacySettled forwardWarn = 1 << iota
+	warnLegacyDropped
+	warnUnknownVersion
+)
+
+// forwardPeerLimit bounds per-sender state; senders are cluster nodes.
+const forwardPeerLimit = 1024
+
+func (r *Raft) forwardPeerLocked(from uint64) forwardPeer {
+	if _, ok := r.forwardPeers[from]; !ok && len(r.forwardPeers) >= forwardPeerLimit {
+		clear(r.forwardPeers)
+	}
+	return r.forwardPeers[from]
+}
+
+func (r *Raft) markTokenAwareLocked(from uint64) {
+	p := r.forwardPeerLocked(from)
+	p.aware, p.awareTerm = true, r.view.Load().(nodeView).term
+	r.forwardPeers[from] = p
+}
+
+// acceptLegacyResponseLocked decides whether a zero-header response may settle
+// the live registration for key. The caller holds forwardMu.
+func (r *Raft) acceptLegacyResponseLocked(key string, from uint64) bool {
+	r.forwardStats.legacy++
+	if p := r.forwardPeerLocked(from); p.aware && p.awareTerm == r.view.Load().(nodeView).term {
+		r.forwardStats.unechoed++
+		r.warnForwardLocked(from, warnLegacyDropped, "zero-header forwarding response from a token-aware leader dropped")
+		return false
+	}
+	reg, ok := r.forwardPending[key]
+	if !ok {
+		r.forwardStats.stale++
+		return false
+	}
+	if reg.leader != from {
+		r.forwardStats.senderMismatch++
+		return false
+	}
+	r.forwardStats.legacySettled++
+	r.warnForwardLocked(from, warnLegacySettled, "leader predates forwarding tokens; settling forwarded proposals by request ID until it is upgraded")
+	return true
+}
+
+// warnForwardLocked logs class at most once per sender and view term.
+func (r *Raft) warnForwardLocked(from uint64, class forwardWarn, msg string, fields ...zap.Field) {
+	term := r.view.Load().(nodeView).term
+	p := r.forwardPeerLocked(from)
+	if p.warnTerm != term {
+		p.warnTerm, p.warned = term, 0
+	}
+	if p.warned&uint8(class) != 0 {
+		return
+	}
+	p.warned |= uint8(class)
+	r.forwardPeers[from] = p
+	r.Warn(msg, append(fields, zap.Uint64("leader", from), zap.Uint32("viewTerm", term))...)
 }
 
 func (r *Raft) ForwardIdentityStats() ForwardIdentityStats {
@@ -123,6 +210,8 @@ func (r *Raft) ForwardIdentityStats() ForwardIdentityStats {
 		UnechoedResponses:  st.unechoed,
 		StaleResponses:     st.stale,
 		SenderMismatches:   st.senderMismatch,
+		LegacyResponses:    st.legacy,
+		LegacySettled:      st.legacySettled,
 	}
 }
 

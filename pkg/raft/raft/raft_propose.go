@@ -65,9 +65,12 @@ func (r *Raft) proposeUntilApplied(ctx context.Context, reqs []types.ProposeReq)
 	if err != nil {
 		return nil, err
 	}
+	// The leader assigns the term and the response does not carry it; the
+	// route's term is only this node's view. Term 0 leaves it unverified, as
+	// in raftgroup: Id, Index and Data identify the entry.
 	logs := make([]types.Log, len(reqs))
 	for i, req := range reqs {
-		logs[i] = types.Log{Id: req.Id, Index: resps[i].Index, Term: route.term, Data: append([]byte(nil), req.Data...)}
+		logs[i] = types.Log{Id: req.Id, Index: resps[i].Index, Data: append([]byte(nil), req.Data...)}
 	}
 	r.forwardMu.Lock()
 	// Commit progress is not a routing change. Generation changes only
@@ -179,19 +182,27 @@ func (r *Raft) handleSendProposeResp(e types.Event) {
 	key := fmt.Sprintf("%d", resps[len(resps)-1].Id)
 	r.forwardMu.Lock()
 	defer r.forwardMu.Unlock()
-	if e.Logs[0].Term != forwardTokenVersion {
-		// Unattributable legacy response; see forward_token.go.
+	switch {
+	case e.Logs[0].Term == forwardTokenVersion:
+		r.markTokenAwareLocked(e.From)
+		token := forwardToken{incarnation: e.Logs[0].Index, attempt: e.Logs[0].Id}
+		reg, ok := r.forwardPending[key]
+		if !ok || reg.token != token {
+			r.forwardStats.stale++
+			return
+		}
+		if reg.leader != e.From {
+			r.forwardStats.senderMismatch++
+			return
+		}
+	case e.Logs[0].Term == 0 && e.Logs[0].Index == 0 && e.Logs[0].Id == 0:
+		// Zero header: a leader that predates the token; see forward_token.go.
+		if !r.acceptLegacyResponseLocked(key, e.From) {
+			return
+		}
+	default:
 		r.forwardStats.unechoed++
-		return
-	}
-	token := forwardToken{incarnation: e.Logs[0].Index, attempt: e.Logs[0].Id}
-	reg, ok := r.forwardPending[key]
-	if !ok || reg.token != token {
-		r.forwardStats.stale++
-		return
-	}
-	if reg.leader != e.From {
-		r.forwardStats.senderMismatch++
+		r.warnForwardLocked(e.From, warnUnknownVersion, "forwarding response with an unknown token version dropped", zap.Uint32("version", e.Logs[0].Term))
 		return
 	}
 	if e.Reason != types.ReasonOk {
