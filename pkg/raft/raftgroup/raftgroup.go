@@ -8,7 +8,6 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/track"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
-	wt "github.com/WuKongIM/WuKongIM/pkg/wait"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/lni/goutils/syncutil"
 	"github.com/panjf2000/ants/v2"
@@ -33,7 +32,15 @@ type RaftGroup struct {
 
 	wait *wait
 
-	fowardProposeWait wt.Wait // 转发提按给领导等待领导的回应
+	// Forwarded proposals awaiting the leader's response; see forward_token.go.
+	forwardMu          sync.Mutex
+	forwardPending     map[string]*forwardRegistration
+	forwardIncarnation uint64
+	forwardAttempt     uint64
+	forwardStats       forwardStats
+	forwardWarned      map[uint64]uint8
+	// forwardObserve, if set by a test, sees correlation events under forwardMu.
+	forwardObserve func(key, phase, detail string)
 
 	proposalSeq   atomic.Uint64 // receipt identity, unique within the group
 	admissionSems sync.Map      // raftKey -> chan struct{}, see admissionSem
@@ -57,17 +64,19 @@ type RaftGroup struct {
 
 func New(opts *Options) *RaftGroup {
 	rg := &RaftGroup{
-		raftList:          newLinkedList(),
-		stopper:           syncutil.NewStopper(),
-		opts:              opts,
-		advanceC:          make(chan struct{}, 1),
-		readStateC:        make(chan readStateRequest),
-		ownerC:            make(chan ownerRequest),
-		Log:               wklog.NewWKLog(fmt.Sprintf("RaftGroup[%s]", opts.LogPrefix)),
-		mq:                NewEventQueue(opts.ReceiveQueueLength, false, 0, 0),
-		fowardProposeWait: wt.New(),
-		poolIdle:          make(chan struct{}),
-		loopDone:          make(chan struct{}),
+		raftList:           newLinkedList(),
+		stopper:            syncutil.NewStopper(),
+		opts:               opts,
+		advanceC:           make(chan struct{}, 1),
+		readStateC:         make(chan readStateRequest),
+		ownerC:             make(chan ownerRequest),
+		Log:                wklog.NewWKLog(fmt.Sprintf("RaftGroup[%s]", opts.LogPrefix)),
+		mq:                 NewEventQueue(opts.ReceiveQueueLength, false, 0, 0),
+		forwardPending:     make(map[string]*forwardRegistration),
+		forwardIncarnation: newForwardIncarnation(),
+		forwardWarned:      make(map[uint64]uint8),
+		poolIdle:           make(chan struct{}),
+		loopDone:           make(chan struct{}),
 	}
 	rg.wait = newWait(rg.readLog)
 	var err error
@@ -193,7 +202,7 @@ func (rg *RaftGroup) AddEvent(raftKey string, e types.Event) {
 		}
 		return
 	} else if e.Type == types.SendProposeResp {
-		rg.handleSendProposeResp(e)
+		rg.handleSendProposeResp(raftKey, e)
 		return
 	}
 
@@ -219,7 +228,7 @@ func (rg *RaftGroup) TryAddEvent(raftKey string, e types.Event) {
 		rg.handleSendPropose(raftKey, e)
 		return
 	} else if e.Type == types.SendProposeResp {
-		rg.handleSendProposeResp(e)
+		rg.handleSendProposeResp(raftKey, e)
 		return
 	}
 

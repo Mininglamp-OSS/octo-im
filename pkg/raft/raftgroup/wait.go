@@ -1,7 +1,9 @@
 package raftgroup
 
 import (
+	"bytes"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -10,17 +12,35 @@ import (
 
 // receipt identifies one admitted proposal. seq is unique within a RaftGroup
 // and is the waiter identity; term and the index range were assigned by the
-// event loop; lastLogId is checked against the entry applied at last.
+// event loop (or by the leader, for forwarded receipts). logs holds the
+// submitted Id and Data for every index in [first, last]; each applied entry
+// in the range is checked against it.
 type receipt struct {
-	raftKey   string
-	seq       uint64
-	term      uint32
-	first     uint64
-	last      uint64
-	lastLogId uint64
+	raftKey string
+	seq     uint64
+	term    uint32
+	first   uint64
+	last    uint64
+	logs    []types.Log
 	// forwarded receipts come from another node's admission. Their term is not
-	// known here, so they are verified by Id only and are not fenced.
+	// known here, so they are verified by Id and Data only and are not fenced.
 	forwarded bool
+}
+
+// newReceiptLogs pairs the submitted requests with the admitted indexes.
+func newReceiptLogs(reqs []types.ProposeReq, first uint64) []types.Log {
+	logs := make([]types.Log, len(reqs))
+	for i, req := range reqs {
+		logs[i] = types.Log{Id: req.Id, Index: first + uint64(i), Data: req.Data}
+	}
+	return logs
+}
+
+func (r receipt) lastLogId() uint64 {
+	if len(r.logs) == 0 {
+		return 0
+	}
+	return r.logs[len(r.logs)-1].Id
 }
 
 func (r receipt) String() string {
@@ -100,8 +120,8 @@ func (m *wait) didApply(key string, appliedIndex uint64, logs []types.Log) {
 		if w.last > appliedIndex {
 			continue
 		}
-		if log, ok := logAt(logs, w.last); ok {
-			b.completeLocked(w, verifyReceipt(w.receipt, log))
+		if covers(logs, w.first, w.last) {
+			b.completeLocked(w, verifyReceipt(w.receipt, logs))
 			continue
 		}
 		if logs == nil && !w.forwarded {
@@ -121,9 +141,9 @@ func (m *wait) didApply(key string, appliedIndex uint64, logs []types.Log) {
 	}
 }
 
-// verifyStored completes w from the stored entry at w.last. It is used when
-// the applied entry is not available, e.g. a forwarded receipt registered
-// after its index was applied.
+// verifyStored completes w from the stored entries of its range. It is used
+// when the applied batch does not cover the range, e.g. a forwarded receipt
+// registered after its range was applied.
 func (m *wait) verifyStored(w *receiptWaiter) {
 	b := m.bucket(w.raftKey)
 	b.mu.Lock()
@@ -141,20 +161,31 @@ func (m *wait) verifyStored(w *receiptWaiter) {
 }
 
 func (m *wait) readReceipt(w *receiptWaiter) {
-	result := proposalOutcomeUnknown(fmt.Errorf("applied log %d is not readable", w.last))
-	if m.readLog != nil {
-		log, ok, err := m.readLog(w.raftKey, w.last)
-		switch {
-		case err != nil:
-			result = proposalOutcomeUnknown(err)
-		case ok:
-			result = verifyReceipt(w.receipt, log)
-		}
-	}
+	result := m.readRange(w.receipt)
 	b := m.bucket(w.raftKey)
 	b.mu.Lock()
 	b.completeLocked(w, result)
 	b.mu.Unlock()
+}
+
+// readRange point-reads every index of r's range and verifies it. Any missing
+// or unreadable entry leaves the outcome unknown.
+func (m *wait) readRange(r receipt) error {
+	if m.readLog == nil {
+		return proposalOutcomeUnknown(fmt.Errorf("applied log %d is not readable", r.last))
+	}
+	logs := make([]types.Log, 0, r.last-r.first+1)
+	for index := r.first; index <= r.last; index++ {
+		log, ok, err := m.readLog(r.raftKey, index)
+		if err != nil {
+			return proposalOutcomeUnknown(err)
+		}
+		if !ok {
+			return proposalOutcomeUnknown(fmt.Errorf("applied log %d is not readable", index))
+		}
+		logs = append(logs, log)
+	}
+	return verifyReceipt(r, logs)
 }
 
 // detach removes w on behalf of a caller that stops waiting. If w was already
@@ -234,21 +265,31 @@ func (m *wait) pending() int {
 	return n
 }
 
-func logAt(logs []types.Log, index uint64) (types.Log, bool) {
-	if len(logs) == 0 || index < logs[0].Index || index > logs[len(logs)-1].Index {
-		return types.Log{}, false
-	}
-	log := logs[index-logs[0].Index]
-	return log, log.Index == index
+// covers reports whether logs, an ascending contiguous applied batch, holds
+// every index in [first, last].
+func covers(logs []types.Log, first, last uint64) bool {
+	return len(logs) > 0 && logs[0].Index <= first && last <= logs[len(logs)-1].Index
 }
 
-// verifyReceipt checks that log, the entry at r.last, is the one r admitted.
-// A batch is appended by one admission, so the identity of its last entry
-// implies the identity of the whole range.
-func verifyReceipt(r receipt, log types.Log) error {
-	if log.Index != r.last || log.Id != r.lastLogId || (!r.forwarded && log.Term != r.term) {
-		return fmt.Errorf("%w: index %d holds id %d term %d, receipt %s, id %d",
-			types.ErrProposalSuperseded, log.Index, log.Id, log.Term, r, r.lastLogId)
+// verifyReceipt checks every entry of r's range against logs, an ascending
+// range holding [r.first, r.last]. A different Id or Data at any index, or a
+// different term for a leader-local receipt, is superseded; an index logs
+// does not hold, or a receipt without its submitted entries, is unknown.
+func verifyReceipt(r receipt, logs []types.Log) error {
+	if len(r.logs) == 0 || uint64(len(r.logs)) != r.last-r.first+1 {
+		return proposalOutcomeUnknown(fmt.Errorf("receipt %s does not hold its submitted entries", r))
+	}
+	j := sort.Search(len(logs), func(i int) bool { return logs[i].Index >= r.first })
+	for _, want := range r.logs {
+		if j == len(logs) || logs[j].Index != want.Index {
+			return proposalOutcomeUnknown(fmt.Errorf("applied log %d unavailable for receipt %s", want.Index, r))
+		}
+		got := logs[j]
+		if got.Id != want.Id || !bytes.Equal(got.Data, want.Data) || (!r.forwarded && got.Term != r.term) {
+			return fmt.Errorf("%w: index %d holds id %d term %d, receipt %s, id %d",
+				types.ErrProposalSuperseded, got.Index, got.Id, got.Term, r, want.Id)
+		}
+		j++
 	}
 	return nil
 }

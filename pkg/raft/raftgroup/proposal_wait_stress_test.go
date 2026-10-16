@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	wt "github.com/WuKongIM/WuKongIM/pkg/wait"
 	"math/rand"
 	"os"
 	"sort"
@@ -191,41 +190,29 @@ func (n *stressNode) Step(e types.Event) error {
 	return n.IRaft.Step(e)
 }
 
-// stressForwardWait retains the real registry behavior and counts registrations
-// under the same wrapper lock used by Register and Trigger.
+// stressForwardWait records the forwarding registry's correlation events;
+// RaftGroup calls it under forwardMu.
 type stressForwardWait struct {
-	wt.Wait
 	mu     sync.Mutex
-	ids    map[string]bool
 	events map[string][]stressForwardEvent
 }
 
-func (w *stressForwardWait) Register(id string) <-chan interface{} {
+func (w *stressForwardWait) observe(key, phase, detail string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	ch := w.Wait.Register(id)
-	w.ids[id] = true
-	w.events[id] = append(w.events[id], stressForwardEvent{"register", time.Now(), ""})
-	return ch
+	w.events[key] = append(w.events[key], stressForwardEvent{phase, time.Now(), detail})
 }
-func (w *stressForwardWait) Trigger(id string, value interface{}) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.events[id] = append(w.events[id], stressForwardEvent{"trigger", time.Now(), fmt.Sprintf("%T", value)})
-	w.Wait.Trigger(id, value)
-	delete(w.ids, id)
-}
-func (w *stressForwardWait) pending() int { w.mu.Lock(); defer w.mu.Unlock(); return len(w.ids) }
 
 type stressCluster struct {
-	groups     []*RaftGroup
-	stores     []*stressStorage
-	keys       []string
-	leaders    map[string]uint64
-	started    []*RaftGroup
-	shutdown   sync.Once
-	stopped    chan struct{}
-	stopErrors []error
+	forwardWaits []*stressForwardWait
+	groups       []*RaftGroup
+	stores       []*stressStorage
+	keys         []string
+	leaders      map[string]uint64
+	started      []*RaftGroup
+	shutdown     sync.Once
+	stopped      chan struct{}
+	stopErrors   []error
 }
 
 func (c *stressCluster) stop(t *testing.T) {
@@ -270,7 +257,7 @@ func (c *stressCluster) assertCleanup(t *testing.T) {
 			}
 			b.mu.Unlock()
 		}
-		registrations := g.fowardProposeWait.(*stressForwardWait).pending()
+		registrations := int(g.ForwardStats().Pending)
 		workers := g.goPool.Running()
 		t.Logf("cleanup node=%d localReceipts=%d forwardedReceipts=%d forwardRegistrations=%d poolWorkers=%d", i+1, local, forwarded, registrations, workers)
 		if local+forwarded+registrations+workers != 0 {
@@ -306,7 +293,9 @@ func newStressCluster(t *testing.T, keyCount int, applyDelay func() time.Duratio
 	for _, id := range nodeIDs {
 		store := newStressStorage(applyDelay)
 		g := New(NewOptions(WithTransport(tr), WithStorage(store), WithTickInterval(10*time.Millisecond), WithLogPrefix(fmt.Sprintf("stress-%d", id))))
-		g.fowardProposeWait = &stressForwardWait{Wait: wt.New(), ids: make(map[string]bool), events: make(map[string][]stressForwardEvent)}
+		fw := &stressForwardWait{events: make(map[string][]stressForwardEvent)}
+		g.forwardObserve = fw.observe
+		c.forwardWaits = append(c.forwardWaits, fw)
 		store.group = g
 		for _, bucket := range g.wait.buckets {
 			bucket.observe = store.observeReceipt
@@ -630,7 +619,7 @@ func (c *stressCluster) run(t *testing.T, load stressLoad) *stressStats {
 						if invalid {
 							atomic.AddInt64(&stats.unexplainedCorrelation, 1)
 						}
-						fwdEvents := g.fowardProposeWait.(*stressForwardWait).timeline(fmt.Sprint(lastID))
+						fwdEvents := c.forwardWaits[node].timeline(forwardKey(key, lastID))
 						t.Logf("receipt timeline node=%d key=%s id=%d forwarded=%t start=%s apply=%s expiry=%s outcome=%s err=%v events=%+v explained=%t firstID=%d forwarding=%+v", node+1, key, lastID, forwarded, start.Format(time.RFC3339Nano), appliedAt.Format(time.RFC3339Nano), expired.Format(time.RFC3339Nano), returned.Format(time.RFC3339Nano), err, trace, !invalid, reqs[0].Id, fwdEvents)
 					}
 				}
@@ -884,7 +873,7 @@ type stressReceiptEvent struct {
 func (s *stressStorage) observeReceipt(r receipt, phase string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.traces[r.lastLogId] = append(s.traces[r.lastLogId], stressReceiptEvent{phase, time.Now(), r, err})
+	s.traces[r.lastLogId()] = append(s.traces[r.lastLogId()], stressReceiptEvent{phase, time.Now(), r, err})
 }
 
 type stressForwardEvent struct {

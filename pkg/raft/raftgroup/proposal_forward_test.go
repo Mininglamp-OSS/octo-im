@@ -24,6 +24,9 @@ type forwardTransport struct {
 	heldKeys  []string
 	// forgeIndex, if set, rewrites the index of delivered propose responses.
 	forgeIndex atomic.Uint64
+	// legacy strips the token header from responses, as a leader that
+	// predates the token answers.
+	legacy atomic.Bool
 }
 
 func (tr *forwardTransport) Send(key string, e types.Event) {
@@ -35,6 +38,9 @@ func (tr *forwardTransport) Send(key string, e types.Event) {
 				data, _ := resps.Marshal()
 				e.Logs = []types.Log{{Data: data}}
 			}
+		}
+		if tr.legacy.Load() {
+			e.Logs = []types.Log{{Data: e.Logs[0].Data}}
 		}
 		if tr.holdResps.Load() {
 			tr.mu.Lock()

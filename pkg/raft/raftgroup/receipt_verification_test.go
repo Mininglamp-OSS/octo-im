@@ -99,7 +99,7 @@ func TestForwardedVerificationCancellation(t *testing.T) {
 				require.ErrorIs(t, r.err, ErrGroupStopped)
 			}
 			require.Zero(t, fp.follower.wait.pending())
-			require.False(t, fp.follower.fowardProposeWait.IsRegistered("100"))
+			require.Zero(t, fp.follower.ForwardStats().Pending)
 			require.EqualValues(t, 1, fp.follower.verificationWorkers.Load())
 			b.mu.Lock()
 			terminalErr := w.err
@@ -172,7 +172,7 @@ func TestReceiptVerificationSchedules(t *testing.T) {
 				if before {
 					g.wait.didApply(admKey, 1, nil)
 				}
-				w, applied := g.wait.register(receipt{raftKey: admKey, seq: 1, last: 1, lastLogId: 7, forwarded: true})
+				w, applied := g.wait.register(receipt{raftKey: admKey, seq: 1, first: 1, last: 1, logs: []types.Log{{Id: 7, Index: 1}}, forwarded: true})
 				if applied {
 					g.wait.verifyStored(w)
 				} else {
@@ -258,7 +258,7 @@ func TestGroupWaitQuiescence(t *testing.T) {
 	require.ErrorIs(t, g.submit(func() { ran.Store(true) }), ErrGroupStopped)
 	var reads atomic.Int64
 	g.wait.readLog = func(string, uint64) (types.Log, bool, error) { reads.Add(1); return types.Log{}, false, nil }
-	w, _ := g.wait.register(receipt{raftKey: admKey, seq: 1, last: 1, lastLogId: 7, forwarded: true})
+	w, _ := g.wait.register(receipt{raftKey: admKey, seq: 1, first: 1, last: 1, logs: []types.Log{{Id: 7, Index: 1}}, forwarded: true})
 	g.verifyReceiptAsync(w)
 	select {
 	case err := <-w.doneC:

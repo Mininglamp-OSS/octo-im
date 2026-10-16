@@ -114,7 +114,7 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 			seq:       rg.proposalSeq.Add(1),
 			first:     resps[0].Index,
 			last:      resps[len(resps)-1].Index,
-			lastLogId: resps[len(resps)-1].Id,
+			logs:      newReceiptLogs(reqs, resps[0].Index),
 			forwarded: true,
 		})
 		// The entry may have been applied before the waiter existed. An
@@ -268,13 +268,17 @@ func (rg *RaftGroup) admitProposal(raft IRaft, e Event) {
 	}
 	var waiter *receiptWaiter
 	if p.waitApplied {
+		submitted := make([]types.Log, len(e.Logs))
+		for i, l := range e.Logs {
+			submitted[i] = types.Log{Id: l.Id, Index: adm.FirstIndex + uint64(i), Data: l.Data}
+		}
 		waiter, _ = rg.wait.register(receipt{
-			raftKey:   raft.Key(),
-			seq:       p.seq,
-			term:      adm.Term,
-			first:     adm.FirstIndex,
-			last:      adm.LastIndex,
-			lastLogId: e.Logs[len(e.Logs)-1].Id,
+			raftKey: raft.Key(),
+			seq:     p.seq,
+			term:    adm.Term,
+			first:   adm.FirstIndex,
+			last:    adm.LastIndex,
+			logs:    submitted,
 		})
 		// RemoveRaft completes the receipts it finds after unlisting the
 		// raft. A receipt registered after that is completed here.
@@ -302,25 +306,22 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 		return nil, err
 	}
 
-	key := fmt.Sprintf("%d", reqs[len(reqs)-1].Id)
-	waitC := rg.fowardProposeWait.Register(key)
+	key := forwardKey(raft.Key(), reqs[len(reqs)-1].Id)
+	reg, ok := rg.registerForward(key, leaderID)
+	if !ok {
+		return nil, proposalNotAdmitted(errors.New("raftgroup: forwarded request ID already pending"))
+	}
+	defer rg.retireForward(key, reg)
 
 	rg.opts.Transport.Send(raft.Key(), types.Event{
 		From: raft.NodeId(),
 		To:   leaderID,
 		Type: types.SendPropose,
-		Logs: []types.Log{
-			{
-				Data: data,
-			},
-		},
+		Logs: []types.Log{reg.token.log(data)},
 	})
 
 	select {
-	case result := <-waitC:
-		if result == nil {
-			return nil, proposalOutcomeUnknown(errors.New("raftgroup: foward propose failed"))
-		}
+	case result := <-reg.resultC:
 		err, ok := result.(error)
 		if ok {
 			return nil, err
@@ -332,11 +333,9 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 		return resps, nil
 	case <-ctx.Done():
 		// The leader may already have admitted it; this caller cannot know.
-		rg.fowardProposeWait.Trigger(key, nil)
 		rg.Error("foward propose timeout", zap.String("raftKey", raft.Key()))
 		return nil, proposalOutcomeUnknown(ctx.Err())
 	case <-rg.stopper.ShouldStop():
-		rg.fowardProposeWait.Trigger(key, nil)
 		return nil, proposalOutcomeUnknown(ErrGroupStopped)
 	}
 }
@@ -363,17 +362,20 @@ func (rg *RaftGroup) handleSendPropose(raftKey string, e types.Event) {
 		return
 	}
 
+	if len(e.Logs) != 1 {
+		return
+	}
 	var reqs types.ProposeReqSet
 	err := reqs.Unmarshal(e.Logs[0].Data)
-	if err != nil {
+	if err != nil || len(reqs) == 0 {
+		// Nothing identifies the caller's registration; it settles at its deadline.
 		rg.Error("raftgroup: unmarshal propose req failed", zap.Error(err))
-		rg.sendProposeRespError(raft, reqs, e.From)
 		return
 	}
 
 	if !raft.IsLeader() {
 		rg.Error("raftgroup: handleSendPropose: node is leader, but receive propose from other node", zap.Uint64("leaderId", raft.LeaderId()), zap.Uint64("from", e.From))
-		rg.sendProposeRespError(raft, reqs, e.From)
+		rg.sendProposeRespError(raft, reqs, e)
 		return
 	}
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), rg.opts.ProposeTimeout)
@@ -383,31 +385,27 @@ func (rg *RaftGroup) handleSendPropose(raftKey string, e types.Event) {
 	resps, _, err := rg.proposeBatchTimeout(timeoutCtx, raft, reqs, false)
 	if err != nil {
 		rg.Error("handleSendPropose: propose batch failed", zap.Error(err))
-		rg.sendProposeRespError(raft, reqs, e.From)
+		rg.sendProposeRespError(raft, reqs, e)
 		return
 	}
 	data, err := types.ProposeRespSet(resps).Marshal()
 	if err != nil {
 		rg.Error("raftgroup: marshal propose resp failed", zap.Error(err))
-		rg.sendProposeRespError(raft, reqs, e.From)
+		rg.sendProposeRespError(raft, reqs, e)
 		return
 	}
 
 	rg.opts.Transport.Send(raftKey, types.Event{
-		From: raft.NodeId(),
-		To:   e.From,
-		Type: types.SendProposeResp,
-		Logs: []types.Log{
-			{
-				Data: data,
-			},
-		},
+		From:   raft.NodeId(),
+		To:     e.From,
+		Type:   types.SendProposeResp,
+		Logs:   []types.Log{echoForwardHeader(e, data)},
 		Reason: types.ReasonOk,
 	})
 
 }
 
-func (rg *RaftGroup) sendProposeRespError(r IRaft, reqs types.ProposeReqSet, to uint64) {
+func (rg *RaftGroup) sendProposeRespError(r IRaft, reqs types.ProposeReqSet, req types.Event) {
 	resps := types.ProposeRespSet{}
 	for _, req := range reqs {
 		resps = append(resps, &types.ProposeResp{
@@ -422,32 +420,59 @@ func (rg *RaftGroup) sendProposeRespError(r IRaft, reqs types.ProposeReqSet, to 
 	}
 	rg.opts.Transport.Send(r.Key(), types.Event{
 		From:   r.NodeId(),
-		To:     to,
+		To:     req.From,
 		Type:   types.SendProposeResp,
 		Reason: types.ReasonError,
-		Logs: []types.Log{
-			{
-				Data: data,
-			},
-		},
+		Logs:   []types.Log{echoForwardHeader(req, data)},
 	})
 }
 
-func (rg *RaftGroup) handleSendProposeResp(e types.Event) {
-
+func (rg *RaftGroup) handleSendProposeResp(raftKey string, e types.Event) {
+	if len(e.Logs) != 1 {
+		return
+	}
 	var resps types.ProposeRespSet
-	err := resps.Unmarshal(e.Logs[0].Data)
-	if err != nil {
+	if err := resps.Unmarshal(e.Logs[0].Data); err != nil || len(resps) == 0 {
 		rg.Error("unmarshal propose resp failed", zap.Error(err))
 		return
 	}
-
-	key := fmt.Sprintf("%d", resps[len(resps)-1].Id)
-
-	if e.Reason == types.ReasonError {
-		rg.Error("handleSendProposeResp: receive propose resp error", zap.Uint64("from", e.From))
-		rg.fowardProposeWait.Trigger(key, proposalOutcomeUnknown(types.ErrForwardRejected))
+	key := forwardKey(raftKey, resps[len(resps)-1].Id)
+	h := e.Logs[0]
+	rg.forwardMu.Lock()
+	defer rg.forwardMu.Unlock()
+	reg, live := rg.forwardPending[key]
+	switch {
+	case h.Term == forwardTokenVersion:
+		if !live || reg.token != (forwardToken{incarnation: h.Index, attempt: h.Id}) {
+			rg.forwardStats.stale++
+			rg.observeForwardLocked(key, "stale", "")
+			return
+		}
+	case h.Term == 0 && h.Index == 0 && h.Id == 0:
+		// A leader that predates the token; see forward_token.go.
+		rg.forwardStats.legacy++
+		if !live {
+			rg.forwardStats.stale++
+			rg.observeForwardLocked(key, "stale", "legacy")
+			return
+		}
+		if reg.leader == e.From {
+			rg.forwardStats.legacySettled++
+			rg.warnForwardLocked(e.From, warnForwardLegacy, "leader predates forwarding tokens; settling forwarded proposals by request ID until it is upgraded", zap.String("raftKey", raftKey))
+		}
+	default:
+		rg.forwardStats.unknownHeader++
+		rg.warnForwardLocked(e.From, warnForwardUnknownHeader, "forwarding response with an unknown token version dropped", zap.Uint32("version", h.Term))
 		return
 	}
-	rg.fowardProposeWait.Trigger(key, resps)
+	if reg.leader != e.From {
+		rg.forwardStats.senderMismatch++
+		return
+	}
+	if e.Reason == types.ReasonError {
+		rg.Error("handleSendProposeResp: receive propose resp error", zap.Uint64("from", e.From))
+		rg.settleForwardLocked(key, reg, proposalOutcomeUnknown(types.ErrForwardRejected))
+		return
+	}
+	rg.settleForwardLocked(key, reg, resps)
 }

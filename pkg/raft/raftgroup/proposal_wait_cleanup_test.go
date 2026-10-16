@@ -76,13 +76,18 @@ func (r *waitTestFollower) AppliedIndex() uint64 { return r.applied }
 
 type waitTestTransport struct{ group *RaftGroup }
 
-func (tr *waitTestTransport) Send(_ string, event types.Event) {
+func (tr *waitTestTransport) Send(key string, event types.Event) {
 	var reqs types.ProposeReqSet
 	if err := reqs.Unmarshal(event.Logs[0].Data); err != nil {
 		panic(err)
 	}
 	responses := types.ProposeRespSet{{Id: reqs[len(reqs)-1].Id, Index: 1}}
-	tr.group.fowardProposeWait.Trigger(fmt.Sprintf("%d", responses[0].Id), responses)
+	data, err := responses.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	// Answer as the leader the follower forwarded to, echoing its token.
+	tr.group.handleSendProposeResp(key, types.Event{Type: types.SendProposeResp, From: event.To, Reason: types.ReasonOk, Logs: []types.Log{echoForwardHeader(event, data)}})
 }
 
 func TestProposeUntilAppliedInvalidAdmissionHasNoWaiter(t *testing.T) {

@@ -11,7 +11,7 @@ import (
 )
 
 func testReceipt(key string, seq uint64, term uint32, index uint64, id uint64) receipt {
-	return receipt{raftKey: key, seq: seq, term: term, first: index, last: index, lastLogId: id}
+	return receipt{raftKey: key, seq: seq, term: term, first: index, last: index, logs: []types.Log{{Index: index, Id: id}}}
 }
 
 func applied(index uint64, term uint32, id uint64) []types.Log {
@@ -123,15 +123,84 @@ func TestReceiptIdentityMismatchIsSuperseded(t *testing.T) {
 	}
 }
 
-// Batches apply as one range; the entry at last identifies the batch.
+// A batch whose range is split across apply batches is verified from storage,
+// entry by entry; the applied batch holding only its last entry is not enough.
 func TestReceiptBatchCompletesFromRange(t *testing.T) {
-	w := newWait(nil)
-	r, _ := w.register(receipt{raftKey: "slot", seq: 1, term: 3, first: 4, last: 6, lastLogId: 600})
+	stored := map[uint64]types.Log{4: {Index: 4, Term: 3, Id: 400}, 5: {Index: 5, Term: 3, Id: 500}, 6: {Index: 6, Term: 3, Id: 600}}
+	w := newWait(func(_ string, index uint64) (types.Log, bool, error) {
+		log, ok := stored[index]
+		return log, ok, nil
+	})
+	r, _ := w.register(receipt{raftKey: "slot", seq: 1, term: 3, first: 4, last: 6, logs: []types.Log{{Index: 4, Id: 400}, {Index: 5, Id: 500}, {Index: 6, Id: 600}}})
 	w.didApply("slot", 5, []types.Log{{Index: 4, Term: 3, Id: 400}, {Index: 5, Term: 3, Id: 500}})
 	assertNoResult(t, r)
 	w.didApply("slot", 7, []types.Log{{Index: 6, Term: 3, Id: 600}, {Index: 7, Term: 3, Id: 700}})
 	if err := result(t, r); err != nil {
 		t.Fatalf("batch: %v", err)
+	}
+	// The same split with a different earlier entry in storage is superseded.
+	stored[4] = types.Log{Index: 4, Term: 3, Id: 999}
+	r, _ = w.register(receipt{raftKey: "slot", seq: 2, term: 3, first: 4, last: 6, logs: []types.Log{{Index: 4, Id: 400}, {Index: 5, Id: 500}, {Index: 6, Id: 600}}})
+	w.verifyStored(r)
+	if err := result(t, r); !errors.Is(err, types.ErrProposalSuperseded) {
+		t.Fatalf("expected superseded, got %v", err)
+	}
+}
+
+// Every entry of a batch is checked, Id and Data, for forwarded and
+// leader-local receipts alike: a matching last Id does not vouch for the rest.
+func TestReceiptBatchVerifiesEveryEntry(t *testing.T) {
+	want := []types.Log{{Index: 4, Id: 400, Data: []byte("a")}, {Index: 5, Id: 500, Data: []byte("b")}}
+	for name, appliedLogs := range map[string][]types.Log{
+		"earlier id":   {{Index: 4, Term: 3, Id: 999, Data: []byte("a")}, {Index: 5, Term: 3, Id: 500, Data: []byte("b")}},
+		"earlier data": {{Index: 4, Term: 3, Id: 400, Data: []byte("x")}, {Index: 5, Term: 3, Id: 500, Data: []byte("b")}},
+		"last data":    {{Index: 4, Term: 3, Id: 400, Data: []byte("a")}, {Index: 5, Term: 3, Id: 500, Data: []byte("x")}},
+		"earlier term": {{Index: 4, Term: 2, Id: 400, Data: []byte("a")}, {Index: 5, Term: 3, Id: 500, Data: []byte("b")}},
+	} {
+		for _, forwarded := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/forwarded=%v", name, forwarded), func(t *testing.T) {
+				for _, path := range []string{"applied", "stored"} {
+					stored := map[uint64]types.Log{}
+					for _, l := range appliedLogs {
+						stored[l.Index] = l
+					}
+					w := newWait(func(_ string, index uint64) (types.Log, bool, error) {
+						log, ok := stored[index]
+						return log, ok, nil
+					})
+					r, _ := w.register(receipt{raftKey: "slot", seq: 1, term: 3, first: 4, last: 5, logs: want, forwarded: forwarded})
+					if path == "applied" {
+						w.didApply("slot", 5, appliedLogs)
+					} else {
+						w.verifyStored(r)
+					}
+					err := result(t, r)
+					if name == "earlier term" && forwarded {
+						// Forwarded receipts do not know the leader's term.
+						if err != nil {
+							t.Fatalf("%s: forwarded receipt with matching entries: %v", path, err)
+						}
+						continue
+					}
+					if !errors.Is(err, types.ErrProposalSuperseded) {
+						t.Fatalf("%s: expected superseded, got %v", path, err)
+					}
+				}
+			})
+		}
+	}
+	// An exact match succeeds through both paths.
+	w := newWait(nil)
+	r, _ := w.register(receipt{raftKey: "slot", seq: 1, term: 3, first: 4, last: 5, logs: want, forwarded: true})
+	w.didApply("slot", 5, []types.Log{{Index: 4, Term: 9, Id: 400, Data: []byte("a")}, {Index: 5, Term: 9, Id: 500, Data: []byte("b")}})
+	if err := result(t, r); err != nil {
+		t.Fatalf("exact match: %v", err)
+	}
+	// A receipt missing its submitted entries is never a success.
+	r, _ = w.register(receipt{raftKey: "slot", seq: 2, term: 3, first: 6, last: 7, logs: want[:1], forwarded: true})
+	w.didApply("slot", 7, []types.Log{{Index: 6, Id: 400, Data: []byte("a")}, {Index: 7, Id: 500, Data: []byte("b")}})
+	if err := result(t, r); !errors.Is(err, types.ErrProposalOutcomeUnknown) {
+		t.Fatalf("incomplete receipt: %v", err)
 	}
 }
 
@@ -300,7 +369,7 @@ func TestReceiptRegisterApplyDetachStress(t *testing.T) {
 			wg.Add(1)
 			go func(key string, r *receiptWaiter) {
 				defer wg.Done()
-				w.didApply(key, index, applied(index, 1, r.lastLogId))
+				w.didApply(key, index, applied(index, 1, r.lastLogId()))
 			}(keys[k], waiters[k])
 		}
 		for k := 1; k < len(keys); k += 2 {
