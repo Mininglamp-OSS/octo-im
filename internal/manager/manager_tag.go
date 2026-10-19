@@ -236,38 +236,30 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 		return errors.TagNotExist(tagKey)
 	}
 
-	// 先算出每个节点要删除的位置；找不到领导节点的用户跳过并返回错误，其余照常删除
-	var err error
+	// 先算出每个节点要删除的位置。按节点里实际存的用户删除，不依赖槽位领导：
+	// 领导选举期间也能删，领导迁移后还留在旧领导节点下的用户也能删掉
 	drops := make(map[uint64]map[int]struct{})
 	for _, uid := range uids {
-		slotId := service.Cluster.GetSlotId(uid)
-		leaderId := service.Cluster.SlotLeaderId(slotId)
-		if leaderId == 0 {
-			err = errors.TagSlotLeaderIsZero
-			continue
-		}
-		node := findNode(tag.Nodes, leaderId)
-		if node == nil {
-			continue
-		}
-		drop := drops[leaderId]
-		for i, nodeUid := range node.Uids {
-			if nodeUid != uid {
-				continue
+		for _, node := range tag.Nodes {
+			drop := drops[node.LeaderId]
+			for i, nodeUid := range node.Uids {
+				if nodeUid != uid {
+					continue
+				}
+				if _, ok := drop[i]; ok {
+					continue
+				}
+				if drop == nil {
+					drop = make(map[int]struct{})
+					drops[node.LeaderId] = drop
+				}
+				drop[i] = struct{}{}
+				break
 			}
-			if _, ok := drop[i]; ok {
-				continue
-			}
-			if drop == nil {
-				drop = make(map[int]struct{})
-				drops[leaderId] = drop
-			}
-			drop[i] = struct{}{}
-			break
 		}
 	}
 	if len(drops) == 0 {
-		return err
+		return nil
 	}
 	// 发布出去的tag可能正在被分发遍历：只替换有变化的节点
 	newTag := copyTag(tag)
@@ -279,7 +271,7 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 		newTag.Nodes = append(newTag.Nodes, node)
 	}
 	t.setTag(newTag)
-	return err
+	return nil
 }
 
 func (t *TagManager) RemoveTag(tagKey string) {

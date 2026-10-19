@@ -274,19 +274,38 @@ func TestFailedAddUsersKeepsPublishedTag(t *testing.T) {
 	require.Equal(t, []string{"n2a"}, nodeUids(before, 2))
 }
 
-// A remove takes out every member whose node is known and reports the one it
-// could not place (it used to stop there, keeping the members after it), and
-// leaves the tag already handed out alone.
-func TestRemoveUsersWithoutLeaderRemovesTheRest(t *testing.T) {
+// Removing does not need a slot leader: members are removed from whichever
+// node they are filed under, even while a slot has no leader.
+func TestRemoveUsersNeedsNoSlotLeader(t *testing.T) {
 	tm := newMultiNodeTestTagManager(t, []string{"a1", "a2", "n2a"})
 	before := tm.Get("tag")
 
-	require.Error(t, tm.RemoveUsers("tag", []string{"orphan", "a1", "n2a"}))
+	require.NoError(t, tm.RemoveUsers("tag", []string{"orphan", "a1", "n2a"}))
 
 	require.Equal(t, []string{"a2"}, nodeUids(tm.Get("tag"), 1))
 	require.Empty(t, nodeUids(tm.Get("tag"), 2))
 	require.Equal(t, []string{"a1", "a2"}, nodeUids(before, 1))
 	require.Equal(t, []string{"n2a"}, nodeUids(before, 2))
+}
+
+// A member filed under a node that no longer leads their slot is still
+// removed. Looking only under the current slot leader used to miss them, so
+// a removed member kept receiving the channel's messages.
+func TestRemoveUsersAfterSlotLeaderMoved(t *testing.T) {
+	c := movingLeaderCluster{leaders: map[uint32]uint64{0: 1, 1: 1, 2: 1, 3: 1}}
+	old := service.Cluster
+	service.Cluster = c
+	t.Cleanup(func() { service.Cluster = old })
+	tm := NewTagManager(4, func() uint64 { return 0 })
+	_, err := tm.MakeTagWithTagKey("tag", []string{"u1", "u2"})
+	require.NoError(t, err)
+
+	c.leaders[c.GetSlotId("u1")] = 2
+	require.NoError(t, tm.RemoveUsers("tag", []string{"u1"}))
+
+	for _, node := range tm.Get("tag").Nodes {
+		require.NotContains(t, node.Uids, "u1")
+	}
 }
 
 // Membership changes are not accesses: they must not keep an unused tag from
@@ -393,8 +412,10 @@ type refNode struct {
 	slots []uint32
 }
 
-// refAdd and refRemove are the in-place algorithms AddUsers and RemoveUsers
-// used before tags were published as copies.
+// refAdd is the in-place algorithm AddUsers used before tags were published
+// as copies. refRemove is the previous RemoveUsers too, except that it removes
+// a member from every node: the previous one looked only under the member's
+// current slot leader and missed members still filed under an old leader.
 func refAdd(ref map[uint64]*refNode, order *[]uint64, c movingLeaderCluster, uids []string) {
 	for _, leader := range *order {
 		node := ref[leader]
@@ -422,9 +443,9 @@ func refAdd(ref map[uint64]*refNode, order *[]uint64, c movingLeaderCluster, uid
 	}
 }
 
-func refRemove(ref map[uint64]*refNode, c movingLeaderCluster, uids []string) {
+func refRemove(ref map[uint64]*refNode, uids []string) {
 	for _, uid := range uids {
-		if node := ref[c.SlotLeaderId(c.GetSlotId(uid))]; node != nil {
+		for _, node := range ref {
 			if i := slices.Index(node.uids, uid); i >= 0 {
 				node.uids = slices.Delete(node.uids, i, i+1)
 			}
@@ -441,8 +462,8 @@ func cloneTagNodes(nodes []*types.Node) []types.Node {
 }
 
 // Random membership changes, with slot leaders moving in between, must give
-// the same members per node as the previous in-place algorithm, and must
-// never change a tag that was already handed out.
+// the same members per node as refAdd and refRemove, and must never change a
+// tag that was already handed out.
 func TestMembershipChangesMatchPreviousAlgorithm(t *testing.T) {
 	c := movingLeaderCluster{leaders: map[uint32]uint64{0: 1, 1: 2, 2: 3, 3: 1}}
 	old := service.Cluster
@@ -477,7 +498,7 @@ func TestMembershipChangesMatchPreviousAlgorithm(t *testing.T) {
 			refAdd(ref, &order, c, uids)
 		} else {
 			require.NoError(t, tm.RemoveUsers("tag", uids))
-			refRemove(ref, c, uids)
+			refRemove(ref, uids)
 		}
 		require.Equal(t, want, cloneTagNodes(inFlight.Nodes), "op %d changed a handed-out tag", op)
 
