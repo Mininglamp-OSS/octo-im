@@ -251,7 +251,8 @@ func testWriteInTwoReads(t *testing.T, conn net.Conn, data []byte, split int) {
 
 func testDialWS(t *testing.T) (net.Conn, *testWSPayloadCollector) {
 	t.Helper()
-	e := NewEngine(WithWSAddr("ws://0.0.0.0:0"))
+	// 引擎默认还会监听 TCP 5100，这里也改用随机端口，避免与本机已有服务冲突
+	e := NewEngine(WithAddr("tcp://127.0.0.1:0"), WithWSAddr("ws://0.0.0.0:0"))
 	collector := &testWSPayloadCollector{}
 	e.OnData(collector.onData)
 	require.NoError(t, e.Start())
@@ -267,7 +268,7 @@ func testDialWSS(t *testing.T) (net.Conn, *testWSPayloadCollector) {
 	t.Helper()
 	cert, err := stls.X509KeyPair(rsaCertPEM, rsaKeyPEM)
 	require.NoError(t, err)
-	e := NewEngine(WithWSSAddr("wss://0.0.0.0:0"), WithWSTLSConfig(&stls.Config{Certificates: []stls.Certificate{cert}}))
+	e := NewEngine(WithAddr("tcp://127.0.0.1:0"), WithWSSAddr("wss://0.0.0.0:0"), WithWSTLSConfig(&stls.Config{Certificates: []stls.Certificate{cert}}))
 	collector := &testWSPayloadCollector{}
 	e.OnData(collector.onData)
 	require.NoError(t, e.Start())
