@@ -14,7 +14,7 @@ func TestTagJSONKeepsShapeWithLiveAccessTime(t *testing.T) {
 	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	tag := &Tag{Key: "k", ChannelId: "g1", ChannelType: 2, CreatedAt: created, LastGetTime: created,
 		Nodes: []*Node{{LeaderId: 1, Uids: []string{"a"}, SlotIds: []uint32{3}}}}
-	tag.GetCount.Store(7)
+	tag.accessState().getCount.Store(7)
 	tag.Touch()
 
 	data, err := json.Marshal(tag)
@@ -44,16 +44,20 @@ func TestGetNodeUsersReturnsCopy(t *testing.T) {
 	require.Nil(t, tag.GetNodeUsers(2))
 }
 
-func TestInheritAccessCopiesTimeAndCount(t *testing.T) {
+func TestShareAccessSharesTimeAndCount(t *testing.T) {
 	src := &Tag{}
 	src.Touch()
-	src.GetCount.Store(5)
+	src.IncGetCount()
 
 	c := &Tag{}
-	c.InheritAccess(src)
-
+	c.ShareAccess(src)
 	require.Equal(t, src.LastGet(), c.LastGet())
-	require.EqualValues(t, 5, c.GetCount.Load())
+	require.EqualValues(t, 1, c.GetCount())
+
+	src.IncGetCount()
+	c.IncGetCount()
+	require.EqualValues(t, 3, src.GetCount())
+	require.EqualValues(t, 3, c.GetCount())
 }
 
 // Expiry uses time.Since(LastGet()), so LastGet must carry a monotonic clock

@@ -146,7 +146,7 @@ func copyTag(tag *types.Tag) *types.Tag {
 		LastGetTime: tag.LastGetTime,
 		NodeVersion: tag.NodeVersion,
 	}
-	c.InheritAccess(tag)
+	c.ShareAccess(tag)
 	return c
 }
 
@@ -306,7 +306,7 @@ func (t *TagManager) Get(tagKey string) *types.Tag {
 		return nil
 	}
 	tag.Touch()
-	tag.GetCount.Inc()
+	tag.IncGetCount()
 	return tag
 }
 

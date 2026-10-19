@@ -314,7 +314,7 @@ func TestMembershipChangeKeepsAccessState(t *testing.T) {
 	tm := newSnapshotTestTagManager(t, []string{"a", "b"})
 	tm.Get("tag")
 	snap := tm.getTag("tag") // getTag does not record an access
-	accessed, count := snap.LastGet(), snap.GetCount.Load()
+	accessed, count := snap.LastGet(), snap.GetCount()
 	time.Sleep(2 * time.Millisecond)
 
 	require.NoError(t, tm.AddUsers("tag", []string{"c"}))
@@ -322,7 +322,7 @@ func TestMembershipChangeKeepsAccessState(t *testing.T) {
 	tm.SetChannelTag("g2", 3, "tag")
 	got := tm.getTag("tag")
 	require.Equal(t, accessed, got.LastGet())
-	require.Equal(t, count, got.GetCount.Load())
+	require.Equal(t, count, got.GetCount())
 
 	require.NoError(t, tm.RenameTag("tag", "tag2"))
 	require.True(t, tm.getTag("tag2").LastGet().After(accessed))
@@ -511,4 +511,24 @@ func TestMembershipChangesMatchPreviousAlgorithm(t *testing.T) {
 			require.ElementsMatch(t, r.slots, node.SlotIds, "op %d node %d slots", op, node.LeaderId)
 		}
 	}
+}
+
+// A Get that fetched the tag just before a membership change replaced it
+// records its access on the replaced copy; the published tag must see it,
+// or an active tag can be counted short and expire early.
+func TestAccessOnReplacedTagIsKept(t *testing.T) {
+	tm := newSnapshotTestTagManager(t, []string{"a"})
+	replaced := tm.getTag("tag")
+	before := replaced.LastGet()
+	time.Sleep(2 * time.Millisecond)
+
+	require.NoError(t, tm.AddUsers("tag", []string{"b"}))
+	require.NotSame(t, replaced, tm.getTag("tag"))
+	replaced.Touch()
+	replaced.IncGetCount()
+
+	got := tm.getTag("tag")
+	require.True(t, got.LastGet().After(before))
+	require.EqualValues(t, replaced.GetCount(), got.GetCount())
+	require.EqualValues(t, 1, got.GetCount())
 }

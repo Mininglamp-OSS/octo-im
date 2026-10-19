@@ -199,7 +199,7 @@ func newTagResp(tag *types.Tag) *tagResp {
 		ExpireAt:    expireAt,
 		LastGetAt:   lastGetAt,
 		NodeVersion: tag.NodeVersion,
-		GetCount:    tag.GetCount.Load(),
+		GetCount:    tag.GetCount(),
 	}
 }
 
