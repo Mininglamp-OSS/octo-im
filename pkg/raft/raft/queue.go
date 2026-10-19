@@ -250,10 +250,17 @@ func (r *queue) truncateLogTo(logIndex uint64) {
 	if logIndex > r.lastLogIndex {
 		r.Panic("truncate log index is out of bound", zap.Uint64("logIndex", logIndex), zap.Uint64("lastLogIndex", r.lastLogIndex))
 	}
+	// A store in flight may still hold a prefix of r.logs (nextStoreLogs), so
+	// the backing array is never reused for entries appended later.
 	if logIndex < r.storedIndex {
+		// Every unstored entry lies past storedIndex and therefore past
+		// logIndex: discard all of it, or it would be stored again after the
+		// entries that replace it.
 		r.storedIndex = logIndex
+		r.logs = nil
 	} else {
-		r.logs = r.logs[:logIndex-r.storedIndex]
+		keep := logIndex - r.storedIndex
+		r.logs = r.logs[:keep:keep]
 	}
 
 	r.lastLogIndex = logIndex
