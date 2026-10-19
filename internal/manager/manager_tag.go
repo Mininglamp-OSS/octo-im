@@ -62,7 +62,10 @@ func (t *TagManager) MakeTagWithTagKey(tagKey string, uids []string) (*types.Tag
 	if err != nil {
 		return nil, err
 	}
-	t.getBlucketByTagKey(tagKey).setTag(tag)
+	// Publish under the same lock as the copy-and-replace updates.
+	t.Lock()
+	t.setTag(tag)
+	t.Unlock()
 	return tag, nil
 }
 
@@ -111,8 +114,9 @@ func (t *TagManager) AddUsers(tagKey string, uids []string) error {
 	return nil
 }
 
-// copyTag returns an unpublished copy of tag. It shares the published nodes,
-// so callers that change membership must replace Nodes with cloneNodes first.
+// copyTag returns an unpublished copy of tag that keeps its access state. It
+// shares the published nodes, so callers that change membership must replace
+// Nodes with cloneNodes first.
 func copyTag(tag *types.Tag) *types.Tag {
 	c := &types.Tag{
 		Key:         tag.Key,
@@ -123,19 +127,19 @@ func copyTag(tag *types.Tag) *types.Tag {
 		LastGetTime: tag.LastGetTime,
 		NodeVersion: tag.NodeVersion,
 	}
-	c.GetCount.Store(tag.GetCount.Load())
-	c.Touch()
+	c.InheritAccess(tag)
 	return c
 }
 
-// cloneNodes deep-copies nodes so the copy can be modified in place.
+// cloneNodes deep-copies nodes so the copy can be modified in place. Empty
+// lists stay empty rather than nil, so /tags keeps reporting "uids": [].
 func cloneNodes(nodes []*types.Node) []*types.Node {
 	out := make([]*types.Node, 0, len(nodes))
 	for _, node := range nodes {
 		out = append(out, &types.Node{
 			LeaderId: node.LeaderId,
-			Uids:     append([]string(nil), node.Uids...),
-			SlotIds:  append([]uint32(nil), node.SlotIds...),
+			Uids:     append(make([]string, 0, len(node.Uids)), node.Uids...),
+			SlotIds:  append(make([]uint32, 0, len(node.SlotIds)), node.SlotIds...),
 		})
 	}
 	return out
@@ -209,6 +213,8 @@ func (t *TagManager) GetUsers(tagKey string) []string {
 	return uids
 }
 
+// Get returns the published tag. It is shared with concurrent fan-out and
+// must not be modified.
 func (t *TagManager) Get(tagKey string) *types.Tag {
 	tag := t.getTag(tagKey)
 	if tag == nil {
@@ -237,17 +243,17 @@ func (t *TagManager) RenameTag(oldTagKey, newTagKey string) error {
 	}
 	newTag := copyTag(tag)
 	newTag.Key = newTagKey
+	newTag.Touch() // a rename has always counted as an access
 	t.setTag(newTag)
 	t.removeTag(oldTagKey)
 	return nil
 }
 
 func (t *TagManager) SetChannelTag(fakeChannelId string, channelType uint8, tagKey string) {
-	blucket := t.getBlucketByChannel(fakeChannelId, channelType)
-	blucket.setChannelTag(fakeChannelId, channelType, tagKey)
-
 	t.Lock()
 	defer t.Unlock()
+	// Publish the tag with its channel first, so a reader that finds the new
+	// mapping also finds the tag labelled with this channel.
 	tag := t.getTag(tagKey)
 	if tag != nil && (tag.ChannelId != fakeChannelId || tag.ChannelType != channelType) {
 		newTag := copyTag(tag)
@@ -255,6 +261,7 @@ func (t *TagManager) SetChannelTag(fakeChannelId string, channelType uint8, tagK
 		newTag.ChannelType = channelType
 		t.setTag(newTag)
 	}
+	t.getBlucketByChannel(fakeChannelId, channelType).setChannelTag(fakeChannelId, channelType, tagKey)
 }
 
 func (t *TagManager) GetChannelTag(fakeChannelId string, channelType uint8) string {
@@ -267,6 +274,7 @@ func (t *TagManager) RemoveChannelTag(fakeChannelId string, channelType uint8) {
 	blucket.removeChannelTag(fakeChannelId, channelType)
 }
 
+// GetAllTags returns the published tags; they must not be modified.
 func (t *TagManager) GetAllTags() []*types.Tag {
 	var tags []*types.Tag
 	for _, blucket := range t.bluckets {

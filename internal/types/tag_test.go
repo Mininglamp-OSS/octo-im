@@ -30,3 +30,28 @@ func TestTagJSONKeepsShapeWithLiveAccessTime(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, last.After(created))
 }
+
+// Callers of GetNodeUsers keep the result; it must not alias the published
+// tag that fan-out ranges over.
+func TestGetNodeUsersReturnsCopy(t *testing.T) {
+	tag := &Tag{Nodes: []*Node{{LeaderId: 1, Uids: []string{"a", "b"}}}}
+
+	got := tag.GetNodeUsers(1)
+	got[0] = "x"
+	_ = append(got[:1], "y")
+
+	require.Equal(t, []string{"a", "b"}, tag.Nodes[0].Uids)
+	require.Nil(t, tag.GetNodeUsers(2))
+}
+
+func TestInheritAccessCopiesTimeAndCount(t *testing.T) {
+	src := &Tag{}
+	src.Touch()
+	src.GetCount.Store(5)
+
+	c := &Tag{}
+	c.InheritAccess(src)
+
+	require.Equal(t, src.LastGet(), c.LastGet())
+	require.EqualValues(t, 5, c.GetCount.Load())
+}

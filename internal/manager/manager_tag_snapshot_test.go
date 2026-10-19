@@ -1,13 +1,16 @@
 package manager
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/stretchr/testify/require"
 )
@@ -142,4 +145,160 @@ func TestTagFanoutDuringMembershipChanges(t *testing.T) {
 		t.Error(err)
 	}
 	require.Positive(t, passes.Load())
+}
+
+func TestTagSnapshotSurvivesSetChannelTag(t *testing.T) {
+	tm := newSnapshotTestTagManager(t, []string{"a", "b"})
+	inFlight := tm.Get("tag")
+
+	tm.SetChannelTag("g2", 3, "tag")
+
+	require.Equal(t, "g1", inFlight.ChannelId)
+	require.EqualValues(t, 2, inFlight.ChannelType)
+	require.Equal(t, "g2", tm.Get("tag").ChannelId)
+	require.EqualValues(t, 3, tm.Get("tag").ChannelType)
+}
+
+// A reader that resolves a channel's key must find a tag already labelled
+// with that channel: the mapping is set only after the labelled tag is
+// published. Run with -race.
+func TestSetChannelTagPublishesTagBeforeMapping(t *testing.T) {
+	tm := newSnapshotTestTagManager(t, []string{"a"})
+	stop := make(chan struct{})
+	errs := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			key := tm.GetChannelTag("g9", 5)
+			if key == "" {
+				continue
+			}
+			if tag := tm.Get(key); tag == nil || tag.ChannelId != "g9" {
+				errs <- fmt.Errorf("key %s resolved before its tag was labelled: %v", key, tag)
+				return
+			}
+		}
+	}()
+	for i := 0; i < 2000; i++ {
+		key := fmt.Sprintf("k%d", i)
+		_, err := tm.MakeTagWithTagKey(key, []string{"a"})
+		require.NoError(t, err)
+		tm.SetChannelTag("g9", 5, key)
+	}
+	close(stop)
+	select {
+	case err := <-errs:
+		t.Fatal(err)
+	default:
+	}
+}
+
+// uids prefixed "n2" live on node 2, "orphan" on a slot without a leader, the
+// rest on node 1.
+type multiNodeTestCluster struct{ icluster.ICluster }
+
+func (multiNodeTestCluster) GetSlotId(uid string) uint32 {
+	switch {
+	case uid == "orphan":
+		return 3
+	case strings.HasPrefix(uid, "n2"):
+		return 2
+	}
+	return 1
+}
+func (multiNodeTestCluster) SlotLeaderId(slot uint32) uint64 {
+	if slot == 3 {
+		return 0
+	}
+	return uint64(slot)
+}
+
+func newMultiNodeTestTagManager(t *testing.T, uids []string) *TagManager {
+	t.Helper()
+	old := service.Cluster
+	service.Cluster = multiNodeTestCluster{}
+	t.Cleanup(func() { service.Cluster = old })
+	tm := NewTagManager(4, func() uint64 { return 0 })
+	_, err := tm.MakeTagWithTagKey("tag", uids)
+	require.NoError(t, err)
+	tm.SetChannelTag("g1", 2, "tag")
+	return tm
+}
+
+func nodeUids(tag *types.Tag, leader uint64) []string {
+	for _, node := range tag.Nodes {
+		if node.LeaderId == leader {
+			return node.Uids
+		}
+	}
+	return nil
+}
+
+func TestTagSnapshotsAcrossNodes(t *testing.T) {
+	tm := newMultiNodeTestTagManager(t, []string{"a1", "a2", "n2a", "n2b"})
+	inFlight := tm.Get("tag")
+	node1, node2 := nodeUids(inFlight, 1), nodeUids(inFlight, 2)
+
+	require.NoError(t, tm.RemoveUsers("tag", []string{"n2a"}))
+	require.NoError(t, tm.AddUsers("tag", []string{"a1", "n2c"}))
+
+	require.Equal(t, []string{"a1", "a2"}, node1)
+	require.Equal(t, []string{"n2a", "n2b"}, node2)
+	require.ElementsMatch(t, []string{"a1", "a2"}, nodeUids(tm.Get("tag"), 1))
+	require.ElementsMatch(t, []string{"n2b", "n2c"}, nodeUids(tm.Get("tag"), 2))
+}
+
+// A change that fails part-way must leave the published tag untouched.
+func TestFailedMembershipChangeKeepsPublishedTag(t *testing.T) {
+	tm := newMultiNodeTestTagManager(t, []string{"a1", "n2a"})
+	before := tm.Get("tag")
+
+	require.Error(t, tm.AddUsers("tag", []string{"n2b", "orphan"}))
+	require.Error(t, tm.RemoveUsers("tag", []string{"a1", "orphan"}))
+
+	require.Same(t, before, tm.Get("tag"))
+	require.Equal(t, []string{"a1"}, nodeUids(before, 1))
+	require.Equal(t, []string{"n2a"}, nodeUids(before, 2))
+}
+
+// Membership changes are not accesses: they must not keep an unused tag from
+// expiring. A rename has always counted as one.
+func TestMembershipChangeKeepsAccessState(t *testing.T) {
+	tm := newSnapshotTestTagManager(t, []string{"a", "b"})
+	tm.Get("tag")
+	snap := tm.getTag("tag") // getTag does not record an access
+	accessed, count := snap.LastGet(), snap.GetCount.Load()
+	time.Sleep(2 * time.Millisecond)
+
+	require.NoError(t, tm.AddUsers("tag", []string{"c"}))
+	require.NoError(t, tm.RemoveUsers("tag", []string{"a"}))
+	tm.SetChannelTag("g2", 3, "tag")
+	got := tm.getTag("tag")
+	require.Equal(t, accessed, got.LastGet())
+	require.Equal(t, count, got.GetCount.Load())
+
+	require.NoError(t, tm.RenameTag("tag", "tag2"))
+	require.True(t, tm.getTag("tag2").LastGet().After(accessed))
+}
+
+// /tags reports an emptied node as "uids": [], and later copies keep it so.
+func TestEmptiedNodeKeepsEmptyUidList(t *testing.T) {
+	tm := newMultiNodeTestTagManager(t, []string{"a1", "n2a"})
+	require.NoError(t, tm.RemoveUsers("tag", []string{"n2a"}))
+	require.NoError(t, tm.AddUsers("tag", []string{"a2"}))
+
+	var node2 *types.Node
+	for _, node := range tm.Get("tag").Nodes {
+		if node.LeaderId == 2 {
+			node2 = node
+		}
+	}
+	require.NotNil(t, node2)
+	data, err := json.Marshal(node2)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"uids":[]`)
 }

@@ -10,6 +10,7 @@ import (
 
 // Tag is immutable once TagManager has published it: fan-out ranges over Nodes
 // and Uids without holding a lock, so every change publishes a modified copy.
+// Code holding a published tag must not modify it.
 type Tag struct {
 	Key string `json:"key"`
 	// 关联的频道
@@ -29,6 +30,13 @@ type Tag struct {
 // Touch records an access; concurrent readers call it without a lock.
 func (t *Tag) Touch() {
 	t.lastGet.Store(time.Now().UnixNano())
+}
+
+// InheritAccess copies src's access time and count, so publishing a modified
+// copy of src is not recorded as an access.
+func (t *Tag) InheritAccess(src *Tag) {
+	t.lastGet.Store(src.lastGet.Load())
+	t.GetCount.Store(src.GetCount.Load())
 }
 
 // LastGet returns the time of the last access.
@@ -71,10 +79,11 @@ func (n *Node) String() string {
 	return fmt.Sprintf("Node{LeaderId:%d, Uids:%v, SlotIds:%v}", n.LeaderId, n.Uids, n.SlotIds)
 }
 
+// GetNodeUsers returns a copy of the uids on nodeId.
 func (t *Tag) GetNodeUsers(nodeId uint64) []string {
 	for _, node := range t.Nodes {
 		if node.LeaderId == nodeId {
-			return node.Uids
+			return append(make([]string, 0, len(node.Uids)), node.Uids...)
 		}
 	}
 	return nil
