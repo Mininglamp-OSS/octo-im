@@ -45,7 +45,7 @@ func TestCacheStats(t *testing.T) {
 	stats := cache.GetCacheStats()
 	assert.Equal(t, 1, stats["last_conversations_cache_len"])
 	assert.Equal(t, 1000, stats["last_conversations_cache_max"])
-	assert.Equal(t, 120.0, stats["cache_ttl_seconds"]) // 2分钟 = 120秒
+	assert.Equal(t, 600.0, stats["cache_ttl_seconds"]) // 10分钟 = 600秒
 }
 
 func TestCacheClear(t *testing.T) {

@@ -14,7 +14,7 @@ func TestDeviceCache(t *testing.T) {
 	// 测试基本缓存操作
 	uid := "test_user"
 	deviceFlag := uint64(123)
-	
+
 	device := wkdb.Device{
 		Id:          1,
 		Uid:         uid,
@@ -134,17 +134,17 @@ func TestDeviceCacheStats(t *testing.T) {
 	stats := cache.GetCacheStats()
 	assert.Equal(t, 3, stats["device_cache_len"])
 	assert.Equal(t, 1000, stats["device_cache_max"])
-	assert.Equal(t, 300.0, stats["cache_ttl_seconds"]) // 5分钟 = 300秒
+	assert.Equal(t, 600.0, stats["cache_ttl_seconds"]) // 10分钟 = 600秒
 
 	// 测试其他统计方法
 	assert.Equal(t, 3, cache.GetCacheSize())
 	assert.Equal(t, 1000, cache.GetMaxCacheSize())
-	assert.Equal(t, 5*time.Minute, cache.GetCacheTTL())
+	assert.Equal(t, 10*time.Minute, cache.GetCacheTTL())
 }
 
 func TestDeviceCacheExpiration(t *testing.T) {
 	cache := wkdb.NewDeviceCache(1000)
-	
+
 	// 设置较短的TTL用于测试
 	cache.SetCacheTTL(100 * time.Millisecond)
 
@@ -260,7 +260,7 @@ func TestDeviceCacheIntegration(t *testing.T) {
 
 	uid := "test_user"
 	deviceFlag := uint64(123)
-	
+
 	device := wkdb.Device{
 		Id:          1,
 		Uid:         uid,

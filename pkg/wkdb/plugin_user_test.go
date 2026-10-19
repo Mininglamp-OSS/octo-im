@@ -34,7 +34,7 @@ func TestAddPluginUsers(t *testing.T) {
 	resultUids, err := d.GetPluginUsers(pluginNo)
 	assert.NoError(t, err)
 
-	assert.ElementsMatch(t, uids, resultUids)
+	assert.ElementsMatch(t, pluginUsers, resultUids)
 
 }
 
@@ -95,7 +95,7 @@ func TestGetPluginUsers(t *testing.T) {
 	resultUids, err := d.GetPluginUsers(pluginNo)
 	assert.NoError(t, err)
 
-	assert.ElementsMatch(t, uids, resultUids)
+	assert.ElementsMatch(t, pluginUsers, resultUids)
 }
 
 func TestGetHighestPriorityPluginByUid(t *testing.T) {
