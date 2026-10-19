@@ -119,72 +119,44 @@ func (w *WSConn) decode() ([]wsutil.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	messages, consumed, err := decodeClientMessages(buff)
+	if len(buff) < ws.MinHeaderSize { // 数据不完整
+		w.Debug("数据不完整", zap.Int("len", len(buff)))
+		return nil, nil
+	}
+	tmpReader := bytes.NewReader(buff)
+	header, err := ws.ReadHeader(tmpReader)
 	if err != nil {
-		w.Warn("read client message error", zap.Error(err))
+		if err == io.EOF || err == io.ErrUnexpectedEOF { //数据不完整
+			return nil, nil
+		}
+		w.Debug("发送错误，丢弃数据", zap.Error(err))
 		w.DiscardFromTemp(len(buff)) // 发送错误，丢弃数据
 		return nil, err
 	}
-	w.DiscardFromTemp(consumed)
-	return messages, nil
-}
-
-// decodeClientMessages 只解码 buff 中已经完整到达的消息，返回消息和消费的字节数。
-// 未到齐的帧（包括分片消息中已到达的部分）不消费，留在缓冲区等后续数据到达后再解码，
-// 避免一次读取到“完整帧 + 后续半帧”时把半帧丢掉，导致后续帧边界错乱。
-func decodeClientMessages(buff []byte) ([]wsutil.Message, int, error) {
-	completeLen, err := completeClientMessagesLen(buff)
-	if err != nil || completeLen == 0 {
-		return nil, 0, err
+	dataLen := header.Length
+	if dataLen > int64(tmpReader.Len()) { // 数据不完整
+		w.Debug("数据不完整", zap.Int64("dataLen", dataLen), zap.Int64("tmpReader.Len()", int64(tmpReader.Len())))
+		return nil, nil
 	}
-	reader := bytes.NewReader(buff[:completeLen])
-	var messages []wsutil.Message
-	for reader.Len() > 0 {
-		messages, err = wsutil.ReadClientMessage(reader, messages)
-		if err != nil {
-			return nil, 0, err
-		}
-	}
-	return messages, completeLen, nil
-}
 
-// completeClientMessagesLen 逐帧检查帧头和长度，返回 buff 开头由完整消息组成的字节数。
-// 分片消息要等到最后一个分片（FIN）到达才算完整；分片之间插入的控制帧随该消息一起解码。
-func completeClientMessagesLen(buff []byte) (int, error) {
-	state := ws.StateServerSide
-	offset, completeLen := 0, 0
-	reader := bytes.NewReader(nil)
-	for offset < len(buff) {
-		reader.Reset(buff[offset:])
-		header, err := ws.ReadHeader(reader)
-		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF { // 帧头不完整
+	if header.Fin { // 当前 frame 已经是最后一个frame
+		var messages []wsutil.Message
+		tmpReader.Reset(buff)
+		remLen := tmpReader.Len()
+		for tmpReader.Len() > 0 {
+			messages, err = wsutil.ReadClientMessage(tmpReader, messages)
+			if err != nil {
+				w.Warn("read client message error", zap.Error(err))
 				break
 			}
-			return 0, err
 		}
-		if err = ws.CheckHeader(header, state); err != nil {
-			return 0, err
-		}
-		if header.Length > int64(reader.Len()) { // 帧数据不完整
-			break
-		}
-		offset = len(buff) - reader.Len() + int(header.Length)
-
-		if header.OpCode.IsControl() {
-			if !state.Fragmented() {
-				completeLen = offset
-			}
-			continue
-		}
-		if header.Fin {
-			state = state.Clear(ws.StateFragmented)
-			completeLen = offset
-		} else {
-			state = state.Set(ws.StateFragmented)
-		}
+		remLen = remLen - tmpReader.Len()
+		w.DiscardFromTemp(remLen)
+		return messages, nil
+	} else {
+		w.Debug("ws header not is fin", zap.Int("len", len(buff)))
 	}
-	return completeLen, nil
+	return nil, nil
 }
 
 func (w *WSConn) upgrade() error {
@@ -462,12 +434,42 @@ func (w *WSSConn) decode() ([]wsutil.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	messages, consumed, err := decodeClientMessages(buff)
+	if len(buff) < ws.MinHeaderSize { // 数据不完整
+		w.d.Debug("数据还没读完", zap.Int("len", len(buff)))
+		return nil, nil
+	}
+	tmpReader := bytes.NewReader(buff)
+	header, err := ws.ReadHeader(tmpReader)
 	if err != nil {
-		w.d.Warn("read client message error", zap.Error(err))
+		if err == io.EOF || err == io.ErrUnexpectedEOF { //数据不完整
+			return nil, nil
+		}
+		w.d.Debug("wss: 发送错误，丢弃数据", zap.Error(err))
 		w.discardFromWSTemp(len(buff)) // 发送错误，丢弃数据
 		return nil, err
 	}
-	w.discardFromWSTemp(consumed)
-	return messages, nil
+	dataLen := header.Length
+	if dataLen > int64(tmpReader.Len()) { // 数据不完整
+		w.d.Debug("wss: 数据还没读完....", zap.Int("dataLen", int(dataLen)), zap.Int("tmpReader.Len()", int(tmpReader.Len())))
+		return nil, nil
+	}
+	if header.Fin { // 当前 frame 已经是最后一个frame
+
+		var messages []wsutil.Message
+		tmpReader.Reset(buff)
+		remLen := tmpReader.Len()
+		for tmpReader.Len() > 0 {
+			messages, err = wsutil.ReadClientMessage(tmpReader, messages)
+			if err != nil {
+				w.d.Warn("read client message error", zap.Error(err))
+				break
+			}
+		}
+		remLen = remLen - tmpReader.Len()
+		w.discardFromWSTemp(remLen)
+		return messages, nil
+	} else {
+		w.d.Debug("wss: ws header not is fin", zap.Int("len", len(buff)))
+	}
+	return nil, nil
 }
