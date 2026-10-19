@@ -2,6 +2,7 @@ package manager
 
 import (
 	"hash/fnv"
+	"slices"
 	"sync"
 	"time"
 
@@ -102,21 +103,39 @@ func (t *TagManager) AddUsers(tagKey string, uids []string) error {
 	if err != nil {
 		return err
 	}
-	// 在副本上修改：发布出去的tag可能正在被分发遍历
+	leaders := make(map[string]uint64, len(uids))
+	for _, node := range nodes {
+		for _, uid := range node.Uids {
+			leaders[uid] = node.LeaderId
+		}
+	}
+	// 发布出去的tag可能正在被分发遍历：只替换有变化的节点，没有变化就不发布
+	newNodes := make([]*types.Node, 0, len(tag.Nodes)+len(nodes))
+	changed := false
+	for _, node := range tag.Nodes {
+		newNode := addUsersToNode(node, leaders, findNode(nodes, node.LeaderId))
+		changed = changed || newNode != node
+		newNodes = append(newNodes, newNode)
+	}
+	for _, node := range nodes {
+		if findNode(tag.Nodes, node.LeaderId) == nil {
+			newNodes = append(newNodes, node)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
 	newTag := copyTag(tag)
-	newTag.Nodes = cloneNodes(tag.Nodes)
-	// 去除已经存在的用户
-	t.removeExistUidsInTag(newTag, uids)
-	// 合并节点
-	t.mergeNodes(newTag, nodes)
+	newTag.Nodes = newNodes
 	t.setTag(newTag)
 
 	return nil
 }
 
 // copyTag returns an unpublished copy of tag that keeps its access state. It
-// shares the published nodes, so callers that change membership must replace
-// Nodes with cloneNodes first.
+// shares the published nodes, so callers that change membership must put new
+// nodes in the copy instead of modifying the shared ones.
 func copyTag(tag *types.Tag) *types.Tag {
 	c := &types.Tag{
 		Key:         tag.Key,
@@ -131,31 +150,80 @@ func copyTag(tag *types.Tag) *types.Tag {
 	return c
 }
 
-// cloneNodes deep-copies nodes so the copy can be modified in place. Empty
-// lists stay empty rather than nil, so /tags keeps reporting "uids": [].
-func cloneNodes(nodes []*types.Node) []*types.Node {
-	out := make([]*types.Node, 0, len(nodes))
-	for _, node := range nodes {
-		out = append(out, &types.Node{
-			LeaderId: node.LeaderId,
-			Uids:     append(make([]string, 0, len(node.Uids)), node.Uids...),
-			SlotIds:  append(make([]uint32, 0, len(node.SlotIds)), node.SlotIds...),
-		})
-	}
-	return out
-}
-
-func (t *TagManager) removeExistUidsInTag(tag *types.Tag, uids []string) {
-	for _, node := range tag.Nodes {
-		for _, uid := range uids {
-			for i, nodeUid := range node.Uids {
-				if nodeUid == uid {
-					node.Uids = append(node.Uids[:i], node.Uids[i+1:]...)
-					break
+// addUsersToNode returns node with the users in add appended and the users
+// now led by another node removed. It returns node itself when nothing
+// changes, so an unchanged node stays shared with the published tag; a
+// changed node gets new lists and the published ones are left alone.
+func addUsersToNode(node *types.Node, leaders map[string]uint64, add *types.Node) *types.Node {
+	var drop map[int]struct{}
+	for uid, leaderId := range leaders {
+		if leaderId == node.LeaderId {
+			continue
+		}
+		for i, nodeUid := range node.Uids {
+			if nodeUid == uid {
+				if drop == nil {
+					drop = make(map[int]struct{})
 				}
+				drop[i] = struct{}{}
+				break
 			}
 		}
 	}
+	var missing []string
+	var newSlotIds []uint32
+	if add != nil {
+		for _, uid := range add.Uids {
+			if !slices.Contains(node.Uids, uid) && !slices.Contains(missing, uid) {
+				missing = append(missing, uid)
+			}
+		}
+		for _, slotId := range add.SlotIds {
+			if !slices.Contains(node.SlotIds, slotId) {
+				newSlotIds = append(newSlotIds, slotId)
+			}
+		}
+	}
+	if len(drop) == 0 && len(missing) == 0 && len(newSlotIds) == 0 {
+		return node
+	}
+	uids := node.Uids
+	if len(drop) > 0 || len(missing) > 0 {
+		uids = withoutIndexes(node.Uids, drop, len(missing))
+		uids = append(uids, missing...)
+	}
+	slotIds := node.SlotIds
+	if len(newSlotIds) > 0 {
+		slotIds = append(append(make([]uint32, 0, len(node.SlotIds)+len(newSlotIds)), node.SlotIds...), newSlotIds...)
+	}
+	return &types.Node{LeaderId: node.LeaderId, Uids: uids, SlotIds: slotIds}
+}
+
+// withoutIndexes returns a new list of uids without the positions in drop,
+// with room for extra more. It is never nil, so /tags keeps reporting an
+// emptied node as "uids": [].
+func withoutIndexes(uids []string, drop map[int]struct{}, extra int) []string {
+	out := make([]string, 0, len(uids)-len(drop)+extra)
+	positions := make([]int, 0, len(drop))
+	for i := range drop {
+		positions = append(positions, i)
+	}
+	slices.Sort(positions)
+	start := 0
+	for _, i := range positions {
+		out = append(out, uids[start:i]...)
+		start = i + 1
+	}
+	return append(out, uids[start:]...)
+}
+
+func findNode(nodes []*types.Node, leaderId uint64) *types.Node {
+	for _, node := range nodes {
+		if node.LeaderId == leaderId {
+			return node
+		}
+	}
+	return nil
 }
 
 func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
@@ -168,29 +236,50 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 		return errors.TagNotExist(tagKey)
 	}
 
-	// 在副本上修改：发布出去的tag可能正在被分发遍历
-	newTag := copyTag(tag)
-	newTag.Nodes = cloneNodes(tag.Nodes)
+	// 先算出每个节点要删除的位置；找不到领导节点的用户跳过并返回错误，其余照常删除
+	var err error
+	drops := make(map[uint64]map[int]struct{})
 	for _, uid := range uids {
 		slotId := service.Cluster.GetSlotId(uid)
 		leaderId := service.Cluster.SlotLeaderId(slotId)
 		if leaderId == 0 {
-			return errors.TagSlotLeaderIsZero
+			err = errors.TagSlotLeaderIsZero
+			continue
 		}
-		for _, node := range newTag.Nodes {
-			if node.LeaderId == leaderId {
-				for i, nodeUid := range node.Uids {
-					if nodeUid == uid {
-						node.Uids = append(node.Uids[:i], node.Uids[i+1:]...)
-						break
-					}
-				}
-				break
+		node := findNode(tag.Nodes, leaderId)
+		if node == nil {
+			continue
+		}
+		drop := drops[leaderId]
+		for i, nodeUid := range node.Uids {
+			if nodeUid != uid {
+				continue
 			}
+			if _, ok := drop[i]; ok {
+				continue
+			}
+			if drop == nil {
+				drop = make(map[int]struct{})
+				drops[leaderId] = drop
+			}
+			drop[i] = struct{}{}
+			break
 		}
 	}
+	if len(drops) == 0 {
+		return err
+	}
+	// 发布出去的tag可能正在被分发遍历：只替换有变化的节点
+	newTag := copyTag(tag)
+	newTag.Nodes = make([]*types.Node, 0, len(tag.Nodes))
+	for _, node := range tag.Nodes {
+		if drop := drops[node.LeaderId]; len(drop) > 0 {
+			node = &types.Node{LeaderId: node.LeaderId, Uids: withoutIndexes(node.Uids, drop, 0), SlotIds: node.SlotIds}
+		}
+		newTag.Nodes = append(newTag.Nodes, node)
+	}
 	t.setTag(newTag)
-	return nil
+	return err
 }
 
 func (t *TagManager) RemoveTag(tagKey string) {
@@ -305,49 +394,6 @@ func (t *TagManager) getBlucketByChannel(channelId string, channelType uint8) *t
 	h.Write([]byte(wkutil.ChannelToKey(channelId, channelType)))
 	i := h.Sum32() % uint32(len(t.bluckets))
 	return t.bluckets[i]
-}
-
-func (t *TagManager) mergeNodes(tag *types.Tag, nodes []*types.Node) {
-	for _, node := range nodes {
-		existNode := false
-		for _, tagNode := range tag.Nodes {
-			if tagNode.LeaderId == node.LeaderId {
-				existNode = true
-
-				// 合并用户
-				for _, uid := range node.Uids {
-					existUser := false
-					for _, tagUid := range tagNode.Uids {
-						if tagUid == uid {
-							existUser = true
-							break
-						}
-					}
-					if !existUser {
-						tagNode.Uids = append(tagNode.Uids, uid)
-					}
-				}
-				// 合并slot
-				for _, slotId := range node.SlotIds {
-					existSlot := false
-					for _, tagSlotId := range tagNode.SlotIds {
-						if tagSlotId == slotId {
-							existSlot = true
-							break
-						}
-					}
-					if !existSlot {
-						tagNode.SlotIds = append(tagNode.SlotIds, slotId)
-					}
-				}
-
-				break
-			}
-		}
-		if !existNode {
-			tag.Nodes = append(tag.Nodes, node)
-		}
-	}
 }
 
 func (t *TagManager) calcUsersInNode(uids []string) ([]*types.Node, error) {

@@ -3,6 +3,8 @@ package manager
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,7 +53,7 @@ func TestTagSnapshotSurvivesReAddingMember(t *testing.T) {
 	tm := newSnapshotTestTagManager(t, []string{"a", "b", "c", "d", "e"})
 	inFlight := tm.Get("tag").Nodes[0].Uids
 
-	// Re-adding an existing member removes and appends it.
+	// Octo-server often re-adds members who are already subscribed.
 	require.NoError(t, tm.AddUsers("tag", []string{"b"}))
 
 	require.Equal(t, []string{"a", "b", "c", "d", "e"}, inFlight, "in-flight fan-out saw the re-add rewrite its list")
@@ -260,16 +262,30 @@ func TestTagSnapshotsAcrossNodes(t *testing.T) {
 	require.ElementsMatch(t, []string{"n2b", "n2c"}, nodeUids(tm.Get("tag"), 2))
 }
 
-// A change that fails part-way must leave the published tag untouched.
-func TestFailedMembershipChangeKeepsPublishedTag(t *testing.T) {
+// An add that fails part-way must leave the published tag untouched.
+func TestFailedAddUsersKeepsPublishedTag(t *testing.T) {
 	tm := newMultiNodeTestTagManager(t, []string{"a1", "n2a"})
 	before := tm.Get("tag")
 
 	require.Error(t, tm.AddUsers("tag", []string{"n2b", "orphan"}))
-	require.Error(t, tm.RemoveUsers("tag", []string{"a1", "orphan"}))
 
 	require.Same(t, before, tm.Get("tag"))
 	require.Equal(t, []string{"a1"}, nodeUids(before, 1))
+	require.Equal(t, []string{"n2a"}, nodeUids(before, 2))
+}
+
+// A remove takes out every member whose node is known and reports the one it
+// could not place (it used to stop there, keeping the members after it), and
+// leaves the tag already handed out alone.
+func TestRemoveUsersWithoutLeaderRemovesTheRest(t *testing.T) {
+	tm := newMultiNodeTestTagManager(t, []string{"a1", "a2", "n2a"})
+	before := tm.Get("tag")
+
+	require.Error(t, tm.RemoveUsers("tag", []string{"orphan", "a1", "n2a"}))
+
+	require.Equal(t, []string{"a2"}, nodeUids(tm.Get("tag"), 1))
+	require.Empty(t, nodeUids(tm.Get("tag"), 2))
+	require.Equal(t, []string{"a1", "a2"}, nodeUids(before, 1))
 	require.Equal(t, []string{"n2a"}, nodeUids(before, 2))
 }
 
@@ -335,4 +351,143 @@ func TestConversationPushAfterTagRename(t *testing.T) {
 	update := u.pendingUpdates[wkutil.ChannelToKey(channelId, 2)]
 	require.NotNil(t, update, "conversation update dropped")
 	require.Len(t, update.UserReadSeqs, 3)
+}
+
+// Re-adding present members and removing absent ones change nothing, so the
+// published tag is kept rather than copied.
+func TestNoOpMembershipChangeKeepsPublishedTag(t *testing.T) {
+	tm := newSnapshotTestTagManager(t, []string{"a", "b"})
+	before := tm.Get("tag")
+
+	require.NoError(t, tm.AddUsers("tag", []string{"a", "b"}))
+	require.NoError(t, tm.RemoveUsers("tag", []string{"x"}))
+
+	require.Same(t, before, tm.Get("tag"))
+}
+
+// A change on one node replaces only that node.
+func TestMembershipChangeSharesUnchangedNodes(t *testing.T) {
+	tm := newMultiNodeTestTagManager(t, []string{"a1", "n2a"})
+	node1 := findNode(tm.Get("tag").Nodes, 1)
+
+	require.NoError(t, tm.AddUsers("tag", []string{"n2b"}))
+	require.NoError(t, tm.RemoveUsers("tag", []string{"n2a"}))
+
+	require.Same(t, node1, findNode(tm.Get("tag").Nodes, 1))
+	require.Equal(t, []string{"n2b"}, nodeUids(tm.Get("tag"), 2))
+}
+
+// Slot leaders can move between membership changes.
+type movingLeaderCluster struct {
+	icluster.ICluster
+	leaders map[uint32]uint64
+}
+
+func (c movingLeaderCluster) GetSlotId(uid string) uint32 {
+	return uint32(len(uid)+int(uid[len(uid)-1])) % 4
+}
+func (c movingLeaderCluster) SlotLeaderId(slot uint32) uint64 { return c.leaders[slot] }
+
+type refNode struct {
+	uids  []string
+	slots []uint32
+}
+
+// refAdd and refRemove are the in-place algorithms AddUsers and RemoveUsers
+// used before tags were published as copies.
+func refAdd(ref map[uint64]*refNode, order *[]uint64, c movingLeaderCluster, uids []string) {
+	for _, leader := range *order {
+		node := ref[leader]
+		for _, uid := range uids {
+			if i := slices.Index(node.uids, uid); i >= 0 {
+				node.uids = slices.Delete(node.uids, i, i+1)
+			}
+		}
+	}
+	for _, uid := range uids {
+		slot := c.GetSlotId(uid)
+		leader := c.SlotLeaderId(slot)
+		node := ref[leader]
+		if node == nil {
+			node = &refNode{}
+			ref[leader] = node
+			*order = append(*order, leader)
+		}
+		if !slices.Contains(node.uids, uid) {
+			node.uids = append(node.uids, uid)
+		}
+		if !slices.Contains(node.slots, slot) {
+			node.slots = append(node.slots, slot)
+		}
+	}
+}
+
+func refRemove(ref map[uint64]*refNode, c movingLeaderCluster, uids []string) {
+	for _, uid := range uids {
+		if node := ref[c.SlotLeaderId(c.GetSlotId(uid))]; node != nil {
+			if i := slices.Index(node.uids, uid); i >= 0 {
+				node.uids = slices.Delete(node.uids, i, i+1)
+			}
+		}
+	}
+}
+
+func cloneTagNodes(nodes []*types.Node) []types.Node {
+	out := make([]types.Node, 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, types.Node{LeaderId: node.LeaderId, Uids: slices.Clone(node.Uids), SlotIds: slices.Clone(node.SlotIds)})
+	}
+	return out
+}
+
+// Random membership changes, with slot leaders moving in between, must give
+// the same members per node as the previous in-place algorithm, and must
+// never change a tag that was already handed out.
+func TestMembershipChangesMatchPreviousAlgorithm(t *testing.T) {
+	c := movingLeaderCluster{leaders: map[uint32]uint64{0: 1, 1: 2, 2: 3, 3: 1}}
+	old := service.Cluster
+	service.Cluster = c
+	t.Cleanup(func() { service.Cluster = old })
+
+	pool := make([]string, 30)
+	for i := range pool {
+		pool[i] = fmt.Sprintf("u%d", i)
+	}
+	tm := NewTagManager(4, func() uint64 { return 0 })
+	_, err := tm.MakeTagWithTagKey("tag", pool[:10])
+	require.NoError(t, err)
+	ref := map[uint64]*refNode{}
+	var order []uint64
+	refAdd(ref, &order, c, pool[:10])
+
+	rnd := rand.New(rand.NewSource(1))
+	for op := 0; op < 3000; op++ {
+		if rnd.Intn(10) == 0 {
+			c.leaders[uint32(rnd.Intn(4))] = uint64(rnd.Intn(3) + 1)
+			continue
+		}
+		uids := make([]string, rnd.Intn(4)+1)
+		for i := range uids {
+			uids[i] = pool[rnd.Intn(len(pool))]
+		}
+		inFlight := tm.Get("tag")
+		want := cloneTagNodes(inFlight.Nodes)
+		if rnd.Intn(2) == 0 {
+			require.NoError(t, tm.AddUsers("tag", uids))
+			refAdd(ref, &order, c, uids)
+		} else {
+			require.NoError(t, tm.RemoveUsers("tag", uids))
+			refRemove(ref, c, uids)
+		}
+		require.Equal(t, want, cloneTagNodes(inFlight.Nodes), "op %d changed a handed-out tag", op)
+
+		got := tm.Get("tag").Nodes
+		require.Len(t, got, len(ref), "op %d", op)
+		for _, node := range got {
+			r := ref[node.LeaderId]
+			require.NotNil(t, r, "op %d: unexpected node %d", op, node.LeaderId)
+			require.ElementsMatch(t, r.uids, node.Uids, "op %d node %d uids", op, node.LeaderId)
+			require.ElementsMatch(t, r.slots, node.SlotIds, "op %d node %d slots", op, node.LeaderId)
+		}
+	}
 }
