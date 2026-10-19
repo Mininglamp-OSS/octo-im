@@ -165,8 +165,11 @@ func TestTagSnapshotSurvivesSetChannelTag(t *testing.T) {
 func TestSetChannelTagPublishesTagBeforeMapping(t *testing.T) {
 	tm := newSnapshotTestTagManager(t, []string{"a"})
 	stop := make(chan struct{})
-	errs := make(chan error, 1)
+	done := make(chan struct{})
+	var checked atomic.Int64
+	var readErr error
 	go func() {
+		defer close(done)
 		for {
 			select {
 			case <-stop:
@@ -177,24 +180,27 @@ func TestSetChannelTagPublishesTagBeforeMapping(t *testing.T) {
 			if key == "" {
 				continue
 			}
+			checked.Add(1)
 			if tag := tm.Get(key); tag == nil || tag.ChannelId != "g9" {
-				errs <- fmt.Errorf("key %s resolved before its tag was labelled: %v", key, tag)
+				readErr = fmt.Errorf("key %s resolved before its tag was labelled: %v", key, tag)
 				return
 			}
 		}
 	}()
+	var once sync.Once
+	join := func() { once.Do(func() { close(stop); <-done }) }
+	defer join()
+
 	for i := 0; i < 2000; i++ {
 		key := fmt.Sprintf("k%d", i)
 		_, err := tm.MakeTagWithTagKey(key, []string{"a"})
 		require.NoError(t, err)
 		tm.SetChannelTag("g9", 5, key)
 	}
-	close(stop)
-	select {
-	case err := <-errs:
-		t.Fatal(err)
-	default:
-	}
+	// The last mapping stays, so the reader checks at least one tag.
+	require.Eventually(t, func() bool { return checked.Load() > 0 }, 5*time.Second, time.Millisecond)
+	join()
+	require.NoError(t, readErr)
 }
 
 // uids prefixed "n2" live on node 2, "orphan" on a slot without a leader, the
