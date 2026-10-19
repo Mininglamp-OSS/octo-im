@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/WuKongIM/crypto/tls"
@@ -34,6 +35,7 @@ type WSConn struct {
 	*DefaultConn
 	upgraded         bool
 	tmpInboundBuffer InboundBuffer // inboundBuffer InboundBuffer
+	decoder          clientMessageDecoder
 }
 
 func NewWSConn(d *DefaultConn) *WSConn {
@@ -119,7 +121,7 @@ func (w *WSConn) decode() ([]wsutil.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	messages, consumed, err := decodeClientMessages(buff)
+	messages, consumed, err := w.decoder.decode(buff)
 	if err != nil {
 		w.Warn("read client message error", zap.Error(err))
 		w.DiscardFromTemp(len(buff)) // 发送错误，丢弃数据
@@ -129,30 +131,22 @@ func (w *WSConn) decode() ([]wsutil.Message, error) {
 	return messages, nil
 }
 
-// decodeClientMessages 只解码 buff 中已经完整到达的消息，返回消息和消费的字节数。
-// 未到齐的帧（包括分片消息中已到达的部分）不消费，留在缓冲区等后续数据到达后再解码，
-// 避免一次读取到“完整帧 + 后续半帧”时把半帧丢掉，导致后续帧边界错乱。
-func decodeClientMessages(buff []byte) ([]wsutil.Message, int, error) {
-	completeLen, err := completeClientMessagesLen(buff)
-	if err != nil || completeLen == 0 {
-		return nil, 0, err
-	}
-	reader := bytes.NewReader(buff[:completeLen])
-	var messages []wsutil.Message
-	for reader.Len() > 0 {
-		messages, err = wsutil.ReadClientMessage(reader, messages)
-		if err != nil {
-			return nil, 0, err
-		}
-	}
-	return messages, completeLen, nil
+// clientMessageDecoder 按帧增量解码客户端发来的 WebSocket 消息。
+// 每个连接一个，只在该连接的读协程中使用。
+type clientMessageDecoder struct {
+	fragmented bool      // 是否正在接收分片消息（已收到非 FIN 的数据帧，还没收到 FIN）
+	fragOpCode ws.OpCode // 分片消息的类型，取自第一个分片
+	fragData   []byte    // 分片消息已到达部分的数据（已去掩码）
 }
 
-// completeClientMessagesLen 逐帧检查帧头和长度，返回 buff 开头由完整消息组成的字节数。
-// 分片消息要等到最后一个分片（FIN）到达才算完整；分片之间插入的控制帧随该消息一起解码。
-func completeClientMessagesLen(buff []byte) (int, error) {
-	state := ws.StateServerSide
-	offset, completeLen := 0, 0
+// decode 解码 buff 开头所有完整到达的帧，返回解出的消息和消费的字节数。
+// 每个完整的帧都会立即被消费：控制帧马上返回（包括分片消息中间插入的控制帧），
+// 分片数据先累积在解码器中，等 FIN 到达后合成一条消息；
+// 只有末尾不完整的帧留在 buff 中，等后续数据到达后再解码，
+// 避免一次读取到“完整帧 + 后续半帧”时把半帧丢掉，导致后续帧边界错乱。
+func (d *clientMessageDecoder) decode(buff []byte) ([]wsutil.Message, int, error) {
+	var messages []wsutil.Message
+	offset := 0
 	reader := bytes.NewReader(nil)
 	for offset < len(buff) {
 		reader.Reset(buff[offset:])
@@ -161,30 +155,49 @@ func completeClientMessagesLen(buff []byte) (int, error) {
 			if err == io.EOF || err == io.ErrUnexpectedEOF { // 帧头不完整
 				break
 			}
-			return 0, err
+			return nil, 0, err
+		}
+		state := ws.StateServerSide
+		if d.fragmented {
+			state = state.Set(ws.StateFragmented)
 		}
 		if err = ws.CheckHeader(header, state); err != nil {
-			return 0, err
+			return nil, 0, err
 		}
 		if header.Length > int64(reader.Len()) { // 帧数据不完整
 			break
 		}
-		offset = len(buff) - reader.Len() + int(header.Length)
+		payloadStart := len(buff) - reader.Len()
+		offset = payloadStart + int(header.Length)
+		// 复制一份：buff 中已消费的部分随后会被丢弃
+		payload := make([]byte, header.Length)
+		copy(payload, buff[payloadStart:offset])
+		ws.Cipher(payload, header.Mask, 0)
 
 		if header.OpCode.IsControl() {
-			if !state.Fragmented() {
-				completeLen = offset
-			}
+			messages = append(messages, wsutil.Message{OpCode: header.OpCode, Payload: payload})
 			continue
 		}
-		if header.Fin {
-			state = state.Clear(ws.StateFragmented)
-			completeLen = offset
-		} else {
-			state = state.Set(ws.StateFragmented)
+		if !header.Fin {
+			if !d.fragmented {
+				d.fragmented = true
+				d.fragOpCode = header.OpCode
+			}
+			d.fragData = append(d.fragData, payload...)
+			continue
 		}
+		opCode := header.OpCode
+		if d.fragmented {
+			opCode = d.fragOpCode
+			payload = append(d.fragData, payload...)
+			d.fragmented, d.fragData = false, nil
+		}
+		if opCode == ws.OpText && !utf8.Valid(payload) {
+			return nil, 0, wsutil.ErrInvalidUTF8
+		}
+		messages = append(messages, wsutil.Message{OpCode: opCode, Payload: payload})
 	}
-	return completeLen, nil
+	return messages, offset, nil
 }
 
 func (w *WSConn) upgrade() error {
@@ -298,6 +311,7 @@ type WSSConn struct {
 	upgraded bool
 
 	wsTmpInboundBuffer InboundBuffer // inboundBuffer InboundBuffer
+	decoder            clientMessageDecoder
 }
 
 func NewWSSConn(tlsConn *TLSConn) *WSSConn {
@@ -462,7 +476,7 @@ func (w *WSSConn) decode() ([]wsutil.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	messages, consumed, err := decodeClientMessages(buff)
+	messages, consumed, err := w.decoder.decode(buff)
 	if err != nil {
 		w.d.Warn("read client message error", zap.Error(err))
 		w.discardFromWSTemp(len(buff)) // 发送错误，丢弃数据
