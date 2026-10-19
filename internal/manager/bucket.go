@@ -84,14 +84,14 @@ func (b *tagBlucket) checkExpireTags() {
 		}
 	}
 
-	if len(removeTags) > 0 {
-		for _, removeTagKey := range removeTags {
-			delete(b.tag.m, removeTagKey)
-		}
-		b.Info("checkExpireTags: remove tags", zap.Int("count", len(removeTags)), zap.String("removeTag", removeTags[0]))
-
+	for _, removeTagKey := range removeTags {
+		delete(b.tag.m, removeTagKey)
 	}
 	b.tag.Unlock()
+	// 日志放在锁外：持有分桶锁时，等待它的tag写入方也占着TagManager的锁
+	if len(removeTags) > 0 {
+		b.Info("checkExpireTags: remove tags", zap.Int("count", len(removeTags)), zap.String("removeTag", removeTags[0]))
+	}
 
 	// channel tag过期检查
 	b.channel.Lock()
@@ -105,13 +105,13 @@ func (b *tagBlucket) checkExpireTags() {
 		}
 	}
 
-	if len(removeChannels) > 0 {
-		for _, removeChannelKey := range removeChannels {
-			delete(b.channel.m, removeChannelKey)
-		}
-		b.Info("checkExpireTags: remove channels", zap.Int("count", len(removeChannels)), zap.String("removeChannel", removeChannels[0]))
+	for _, removeChannelKey := range removeChannels {
+		delete(b.channel.m, removeChannelKey)
 	}
 	b.channel.Unlock()
+	if len(removeChannels) > 0 {
+		b.Info("checkExpireTags: remove channels", zap.Int("count", len(removeChannels)), zap.String("removeChannel", removeChannels[0]))
+	}
 }
 
 func (b *tagBlucket) setTag(tag *types.Tag) {
