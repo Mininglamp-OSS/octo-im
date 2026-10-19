@@ -24,12 +24,16 @@ type Tag struct {
 	NodeVersion uint64        `json:"node_version"` // 生成tag时的当前节点版本号，如果当前节点版本号大于生成tag时的节点版本号，则tag失效
 	GetCount    atomic.Uint64 `json:"get_count"`    // 获取次数
 
-	lastGet atomic.Int64 // 最后一次获取时间（UnixNano），由并发的读取方更新
+	lastGet atomic.Int64 // 最后一次获取时间（processStart 之后的纳秒数+1，0 表示没有记录），由并发的读取方更新
 }
+
+// processStart anchors access times to the monotonic clock, so wall-clock
+// steps do not make tags expire early or never.
+var processStart = time.Now()
 
 // Touch records an access; concurrent readers call it without a lock.
 func (t *Tag) Touch() {
-	t.lastGet.Store(time.Now().UnixNano())
+	t.lastGet.Store(int64(time.Since(processStart)) + 1)
 }
 
 // InheritAccess copies src's access time and count, so publishing a modified
@@ -42,7 +46,7 @@ func (t *Tag) InheritAccess(src *Tag) {
 // LastGet returns the time of the last access.
 func (t *Tag) LastGet() time.Time {
 	if n := t.lastGet.Load(); n != 0 {
-		return time.Unix(0, n)
+		return processStart.Add(time.Duration(n - 1))
 	}
 	return t.LastGetTime
 }

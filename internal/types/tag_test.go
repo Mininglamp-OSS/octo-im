@@ -55,3 +55,12 @@ func TestInheritAccessCopiesTimeAndCount(t *testing.T) {
 	require.Equal(t, src.LastGet(), c.LastGet())
 	require.EqualValues(t, 5, c.GetCount.Load())
 }
+
+// Expiry uses time.Since(LastGet()), so LastGet must carry a monotonic clock
+// reading; otherwise a wall-clock step expires tags early or never.
+func TestLastGetUsesMonotonicClock(t *testing.T) {
+	tag := &Tag{}
+	tag.Touch()
+	require.Contains(t, tag.LastGet().String(), "m=")
+	require.Less(t, time.Since(tag.LastGet()), time.Second)
+}
