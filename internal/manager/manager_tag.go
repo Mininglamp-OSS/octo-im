@@ -90,6 +90,8 @@ func (t *TagManager) MakeTagNotCacheWithTagKey(tagKey string, uids []string) (*t
 }
 
 func (t *TagManager) AddUsers(tagKey string, uids []string) error {
+	// 计算用户所在的节点，不依赖tag，放在锁外
+	nodes, err := t.calcUsersInNode(uids)
 
 	t.Lock()
 	defer t.Unlock()
@@ -98,8 +100,6 @@ func (t *TagManager) AddUsers(tagKey string, uids []string) error {
 	if tag == nil {
 		return errors.TagNotExist(tagKey)
 	}
-	// 计算用户所在的节点
-	nodes, err := t.calcUsersInNode(uids)
 	if err != nil {
 		return err
 	}
@@ -351,6 +351,9 @@ func (t *TagManager) GetChannelTag(fakeChannelId string, channelType uint8) stri
 }
 
 func (t *TagManager) RemoveChannelTag(fakeChannelId string, channelType uint8) {
+	// 与 SetChannelTag 串行
+	t.Lock()
+	defer t.Unlock()
 	blucket := t.getBlucketByChannel(fakeChannelId, channelType)
 	blucket.removeChannelTag(fakeChannelId, channelType)
 }
