@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -166,6 +167,54 @@ func TestClientMessageDecoderControlFrameDuringFragmentedMessage(t *testing.T) {
 	}
 }
 
+func TestClientMessageDecoderRejectsOversizedMessage(t *testing.T) {
+	const maxSize = 10
+
+	t.Run("declared frame too large", func(t *testing.T) {
+		d := &clientMessageDecoder{maxSize: maxSize}
+		frame := testMaskedFrame(t, true, ws.OpBinary, strings.Repeat("x", maxSize+1))
+		// 只收到帧头和掩码就拒绝，不等数据到齐
+		messages, consumed, err := d.decode(frame[:6])
+		require.ErrorIs(t, err, errWSMessageTooLarge)
+		require.Zero(t, consumed)
+		require.Empty(t, messages)
+	})
+
+	t.Run("fragmented message too large", func(t *testing.T) {
+		d := &clientMessageDecoder{maxSize: maxSize}
+		start := testJoin(testMaskedFrame(t, false, ws.OpBinary, "12345"), testMaskedFrame(t, false, ws.OpContinuation, "67890"))
+		messages, consumed, err := d.decode(start)
+		require.NoError(t, err)
+		require.Equal(t, len(start), consumed)
+		require.Empty(t, messages)
+
+		messages, consumed, err = d.decode(testMaskedFrame(t, true, ws.OpContinuation, "1"))
+		require.ErrorIs(t, err, errWSMessageTooLarge)
+		require.Zero(t, consumed)
+		require.Empty(t, messages)
+	})
+
+	t.Run("messages at the limit", func(t *testing.T) {
+		d := &clientMessageDecoder{maxSize: maxSize}
+		buff := testJoin(
+			testMaskedFrame(t, true, ws.OpBinary, "1234567890"),
+			testMaskedFrame(t, false, ws.OpBinary, "12345"),
+			testMaskedFrame(t, false, ws.OpContinuation, "67890"),
+			// 分片中间的控制帧不计入分片消息的累计长度
+			testMaskedFrame(t, true, ws.OpPing, "p"),
+			testMaskedFrame(t, true, ws.OpContinuation, ""),
+		)
+		messages, consumed, err := d.decode(buff)
+		require.NoError(t, err)
+		require.Equal(t, len(buff), consumed)
+		require.Equal(t, []wsutil.Message{
+			{OpCode: ws.OpBinary, Payload: []byte("1234567890")},
+			{OpCode: ws.OpPing, Payload: []byte("p")},
+			{OpCode: ws.OpBinary, Payload: []byte("1234567890")},
+		}, messages)
+	})
+}
+
 func TestClientMessageDecoderRejectsInvalidFrames(t *testing.T) {
 	var unmasked bytes.Buffer
 	require.NoError(t, ws.WriteFrame(&unmasked, ws.NewBinaryFrame([]byte("data"))))
@@ -249,10 +298,10 @@ func testWriteInTwoReads(t *testing.T, conn net.Conn, data []byte, split int) {
 	require.NoError(t, err)
 }
 
-func testDialWS(t *testing.T) (net.Conn, *testWSPayloadCollector) {
+func testDialWS(t *testing.T, opts ...Option) (net.Conn, *testWSPayloadCollector) {
 	t.Helper()
 	// 引擎默认还会监听 TCP 5100，这里也改用随机端口，避免与本机已有服务冲突
-	e := NewEngine(WithAddr("tcp://127.0.0.1:0"), WithWSAddr("ws://0.0.0.0:0"))
+	e := NewEngine(append([]Option{WithAddr("tcp://127.0.0.1:0"), WithWSAddr("ws://0.0.0.0:0")}, opts...)...)
 	collector := &testWSPayloadCollector{}
 	e.OnData(collector.onData)
 	require.NoError(t, e.Start())
@@ -264,11 +313,11 @@ func testDialWS(t *testing.T) (net.Conn, *testWSPayloadCollector) {
 	return conn, collector
 }
 
-func testDialWSS(t *testing.T) (net.Conn, *testWSPayloadCollector) {
+func testDialWSS(t *testing.T, opts ...Option) (net.Conn, *testWSPayloadCollector) {
 	t.Helper()
 	cert, err := stls.X509KeyPair(rsaCertPEM, rsaKeyPEM)
 	require.NoError(t, err)
-	e := NewEngine(WithAddr("tcp://127.0.0.1:0"), WithWSSAddr("wss://0.0.0.0:0"), WithWSTLSConfig(&stls.Config{Certificates: []stls.Certificate{cert}}))
+	e := NewEngine(append([]Option{WithAddr("tcp://127.0.0.1:0"), WithWSSAddr("wss://0.0.0.0:0"), WithWSTLSConfig(&stls.Config{Certificates: []stls.Certificate{cert}})}, opts...)...)
 	collector := &testWSPayloadCollector{}
 	e.OnData(collector.onData)
 	require.NoError(t, e.Start())
@@ -322,8 +371,21 @@ func testReadServerFrame(t *testing.T, conn net.Conn) ws.Frame {
 	return frame
 }
 
+// 服务端应当立即关闭连接（收到 Close 帧或连接断开），而不是一直挂起
+func testRequireConnClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	frame, err := ws.ReadFrame(conn)
+	if err == nil {
+		require.Equal(t, ws.OpClose, frame.Header.OpCode)
+		return
+	}
+	var netErr net.Error
+	require.False(t, errors.As(err, &netErr) && netErr.Timeout(), "连接没有被关闭: %v", err)
+}
+
 // 发出一个非 FIN 的分片后暂停，紧接着发送控制帧：服务端必须立即处理控制帧，不能等分片消息结束
-func testControlFrameDuringFragmentedMessage(t *testing.T, dial func(t *testing.T) (net.Conn, *testWSPayloadCollector)) {
+func testControlFrameDuringFragmentedMessage(t *testing.T, dial func(t *testing.T, opts ...Option) (net.Conn, *testWSPayloadCollector)) {
 	ready := testMaskedFrame(t, true, ws.OpBinary, "ready|")
 	fragStart := testMaskedFrame(t, false, ws.OpBinary, "part-")
 
@@ -351,14 +413,7 @@ func testControlFrameDuringFragmentedMessage(t *testing.T, dial func(t *testing.
 
 		// 服务端收到 Close 后直接断开连接、不回 Close 帧（原有行为），
 		// 这里只要求连接被立即关闭，而不是等最后一个分片一直挂起
-		require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
-		frame, err := ws.ReadFrame(conn)
-		if err == nil {
-			require.Equal(t, ws.OpClose, frame.Header.OpCode)
-			return
-		}
-		var netErr net.Error
-		require.False(t, errors.As(err, &netErr) && netErr.Timeout(), "连接没有被关闭: %v", err)
+		testRequireConnClosed(t, conn)
 	})
 }
 
@@ -368,4 +423,50 @@ func TestWSConnHandlesControlFrameDuringFragmentedMessage(t *testing.T) {
 
 func TestWSSConnHandlesControlFrameDuringFragmentedMessage(t *testing.T) {
 	testControlFrameDuringFragmentedMessage(t, testDialWSS)
+}
+
+// 单条消息（分片按累计长度）和连接上未处理完的数据都受 MaxReadBufferSize 限制，超过时关闭连接
+func testInboundSizeLimit(t *testing.T, dial func(t *testing.T, opts ...Option) (net.Conn, *testWSPayloadCollector)) {
+	const maxSize = 4096
+	limit := func(opts *Options) { opts.MaxReadBufferSize = maxSize }
+
+	t.Run("message within limit", func(t *testing.T) {
+		conn, collector := dial(t, limit)
+		payload := strings.Repeat("a", 3000)
+		_, err := conn.Write(testMaskedFrame(t, true, ws.OpBinary, payload))
+		require.NoError(t, err)
+		collector.waitFor(t, payload)
+	})
+
+	t.Run("declared frame too large", func(t *testing.T) {
+		conn, _ := dial(t, limit)
+		frame := testMaskedFrame(t, true, ws.OpBinary, strings.Repeat("x", 1<<20))
+		// 只发帧头（2 字节 + 8 字节扩展长度）和掩码，不发数据
+		_, err := conn.Write(frame[:14])
+		require.NoError(t, err)
+		testRequireConnClosed(t, conn)
+	})
+
+	t.Run("fragmented message too large", func(t *testing.T) {
+		conn, _ := dial(t, limit)
+		chunk := strings.Repeat("y", 1000)
+		for i := 0; i < 5; i++ {
+			op := ws.OpContinuation
+			if i == 0 {
+				op = ws.OpBinary
+			}
+			if _, err := conn.Write(testMaskedFrame(t, false, op, chunk)); err != nil {
+				break // 连接可能已被服务端关闭
+			}
+		}
+		testRequireConnClosed(t, conn)
+	})
+}
+
+func TestWSConnInboundSizeLimit(t *testing.T) {
+	testInboundSizeLimit(t, testDialWS)
+}
+
+func TestWSSConnInboundSizeLimit(t *testing.T) {
+	testInboundSizeLimit(t, testDialWSS)
 }

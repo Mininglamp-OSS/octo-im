@@ -3,6 +3,7 @@ package wknet
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -42,6 +43,7 @@ func NewWSConn(d *DefaultConn) *WSConn {
 	w := &WSConn{
 		DefaultConn:      d,
 		tmpInboundBuffer: d.eg.eventHandler.OnNewInboundConn(d, d.eg),
+		decoder:          clientMessageDecoder{maxSize: d.eg.options.MaxReadBufferSize},
 	}
 	return w
 }
@@ -54,6 +56,11 @@ func (w *WSConn) ReadToInboundBuffer() (int, error) {
 	}
 	if w.eg.options.Event.OnReadBytes != nil {
 		w.eg.options.Event.OnReadBytes(n)
+	}
+	// 与普通 TCP 连接的 overflowForInbound 一致：已收到但未处理完的数据不能超过 MaxReadBufferSize
+	staged := w.tmpInboundBuffer.BoundBufferSize() + len(w.decoder.fragData) + w.inboundBuffer.BoundBufferSize()
+	if wsInboundOverflow(w.eg.options.MaxReadBufferSize, staged, n) {
+		return 0, fmt.Errorf("websocket inbound buffer overflow, fd: %d staged: %d n: %d maxSize: %d", w.fd, staged, n, w.eg.options.MaxReadBufferSize)
 	}
 	_, err = w.tmpInboundBuffer.Write(readBuffer[:n])
 	if err != nil {
@@ -131,9 +138,18 @@ func (w *WSConn) decode() ([]wsutil.Message, error) {
 	return messages, nil
 }
 
+// errWSMessageTooLarge 单个帧声明的长度或分片消息的累计长度超过上限
+var errWSMessageTooLarge = errors.New("websocket message too large")
+
+// wsInboundOverflow 判断再收到 n 字节后，连接上已收到但未处理完的数据是否超过上限（maxSize <= 0 表示不限制）
+func wsInboundOverflow(maxSize, staged, n int) bool {
+	return maxSize > 0 && staged+n > maxSize
+}
+
 // clientMessageDecoder 按帧增量解码客户端发来的 WebSocket 消息。
 // 每个连接一个，只在该连接的读协程中使用。
 type clientMessageDecoder struct {
+	maxSize    int       // 单条消息（分片消息按累计长度）的最大字节数，<= 0 表示不限制
 	fragmented bool      // 是否正在接收分片消息（已收到非 FIN 的数据帧，还没收到 FIN）
 	fragOpCode ws.OpCode // 分片消息的类型，取自第一个分片
 	fragData   []byte    // 分片消息已到达部分的数据（已去掩码）
@@ -163,6 +179,14 @@ func (d *clientMessageDecoder) decode(buff []byte) ([]wsutil.Message, int, error
 		}
 		if err = ws.CheckHeader(header, state); err != nil {
 			return nil, 0, err
+		}
+		// 按帧头声明的长度检查，不等数据到齐；分片消息的数据帧按累计长度计算
+		size := header.Length
+		if d.fragmented && !header.OpCode.IsControl() {
+			size += int64(len(d.fragData))
+		}
+		if d.maxSize > 0 && size > int64(d.maxSize) {
+			return nil, 0, errWSMessageTooLarge
 		}
 		if header.Length > int64(reader.Len()) { // 帧数据不完整
 			break
@@ -318,6 +342,7 @@ func NewWSSConn(tlsConn *TLSConn) *WSSConn {
 	return &WSSConn{
 		TLSConn:            tlsConn,
 		wsTmpInboundBuffer: tlsConn.d.eg.eventHandler.OnNewInboundConn(tlsConn.d, tlsConn.d.eg), // tls解码后的数据
+		decoder:            clientMessageDecoder{maxSize: tlsConn.d.eg.options.MaxReadBufferSize},
 	}
 }
 
@@ -329,6 +354,11 @@ func (w *WSSConn) ReadToInboundBuffer() (int, error) {
 	}
 	if w.d.eg.options.Event.OnReadBytes != nil {
 		w.d.eg.options.Event.OnReadBytes(n)
+	}
+	// 与普通 TCP 连接的 overflowForInbound 一致：已收到但未处理完的数据（含未解密部分）不能超过 MaxReadBufferSize
+	staged := w.tmpInboundBuffer.BoundBufferSize() + w.wsTmpInboundBuffer.BoundBufferSize() + len(w.decoder.fragData) + w.d.inboundBuffer.BoundBufferSize()
+	if wsInboundOverflow(w.d.eg.options.MaxReadBufferSize, staged, n) {
+		return 0, fmt.Errorf("websocket inbound buffer overflow, fd: %d staged: %d n: %d maxSize: %d", w.d.fd, staged, n, w.d.eg.options.MaxReadBufferSize)
 	}
 
 	_, err = w.tmpInboundBuffer.Write(readBuffer[:n])
