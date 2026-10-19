@@ -140,7 +140,10 @@ func (u *userHandler) tick() {
 // 检查连无效连接
 func (u *userHandler) checkInvalidConn(conns []*eventbus.Conn) {
 	for _, conn := range conns {
-		if fasttime.UnixTimestamp()-conn.LastActive > uint64(options.G.ConnIdleTime.Seconds()) {
+		now, lastActive := fasttime.UnixTimestamp(), conn.LastActive
+		// A cached clock or a wall-clock rollback can put activity in the
+		// future. Do not let unsigned subtraction turn that into an idle expiry.
+		if now > lastActive && now-lastActive > uint64(options.G.ConnIdleTime.Seconds()) {
 			u.addEvent(&eventbus.Event{
 				Type: eventbus.EventConnRemove,
 				Conn: conn,

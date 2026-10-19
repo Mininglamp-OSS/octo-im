@@ -10,6 +10,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/fasttime"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"golang.org/x/sync/errgroup"
@@ -150,7 +151,7 @@ func (m *Manager) read(ctx context.Context, node uint64, uids []string) (snapsho
 				return nil, ErrNotReady
 			}
 			seen[conn.SessionID] = true
-			conn.LastActive = uint64(time.Now().Unix())
+			conn.LastActive = fasttime.UnixTimestamp()
 			conns = append(conns, conn)
 		}
 		return conns, nil
