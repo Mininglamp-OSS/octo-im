@@ -9,9 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -307,4 +309,30 @@ func TestEmptiedNodeKeepsEmptyUidList(t *testing.T) {
 	data, err := json.Marshal(node2)
 	require.NoError(t, err)
 	require.Contains(t, string(data), `"uids":[]`)
+}
+
+// A subscriber change renames the channel's tag. A fan-out that started before
+// it still holds the old key when it updates conversations, and the update
+// must not be dropped.
+func TestConversationPushAfterTagRename(t *testing.T) {
+	tm := newSnapshotTestTagManager(t, []string{"a", "b"})
+	oldTagManager, oldNodeId := service.TagManager, options.G.Cluster.NodeId
+	service.TagManager, options.G.Cluster.NodeId = tm, 1
+	t.Cleanup(func() { service.TagManager, options.G.Cluster.NodeId = oldTagManager, oldNodeId })
+
+	channelId := "g1" + options.G.Channel.CmdSuffix
+	tm.SetChannelTag(channelId, 2, "tag")
+	inFlight := tm.Get("tag")
+
+	// What a subscriber add does on the channel leader.
+	require.NoError(t, tm.AddUsers("tag", []string{"c"}))
+	require.NoError(t, tm.RenameTag("tag", "tag2"))
+	tm.SetChannelTag(channelId, 2, "tag2")
+
+	u := newConversationUpdater(nil)
+	u.push(channelId, 2, inFlight.Key, 5, nil)
+
+	update := u.pendingUpdates[wkutil.ChannelToKey(channelId, 2)]
+	require.NotNil(t, update, "conversation update dropped")
+	require.Len(t, update.UserReadSeqs, 3)
 }
