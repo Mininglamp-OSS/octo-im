@@ -1,7 +1,8 @@
 # fix1 分支镜像构建
 
 GitHub Actions 的 `Docker Publish` 使用 `GITHUB_TOKEN` 发布到
-`ghcr.io/mininglamp-oss/octo-im`，同时构建 `linux/amd64` 和 `linux/arm64`。
+`ghcr.io/mininglamp-oss/octo-im`，构建 `linux/amd64` 和 `linux/arm64`。
+构建文件使用 [41dd1e5 中的 Dockerfile.pr](https://github.com/Mininglamp-OSS/octo-im/blob/41dd1e597a66f1cad44a38e9e4cd4f2d9796695c/Dockerfile.pr)，内容保持一致。
 不需要额外配置 Docker Hub 或阿里云凭据。仓库 Actions 策略必须允许
 工作流使用 `packages: write`。
 
@@ -40,11 +41,18 @@ gh workflow run docker-publish.yml \
 
 ```sh
 python3 -B -m unittest discover -s test/ci -p 'test_*.py' -v
-docker buildx build --platform linux/arm64 --load -t local/octo-im:arm64 .
-docker buildx build --platform linux/amd64 --load -t local/octo-im:amd64 .
+docker buildx build -f Dockerfile.pr --load -t local/octo-im:test \
+  --build-arg "SOURCE_REVISION=$(git rev-parse HEAD)" \
+  --build-arg "SOURCE_DATE=$(git log -1 --format=%ct)" \
+  --build-arg SOURCE_VERSION=test-local .
 ```
 
-Dockerfile 分别编译前端和 Go 服务，通过 `TARGETOS` / `TARGETARCH` 交叉编译，
-无需 QEMU。前端依赖使用 Yarn lockfile；Go 保持已验证的 `1.23.0` 工具链。
+本地命令按 Docker 当前平台构建，三个 `SOURCE_*` 参数均为必填。
+Actions 分别使用 `ubuntu-24.04` 和 `ubuntu-24.04-arm` 原生 runner，
+每个 runner 使用 `Dockerfile.pr` 编译并推送对应平台的 digest。
+两种架构均成功后，合并任务生成带镜像标签的 manifest，并核对包含 AMD64 和 ARM64。
+构建无需 QEMU，也不依赖 `TARGETARCH` 交叉编译参数。
+前端使用 Node 20 和 Yarn 1.22.22，依赖使用 Yarn lockfile；Go 为 `1.23.0`。
 构建上下文不包含 `.git`、`.context` 或宿主机的 `node_modules`，
+由专用的 `Dockerfile.pr.dockerignore` 排除这些路径，
 仅将前端编译结果复制到 Go 构建阶段。
