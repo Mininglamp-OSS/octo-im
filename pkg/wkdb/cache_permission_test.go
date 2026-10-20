@@ -178,23 +178,23 @@ func TestPermissionCacheStats(t *testing.T) {
 
 	// 获取缓存统计
 	stats := cache.GetCacheStats()
-	assert.Equal(t, 7, stats["total_cache_len"])      // 2+2+2+1 = 7
-	assert.Equal(t, 2, stats["denylist_cache_len"])   // 2个黑名单
-	assert.Equal(t, 2, stats["subscriber_cache_len"]) // 2个订阅者
-	assert.Equal(t, 2, stats["allowlist_cache_len"])  // 2个白名单
+	assert.Equal(t, 7, stats["total_cache_len"])         // 2+2+2+1 = 7
+	assert.Equal(t, 2, stats["denylist_cache_len"])      // 2个黑名单
+	assert.Equal(t, 2, stats["subscriber_cache_len"])    // 2个订阅者
+	assert.Equal(t, 2, stats["allowlist_cache_len"])     // 2个白名单
 	assert.Equal(t, 1, stats["has_allowlist_cache_len"]) // 1个HasAllowlist
 	assert.Equal(t, 1000, stats["cache_max"])
-	assert.Equal(t, 300.0, stats["cache_ttl_seconds"]) // 5分钟 = 300秒
+	assert.Equal(t, 1800.0, stats["cache_ttl_seconds"]) // 30分钟 = 1800秒
 
 	// 测试其他统计方法
 	assert.Equal(t, 7, cache.GetCacheSize())
 	assert.Equal(t, 1000, cache.GetMaxCacheSize())
-	assert.Equal(t, 5*time.Minute, cache.GetCacheTTL())
+	assert.Equal(t, 30*time.Minute, cache.GetCacheTTL())
 }
 
 func TestPermissionCacheExpiration(t *testing.T) {
 	cache := wkdb.NewPermissionCache(1000)
-	
+
 	// 设置较短的TTL用于测试
 	cache.SetCacheTTL(100 * time.Millisecond)
 
