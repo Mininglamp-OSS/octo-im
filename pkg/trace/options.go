@@ -20,6 +20,7 @@ type Options struct {
 
 	prometheusClient api.Client // prometheus client
 	prometheusApi    v1.API
+	onlineUserCount  func() int64
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -60,6 +61,14 @@ func WithPrometheusApiUrl(url string) Option {
 func WithReqTimeout(timeout time.Duration) Option {
 	return func(o *Options) {
 		o.ReqTimeout = timeout
+	}
+}
+
+// WithOnlineUserCount supplies the current online UID count at collection time.
+// The callback must support concurrent collections and must not perform I/O.
+func WithOnlineUserCount(observe func() int64) Option {
+	return func(o *Options) {
+		o.onlineUserCount = observe
 	}
 }
 
