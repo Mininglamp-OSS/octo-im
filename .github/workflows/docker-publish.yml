@@ -82,6 +82,8 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           REVISION: ${{ steps.meta.outputs.revision }}
         run: |
+          # Backticks in these printf formats are literal Markdown delimiters.
+          # shellcheck disable=SC2016
           {
             printf 'Source: `%s`\n\nPlatforms: `linux/amd64`, `linux/arm64`\n\n' "$REVISION"
             printf 'Pull by digest: `docker pull %s@%s`\n\n' "$IMAGE" "$DIGEST"
