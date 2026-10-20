@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Compile frontends on the builder's native CPU for both image architectures.
-FROM --platform=$BUILDPLATFORM node:22-bookworm AS frontend
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS frontend
 WORKDIR /frontend
 COPY demo/chatdemo/package.json demo/chatdemo/yarn.lock ./chatdemo/
 RUN cd chatdemo && yarn install --frozen-lockfile --non-interactive
@@ -32,9 +32,8 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     go version -m /out/app > /out/buildinfo.txt
 
 FROM alpine:3.23.4 AS prod
-RUN apk add --no-cache ca-certificates tzdata && \
-    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-    echo "Asia/Shanghai" > /etc/timezone
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 WORKDIR /home
 COPY --from=build /out/app /home/app
 COPY --from=build /out/buildinfo.txt /home/buildinfo.txt
