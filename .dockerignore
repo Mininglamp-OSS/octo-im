@@ -1,5 +1,11 @@
 web/dist
 web/node_modules
+demo/chatdemo/dist
+demo/chatdemo/node_modules
+.git
+.context
+.DS_Store
+**/__pycache__
 .vscode
 .VSCodeCounter
 .github

@@ -1,0 +1,89 @@
+name: Docker Publish
+run-name: Image ${{ github.ref_name }} (${{ github.event_name }})
+
+on:
+  push:
+    branches:
+      - v2.2.5-20260422-fix1
+    tags:
+      - v2.2.5-20260422-fix1
+      - v2.2.5-20260422-fix1.*
+      - v2.2.5-20260422-fix1-*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional test-* image tag; defaults to test-<commit SHA>'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fix1-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker:
+    name: Build and publish amd64 + arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout triggered commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Test image metadata
+        run: python3 -B -m unittest discover -s test/ci -p 'test_*.py' -v
+
+      - name: Prepare image metadata
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: bash .github/scripts/image-metadata.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.revision }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          build-args: |
+            SOURCE_REVISION=${{ steps.meta.outputs.revision }}
+            SOURCE_DATE=${{ steps.meta.outputs.commit_date }}
+            SOURCE_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha,scope=fix1-image
+          cache-to: type=gha,mode=max,scope=fix1-image
+
+      - name: Summarize published image
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REVISION: ${{ steps.meta.outputs.revision }}
+        run: |
+          {
+            printf 'Source: `%s`\n\nPlatforms: `linux/amd64`, `linux/arm64`\n\n' "$REVISION"
+            printf 'Pull by digest: `docker pull %s@%s`\n\n' "$IMAGE" "$DIGEST"
+            printf 'Tags:\n```text\n%s\n```\n' "$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"

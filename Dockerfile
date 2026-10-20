@@ -1,53 +1,42 @@
-FROM golang:1.23 as build
+# syntax=docker/dockerfile:1
 
-# ENV GOPROXY=https://goproxy.cn,direct
-ENV GO111MODULE=on
+# Compile frontends on the builder's native CPU for both image architectures.
+FROM --platform=$BUILDPLATFORM node:22-bookworm AS frontend
+WORKDIR /frontend
+COPY demo/chatdemo/package.json demo/chatdemo/yarn.lock ./chatdemo/
+RUN cd chatdemo && yarn install --frozen-lockfile --non-interactive
+COPY demo/chatdemo ./chatdemo
+RUN cd chatdemo && yarn build
+COPY web/package.json web/yarn.lock ./web/
+RUN cd web && yarn install --frozen-lockfile --non-interactive
+COPY web ./web
+RUN cd web && yarn build
 
-# 安装 Node.js 和 Yarn
-RUN curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg |  apt-key add -
-RUN echo "deb https://dl.yarnpkg.com/debian/ stable main" |  tee /etc/apt/sources.list.d/yarn.list
-RUN apt-get update -y  && apt-get install -y yarn
-RUN apt-get install -y nodejs
-RUN yarn config set registry https://registry.npm.taobao.org -g
-
-# 编译前端demo
-WORKDIR /go/release/demo
-ADD demo .
-
-#------ 编译chatdemo ------
-WORKDIR /go/release/demo/chatdemo
-RUN yarn install && yarn build
-
-# 编译前端 monitor
-WORKDIR /go/release/web
-ADD web .
-RUN yarn install && yarn build
-
-# 编译后端
-
-WORKDIR /go/cache
-
-ADD go.mod .
-ADD go.sum .
+# Keep the toolchain used by the validated fix1 build.
+FROM --platform=$BUILDPLATFORM golang:1.23.0 AS build
+ENV GOTOOLCHAIN=local CGO_ENABLED=0
+WORKDIR /src
+COPY go.mod go.sum ./
 RUN go mod download
+COPY . .
+COPY --from=frontend /frontend/chatdemo/dist ./demo/chatdemo/dist
+COPY --from=frontend /frontend/web/dist ./web/dist
+ARG TARGETOS
+ARG TARGETARCH
+ARG SOURCE_REVISION=unknown
+ARG SOURCE_DATE=0
+ARG SOURCE_VERSION=dev
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="-w -extldflags '-static' -X main.Commit=${SOURCE_REVISION} -X main.CommitDate=${SOURCE_DATE} -X main.Version=${SOURCE_VERSION} -X main.TreeState=clean" \
+    -installsuffix cgo -o /out/app ./main.go && \
+    go version -m /out/app > /out/buildinfo.txt
 
-WORKDIR /go/release
-ADD . .
-
-# RUN CGO_ENABLED=0 GOOS=linux go build -ldflags='-w -extldflags "-static"' -o app main.go
-
-RUN GIT_COMMIT=$(git rev-parse HEAD) && \
-    GIT_COMMIT_DATE=$(git log --date=iso8601-strict -1 --pretty=%ct) && \
-    GIT_VERSION=$(git describe --tags --abbrev=0) && \
-    GIT_TREE_STATE=$(test -n "`git status --porcelain`" && echo "dirty" || echo "clean") && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -extldflags '-static' -X main.Commit=$GIT_COMMIT -X main.CommitDate=$GIT_COMMIT_DATE -X main.Version=$GIT_VERSION -X main.TreeState=$GIT_TREE_STATE" -installsuffix cgo  -o app ./main.go
-
-FROM alpine as prod
-# Import the user and group files from the builder.
-COPY --from=build /etc/passwd /etc/passwd
-COPY --from=build /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+FROM alpine:3.23.4 AS prod
+RUN apk add --no-cache ca-certificates tzdata && \
+    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone
 WORKDIR /home
-COPY --from=build /go/release/app /home
-COPY --from=build /go/release/config/wk.yaml /root/wukongim/wk.yaml
+COPY --from=build /out/app /home/app
+COPY --from=build /out/buildinfo.txt /home/buildinfo.txt
+COPY config/wk.yaml /root/wukongim/wk.yaml
 ENTRYPOINT ["/home/app","--config=/root/wukongim/wk.yaml","--ignoreMissingConfig=true"]
