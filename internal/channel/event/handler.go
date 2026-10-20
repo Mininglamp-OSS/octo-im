@@ -141,7 +141,9 @@ func (c *channelHandler) checkAndUpdateLeaderIdChange() error {
 
 // isTimeout 判断用户是否超时
 func (c *channelHandler) isTimeout() bool {
-	return fasttime.UnixTimestamp()-c.lastActive > uint64(options.G.Poller.ChannelTimeout.Seconds())
+	now, lastActive := fasttime.UnixTimestamp(), c.lastActive
+	// Avoid unsigned underflow when the wall clock moves backwards.
+	return now > lastActive && now-lastActive > uint64(options.G.Poller.ChannelTimeout.Seconds())
 }
 
 // groupByType 将待处理事件按照事件类型分组

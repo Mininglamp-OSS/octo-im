@@ -166,7 +166,9 @@ func (u *userHandler) addConn(conn *eventbus.Conn) {
 
 // isTimeout 判断用户是否超时
 func (u *userHandler) isTimeout() bool {
-	return fasttime.UnixTimestamp()-u.lastActive > uint64(options.G.Poller.UserTimeout.Seconds())
+	now, lastActive := fasttime.UnixTimestamp(), u.lastActive
+	// Avoid unsigned underflow when the wall clock moves backwards.
+	return now > lastActive && now-lastActive > uint64(options.G.Poller.UserTimeout.Seconds())
 }
 
 // groupByType 将待处理事件按照事件类型分组
