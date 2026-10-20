@@ -13,6 +13,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/fasttime"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
@@ -223,7 +224,8 @@ func copyConn(conn *eventbus.Conn) *eventbus.Conn {
 	data, _ := conn.Encode()
 	out := &eventbus.Conn{}
 	_ = out.Decode(data)
-	out.LastActive = uint64(time.Now().Unix())
+	// Logical session activity must use the same clock as idle expiry.
+	out.LastActive = fasttime.UnixTimestamp()
 	return out
 }
 
