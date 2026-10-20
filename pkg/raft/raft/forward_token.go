@@ -41,10 +41,13 @@ import (
 //     outcome-unknown immediately instead of at the caller's deadline. The
 //     first such response per leader and term is logged at WARN and every one
 //     is counted (LegacyResponses, LegacySettled).
-//   - A leader that echoed a token while this node's view is in term T is
-//     token-aware for T, and a zero-header response attributed to it in T is
-//     dropped as unattributable (UnechoedResponses). A restarted or rolled-back
-//     leader can only lead again in a later term, which clears the observation.
+//   - A leader that echoed the token of a live registration while this
+//     node's view is in term T is token-aware for T, and a zero-header
+//     response attributed to it in T is dropped as unattributable
+//     (UnechoedResponses). Only a live match counts: registrations retire on
+//     every route change, so a stale echo can predate the term and proves
+//     nothing about its leader. A restarted or rolled-back leader can only
+//     lead again in a later term, which clears the observation.
 //   - A response with any other header version is dropped and logged.
 const forwardTokenVersion uint32 = 1
 

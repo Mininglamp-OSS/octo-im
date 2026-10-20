@@ -184,10 +184,11 @@ func (r *Raft) handleSendProposeResp(e types.Event) {
 	defer r.forwardMu.Unlock()
 	switch {
 	case e.Logs[0].Term == forwardTokenVersion:
-		r.markTokenAwareLocked(e.From)
 		token := forwardToken{incarnation: e.Logs[0].Index, attempt: e.Logs[0].Id}
 		reg, ok := r.forwardPending[key]
 		if !ok || reg.token != token {
+			// A stale echo may predate a term change, so it proves nothing
+			// about the leader of the current term.
 			r.forwardStats.stale++
 			return
 		}
@@ -195,6 +196,9 @@ func (r *Raft) handleSendProposeResp(e types.Event) {
 			r.forwardStats.senderMismatch++
 			return
 		}
+		// A live registration is retired on every route change, so this
+		// echo comes from the current term's leader.
+		r.markTokenAwareLocked(e.From)
 	case e.Logs[0].Term == 0 && e.Logs[0].Index == 0 && e.Logs[0].Id == 0:
 		// Zero header: a leader that predates the token; see forward_token.go.
 		if !r.acceptLegacyResponseLocked(key, e.From) {

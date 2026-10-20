@@ -188,7 +188,7 @@ func errorsIsAll(err error, targets ...error) bool {
 
 // Stale, foreign, unechoed (from a token-aware leader) and wrong-sender
 // responses never settle or retire a live registration; only the exact echoed
-// token from the routed leader does.
+// token from the routed leader does, and only that proves token awareness.
 func TestConfigForwardTokenMismatch(t *testing.T) {
 	c := studyNew(t, true)
 	r := c.rr[1]
@@ -215,12 +215,16 @@ func TestConfigForwardTokenMismatch(t *testing.T) {
 	foreign.Logs[0].Index = other.forwardToken.incarnation
 	versioned := studyResponse(t, live, 1, types.ReasonOk, resps)
 	versioned.Logs[0].Term = forwardTokenVersion + 1
-	// An echoed token, even a stale one, shows the leader is token-aware in
-	// this term, so a zero-header response from it is unattributable.
-	r.Step(studyResponse(t, older, 1, types.ReasonOk, resps))
+	// The echo of a live request shows the leader is token-aware in this
+	// term, so a zero-header response from it is unattributable.
+	probe := studyCall(r, ctx, 1499)
+	probeReq := studyRecv(t, c.tr.c)
+	r.Step(studyResponse(t, probeReq, 1, types.ReasonError, types.ProposeRespSet{&types.ProposeResp{Id: 1499}}))
+	require.ErrorIs(t, studyRecv(t, probe).err, types.ErrForwardRejected)
 	for name, e := range map[string]types.Event{
 		"unechoed":       unechoed,
 		"unknownVersion": versioned,
+		"olderAttempt":   studyResponse(t, older, 1, types.ReasonOk, resps),
 		"otherInstance":  foreign,
 		"wrongSender":    studyResponse(t, live, 3, types.ReasonOk, resps),
 		"rejectedOlder":  studyResponse(t, older, 1, types.ReasonError, resps),

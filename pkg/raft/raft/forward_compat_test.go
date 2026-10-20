@@ -146,23 +146,22 @@ func TestConfigForwardLegacyResponses(t *testing.T) {
 		require.ErrorIs(t, studyRecv(t, out).err, types.ErrProposalOutcomeUnknown)
 		requireForwardQuiescent(t, r)
 	})
-	// A leader that echoed a token in the current term is token-aware; a
-	// zero-header response attributed to it cannot come from that leader and
-	// is dropped. A new term clears the observation, so a rolled-back leader
-	// is again served by the compatibility path.
+	// A leader that echoed the token of a live request in the current term is
+	// token-aware; a zero-header response attributed to it cannot come from
+	// that leader and is dropped. A new term clears the observation, so a
+	// rolled-back leader is again served by the compatibility path.
 	t.Run("token_aware_leader_until_term_change", func(t *testing.T) {
 		c := studyNew(t, true)
 		r := c.rr[1]
-		olderCtx, olderCancel := context.WithCancel(context.Background())
-		older := studyCall(r, olderCtx, 1914)
-		olderReq := studyRecv(t, c.tr.c)
-		olderCancel()
-		require.ErrorIs(t, studyRecv(t, older).err, types.ErrProposalOutcomeUnknown)
+		// The echo of a live request proves the leader is token-aware.
+		probe := studyCall(r, context.Background(), 1913)
+		probeReq := studyRecv(t, c.tr.c)
+		r.Step(studyResponse(t, probeReq, 1, types.ReasonError, types.ProposeRespSet{{Id: 1913}}))
+		require.ErrorIs(t, studyRecv(t, probe).err, types.ErrForwardRejected)
 		ctx, cancel := context.WithCancel(context.Background())
 		out := studyCall(r, ctx, 1914)
 		live := studyRecv(t, c.tr.c)
 		resps := types.ProposeRespSet{{Id: 1914, Index: 1}}
-		r.Step(studyResponse(t, olderReq, 1, types.ReasonOk, resps)) // stale, but token-aware
 		r.Step(legacyResponse(t, live, 1, types.ReasonOk, resps))
 		require.True(t, r.fowardProposeWait.IsRegistered("1914"))
 		st := r.ForwardIdentityStats()
@@ -194,4 +193,47 @@ func TestConfigForwardLegacyResponses(t *testing.T) {
 		require.ErrorIs(t, studyRecv(t, out).err, types.ErrProposalOutcomeUnknown)
 		requireForwardQuiescent(t, r)
 	})
+}
+
+// A leader is rolled back to a build that predates the token and leads again
+// in a later term. A version-1 echo of a request retired before the term
+// change can still arrive afterwards. It matches no live request, so it must
+// not mark the rolled-back leader token-aware for the new term; otherwise its
+// zero-header replies are dropped and every forward ends at its deadline as
+// unknown instead of being settled.
+func TestConfigForwardStaleEchoAfterTermChange(t *testing.T) {
+	for _, retired := range []string{"cancel", "term_change"} {
+		t.Run(retired, func(t *testing.T) {
+			c := studyNew(t, true)
+			r := c.rr[1]
+			ctxA, cancelA := context.WithCancel(context.Background())
+			defer cancelA()
+			outA := studyCall(r, ctxA, 2200)
+			reqA := studyRecv(t, c.tr.c)
+			require.Equal(t, forwardTokenVersion, reqA.Logs[0].Term)
+			if retired == "cancel" {
+				cancelA()
+				require.ErrorIs(t, studyRecv(t, outA).err, types.ErrProposalOutcomeUnknown)
+			}
+			r.BecomeFollower(2, 1) // the rolled-back leader 1 leads term 2
+			if retired == "term_change" {
+				require.ErrorIs(t, studyRecv(t, outA).err, types.ErrProposalOutcomeUnknown)
+			}
+			// A's echo, read off the old connection, arrives in term 2.
+			r.Step(studyResponse(t, reqA, 1, types.ReasonOk, types.ProposeRespSet{{Id: 2200, Index: 1}}))
+			require.EqualValues(t, 1, r.ForwardIdentityStats().StaleResponses)
+
+			ctxB, cancelB := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancelB()
+			outB := studyCall(r, ctxB, 2201)
+			reqB := studyRecv(t, c.tr.c)
+			r.Step(legacyResponse(t, reqB, 1, types.ReasonError, types.ProposeRespSet{{Id: 2201}}))
+			err := studyRecv(t, outB).err
+			require.ErrorIs(t, err, types.ErrForwardRejected, "the legacy leader's reply must settle the forward")
+			require.NotErrorIs(t, err, context.DeadlineExceeded)
+			st := requireForwardQuiescent(t, r)
+			require.EqualValues(t, 1, st.LegacySettled)
+			require.Zero(t, st.UnechoedResponses)
+		})
+	}
 }
