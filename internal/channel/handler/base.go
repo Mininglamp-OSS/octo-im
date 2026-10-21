@@ -53,6 +53,8 @@ func (h *Handler) OnMessage(m *proto.Message) {
 	switch msgType(m.MsgType) {
 	case msgForwardChannelEvent:
 		h.onForwardChannelEvent(m)
+	case msgSendResult:
+		h.onSendResult(m)
 	}
 }
 

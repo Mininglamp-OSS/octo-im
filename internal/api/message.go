@@ -159,7 +159,7 @@ func (m *message) send(c *wkhttp.Context) {
 		// 发送消息
 		_, err := sendMessageToChannel(req, tmpChannelId, tmpChannelType, clientMsgNo)
 		if err != nil {
-			c.ResponseError(err)
+			responseSendError(c, err, clientMsgNo)
 			return
 		}
 		c.ResponseOK()
@@ -173,11 +173,12 @@ func (m *message) send(c *wkhttp.Context) {
 	}
 
 	// 发送消息
-	messageId, err := sendMessageToChannel(req, channelId, channelType, clientMsgNo)
+	ack, err := sendMessageToChannel(req, channelId, channelType, clientMsgNo)
 	if err != nil {
-		c.ResponseError(err)
+		responseSendError(c, err, clientMsgNo)
 		return
 	}
+	messageId := ack.messageId
 
 	// 流式消息 → 注册元信息到缓存，供后续 eventappend 自动填充
 	if req.IsStream == 1 && service.MessageEventCache != nil {
@@ -199,6 +200,7 @@ func (m *message) send(c *wkhttp.Context) {
 
 	c.ResponseOKWithData(map[string]interface{}{
 		"message_id":    messageId,
+		"message_seq":   ack.messageSeq,
 		"client_msg_no": clientMsgNo,
 	})
 }
@@ -235,7 +237,14 @@ func (m *message) requestSetSubscribersForTmpChannel(tmpChannelId string, uids [
 	return nil
 }
 
-func sendMessageToChannel(req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (int64, error) {
+// sendMessageToChannel returns after the message is persisted on the channel
+// slot leader. A NoPersist message has nothing to persist and is acknowledged
+// once queued, as before.
+func sendMessageToChannel(req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (sendAck, error) {
+	return defaultSendAcker.sendMessage(req, channelId, channelType, clientMsgNo)
+}
+
+func (a *sendAcker) sendMessage(req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (sendAck, error) {
 
 	// m.s.monitor.SendPacketInc(req.Header.NoPersist != 1)
 	// m.s.monitor.SendSystemMsgInc()
@@ -243,7 +252,7 @@ func sendMessageToChannel(req messageSendReq, channelId string, channelType uint
 	// var messageID = m.s.dispatch.processor.genMessageID()
 
 	if options.IsSpecialChar(channelId) {
-		return 0, errors.New("频道ID不合法！")
+		return sendAck{}, errors.New("频道ID不合法！")
 	}
 
 	fakeChannelId := channelId
@@ -262,39 +271,41 @@ func sendMessageToChannel(req messageSendReq, channelId string, channelType uint
 		setting = setting.Set(wkproto.SettingStream)
 	}
 
-	sendPacket := &wkproto.SendPacket{
-		Framer: wkproto.Framer{
-			RedDot:    wkutil.IntToBool(req.Header.RedDot),
-			SyncOnce:  wkutil.IntToBool(req.Header.SyncOnce),
-			NoPersist: wkutil.IntToBool(req.Header.NoPersist),
-		},
-		Setting:     setting,
-		Expire:      req.Expire,
-		ClientMsgNo: clientMsgNo,
-		ChannelID:   channelId,
-		ChannelType: channelType,
-		Payload:     req.Payload,
+	build := func(messageId int64) *eventbus.Event {
+		sendPacket := &wkproto.SendPacket{
+			Framer: wkproto.Framer{
+				RedDot:    wkutil.IntToBool(req.Header.RedDot),
+				SyncOnce:  wkutil.IntToBool(req.Header.SyncOnce),
+				NoPersist: wkutil.IntToBool(req.Header.NoPersist),
+			},
+			Setting:     setting,
+			Expire:      req.Expire,
+			ClientMsgNo: clientMsgNo,
+			ChannelID:   channelId,
+			ChannelType: channelType,
+			Payload:     req.Payload,
+		}
+		return &eventbus.Event{
+			Conn: &eventbus.Conn{
+				Uid:      req.FromUID,
+				DeviceId: options.G.SystemDeviceId,
+			},
+			Type:      eventbus.EventChannelOnSend,
+			Frame:     sendPacket,
+			MessageId: messageId,
+			TagKey:    req.TagKey,
+			Track: track.Message{
+				PreStart: time.Now(),
+			},
+		}
 	}
-	messageId := options.G.GenMessageId()
 
-	event := &eventbus.Event{
-		Conn: &eventbus.Conn{
-			Uid:      req.FromUID,
-			DeviceId: options.G.SystemDeviceId,
-		},
-		Type:      eventbus.EventChannelOnSend,
-		Frame:     sendPacket,
-		MessageId: messageId,
-		TagKey:    req.TagKey,
-		Track: track.Message{
-			PreStart: time.Now(),
-		},
+	if wkutil.IntToBool(req.Header.NoPersist) {
+		messageId := a.newId()
+		a.submit(fakeChannelId, channelType, build(messageId))
+		return sendAck{messageId: messageId}, nil
 	}
-	eventbus.Channel.SendMessage(fakeChannelId, channelType, event)
-	event.Track.Record(track.PositionStart)
-	eventbus.Channel.Advance(fakeChannelId, channelType)
-
-	return messageId, nil
+	return a.send(fakeChannelId, channelType, build)
 }
 
 func (m *message) sendBatch(c *wkhttp.Context) {
@@ -321,21 +332,49 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 		c.ResponseError(errors.New("payload不能为空！"))
 		return
 	}
+	// Each subscriber is a separate channel; wait for them concurrently.
+	errs := make([]error, len(req.Subscribers))
+	slots := make(chan struct{}, sendBatchConcurrency)
+	var wg sync.WaitGroup
+	for i, subscriber := range req.Subscribers {
+		wg.Add(1)
+		slots <- struct{}{}
+		go func(i int, subscriber string) {
+			defer func() { <-slots; wg.Done() }()
+			clientMsgNo := fmt.Sprintf("%s0", wkutil.GenUUID())
+			_, errs[i] = sendMessageToChannel(messageSendReq{
+				Header:      req.Header,
+				FromUID:     req.FromUID,
+				ChannelID:   subscriber,
+				ChannelType: wkproto.ChannelTypePerson,
+				Payload:     req.Payload,
+			}, subscriber, wkproto.ChannelTypePerson, clientMsgNo)
+		}(i, subscriber)
+	}
+	wg.Wait()
 	failUids := make([]string, 0)
 	reasons := make([]string, 0)
-	for _, subscriber := range req.Subscribers {
-		clientMsgNo := fmt.Sprintf("%s0", wkutil.GenUUID())
-		_, err := sendMessageToChannel(messageSendReq{
-			Header:      req.Header,
-			FromUID:     req.FromUID,
-			ChannelID:   subscriber,
-			ChannelType: wkproto.ChannelTypePerson,
-			Payload:     req.Payload,
-		}, subscriber, wkproto.ChannelTypePerson, clientMsgNo)
-		if err != nil {
-			failUids = append(failUids, subscriber)
-			reasons = append(reasons, err.Error())
+	unknownUids := make([]string, 0)
+	for i, err := range errs {
+		if err == nil {
+			continue
 		}
+		failUids = append(failUids, req.Subscribers[i])
+		reasons = append(reasons, err.Error())
+		if errors.Is(err, errSendOutcomeUnknown) {
+			unknownUids = append(unknownUids, req.Subscribers[i])
+		}
+	}
+	if len(unknownUids) > 0 {
+		// A subscriber's message may still commit; never report the batch as OK.
+		c.JSON(http.StatusGatewayTimeout, gin.H{
+			"msg":          errSendOutcomeUnknown.Error(),
+			"status":       http.StatusGatewayTimeout,
+			"fail_uids":    failUids,
+			"reason":       reasons,
+			"unknown_uids": unknownUids,
+		})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"fail_uids": failUids,
