@@ -12,6 +12,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/sendresult"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
@@ -92,6 +93,8 @@ func OnlyRetryableSends(events []*eventbus.Event) bool {
 // A failed read-only probe can safely select the legacy transport during a
 // rolling upgrade without guessing after an admission response is lost.
 type CapabilityCache struct {
+	// Path is the probed route; empty selects CapabilityPath.
+	Path    string
 	mu      sync.Mutex
 	entries map[uint64]capabilityEntry
 }
@@ -112,7 +115,11 @@ func (c *CapabilityCache) Supports(ctx context.Context, node uint64) bool {
 	c.mu.Unlock()
 
 	probeCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-	resp, err := service.Cluster.RequestWithContext(probeCtx, node, CapabilityPath, nil)
+	path := c.Path
+	if path == "" {
+		path = CapabilityPath
+	}
+	resp, err := service.Cluster.RequestWithContext(probeCtx, node, path, nil)
 	cancel()
 	supported := err == nil && resp != nil && resp.Status == proto.StatusOK
 	if ctx.Err() != nil {
@@ -248,6 +255,7 @@ func Fail(events []*eventbus.Event, cause error) {
 		// possible success with a locally generated terminal failure.
 		return
 	}
+	failSendResultWaiters(events)
 	for _, e := range events {
 		packet, ok := e.Frame.(*wkproto.SendPacket)
 		if !ok || packet == nil || e.Conn == nil ||
@@ -260,5 +268,18 @@ func Fail(events []*eventbus.Event, cause error) {
 			ReasonCode: wkproto.ReasonNodeNotMatch,
 		})
 		eventbus.User.Advance(e.Conn.Uid)
+	}
+}
+
+// failSendResultWaiters releases API sends accepted by this node early. The
+// transport error does not prove the peer never received the batch, so the
+// attempt is reported as outcome unknown rather than as not persisted.
+func failSendResultWaiters(events []*eventbus.Event) {
+	for _, e := range events {
+		if e == nil || e.Conn == nil || e.Type != eventbus.EventChannelOnSend ||
+			!options.G.IsSystemDevice(e.Conn.DeviceId) || e.SourceNodeId == 0 || !options.G.IsLocalNode(e.SourceNodeId) {
+			continue
+		}
+		sendresult.Default.Complete(sendresult.Result{Key: e.MessageId, Outcome: sendresult.OutcomeUnknown, Reason: wkproto.ReasonSystemError})
 	}
 }

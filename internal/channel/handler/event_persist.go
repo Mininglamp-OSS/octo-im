@@ -26,6 +26,8 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	}
 
 	// ========== 存储消息 ==========
+	waiters := collectSendResultWaiters(events)
+	var storeErr, resultErr error
 	persists := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, events)
 	if len(persists) > 0 {
 
@@ -35,6 +37,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		if err != nil {
 			h.Error("store message failed", zap.Error(err), zap.Int("events", len(persists)), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
 			markPersistFailure(events, err)
+			storeErr = err
 		}
 
 		if err == nil {
@@ -42,6 +45,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 			if err != nil {
 				h.Error("invalid persistence response", zap.Error(err))
 				markPersistFailure(events, err)
+				resultErr = err
 			}
 		}
 		if err == nil {
@@ -49,6 +53,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		}
 
 	}
+	h.reportSendResults(waiters, storeErr, resultErr)
 
 	if options.G.Logger.TraceOn {
 		for _, e := range events {

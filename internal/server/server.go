@@ -24,6 +24,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/presence"
 	pusherevent "github.com/WuKongIM/WuKongIM/internal/pusher/event"
 	pusherhandler "github.com/WuKongIM/WuKongIM/internal/pusher/handler"
+	"github.com/WuKongIM/WuKongIM/internal/sendresult"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	userevent "github.com/WuKongIM/WuKongIM/internal/user/event"
 	userhandler "github.com/WuKongIM/WuKongIM/internal/user/handler"
@@ -266,6 +267,8 @@ func (s *Server) Start() error {
 
 	var err error
 
+	sendresult.Default.Open()
+
 	err = s.commonService.Start()
 	if err != nil {
 		return err
@@ -361,6 +364,10 @@ func (s *Server) StopNoErr() {
 func (s *Server) Stop() error {
 
 	s.cancel()
+
+	// Release API sends still waiting for a persistence result; they answer
+	// outcome unknown instead of holding the API server open.
+	sendresult.Default.Close()
 
 	s.pluginServer.Stop()
 

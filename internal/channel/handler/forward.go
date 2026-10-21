@@ -4,6 +4,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/forward"
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/sendresult"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
@@ -12,6 +13,7 @@ import (
 
 func (h *Handler) SetForwardRoutes() {
 	service.Cluster.Route(forward.ChannelPath, func(c *wkserver.Context) { c.WriteStatus(h.acceptForward(c.Body())) })
+	service.Cluster.Route(sendresult.CapabilityPath, func(c *wkserver.Context) { c.WriteStatus(proto.StatusOK) })
 }
 
 func (h *Handler) acceptForward(data []byte) proto.Status {
