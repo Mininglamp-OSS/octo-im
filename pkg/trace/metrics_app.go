@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -33,6 +34,11 @@ type appMetrics struct {
 	connPacketCount    atomic.Int64
 	connackPacketBytes atomic.Int64
 	connackPacketCount atomic.Int64
+
+	sendResultCapabilityProbe        metric.Int64Counter
+	sendResultCapabilityProbeLatency metric.Int64Histogram
+	sendResultCapabilityStaleServe   metric.Int64Counter
+	apiSendNotPersisted              metric.Int64Counter
 }
 
 func newAppMetrics(opts *Options) *appMetrics {
@@ -89,6 +95,13 @@ func newAppMetrics(opts *Options) *appMetrics {
 	if err != nil {
 		a.Panic("Failed to create app_message_latency histogram", zap.Error(err))
 	}
+	a.sendResultCapabilityProbe = NewInt64Counter("sendresult_capability_probe_total")
+	a.sendResultCapabilityProbeLatency, err = meter.Int64Histogram("sendresult_capability_probe_latency", metric.WithDescription("The latency of one send-result capability probe attempt"), metric.WithUnit("ms"))
+	if err != nil {
+		a.Panic("Failed to create sendresult_capability_probe_latency histogram", zap.Error(err))
+	}
+	a.sendResultCapabilityStaleServe = NewInt64Counter("sendresult_capability_stale_serve_total")
+	a.apiSendNotPersisted = NewInt64Counter("api_send_not_persisted_total")
 	return a
 }
 
@@ -241,4 +254,18 @@ func (a *appMetrics) ConnackPacketCountAdd(v int64) {
 
 func (a *appMetrics) ConnackPacketCount() int64 {
 	return a.connackPacketCount.Load()
+}
+
+func (a *appMetrics) SendResultCapabilityProbeOb(result string, latencyMs int64) {
+	attrs := metric.WithAttributes(attribute.String("result", result))
+	a.sendResultCapabilityProbe.Add(a.ctx, 1, attrs)
+	a.sendResultCapabilityProbeLatency.Record(a.ctx, latencyMs, attrs)
+}
+
+func (a *appMetrics) SendResultCapabilityStaleServeAdd(v int64) {
+	a.sendResultCapabilityStaleServe.Add(a.ctx, v)
+}
+
+func (a *appMetrics) APISendNotPersistedAdd(reason string) {
+	a.apiSendNotPersisted.Add(a.ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }
