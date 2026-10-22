@@ -1,5 +1,7 @@
 package wkdb
 
+import "github.com/cockroachdb/pebble/vfs"
+
 type Options struct {
 	NodeId            uint64
 	DataDir           string
@@ -11,6 +13,10 @@ type Options struct {
 	MemTableSize int
 
 	BatchPerSize int // 每个batch里key的大小
+
+	// FS overrides the Pebble filesystem. Nil keeps the default disk FS; tests
+	// use it for crash simulation through wkdbtest.OpenWithFS.
+	FS vfs.FS
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -70,5 +76,12 @@ func WithShardNum(shardNum int) Option {
 func WithMemTableSize(size int) Option {
 	return func(o *Options) {
 		o.MemTableSize = size
+	}
+}
+
+// WithFS sets the Pebble filesystem. It is meant for tests.
+func WithFS(fs vfs.FS) Option {
+	return func(o *Options) {
+		o.FS = fs
 	}
 }

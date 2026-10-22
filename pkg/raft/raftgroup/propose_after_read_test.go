@@ -3,6 +3,7 @@ package raftgroup_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -97,21 +98,19 @@ func TestProposeAfterReadDrainsPrefixAndRevalidates(t *testing.T) {
 				err   error
 			}
 			done := make(chan result, 1)
+			reserved := make(chan struct{})
 			writeCtx, cancelWrite := context.WithCancel(ctx)
+			reservationCtx := &afterReadContext{Context: writeCtx, reserved: reserved}
 			defer cancelWrite()
 			go func() {
-				index, err := rg.ProposeAfterRead(writeCtx, "slot", before, 2, []byte("conditional metadata"), validate)
+				index, err := rg.ProposeAfterRead(reservationCtx, "slot", before, 2, []byte("conditional metadata"), validate)
 				done <- result{index, err}
 			}()
-			// No other proposal is running: a held admission lock here means the
-			// new writer reserved its turn despite an unapplied log already present.
-			require.Eventually(t, func() bool {
-				if n.TryLock() {
-					n.Unlock()
-					return false
-				}
-				return true
-			}, time.Second, time.Millisecond)
+			select {
+			case <-reserved:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
 			require.False(t, validated.Load(), "must not read stale business state before Apply")
 			if mode == "cancel while draining" {
 				cancelWrite()
@@ -149,4 +148,17 @@ func TestProposeAfterReadDrainsPrefixAndRevalidates(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ProposeAfterRead's first context error check is Do, after acquisition.
+// Observe that boundary without coupling this test to the reservation type.
+type afterReadContext struct {
+	context.Context
+	reserved chan struct{}
+	once     sync.Once
+}
+
+func (c *afterReadContext) Err() error {
+	c.once.Do(func() { close(c.reserved) })
+	return c.Context.Err()
 }

@@ -25,20 +25,13 @@ func (rg *RaftGroup) ProposeAfterRead(ctx context.Context, key string, before Re
 		return 0, ErrReadStateChanged
 	}
 	// Use the same reservation as generic proposals, with bounded acquisition.
-	locker, ok := r.(interface{ TryLock() bool })
-	if !ok {
-		return 0, ErrReadStateChanged
-	}
-	poll := time.NewTicker(time.Millisecond)
-	defer poll.Stop()
-	for !locker.TryLock() {
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-rg.stopper.ShouldStop():
-			return 0, ErrGroupStopped
-		case <-poll.C:
-		}
+	sem := rg.admissionSem(key)
+	select {
+	case sem <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-rg.stopper.ShouldStop():
+		return 0, ErrGroupStopped
 	}
 	checkOwner := func(current IRaft) error {
 		if current != r || !before.Exists || !before.Ready || !r.IsLeader() ||
@@ -52,7 +45,7 @@ func (rg *RaftGroup) ProposeAfterRead(ctx context.Context, key string, before Re
 		return nil
 	}
 	index, err := func() (uint64, error) {
-		defer r.Unlock()
+		defer func() { <-sem }()
 		var target uint64
 		if err := rg.Do(ctx, key, func(current IRaft) error {
 			if err := checkOwner(current); err != nil {
@@ -63,6 +56,8 @@ func (rg *RaftGroup) ProposeAfterRead(ctx context.Context, key string, before Re
 		}); err != nil {
 			return 0, err
 		}
+		// The drain polls Apply progress; the ticker exists only if it waits.
+		var poll *time.Ticker
 		for {
 			state, err := rg.ReadLeaderState(ctx, key)
 			if err != nil {
@@ -74,6 +69,10 @@ func (rg *RaftGroup) ProposeAfterRead(ctx context.Context, key string, before Re
 			}
 			if state.AppliedIndex >= target {
 				break
+			}
+			if poll == nil {
+				poll = time.NewTicker(time.Millisecond)
+				defer poll.Stop()
 			}
 			select {
 			case <-ctx.Done():

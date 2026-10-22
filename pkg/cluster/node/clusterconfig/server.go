@@ -3,10 +3,12 @@ package clusterconfig
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -19,18 +21,51 @@ import (
 	"go.uber.org/zap"
 )
 
+// serverStorage keeps the resource lifecycle at its owner without changing Raft Storage.
+type serverStorage interface {
+	raft.Storage
+	incarnationStore
+	Open() error
+	Close() error
+	GetLogsByLimit(uint64, uint64, int) ([]rafttypes.Log, error)
+	GetLogsInReverseOrder(uint64, uint64, int) ([]rafttypes.Log, error)
+	AppliedIndex() (uint64, error)
+	LastIndex() (uint64, error)
+}
+
+type lifecycleState uint8
+
+const (
+	lifecycleNew lifecycleState = iota
+	lifecycleStarted
+	lifecycleStopped
+)
+
+// A Server runs at most one lifecycle: New, Start, Stop. Stop closes Storage
+// asynchronously once workers quiesce, so the same instance cannot safely
+// reopen it; Start after Start or Stop returns ErrServerLifecycle. Restart by
+// constructing a new Server on the same directory.
 type Server struct {
-	opts     *Options
-	raft     *raft.Raft             // raft算法
-	config   *Config                // 分布式配置对象
-	storage  *PebbleShardLogStorage // 配置日志存储
-	cfgGenId *snowflake.Node        // 配置ID生成器
+	// lifecycleMu serializes Start against Stop's handoff of s.raft.
+	lifecycleMu sync.Mutex
+	lifecycle   lifecycleState
+
+	stopOnce  sync.Once
+	closeDone chan struct{}
+	closeErr  error
+	opts      *Options
+	raft      *raft.Raft      // raft算法
+	config    *Config         // 分布式配置对象
+	storage   serverStorage   // 配置日志存储
+	cfgGenId  *snowflake.Node // 配置ID生成器
+	// Durably reserved by Start before Raft exists; zero until then.
+	senderIncarnation uint64
+	listeners         []IEvent // 事件监听器
 	// Apply-worker-only progress. On restart the persisted snapshot and
 	// initRaft reconstruct membership; these flags cover in-process retries.
 	membershipPending   bool
 	configSavePending   bool
 	configNotifyPending bool
-	listeners           []IEvent // 事件监听器
 	wklog.Log
 }
 
@@ -46,9 +81,10 @@ func New(opts *Options) *Server {
 	}
 
 	s := &Server{
-		opts:   opts,
-		config: NewConfig(opts),
-		Log:    wklog.NewWKLog("node"),
+		opts:      opts,
+		closeDone: make(chan struct{}),
+		config:    NewConfig(opts),
+		Log:       wklog.NewWKLog("node"),
 	}
 
 	s.storage = NewPebbleShardLogStorage(path.Join(dataDir, "cfglogdb"), s)
@@ -72,16 +108,34 @@ func mkDirAll(p string) error {
 }
 
 func (s *Server) Start() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.lifecycle != lifecycleNew {
+		return ErrServerLifecycle
+	}
+	// A failed Start still consumes the lifecycle; it owns nothing afterwards.
+	s.lifecycle = lifecycleStarted
 
 	err := s.storage.Open()
 	if err != nil {
 		return err
 	}
-	err = s.initRaft()
+	// Reserve the forwarding incarnation under the directory lock before Raft
+	// exists, so nothing can forward without it. Failures are fatal to Start.
+	s.senderIncarnation, err = reserveSenderIncarnation(s.storage)
+	if err == nil {
+		err = s.initRaft()
+	}
 	if err != nil {
-		return err
+		// No Raft was constructed; release Storage so Start owns nothing.
+		return errors.Join(err, s.storage.Close())
 	}
 	return s.raft.Start()
+}
+
+// SenderIncarnation returns the incarnation reserved by Start, or zero.
+func (s *Server) SenderIncarnation() uint64 {
+	return s.senderIncarnation
 }
 
 func (s *Server) Options() *Options {
@@ -132,6 +186,7 @@ func (s *Server) initRaft() error {
 		raft.WithTransport(newRaftTransport(s)),
 		raft.WithStorage(s.storage),
 		raft.WithElectionOn(true),
+		raft.WithForwardIncarnation(s.senderIncarnation),
 	))
 	s.raft.Step(rafttypes.Event{
 		Type:   rafttypes.ConfChange,
@@ -141,9 +196,60 @@ func (s *Server) initRaft() error {
 	return nil
 }
 
+// quiescenceWarnInterval paces the warning while Stop waits for workers.
+var quiescenceWarnInterval = 10 * time.Second
+
+// Stop settles callers and starts one tracked resource-close lifecycle. Synchronous
+// storage I/O can keep that lifecycle pending; WaitStopped exposes its result.
 func (s *Server) Stop() {
-	s.raft.Stop()
-	s.storage.Close()
+	s.stopOnce.Do(func() {
+		// Waits for an in-progress Start; any later Start is refused.
+		s.lifecycleMu.Lock()
+		s.lifecycle = lifecycleStopped
+		r := s.raft
+		s.lifecycleMu.Unlock()
+		if r == nil {
+			// Start never succeeded and owns no Storage.
+			close(s.closeDone)
+			return
+		}
+		r.BeginStop()
+		go func() {
+			// Stop joins the event loop, whose durable hard-state write may
+			// itself be blocked. Include that join in the tracked lifecycle
+			// so WaitStopped's deadline also bounds this ownership boundary.
+			r.Stop()
+			// Keep Storage and dependent server state alive until every worker exits.
+			s.closeErr = wkutil.WaitReportingSlow(r.WaitQuiescence, quiescenceWarnInterval, func(elapsed time.Duration) {
+				s.Warn("clusterconfig shutdown still waiting for workers to quiesce; storage stays open", zap.Duration("elapsed", elapsed))
+			})
+			if s.closeErr == nil {
+				s.closeErr = s.storage.Close()
+			}
+			if s.closeErr != nil {
+				s.Error("clusterconfig shutdown failed", zap.Error(s.closeErr))
+			}
+			close(s.closeDone)
+		}()
+	})
+}
+
+// WaitStopped initiates Stop and waits for actual quiescence and Storage close.
+// A deadline leaves the single close lifecycle pending and retains Storage.
+// Nil means all workers exited and Close succeeded; repeated calls retain errors.
+func (s *Server) WaitStopped(ctx context.Context) error {
+	s.Stop()
+	select {
+	case <-s.closeDone:
+		return s.closeErr
+	default:
+	}
+	select {
+	case <-s.closeDone:
+		return s.closeErr
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", raft.ErrIncompleteQuiescence, ctx.Err())
+	}
 }
 
 func (s *Server) AddEventListener(listener IEvent) {
@@ -184,6 +290,11 @@ func (s *Server) ProposeBatchTimeout(ctx context.Context, reqs []rafttypes.Propo
 
 func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []rafttypes.ProposeReq) ([]*rafttypes.ProposeResp, error) {
 	return s.raft.ProposeBatchUntilAppliedTimeout(ctx, reqs)
+}
+
+// ForwardIdentityStats exposes forwarded proposal correlation pressure.
+func (s *Server) ForwardIdentityStats() raft.ForwardIdentityStats {
+	return s.raft.ForwardIdentityStats()
 }
 
 func (s *Server) StepRaftEvent(e rafttypes.Event) {

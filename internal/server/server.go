@@ -24,6 +24,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/presence"
 	pusherevent "github.com/WuKongIM/WuKongIM/internal/pusher/event"
 	pusherhandler "github.com/WuKongIM/WuKongIM/internal/pusher/handler"
+	"github.com/WuKongIM/WuKongIM/internal/sendresult"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	userevent "github.com/WuKongIM/WuKongIM/internal/user/event"
 	userhandler "github.com/WuKongIM/WuKongIM/internal/user/handler"
@@ -266,6 +267,8 @@ func (s *Server) Start() error {
 
 	var err error
 
+	sendresult.Default.Open()
+
 	err = s.commonService.Start()
 	if err != nil {
 		return err
@@ -362,6 +365,10 @@ func (s *Server) Stop() error {
 
 	s.cancel()
 
+	// Release API sends still waiting for a persistence result; they answer
+	// outcome unknown instead of holding the API server open.
+	sendresult.Default.Close()
+
 	s.pluginServer.Stop()
 
 	s.userEventPool.Stop()
@@ -385,7 +392,9 @@ func (s *Server) Stop() error {
 		s.conversationManager.Stop()
 	}
 
-	s.clusterServer.Stop()
+	// A cluster storage ownership error keeps that storage open, but must not
+	// skip the storage-independent teardown below. It is returned afterwards.
+	clusterErr := s.clusterServer.Stop()
 
 	if s.opts.Demo.On {
 		s.demoServer.Stop()
@@ -400,6 +409,10 @@ func (s *Server) Stop() error {
 	s.tagManager.Stop()
 
 	s.webhook.Stop()
+
+	if clusterErr != nil {
+		return fmt.Errorf("cluster stop: %w", clusterErr)
+	}
 
 	s.Info("Server is stopped")
 

@@ -1398,7 +1398,8 @@ func (wk *wukongDB) parseChannelMessagesWithLimitSize(iter *pebble.Iterator, lim
 
 		if preMessageSeq != messageSeq {
 			if preMessageSeq != 0 {
-				size += uint64(preMessage.Size())
+				// Budget at the size GetLogs emits, which counts a preserved StreamNo.
+				size += uint64(ChannelLogBodySize(&preMessage))
 				msgs = append(msgs, preMessage)
 				if limitSize != 0 && size >= limitSize {
 					lastNeedAppend = false

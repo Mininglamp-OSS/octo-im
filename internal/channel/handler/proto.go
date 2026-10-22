@@ -11,6 +11,8 @@ type msgType uint32
 const (
 	// 转发用户事件
 	msgForwardChannelEvent msgType = 3002
+	// API send persistence outcome, reported to the accepting node
+	msgSendResult msgType = 3003
 )
 
 type forwardChannelEventReq struct {

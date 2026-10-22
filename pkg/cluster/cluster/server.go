@@ -17,6 +17,8 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/slot"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
 	"github.com/WuKongIM/WuKongIM/pkg/keylock"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -31,6 +33,9 @@ import (
 )
 
 type Server struct {
+	stopBegin sync.Once
+	shutdown  *ownerShutdown
+
 	// 分布式配置服务
 	cfgServer *clusterconfig.Server
 	// 分布式事件
@@ -247,18 +252,93 @@ func (s *Server) Start() error {
 	return nil
 }
 
-func (s *Server) Stop() {
-	s.configReconciler.stop()
-	s.stopper.Stop()
-	s.eventServer.Stop()
-	s.cfgServer.Stop()
-	s.slotServer.Stop()
-	s.channelServer.Stop()
-	s.netServer.Stop()
-	s.cancelFnc()
-	s.store.Stop()
-	s.db.Close()
-	s.channelKeyLock.StopCleanLoop()
+// Stop uses the existing request budget for the storage ownership handoffs.
+// Storage-independent teardown always runs; see StopWithContext.
+func (s *Server) Stop() error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.ReqTimeout)
+	defer cancel()
+	return s.StopWithContext(ctx)
+}
+
+// StopWithContext runs storage-independent teardown on every call path and
+// returns the aggregated ownership errors afterwards. Storage whose workers
+// have not quiesced stays open and owned; a later call awaits the same pending
+// lifecycles and closes the shared DB once every owner has quiesced.
+func (s *Server) StopWithContext(ctx context.Context) error {
+	s.stopBegin.Do(func() {
+		s.configReconciler.stop()
+		s.stopper.Stop()
+		s.eventServer.Stop()
+		s.shutdown = &ownerShutdown{
+			config:  s.cfgServer.WaitStopped,
+			slot:    s.slotServer.StopWithContext,
+			channel: s.channelServer.StopWithContext,
+			independent: func() {
+				s.netServer.Stop()
+				s.cancelFnc()
+				s.channelKeyLock.StopCleanLoop()
+			},
+			closeShared: func() error {
+				s.store.Stop()
+				return s.db.Close()
+			},
+		}
+	})
+	return s.shutdown.stop(ctx)
+}
+
+// ownerShutdown sequences the storage owners of a cluster Server. An owner step
+// returns an error wrapping an incomplete-quiescence sentinel while its
+// workers may still touch storage; any other error (e.g. a failed Close) means
+// its workers have exited.
+type ownerShutdown struct {
+	// Config Raft apply calls into the slot and channel owners, so those are
+	// stopped only after Config Raft workers have exited.
+	config  func(context.Context) error
+	slot    func(context.Context) error
+	channel func(context.Context) error
+	// independent does not touch storage. It runs exactly once, on the first
+	// call, whatever the ownership outcome.
+	independent func()
+	// closeShared closes storage shared by every owner, exactly once, only
+	// after all owners have quiesced.
+	closeShared func() error
+
+	independentOnce sync.Once
+	closeOnce       sync.Once
+	closeErr        error
+}
+
+func (o *ownerShutdown) stop(ctx context.Context) error {
+	var errs []error
+	quiesced := true
+	step := func(name string, fn func(context.Context) error) {
+		err := fn(ctx)
+		if err == nil {
+			return
+		}
+		errs = append(errs, fmt.Errorf("%s ownership handoff: %w", name, err))
+		if incompleteQuiescence(err) {
+			quiesced = false
+		}
+	}
+	step("config raft", o.config)
+	if quiesced {
+		step("slot", o.slot)
+		step("channel", o.channel)
+	}
+	o.independentOnce.Do(o.independent)
+	if quiesced {
+		o.closeOnce.Do(func() { o.closeErr = o.closeShared() })
+		if o.closeErr != nil {
+			errs = append(errs, fmt.Errorf("shared storage close: %w", o.closeErr))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func incompleteQuiescence(err error) bool {
+	return errors.Is(err, raft.ErrIncompleteQuiescence) || errors.Is(err, raftgroup.ErrIncompleteQuiescence)
 }
 
 func (s *Server) NodeStep(event rafttype.Event) {

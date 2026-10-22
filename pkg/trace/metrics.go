@@ -338,6 +338,13 @@ type IAppMetrics interface {
 	// ConnackPacketCountAdd 连接应答包数量
 	ConnackPacketCountAdd(v int64)
 	ConnackPacketCount() int64
+
+	// SendResultCapabilityProbeOb 发送结果能力探测（每次探测的结果与耗时）
+	SendResultCapabilityProbeOb(result string, latencyMs int64)
+	// SendResultCapabilityStaleServeAdd 使用过期的正向能力结果的次数
+	SendResultCapabilityStaleServeAdd(v int64)
+	// APISendNotPersistedAdd API 发送在未提交时返回 503 的次数
+	APISendNotPersistedAdd(reason string)
 }
 
 // IClusterMetrics 分布式监控
