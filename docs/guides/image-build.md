@@ -10,8 +10,8 @@ GitHub Actions 的 `Docker Publish` 使用 `GITHUB_TOKEN` 发布到
 
 - 向 `v2.2.5-20260422-fix1` 分支 push：生成
   `branch-v2.2.5-20260422-fix1` 标签。
-- push `v2.2.5-20260422-fix1`、`v2.2.5-20260422-fix1.*` 或
-  `v2.2.5-20260422-fix1-*` tag：生成与 Git tag 完全一致的镜像标签。
+- push `v2.2.5-YYYYMMDD-fix1` 日期版本 tag：生成与 Git tag 完全一致的镜像标签，
+  例如 `v2.2.5-20261021-fix1`。日期必须是 8 位数字，也支持 `.2`、`-rc1` 等后缀。
 - 每次构建还生成 `sha-<提交 SHA 前 12 位>`，可在 Actions 摘要中查看
   完整提交、镜像标签和 digest。
 
@@ -28,6 +28,9 @@ gh workflow run docker-publish.yml \
   --ref v2.2.5-20260422-fix1 \
   -f tag=test-fix1-candidate
 ```
+
+正式日期版本通过推送 Git tag 触发；在手动运行的 `tag` 输入框填写
+`v2.2.5-20261021-fix1` 会被拒绝。Git tag 所在提交必须包含当前工作流规则。
 
 验证当前开发分支时，将 `--ref` 替换为已推送的开发分支名。
 工作流固定 checkout 触发事件的提交，镜像内的版本、提交和日期由该提交生成。

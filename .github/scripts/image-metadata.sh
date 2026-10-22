@@ -17,11 +17,13 @@ case "$GITHUB_EVENT_NAME" in
     [[ "$version" == test-?* ]] || fail 'Manual image tags must start with test- and include a suffix.'
     ;;
   push)
-    case "$GITHUB_REF" in
-      "refs/heads/$branch") version="branch-${branch}" ;;
-      "refs/tags/$branch"|"refs/tags/$branch"[.-]*) version="${GITHUB_REF#refs/tags/}" ;;
-      *) fail "Automatic publishing is restricted to $branch and its release tags." ;;
-    esac
+    if [ "$GITHUB_REF" = "refs/heads/$branch" ]; then
+      version="branch-${branch}"
+    elif [[ "$GITHUB_REF" =~ ^refs/tags/v2\.2\.5-[0-9]{8}-fix1([.-][a-zA-Z0-9_.-]+)?$ ]]; then
+      version="${GITHUB_REF#refs/tags/}"
+    else
+      fail "Automatic publishing requires $branch or a v2.2.5-YYYYMMDD-fix1 release tag."
+    fi
     ;;
   *) fail "Unsupported event: $GITHUB_EVENT_NAME" ;;
 esac
