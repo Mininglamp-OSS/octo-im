@@ -6,9 +6,9 @@ on:
     branches:
       - v2.2.5-20260422-fix1
     tags:
-      - v2.2.5-20260422-fix1
-      - v2.2.5-20260422-fix1.*
-      - v2.2.5-20260422-fix1-*
+      - v2.2.5-*-fix1
+      - v2.2.5-*-fix1.*
+      - v2.2.5-*-fix1-*
   workflow_dispatch:
     inputs:
       tag:
