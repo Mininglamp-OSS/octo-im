@@ -86,6 +86,31 @@ returns 503 without submitting. An older API node leaves `SourceNodeId` zero,
 and a newer leader then sends no report. The whole-tier runbook below still
 applies.
 
+Before submitting through a remote leader, the API node needs positive evidence
+that the leader reports results. It probes the capability route with a 250 ms
+attempt, then a 1 s attempt, each limited so at least half of the remaining
+send budget is left for the send. Concurrent sends to the same leader share one
+probe.
+
+| Capability state | Send behaviour |
+| --- | --- |
+| Leader answered OK within 30 s | Submit without probing |
+| Leader answered OK 30 s to 5 min ago | Submit; one send refreshes the probe and no send waits for it. A refresh without an answer does not extend the 5 min limit |
+| Leader answered with a non-OK status within 5 s | HTTP 503, log `reason=capability_unsupported` |
+| No answer to either attempt (timeout, connection not authenticated, no connection) | HTTP 503 for this send only, log `reason=capability_inconclusive`. Nothing is cached; the next send probes again |
+
+Each of these 503 responses is returned before any attempt is submitted, so
+the message was not persisted. A leader with retained positive evidence that
+stops reporting, for example after a rollback, yields 504 for at most 5 min,
+never 200. The HTTP response shape is unchanged; the reason appears only in the
+`API send not persisted` warning (fields `reason`, `leader`, `cached`, `stale`,
+`probe_err_class`) and in the metrics `api_send_not_persisted_total{reason}`,
+`sendresult_capability_probe_total{result}`,
+`sendresult_capability_probe_latency` and
+`sendresult_capability_stale_serve_total`. Other 503 reasons are
+`leader_unknown`, `attempts_unavailable` (every attempt reported a retryable
+failure), `budget_exhausted` and `registry_closed` (shutdown).
+
 ## IM-tier upgrade runbook
 
 1. Schedule an IM write outage; stop admitting sends at the gateway/API and let
