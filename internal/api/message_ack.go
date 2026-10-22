@@ -13,6 +13,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/sendresult"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/track"
+	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -28,6 +29,21 @@ const (
 	sendRetryDelay  = 50 * time.Millisecond
 	// sendBatchConcurrency bounds the subscriber sends one batch waits on.
 	sendBatchConcurrency = 16
+
+	// Send-result capability policy. A probe without a response is never
+	// cached as unsupported; only a non-OK answer is, for capabilityNegativeTTL.
+	capabilityPositiveFresh = 30 * time.Second
+	capabilityPositiveHard  = 5 * time.Minute
+	capabilityNegativeTTL   = 5 * time.Second
+	// capabilitySendReserve is the share of the remaining send budget a
+	// capability probe must leave for the send itself.
+	capabilitySendReserve = 0.5
+
+	// Reasons an API send returned not persisted without an attempt in flight.
+	notPersistedLeaderUnknown  = "leader_unknown"
+	notPersistedRegistryClosed = "registry_closed"
+	notPersistedBudget         = "budget_exhausted"
+	notPersistedUnavailable    = "attempts_unavailable"
 )
 
 var (
@@ -57,14 +73,34 @@ type sendAcker struct {
 	registry    *sendresult.Registry
 	submit      func(channelId string, channelType uint8, event *eventbus.Event)
 	leader      func(channelId string, channelType uint8) (uint64, error)
-	supports    func(ctx context.Context, node uint64) bool
+	check       func(ctx context.Context, node uint64) forward.CapabilityVerdict
 	newId       func() int64
 	budget      func() time.Duration
 	maxAttempts int
 	retryDelay  time.Duration
 }
 
-var sendResultCapabilities = &forward.CapabilityCache{Path: sendresult.CapabilityPath}
+var capabilityProbeSteps = []time.Duration{250 * time.Millisecond, time.Second}
+
+var sendResultPolicy = forward.CapabilityPolicy{
+	PositiveFresh: capabilityPositiveFresh,
+	PositiveHard:  capabilityPositiveHard,
+	NegativeTTL:   capabilityNegativeTTL,
+	ProbeSteps:    capabilityProbeSteps,
+	SendReserve:   capabilitySendReserve,
+	OnProbe: func(class string, latency time.Duration) {
+		if trace.GlobalTrace != nil {
+			trace.GlobalTrace.Metrics.App().SendResultCapabilityProbeOb(class, latency.Milliseconds())
+		}
+	},
+	OnStaleServe: func() {
+		if trace.GlobalTrace != nil {
+			trace.GlobalTrace.Metrics.App().SendResultCapabilityStaleServeAdd(1)
+		}
+	},
+}
+
+var sendResultCapabilities = &forward.CapabilityCache{Path: sendresult.CapabilityPath, Policy: &sendResultPolicy}
 
 var defaultSendAcker = &sendAcker{
 	Log:      wklog.NewWKLog("sendAcker"),
@@ -78,8 +114,8 @@ var defaultSendAcker = &sendAcker{
 	leader: func(channelId string, channelType uint8) (uint64, error) {
 		return service.Cluster.SlotLeaderIdOfChannel(channelId, channelType)
 	},
-	supports: sendResultCapabilities.Supports,
-	newId:    func() int64 { return options.G.GenMessageId() },
+	check: sendResultCapabilities.Check,
+	newId: func() int64 { return options.G.GenMessageId() },
 	// The wait spans forwarding plus one channel persistence deadline; it
 	// reuses the cluster request deadline rather than adding a new timeout.
 	budget:      func() time.Duration { return options.G.Cluster.ReqTimeout },
@@ -87,22 +123,30 @@ var defaultSendAcker = &sendAcker{
 	retryDelay:  sendRetryDelay,
 }
 
+// readiness is the result of one ready check; reason is set when not ready.
+type readiness struct {
+	ok      bool
+	reason  string
+	leader  uint64
+	verdict forward.CapabilityVerdict
+}
+
 // ready reports whether the current slot leader will report the outcome. A
 // leader on an older build never reports, so submitting through it could only
-// end in outcome unknown.
-func (a *sendAcker) ready(ctx context.Context, channelId string, channelType uint8) bool {
+// end in outcome unknown. Without positive evidence nothing is submitted.
+func (a *sendAcker) ready(ctx context.Context, channelId string, channelType uint8) readiness {
 	leader, err := a.leader(channelId, channelType)
 	if err != nil || leader == 0 {
-		return false
+		return readiness{reason: notPersistedLeaderUnknown, leader: leader}
 	}
 	if options.G.IsLocalNode(leader) {
-		return true
+		return readiness{ok: true, leader: leader}
 	}
-	if !a.supports(ctx, leader) {
-		a.Warn("channel slot leader does not report API send results", zap.Uint64("leader", leader), zap.String("channelId", channelId))
-		return false
+	v := a.check(ctx, leader)
+	if !v.Supported {
+		return readiness{reason: v.Reason, leader: leader, verdict: v}
 	}
-	return true
+	return readiness{ok: true, leader: leader, verdict: v}
 }
 
 // send submits up to maxAttempts events built by build and returns once one
@@ -120,6 +164,7 @@ func (a *sendAcker) send(channelId string, channelType uint8, build func(message
 		}
 	}()
 	outstanding, ambiguous := 0, false
+	var notReady readiness
 wait:
 	for {
 		if outstanding == 0 {
@@ -131,15 +176,18 @@ wait:
 				case <-ctx.Done():
 					break wait
 				case <-a.registry.Done():
+					notReady.reason = notPersistedRegistryClosed
 					break wait
 				case <-time.After(a.retryDelay):
 				}
 			}
-			if !a.ready(ctx, channelId, channelType) {
+			if r := a.ready(ctx, channelId, channelType); !r.ok {
+				notReady = r
 				break
 			}
 			key := a.newId()
 			if err := a.registry.Register(key, results); err != nil {
+				notReady.reason = notPersistedRegistryClosed
 				break
 			}
 			keys = append(keys, key)
@@ -173,7 +221,31 @@ wait:
 		a.Warn("API send outcome unknown", zap.String("channelId", channelId), zap.Int("attempts", len(keys)))
 		return sendAck{}, errSendOutcomeUnknown
 	}
+	a.notPersisted(channelId, len(keys), notReady)
 	return sendAck{}, errSendNotPersisted
+}
+
+// notPersisted records why a send ends in 503 with no attempt in flight.
+func (a *sendAcker) notPersisted(channelId string, attempts int, r readiness) {
+	reason := r.reason
+	switch {
+	case reason != "":
+	case attempts > 0:
+		reason = notPersistedUnavailable
+	default:
+		reason = notPersistedBudget
+	}
+	a.Warn("API send not persisted",
+		zap.String("reason", reason),
+		zap.Uint64("leader", r.leader),
+		zap.Bool("cached", r.verdict.Cached),
+		zap.Bool("stale", r.verdict.Stale),
+		zap.String("probe_err_class", r.verdict.ErrClass),
+		zap.String("channelId", channelId),
+		zap.Int("attempts", attempts))
+	if trace.GlobalTrace != nil {
+		trace.GlobalTrace.Metrics.App().APISendNotPersistedAdd(reason)
+	}
 }
 
 // responseSendError keeps the existing error shape and gives the two

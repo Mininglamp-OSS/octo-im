@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/forward"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/sendresult"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
@@ -138,11 +139,13 @@ func newTestAcker(t *testing.T, leaderNode uint64, budget time.Duration) (*sendA
 	var ids atomic.Int64
 	ids.Store(1000)
 	a := &sendAcker{
-		Log:         wklog.NewWKLog("sendAckerTest"),
-		registry:    registry,
-		submit:      leader.submit,
-		leader:      func(string, uint8) (uint64, error) { return leaderNode, nil },
-		supports:    func(context.Context, uint64) bool { return true },
+		Log:      wklog.NewWKLog("sendAckerTest"),
+		registry: registry,
+		submit:   leader.submit,
+		leader:   func(string, uint8) (uint64, error) { return leaderNode, nil },
+		check: func(context.Context, uint64) forward.CapabilityVerdict {
+			return forward.CapabilityVerdict{Supported: true}
+		},
 		newId:       func() int64 { return ids.Add(1) },
 		budget:      func() time.Duration { return budget },
 		maxAttempts: maxSendAttempts,
@@ -264,12 +267,16 @@ func TestAPISendShutdownReleasesWaiters(t *testing.T) {
 
 func TestAPISendRequiresReportingLeader(t *testing.T) {
 	a, leader := newTestAcker(t, 2, time.Second)
-	a.supports = func(context.Context, uint64) bool { return false }
+	a.check = func(context.Context, uint64) forward.CapabilityVerdict {
+		return forward.CapabilityVerdict{Reason: forward.CapabilityInconclusive}
+	}
 	_, err := sendTo(a, "old")
 	require.ErrorIs(t, err, errSendNotPersisted)
 	require.Zero(t, leader.attempts("old"), "an older leader never reports; do not submit through it")
 
-	a.supports = func(context.Context, uint64) bool { return true }
+	a.check = func(context.Context, uint64) forward.CapabilityVerdict {
+		return forward.CapabilityVerdict{Supported: true}
+	}
 	_, err = sendTo(a, "new")
 	require.NoError(t, err)
 }
