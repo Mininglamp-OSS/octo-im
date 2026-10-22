@@ -94,9 +94,18 @@ func OnlyRetryableSends(events []*eventbus.Event) bool {
 // rolling upgrade without guessing after an admission response is lost.
 type CapabilityCache struct {
 	// Path is the probed route; empty selects CapabilityPath.
-	Path    string
+	Path string
+	// Policy selects positive retention, singleflight probing and a probe
+	// ladder. Nil keeps the original single probe whose failure is cached as
+	// unsupported, which the forward transport relies on to pick legacy.
+	Policy  *CapabilityPolicy
 	mu      sync.Mutex
 	entries map[uint64]capabilityEntry
+	states  map[uint64]*capabilityState
+	// request and now are test seams for the policy path; nil selects
+	// service.Cluster and time.Now.
+	request func(ctx context.Context, node uint64, path string) (*proto.Response, error)
+	now     func() time.Time
 }
 
 func RegisterCapabilityRoute() {
@@ -106,6 +115,13 @@ func RegisterCapabilityRoute() {
 }
 
 func (c *CapabilityCache) Supports(ctx context.Context, node uint64) bool {
+	if c.Policy != nil {
+		return c.Check(ctx, node).Supported
+	}
+	return c.supportsLegacy(ctx, node)
+}
+
+func (c *CapabilityCache) supportsLegacy(ctx context.Context, node uint64) bool {
 	now := time.Now()
 	c.mu.Lock()
 	if entry, ok := c.entries[node]; ok && now.Before(entry.expiresAt) {
