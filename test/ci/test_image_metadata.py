@@ -53,6 +53,15 @@ class ImageMetadataTest(unittest.TestCase):
         self.assertIn(f"version={tag}\n", output)
         self.assertIn(f"{IMAGE}:{tag}\n", output)
 
+    def test_dated_release_push_preserves_exact_tag(self):
+        for tag in ("v2.2.5-20261021-fix1", "v2.2.5-20261021-fix1.2", "v2.2.5-20261021-fix1-rc1"):
+            with self.subTest(tag=tag):
+                result, output = self.metadata("push", f"refs/tags/{tag}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"version={tag}\n", output)
+                self.assertIn(f"{IMAGE}:{tag}\n", output)
+                self.assertIn(f"{IMAGE}:sha-{REVISION[:12]}\n", output)
+
     def test_dispatch_defaults_to_source_specific_test_tag(self):
         result, output = self.metadata("workflow_dispatch", "refs/heads/feature/build")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -78,6 +87,13 @@ class ImageMetadataTest(unittest.TestCase):
             ("push", "refs/heads/main"),
             ("push", "refs/tags/v2.2.6"),
             ("push", f"refs/tags/{BRANCH}bad"),
+            ("push", "refs/tags/v2.2.6-20261021-fix1"),
+            ("push", "refs/tags/v2.2.5-abcdefgh-fix1"),
+            ("push", "refs/tags/v2.2.5-2026102-fix1"),
+            ("push", "refs/tags/v2.2.5-202610211-fix1"),
+            ("push", "refs/tags/v2.2.5-20261021-fix2"),
+            ("push", "refs/tags/v2.2.5-20261021-fix1bad"),
+            ("push", "refs/tags/v2.2.5-20261021-fix1."),
             ("pull_request", "refs/pull/1/merge"),
         ):
             with self.subTest(event=event, ref=ref):
