@@ -130,6 +130,7 @@ func New(opts *options.Options) *Server {
 			trace.WithServiceName(s.opts.Trace.ServiceName),
 			trace.WithServiceHostName(s.opts.Trace.ServiceHostName),
 			trace.WithPrometheusApiUrl(s.opts.Trace.PrometheusApiUrl),
+			trace.WithOnlineUserCount(s.userEventPool.OnlineUserCount),
 		))
 	trace.SetGlobalTrace(s.trace)
 
