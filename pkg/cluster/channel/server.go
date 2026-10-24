@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -70,10 +71,20 @@ func (s *Server) Start() error {
 	return nil
 }
 
-func (s *Server) Stop() {
+// StopWithContext starts the shutdown lifecycle of every RaftGroup and waits,
+// within ctx, until each has joined its event loop and none of its pool tasks
+// can touch the shared DB. The DB belongs to the caller: on error it must stay
+// open, and a later call awaits the same pending lifecycles.
+func (s *Server) StopWithContext(ctx context.Context) error {
 	for _, rg := range s.raftGroups {
-		rg.Stop()
+		rg.BeginStop()
 	}
+	for _, rg := range s.raftGroups {
+		if err := rg.WaitQuiescence(ctx); err != nil {
+			return fmt.Errorf("channel storage handoff: %w", err)
+		}
+	}
+	return nil
 }
 
 // 唤醒频道领导

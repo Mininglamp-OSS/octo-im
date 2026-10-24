@@ -24,11 +24,18 @@ func (tr *configTransport) Send(_ string, e types.Event) {
 	}
 }
 
+// stopServer joins storage workers before the test DB closes.
+func stopServer(t *testing.T, s *Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, s.StopWithContext(ctx))
+}
+
 func TestConfigReconcileIdempotentAndMonotonic(t *testing.T) {
 	tr := &configTransport{replies: make(chan types.Event, 128)}
 	s := NewServer(NewOptions(WithNodeId(1), WithDB(retryDB(t)), WithGroupCount(1), WithTransport(tr)))
 	require.NoError(t, s.Start())
-	t.Cleanup(s.Stop)
+	t.Cleanup(func() { stopServer(t, s) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cfg := wkdb.ChannelClusterConfig{ChannelId: "reconcile", ChannelType: 2, LeaderId: 1, Replicas: []uint64{1, 2}, Term: 1, ConfVersion: 1}
@@ -98,7 +105,7 @@ func TestConfigInitializationCancellationDoesNotPublish(t *testing.T) {
 	db := &configRestoreDB{DB: retryDB(t)}
 	s := NewServer(NewOptions(WithNodeId(1), WithDB(db), WithGroupCount(1), WithTransport(retryNetwork())))
 	require.NoError(t, s.Start())
-	t.Cleanup(s.Stop)
+	t.Cleanup(func() { stopServer(t, s) })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	db.cancel = cancel
@@ -123,7 +130,7 @@ func TestConfigRestoredHigherTermAllowsWakeAndReconcile(t *testing.T) {
 		require.NoError(t, db.SaveRaftHardState(key, types.HardState{Term: 5}))
 		s := NewServer(NewOptions(WithNodeId(1), WithDB(db), WithGroupCount(1), WithTransport(retryNetwork())))
 		require.NoError(t, s.Start())
-		t.Cleanup(s.Stop)
+		t.Cleanup(func() { stopServer(t, s) })
 		if wake {
 			require.NoError(t, s.WakeLeaderIfNeed(cfg))
 		} else {
@@ -147,7 +154,7 @@ func TestConfigResumeSurvivesHardStateFailure(t *testing.T) {
 	db.failHardState.Store(true)
 	s := NewServer(NewOptions(WithNodeId(1), WithDB(db), WithGroupCount(1), WithTransport(retryNetwork())))
 	require.NoError(t, s.Start())
-	t.Cleanup(s.Stop)
+	t.Cleanup(func() { stopServer(t, s) })
 	cfg := wkdb.ChannelClusterConfig{ChannelId: "retry", ChannelType: 2, LeaderId: 1, Replicas: []uint64{1}, Term: 5, ConfVersion: 4}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -233,7 +240,7 @@ func TestConfigForegroundWaitsForResume(t *testing.T) {
 			cfg := wkdb.ChannelClusterConfig{ChannelId: "retry", ChannelType: 2, LeaderId: 1, Replicas: []uint64{1}, Term: 5, ConfVersion: 5}
 			s := NewServer(NewOptions(WithNodeId(1), WithDB(db), WithGroupCount(1), WithTransport(retryNetwork()), WithCluster(resumeConfigCluster{cfg: cfg})))
 			require.NoError(t, s.Start())
-			t.Cleanup(s.Stop)
+			t.Cleanup(func() { stopServer(t, s) })
 			if mode == "switch" {
 				initial := cfg.Clone()
 				initial.Term, initial.ConfVersion = 1, 1

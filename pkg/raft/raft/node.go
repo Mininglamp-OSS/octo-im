@@ -3,6 +3,7 @@ package raft
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -48,9 +49,15 @@ type Node struct {
 	truncating  bool // 截断中
 	stopPropose bool // 停止提案
 
+	// A truncation requested while a store was in flight; see requestTruncate.
+	deferredTruncate    uint64
+	hasDeferredTruncate bool
+
 	suspend bool // 挂起
 
-	idleTick int // 服务空闲计数
+	idleTick atomic.Int64 // KeepAlive is also called by proposal goroutines
+
+	proposeRejects proposeRejectStats // 被拒绝的本地提案
 
 	syncing             bool // 正在同步
 	syncRespTimeoutTick int  // 同步响应超时计数
@@ -134,7 +141,7 @@ func (n *Node) HasReady() bool {
 	if n.hasUnpersistedHardState() {
 		return true
 	}
-	if n.queue.hasNextStoreLogs() {
+	if !n.storeHeldForTruncate() && n.queue.hasNextStoreLogs() {
 		return true
 	}
 	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
@@ -162,7 +169,7 @@ func (n *Node) Ready() []types.Event {
 		n.persistedHardState = state
 	}
 
-	if n.queue.hasNextStoreLogs() {
+	if !n.storeHeldForTruncate() && n.queue.hasNextStoreLogs() {
 		logs := n.queue.nextStoreLogs(0)
 		if len(logs) > 0 {
 			var termStartIndexInfo *types.TermStartIndexInfo
@@ -241,7 +248,7 @@ func (n *Node) GetReplicaLastLogIndex(replicaId uint64) uint64 {
 }
 
 func (n *Node) KeepAlive() {
-	n.idleTick = 0
+	n.idleTick.Store(0)
 }
 func (n *Node) advance() {
 	if n.opts.Advance != nil {

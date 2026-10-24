@@ -1,6 +1,7 @@
 package clusterconfig_test
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -45,11 +46,16 @@ func TestRestartedVoterCanElectWithLivePeer(t *testing.T) {
 	nodes := map[uint64]*clusterconfig.Server{}
 	active := map[uint64]bool{}
 	opts := map[uint64]*clusterconfig.Options{}
+	stop := func(s *clusterconfig.Server) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, s.WaitStopped(ctx))
+	}
 	t.Cleanup(func() {
 		for id, s := range nodes {
 			if active[id] {
 				tr.set(id, nil)
-				s.Stop()
+				stop(s)
 			}
 		}
 	})
@@ -57,8 +63,8 @@ func TestRestartedVoterCanElectWithLivePeer(t *testing.T) {
 		opts[id] = newTestOptions(t, id, map[uint64]string{1: "", 2: "", 3: ""}, clusterconfig.WithTransport(tr))
 		s := clusterconfig.New(opts[id])
 		nodes[id] = s
-		tr.set(id, s)
 		require.NoError(t, s.Start())
+		tr.set(id, s)
 		active[id] = true
 	}
 	var leaderID uint64
@@ -89,19 +95,19 @@ func TestRestartedVoterCanElectWithLivePeer(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond)
 	restartID := leaderID%3 + 1
 	tr.set(restartID, nil)
-	nodes[restartID].Stop()
+	stop(nodes[restartID])
 	active[restartID] = false
 	restarted := clusterconfig.New(opts[restartID])
 	nodes[restartID] = restarted
-	tr.set(restartID, restarted)
 	require.NoError(t, restarted.Start())
+	tr.set(restartID, restarted)
 	active[restartID] = true
 	require.Eventually(t, func() bool { return restarted.LeaderId() == leaderID }, 5*time.Second, 20*time.Millisecond)
 	tr.mu.Lock()
 	tr.votes = map[uint64]map[uint64]int{}
 	tr.mu.Unlock()
 	tr.set(leaderID, nil)
-	leader.Stop()
+	stop(leader)
 	active[leaderID] = false
 	t.Logf("stopped leader=%d, restarted follower=%d, persisted application version=%d", leaderID, restartID, restarted.GetClusterConfig().Version)
 	elected := false

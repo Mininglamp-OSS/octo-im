@@ -143,6 +143,9 @@ func (wk *wukongDB) Open() error {
 	wk.dblock.start()
 
 	opts := wk.defaultPebbleOptions()
+	if wk.opts.FS != nil {
+		opts.FS = wk.opts.FS
+	}
 	for i := 0; i < int(wk.shardNum); i++ {
 
 		db, err := pebble.Open(filepath.Join(wk.opts.DataDir, "wukongimdb", fmt.Sprintf("shard%03d", i)), opts)

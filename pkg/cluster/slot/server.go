@@ -2,9 +2,11 @@ package slot
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -26,12 +28,16 @@ type Server struct {
 	genLogId *snowflake.Node
 
 	slotUpdateLock sync.Mutex
+	stopOnce       sync.Once
+	stopDone       chan struct{}
+	stopErr        error
 }
 
 func NewServer(opts *Options) *Server {
 	s := &Server{
-		opts: opts,
-		Log:  wklog.NewWKLog("slot.Server"),
+		opts:     opts,
+		Log:      wklog.NewWKLog("slot.Server"),
+		stopDone: make(chan struct{}),
 	}
 	s.storage = NewPebbleShardLogStorage(s, path.Join(opts.DataDir, "logdb"), uint32(opts.SlotDbShardNum))
 	s.raftGroup = raftgroup.New(raftgroup.NewOptions(raftgroup.WithLogPrefix("slot"), raftgroup.WithStorage(s.storage), raftgroup.WithTransport(opts.Transport)))
@@ -63,12 +69,43 @@ func (s *Server) Start() error {
 	return nil
 }
 
-func (s *Server) Stop() {
-	s.raftGroup.Stop()
+// quiescenceWarnInterval paces the warning while Stop waits for workers.
+var quiescenceWarnInterval = 10 * time.Second
 
-	err := s.storage.Close()
-	if err != nil {
-		s.Error("storage close failed", zap.Error(err))
+// StopWithContext starts the single shutdown lifecycle and waits for it within
+// ctx. The lifecycle joins the RaftGroup event loop and every pool task that
+// may read or write storage, then closes storage once. On a deadline storage
+// stays open and owned by the pending lifecycle; a later call awaits the same
+// handoff. Once the lifecycle has finished, every call returns its result.
+func (s *Server) StopWithContext(ctx context.Context) error {
+	s.stopOnce.Do(func() {
+		s.raftGroup.BeginStop()
+		go func() {
+			defer close(s.stopDone)
+			// The lifecycle owns storage, so it waits without a deadline.
+			err := wkutil.WaitReportingSlow(s.raftGroup.WaitQuiescence, quiescenceWarnInterval, func(elapsed time.Duration) {
+				s.Warn("slot shutdown still waiting for workers to quiesce; storage stays open", zap.Duration("elapsed", elapsed))
+			})
+			if err != nil {
+				s.stopErr = err
+				return
+			}
+			s.stopErr = s.storage.Close()
+			if s.stopErr != nil {
+				s.Error("storage close failed", zap.Error(s.stopErr))
+			}
+		}()
+	})
+	select {
+	case <-s.stopDone:
+		return s.stopErr
+	default:
+	}
+	select {
+	case <-s.stopDone:
+		return s.stopErr
+	case <-ctx.Done():
+		return fmt.Errorf("slot storage handoff: %w: %w", raftgroup.ErrIncompleteQuiescence, ctx.Err())
 	}
 }
 

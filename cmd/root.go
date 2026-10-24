@@ -125,11 +125,11 @@ func cmdRun() error {
 		// 处理 pingback (如果提供了)
 		if pingback != "" {
 			if err := handlePingback(); err != nil {
-				s.Stop() // 如果 pingback 失败，也尝试停止服务器
+				s.StopNoErr() // 如果 pingback 失败，也尝试停止服务器
 				return err
 			}
 			if err := writePIDFile(); err != nil {
-				s.Stop() // 如果写 PID 文件失败，也尝试停止服务器
+				s.StopNoErr() // 如果写 PID 文件失败，也尝试停止服务器
 				return err
 			}
 		}
@@ -142,7 +142,7 @@ func cmdRun() error {
 		// 阻塞直到收到退出信号
 		<-quit
 
-		s.Stop() // <-- 调用 Stop() 进行清理
+		s.StopNoErr() // logs a failed or incomplete shutdown
 		wklog.Info("WuKongIM server stopped.")
 	}
 	return nil

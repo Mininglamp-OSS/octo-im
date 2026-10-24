@@ -119,9 +119,8 @@ func (n *Node) stepLeader(e types.Event) error {
 			n.Foucs("stop propose", zap.String("key", n.Key()))
 			return types.ErrProposalDropped
 		}
-		n.idleTick = 0
-		err := n.queue.append(e.Logs...)
-		if err != nil {
+		n.idleTick.Store(0)
+		if err := n.appendLeaderLocal(e.Logs); err != nil {
 			return err
 		}
 		// if n.Key() == "2&ch1" {
@@ -129,7 +128,7 @@ func (n *Node) stepLeader(e types.Event) error {
 		// }
 		n.advance()
 	case types.SyncReq: // 同步
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		isLearner := n.isLearner(e.From) // 当前同步节点是否是学习者
 		n.updateSyncInfo(e)              // 更新副本同步信息
 		if !isLearner {
@@ -231,7 +230,7 @@ func (n *Node) stepFollower(e types.Event) error {
 			n.BecomeFollower(e.Term, e.From)
 		}
 		n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		// 如果领导的配置版本大于本地配置版本，那么请求配置
 		if e.ConfigVersion > n.cfg.Version {
 			n.sendConfigReq()
@@ -240,13 +239,13 @@ func (n *Node) stepFollower(e types.Event) error {
 		// if n.Key() == "2&ch1" {
 		// 	n.Info("NotifySync...", zap.Uint64("from", e.From), zap.Uint64("index", e.Index))
 		// }
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		n.suspend = false // 解除挂起
 		n.sendSyncReq()
 		n.advance()
 	case types.SyncResp: // 同步返回
 		n.electionElapsed = 0
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		n.syncRespTimeoutTick = 0
 		n.syncing = false
 		if !n.onlySync {
@@ -279,8 +278,7 @@ func (n *Node) stepFollower(e types.Event) error {
 			if n.truncating {
 				return nil
 			}
-			n.truncating = true
-			n.sendTruncateReq(e.Index)
+			n.requestTruncate(e.Index)
 			n.advance()
 		default:
 			n.Error("sync error", zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.String("reason", e.Reason.String()))
@@ -305,6 +303,7 @@ func (n *Node) stepFollower(e types.Event) error {
 			n.sendSyncReq()
 			n.advance()
 		}
+		n.releaseDeferredTruncate()
 
 	case types.ConfigResp: // 配置返回
 		return n.switchRemoteConfig(e.Config)
@@ -338,19 +337,19 @@ func (n *Node) stepLearner(e types.Event) error {
 			n.BecomeLearner(e.Term, e.From)
 		}
 		n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		// 如果领导的配置版本大于本地配置版本，那么请求配置
 		if e.ConfigVersion > n.cfg.Version {
 			n.sendConfigReq()
 		}
 	case types.NotifySync:
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		n.suspend = false // 解除挂起，允许后续 tickSync
 		n.sendSyncReq()
 		n.advance()
 	case types.SyncResp: // 同步返回
 		n.electionElapsed = 0
-		n.idleTick = 0
+		n.idleTick.Store(0)
 		n.syncRespTimeoutTick = 0
 		n.syncing = false
 		if !n.onlySync {
@@ -381,8 +380,7 @@ func (n *Node) stepLearner(e types.Event) error {
 			if n.truncating {
 				return nil
 			}
-			n.truncating = true
-			n.sendTruncateReq(e.Index)
+			n.requestTruncate(e.Index)
 			n.advance()
 		} else {
 			n.Error("sync error", zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.String("reason", e.Reason.String()))
@@ -406,6 +404,7 @@ func (n *Node) stepLearner(e types.Event) error {
 			n.sendSyncReq()
 			n.advance()
 		}
+		n.releaseDeferredTruncate()
 
 	case types.ConfigResp: // 配置返回
 		return n.switchRemoteConfig(e.Config)
@@ -686,4 +685,48 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 			n.stopPropose = true // 停止提案
 		}
 	}
+}
+
+// requestTruncate starts a follower or learner truncation. Storage runs the
+// store and the truncation as independent tasks, so a truncation dispatched
+// while a store is in flight can complete first: the late store then writes
+// the discarded entries back, and its StoreResp reports an index the queue no
+// longer holds. Such a truncation therefore waits for the in-flight store.
+// truncating stays set meanwhile, so no sync or new store starts.
+func (n *Node) requestTruncate(index uint64) {
+	n.truncating = true
+	if n.queue.appending {
+		n.deferredTruncate = index
+		n.hasDeferredTruncate = true
+		return
+	}
+	n.sendTruncateReq(index)
+}
+
+// storeHeldForTruncate reports that a follower or learner truncation is
+// pending, deferred or dispatched; no store may start until it completes.
+// Leaders never truncate their own log and are not held.
+func (n *Node) storeHeldForTruncate() bool {
+	return n.truncating && !n.IsLeader()
+}
+
+// dropDeferredTruncate forgets a truncation that never reached storage. It
+// runs on every role change: the new leader asks for a truncation again if one
+// is still needed.
+func (n *Node) dropDeferredTruncate() {
+	if n.hasDeferredTruncate {
+		n.hasDeferredTruncate = false
+		n.truncating = false
+	}
+}
+
+// releaseDeferredTruncate dispatches a truncation that waited for the store
+// that just returned, whatever its outcome.
+func (n *Node) releaseDeferredTruncate() {
+	if !n.hasDeferredTruncate || n.queue.appending {
+		return
+	}
+	n.hasDeferredTruncate = false
+	n.sendTruncateReq(n.deferredTruncate)
+	n.advance()
 }

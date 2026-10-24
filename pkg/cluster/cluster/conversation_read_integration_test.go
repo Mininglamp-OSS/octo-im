@@ -37,7 +37,7 @@ func TestConversationReadRPC(t *testing.T) {
 		s := New(NewOptions(WithAddr("tcp://"+addresses[id]), WithConfigOptions(config), WithDataDir(t.TempDir()),
 			WithDBWKDbShardNum(1), WithDBSlotShardNum(1), WithDBWKDbMemTableSize(1<<20), WithDBSlotMemTableSize(1<<20)))
 		require.NoError(t, s.Start())
-		t.Cleanup(s.Stop)
+		t.Cleanup(func() { require.NoError(t, s.Stop()) })
 		servers = append(servers, s)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -172,7 +172,7 @@ func TestConversationReadSingleNode(t *testing.T) {
 	s := New(NewOptions(WithAddr("tcp://"+address), WithConfigOptions(config), WithDataDir(t.TempDir()),
 		WithDBWKDbShardNum(1), WithDBSlotShardNum(1), WithDBWKDbMemTableSize(1<<20), WithDBSlotMemTableSize(1<<20)))
 	require.NoError(t, s.Start())
-	t.Cleanup(s.Stop)
+	t.Cleanup(func() { require.NoError(t, s.Stop()) })
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	require.NoError(t, s.WaitAllSlotReady(ctx, 1))

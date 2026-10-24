@@ -33,6 +33,8 @@ func skipUnlessApplyWaitStress(t *testing.T) {
 // stressStorage is a thread-safe in-memory store that records when this node
 // applied each proposal id, so callers can compare results with reality.
 type stressStorage struct {
+	group      *RaftGroup
+	traces     map[uint64][]stressReceiptEvent
 	mu         sync.Mutex
 	logs       map[string][]types.Log
 	termStarts map[string]types.TermStartIndexInfo
@@ -42,6 +44,7 @@ type stressStorage struct {
 
 func newStressStorage(applyDelay func() time.Duration) *stressStorage {
 	return &stressStorage{
+		traces:     make(map[uint64][]stressReceiptEvent),
 		logs:       make(map[string][]types.Log),
 		termStarts: make(map[string]types.TermStartIndexInfo),
 		appliedAt:  make(map[uint64]time.Time),
@@ -165,94 +168,219 @@ func (tr *stressTransport) Send(key string, event types.Event) {
 	g.Advance()
 }
 
-type stressCluster struct {
-	groups []*RaftGroup
-	stores []*stressStorage
-	keys   []string
+// stressNode intercepts fixture-only snapshot events on the group's event loop.
+// Raw Node state is never read by the test goroutine. Production methods and
+// their concurrency are unchanged; this adds no getter-only lock.
+type stressNode struct {
+	IRaft
+	requests chan chan stressSnapshot
+}
+type stressSnapshot struct {
+	leader                   uint64
+	term                     uint32
+	last, committed, applied uint64
 }
 
+func (n *stressNode) Step(e types.Event) error {
+	if e.Type == types.Unknown && e.From == ^uint64(0) {
+		reply := <-n.requests
+		reply <- stressSnapshot{n.IRaft.LeaderId(), n.IRaft.Config().Term, n.IRaft.LastLogIndex(), n.IRaft.CommittedIndex(), n.IRaft.AppliedIndex()}
+		return nil
+	}
+	return n.IRaft.Step(e)
+}
+
+// stressForwardWait records the forwarding registry's correlation events;
+// RaftGroup calls it under forwardMu.
+type stressForwardWait struct {
+	mu     sync.Mutex
+	events map[string][]stressForwardEvent
+}
+
+func (w *stressForwardWait) observe(key, phase, detail string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.events[key] = append(w.events[key], stressForwardEvent{phase, time.Now(), detail})
+}
+
+type stressCluster struct {
+	forwardWaits []*stressForwardWait
+	groups       []*RaftGroup
+	stores       []*stressStorage
+	keys         []string
+	leaders      map[string]uint64
+	started      []*RaftGroup
+	shutdown     sync.Once
+	stopped      chan struct{}
+	stopErrors   []error
+}
+
+func (c *stressCluster) stop(t *testing.T) {
+	t.Helper()
+	c.shutdown.Do(func() {
+		go func() {
+			defer close(c.stopped)
+			for _, g := range c.started {
+				g.Stop()
+			}
+			// All event loops have joined: no new pool work can be scheduled.
+			for _, g := range c.groups {
+				if err := g.goPool.ReleaseTimeout(3 * time.Second); err != nil {
+					c.stopErrors = append(c.stopErrors, err)
+				}
+			}
+		}()
+	})
+	select {
+	case <-c.stopped:
+		for _, err := range c.stopErrors {
+			t.Errorf("pool shutdown: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("complete Stop and pool join exceeded 10s")
+	}
+}
+func (c *stressCluster) assertCleanup(t *testing.T) {
+	t.Helper()
+	for i, g := range c.groups {
+		local, forwarded := 0, 0
+		for _, b := range g.wait.buckets {
+			b.mu.Lock()
+			for _, entries := range b.waiters {
+				for _, w := range entries {
+					if w.forwarded {
+						forwarded++
+					} else {
+						local++
+					}
+				}
+			}
+			b.mu.Unlock()
+		}
+		registrations := int(g.ForwardStats().Pending)
+		workers := g.goPool.Running()
+		t.Logf("cleanup node=%d localReceipts=%d forwardedReceipts=%d forwardRegistrations=%d poolWorkers=%d", i+1, local, forwarded, registrations, workers)
+		if local+forwarded+registrations+workers != 0 {
+			t.Errorf("node %d did not drain", i+1)
+		}
+	}
+}
+func (c *stressCluster) snapshot(t *testing.T, g *RaftGroup, key string) stressSnapshot {
+	t.Helper()
+	n := g.GetRaft(key).(*stressNode)
+	reply := make(chan stressSnapshot, 1)
+	n.requests <- reply
+	g.AddEvent(key, types.Event{Type: types.Unknown, From: ^uint64(0)})
+	g.Advance()
+	select {
+	case state := <-reply:
+		return state
+	case <-time.After(3 * time.Second):
+		t.Fatal("event-loop snapshot timed out")
+	}
+	return stressSnapshot{}
+}
 func newStressCluster(t *testing.T, keyCount int, applyDelay func() time.Duration) *stressCluster {
 	t.Helper()
 	nodeIDs := []uint64{1, 2}
 	tr := &stressTransport{groups: make(map[uint64]*RaftGroup)}
-	c := &stressCluster{}
+	c := &stressCluster{stopped: make(chan struct{}), leaders: make(map[string]uint64)}
+	// Registered before allocation/start: partial setup failures also join workers.
+	t.Cleanup(func() { c.stop(t); c.assertCleanup(t) })
 	for i := 0; i < keyCount; i++ {
 		c.keys = append(c.keys, fmt.Sprintf("slot-%d", i))
 	}
 	for _, id := range nodeIDs {
 		store := newStressStorage(applyDelay)
-		g := New(NewOptions(WithTransport(tr), WithStorage(store), WithTickInterval(10*time.Millisecond),
-			WithLogPrefix(fmt.Sprintf("stress-%d", id))))
+		g := New(NewOptions(WithTransport(tr), WithStorage(store), WithTickInterval(10*time.Millisecond), WithLogPrefix(fmt.Sprintf("stress-%d", id))))
+		fw := &stressForwardWait{events: make(map[string][]stressForwardEvent)}
+		g.forwardObserve = fw.observe
+		c.forwardWaits = append(c.forwardWaits, fw)
+		store.group = g
+		for _, bucket := range g.wait.buckets {
+			bucket.observe = store.observeReceipt
+		}
 		tr.groups[id] = g
 		c.groups = append(c.groups, g)
 		c.stores = append(c.stores, store)
+		for _, key := range c.keys {
+			n := raft.NewNode(0, types.RaftState{}, raft.NewOptions(raft.WithNodeId(id), raft.WithKey(key), raft.WithElectionOn(true), raft.WithElectionInterval(5), raft.WithReplicas(nodeIDs), raft.WithAdvance(g.Advance)))
+			g.AddRaft(&stressNode{IRaft: n, requests: make(chan chan stressSnapshot, 1)})
+		}
 	}
-	for i, id := range nodeIDs {
-		g := c.groups[i]
+	for _, g := range c.groups {
 		if err := g.Start(); err != nil {
 			t.Fatal(err)
 		}
-		for _, key := range c.keys {
-			g.AddRaft(raft.NewNode(0, types.RaftState{}, raft.NewOptions(
-				raft.WithNodeId(id), raft.WithKey(key), raft.WithElectionOn(true),
-				raft.WithElectionInterval(5), raft.WithReplicas(nodeIDs), raft.WithAdvance(g.Advance))))
-		}
+		c.started = append(c.started, g)
 	}
-	t.Cleanup(func() {
-		for _, g := range c.groups {
-			select {
-			case <-g.stopper.ShouldStop():
-			default:
-				g.Stop()
-			}
-			g.goPool.Release()
+	// Require ten agreeing event-loop snapshots over >=200ms (four election
+	// intervals), with unchanged leaders/terms; a single matching poll is insufficient.
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+	var previous []stressSnapshot
+	stable := 0
+	for {
+		select {
+		case <-timeout.C:
+			t.Fatal("election stabilization timed out")
+		case <-ticker.C:
 		}
-	})
-	deadline := time.Now().Add(10 * time.Second)
-	for _, key := range c.keys {
-		for {
-			l1, l2 := c.groups[0].GetRaft(key).LeaderId(), c.groups[1].GetRaft(key).LeaderId()
-			if l1 != 0 && l1 == l2 {
-				break
+		states := make([]stressSnapshot, 0, keyCount*2)
+		agree := true
+		for _, key := range c.keys {
+			a, b := c.snapshot(t, c.groups[0], key), c.snapshot(t, c.groups[1], key)
+			agree = agree && a.leader != 0 && a.leader == b.leader && a.term == b.term
+			states = append(states, a, b)
+		}
+		if len(previous) == len(states) {
+			for i, state := range states {
+				agree = agree && state.leader == previous[i].leader && state.term == previous[i].term
 			}
-			if time.Now().After(deadline) {
-				t.Fatalf("no stable leader for %s", key)
+		} else {
+			agree = false
+		}
+		if agree {
+			stable++
+		} else {
+			stable = 0
+		}
+		previous = states
+		if stable >= 10 {
+			for i, key := range c.keys {
+				c.leaders[key] = states[i*2].leader
 			}
-			time.Sleep(10 * time.Millisecond)
+			t.Logf("election barrier: 10 stable event-loop rounds, states=%v", states)
+			break
 		}
 	}
 	return c
 }
 
-// waitQuiescent waits until every replica has applied everything it stored.
-// It reports false when replicas stop making progress.
 func (c *stressCluster) waitQuiescent(t *testing.T) bool {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
 	for {
 		idle := true
 		for _, g := range c.groups {
 			for _, key := range c.keys {
-				r := g.GetRaft(key)
-				if r.AppliedIndex() != r.LastLogIndex() || r.CommittedIndex() != r.LastLogIndex() {
-					idle = false
-				}
+				state := c.snapshot(t, g, key)
+				idle = idle && state.applied == state.last && state.committed == state.last
 			}
 		}
 		if idle {
-			time.Sleep(50 * time.Millisecond) // let trailing didApply calls finish
 			return true
 		}
-		if time.Now().After(deadline) {
-			for i, g := range c.groups {
-				for _, key := range c.keys {
-					r := g.GetRaft(key)
-					t.Logf("  node=%d %s last=%d committed=%d applied=%d", i+1, key, r.LastLogIndex(), r.CommittedIndex(), r.AppliedIndex())
-				}
-			}
+		select {
+		case <-timeout.C:
 			return false
+		case <-ticker.C:
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -260,20 +388,20 @@ func (c *stressCluster) waitQuiescent(t *testing.T) bool {
 func (c *stressCluster) remainingWaiters() int {
 	total := 0
 	for _, g := range c.groups {
-		for _, b := range g.wait.buckets {
-			b.mu.Lock()
-			total += len(b.progresses)
-			b.mu.Unlock()
-		}
+		total += g.wait.pending()
 	}
 	return total
 }
 
 type stressStats struct {
-	calls, ok, deadline, canceled, stopped, other int64
-	// This node applied the batch before the context expired, yet the call
-	// reported a timeout or cancellation.
+	calls, ok, deadline, canceled, stopped, other                                  int64
+	notAdmitted, unknown, rejected, superseded                                     int64
+	leaderCalls, forwardedCalls, deadlineCalls, cancelCalls                        int64
+	leaderOK, forwardedOK                                                          int64
+	businessAppliedUnpublished, businessAppliedPublished, businessAppliedNoReceipt int64
+	// Business Apply precedes expiry; this alone does not prove receipt completion.
 	appliedBeforeExpiryButFailed int64
+	unexplainedCorrelation       int64
 	// Success was returned although this node had not applied the batch yet.
 	okButNotApplied int64
 	// The call returned more than 500ms after its context expired.
@@ -293,7 +421,8 @@ type stressProposal struct {
 
 func (s *stressStats) String() string {
 	return fmt.Sprintf("calls=%d ok=%d deadline=%d canceled=%d stopped=%d other=%d appliedBeforeExpiryButFailed=%d okButNotApplied=%d lateReturn=%d",
-		s.calls, s.ok, s.deadline, s.canceled, s.stopped, s.other, s.appliedBeforeExpiryButFailed, s.okButNotApplied, s.lateReturn)
+		s.calls, s.ok, s.deadline, s.canceled, s.stopped, s.other, s.appliedBeforeExpiryButFailed, s.okButNotApplied, s.lateReturn) +
+		fmt.Sprintf(" notAdmitted=%d unknown=%d rejected=%d superseded=%d leaderCalls=%d forwardedCalls=%d deadlineCalls=%d cancelCalls=%d businessAppliedUnpublished=%d businessAppliedPublished=%d businessAppliedNoReceipt=%d leaderOK=%d forwardedOK=%d", s.notAdmitted, s.unknown, s.rejected, s.superseded, s.leaderCalls, s.forwardedCalls, s.deadlineCalls, s.cancelCalls, s.businessAppliedUnpublished, s.businessAppliedPublished, s.businessAppliedNoReceipt, s.leaderOK, s.forwardedOK)
 }
 
 type stressLoad struct {
@@ -303,6 +432,7 @@ type stressLoad struct {
 	// expired (zero while it has not).
 	newContext func(r *rand.Rand) (context.Context, context.CancelFunc, func() time.Time)
 	onSuccess  func(time.Duration)
+	started    chan<- struct{}
 }
 
 func timeoutContext(d time.Duration) (context.Context, context.CancelFunc, func() time.Time) {
@@ -319,21 +449,28 @@ func timeoutContext(d time.Duration) (context.Context, context.CancelFunc, func(
 func cancelAfterContext(d time.Duration) (context.Context, context.CancelFunc, func() time.Time) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var firedAt atomic.Int64
+	done := make(chan struct{})
 	timer := time.AfterFunc(d, func() {
+		defer close(done)
 		firedAt.Store(time.Now().UnixNano())
 		cancel()
 	})
-	return ctx, func() { timer.Stop(); cancel() }, func() time.Time {
-		if at := firedAt.Load(); at != 0 {
-			return time.Unix(0, at)
+	return ctx, func() {
+			if !timer.Stop() {
+				<-done
+			}
+			cancel()
+		}, func() time.Time {
+			if at := firedAt.Load(); at != 0 {
+				return time.Unix(0, at)
+			}
+			return time.Time{}
 		}
-		return time.Time{}
-	}
 }
 
 var stressProposalID atomic.Uint64
 
-func (c *stressCluster) run(load stressLoad) *stressStats {
+func (c *stressCluster) run(t *testing.T, load stressLoad) *stressStats {
 	stats := &stressStats{otherErrors: make(map[string]int)}
 	var wg sync.WaitGroup
 	for node := range c.groups {
@@ -343,6 +480,7 @@ func (c *stressCluster) run(load stressLoad) *stressStats {
 				defer wg.Done()
 				r := rand.New(rand.NewSource(seed))
 				g, store := c.groups[node], c.stores[node]
+				firstCall := true
 				for {
 					select {
 					case <-load.stop:
@@ -355,6 +493,23 @@ func (c *stressCluster) run(load stressLoad) *stressStats {
 					}
 					key := c.keys[r.Intn(len(c.keys))]
 					ctx, cancel, expiredAt := load.newContext(r)
+					if uint64(node+1) == c.leaders[key] {
+						atomic.AddInt64(&stats.leaderCalls, 1)
+					} else {
+						atomic.AddInt64(&stats.forwardedCalls, 1)
+					}
+					if _, hasDeadline := ctx.Deadline(); hasDeadline {
+						atomic.AddInt64(&stats.deadlineCalls, 1)
+					} else {
+						atomic.AddInt64(&stats.cancelCalls, 1)
+					}
+					if load.started != nil && firstCall {
+						firstCall = false
+						select {
+						case load.started <- struct{}{}:
+						default:
+						}
+					}
 					start := time.Now()
 					resps, err := g.ProposeBatchUntilAppliedTimeout(ctx, key, reqs)
 					returned := time.Now()
@@ -367,10 +522,44 @@ func (c *stressCluster) run(load stressLoad) *stressStats {
 					if !expired.IsZero() && returned.Sub(expired) > 500*time.Millisecond {
 						atomic.AddInt64(&stats.lateReturn, 1)
 					}
+					if err != nil {
+						switch {
+						case errors.Is(err, types.ErrProposalNotAdmitted):
+							atomic.AddInt64(&stats.notAdmitted, 1)
+						case errors.Is(err, types.ErrProposalOutcomeUnknown):
+							atomic.AddInt64(&stats.unknown, 1)
+						case errors.Is(err, types.ErrForwardRejected):
+							atomic.AddInt64(&stats.rejected, 1)
+						case errors.Is(err, types.ErrProposalSuperseded):
+							atomic.AddInt64(&stats.superseded, 1)
+						default:
+							atomic.AddInt64(&stats.other, 1)
+						}
+					}
 					switch {
 					case err == nil:
 						atomic.AddInt64(&stats.ok, 1)
-						if !applied || appliedAt.After(returned) || len(resps) != len(reqs) {
+						if uint64(node+1) == c.leaders[key] {
+							atomic.AddInt64(&stats.leaderOK, 1)
+						} else {
+							atomic.AddInt64(&stats.forwardedOK, 1)
+						}
+						valid := forwardRespsMatch(reqs, resps)
+						if valid {
+							store.mu.Lock()
+							for _, resp := range resps {
+								logs := store.logs[key]
+								if resp.Index > uint64(len(logs)) || logs[resp.Index-1].Id != resp.Id {
+									valid = false
+								}
+							}
+							store.mu.Unlock()
+						}
+						for _, req := range reqs {
+							at, exists := store.applyTime(req.Id)
+							valid = valid && exists && !at.After(returned)
+						}
+						if !valid {
 							atomic.AddInt64(&stats.okButNotApplied, 1)
 							stats.mu.Lock()
 							stats.notApplied = append(stats.notApplied, stressProposal{node, key, lastID, resps})
@@ -387,19 +576,63 @@ func (c *stressCluster) run(load stressLoad) *stressStats {
 						atomic.AddInt64(&stats.stopped, 1)
 						return
 					default:
-						atomic.AddInt64(&stats.other, 1)
 						stats.mu.Lock()
 						stats.otherErrors[err.Error()]++
 						stats.mu.Unlock()
 					}
 					if err != nil && applied && !expired.IsZero() && appliedAt.Before(expired) {
 						atomic.AddInt64(&stats.appliedBeforeExpiryButFailed, 1)
+						store.mu.Lock()
+						trace := append([]stressReceiptEvent(nil), store.traces[lastID]...)
+						store.mu.Unlock()
+						registered, published, detached := false, false, false
+						invalid := false
+						for _, event := range trace {
+							if event.at.After(returned) {
+								invalid = true
+							}
+							switch event.phase {
+							case "register":
+								invalid = invalid || registered || event.receipt.forwarded != (uint64(node+1) != c.leaders[key])
+								registered = true
+							case "publish":
+								invalid = invalid || !registered || published || detached || event.err == nil
+								published = true
+							case "detach":
+								invalid = invalid || !registered || published || detached
+								detached = true
+							}
+						}
+						forwarded := uint64(node+1) != c.leaders[key]
+						if !registered {
+							// Forwarding can settle before this node registers a receipt.
+							if !forwarded || !errors.Is(err, types.ErrProposalOutcomeUnknown) {
+								invalid = true
+							}
+							atomic.AddInt64(&stats.businessAppliedNoReceipt, 1)
+						} else if published {
+							atomic.AddInt64(&stats.businessAppliedPublished, 1)
+						} else {
+							invalid = invalid || !detached
+							atomic.AddInt64(&stats.businessAppliedUnpublished, 1)
+						}
+						if invalid {
+							atomic.AddInt64(&stats.unexplainedCorrelation, 1)
+						}
+						fwdEvents := c.forwardWaits[node].timeline(forwardKey(key, lastID))
+						t.Logf("receipt timeline node=%d key=%s id=%d forwarded=%t start=%s apply=%s expiry=%s outcome=%s err=%v events=%+v explained=%t firstID=%d forwarding=%+v", node+1, key, lastID, forwarded, start.Format(time.RFC3339Nano), appliedAt.Format(time.RFC3339Nano), expired.Format(time.RFC3339Nano), returned.Format(time.RFC3339Nano), err, trace, !invalid, reqs[0].Id, fwdEvents)
 					}
 				}
 			}(node, int64(node*1000+w+1))
 		}
 	}
-	wg.Wait()
+	joined := make(chan struct{})
+	go func() { wg.Wait(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(20 * time.Second):
+		t.Fatal("load callers exceeded 20s bounded join")
+	}
 	return stats
 }
 
@@ -428,7 +661,7 @@ func TestApplyWaitStressDeadlinesNearApply(t *testing.T) {
 	// Calibrate: measure successful latency under the same concurrency.
 	var mu sync.Mutex
 	var latencies []time.Duration
-	c.run(stressLoad{
+	calibration := c.run(t, stressLoad{
 		workersPerNode: 32,
 		stop:           stopAfter(time.Second),
 		newContext: func(*rand.Rand) (context.Context, context.CancelFunc, func() time.Time) {
@@ -440,6 +673,10 @@ func TestApplyWaitStressDeadlinesNearApply(t *testing.T) {
 			mu.Unlock()
 		},
 	})
+	calibration.assert(t, false)
+	if calibration.leaderOK == 0 || calibration.forwardedOK == 0 {
+		t.Fatal("calibration missing local/forwarded successes")
+	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	if len(latencies) == 0 {
 		t.Fatal("calibration produced no successful proposal")
@@ -449,17 +686,21 @@ func TestApplyWaitStressDeadlinesNearApply(t *testing.T) {
 
 	duration := 5 * time.Second
 	if v := os.Getenv("RAFT_WAIT_STRESS_SECONDS"); v != "" {
-		if d, err := time.ParseDuration(v + "s"); err == nil {
-			duration = d
+		d, err := time.ParseDuration(v + "s")
+		if err != nil || d < time.Second || d > 10*time.Second {
+			t.Fatal("stress duration must be between 1s and 10s")
 		}
+		duration = d
 	}
 	// RAFT_WAIT_STRESS_TIMEOUT_SCALE widens deadlines so that fewer calls expire.
 	timeoutScale := 1
 	if v := os.Getenv("RAFT_WAIT_STRESS_TIMEOUT_SCALE"); v != "" {
-		fmt.Sscanf(v, "%d", &timeoutScale)
+		if n, err := fmt.Sscanf(v, "%d", &timeoutScale); err != nil || n != 1 || timeoutScale < 1 || timeoutScale > 10 {
+			t.Fatal("timeout scale must be between 1 and 10")
+		}
 	}
 	var okLatencies []time.Duration
-	stats := c.run(stressLoad{
+	stats := c.run(t, stressLoad{
 		workersPerNode: 32,
 		stop:           stopAfter(duration),
 		onSuccess: func(d time.Duration) {
@@ -487,6 +728,10 @@ func TestApplyWaitStressDeadlinesNearApply(t *testing.T) {
 	t.Logf("after load: allLogsApplied=%v remainingWaiters=%d", applied, remaining)
 	c.explainNotApplied(t, stats)
 
+	stats.assert(t, true)
+	if !applied {
+		t.Error("replicas did not converge")
+	}
 	if remaining != 0 {
 		t.Errorf("%d apply waiters remain after every proposal returned", remaining)
 	}
@@ -500,28 +745,53 @@ func TestApplyWaitStressStopDuringLoad(t *testing.T) {
 	skipUnlessApplyWaitStress(t)
 	c := newStressCluster(t, 4, func() time.Duration { return 5 * time.Millisecond })
 	stop := make(chan struct{})
+	started := make(chan struct{}, 64)
 	done := make(chan *stressStats, 1)
 	go func() {
-		done <- c.run(stressLoad{
+		done <- c.run(t, stressLoad{
 			workersPerNode: 32,
 			stop:           stop,
+			started:        started,
 			newContext: func(*rand.Rand) (context.Context, context.CancelFunc, func() time.Time) {
 				return timeoutContext(10 * time.Second)
 			},
 		})
 	}()
-	time.Sleep(500 * time.Millisecond)
-	for _, g := range c.groups {
-		g.Stop()
+	// Wait for all 64 callers to enter the workload, then for a real pending
+	// receipt. No arbitrary warm-up sleep, and Stop itself is inside the bound.
+	timer := time.NewTimer(3 * time.Second)
+	for i := 0; i < 64; i++ {
+		select {
+		case <-started:
+		case <-timer.C:
+			t.Fatal("load did not start")
+		}
 	}
+	timer.Stop()
+	pendingDeadline := time.NewTimer(3 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	for c.remainingWaiters() == 0 {
+		select {
+		case <-ticker.C:
+		case <-pendingDeadline.C:
+			t.Fatal("no in-flight receipts")
+		}
+	}
+	ticker.Stop()
+	pendingDeadline.Stop()
+	c.stop(t)
 	close(stop)
 	var stats *stressStats
 	select {
 	case stats = <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("callers did not return after Stop")
+		t.Fatal("callers did not join after Stop")
 	}
-	time.Sleep(100 * time.Millisecond) // let in-flight applies notify
+	stats.assert(t, false)
+	if stats.stopped == 0 {
+		t.Error("Stop did not interrupt a caller")
+	}
+	c.assertCleanup(t)
 	remaining := c.remainingWaiters()
 	t.Logf("stop during load: %s", stats)
 	t.Logf("after Stop: remainingWaiters=%d", remaining)
@@ -547,7 +817,10 @@ func (c *stressCluster) explainNotApplied(t *testing.T, stats *stressStats) {
 			lost++
 		}
 		if i < 3 {
-			index := p.resp[len(p.resp)-1].Index
+			var index uint64
+			if len(p.resp) > 0 && p.resp[len(p.resp)-1] != nil {
+				index = p.resp[len(p.resp)-1].Index
+			}
 			store := c.stores[p.node]
 			store.mu.Lock()
 			var at types.Log
@@ -560,4 +833,57 @@ func (c *stressCluster) explainNotApplied(t *testing.T, stats *stressStats) {
 		}
 	}
 	t.Logf("success-before-apply breakdown: appliedLater=%d neverApplied=%d; other errors=%v", later, lost, stats.otherErrors)
+}
+
+func (s *stressStats) assert(t *testing.T, deadlines bool) {
+	t.Helper()
+	if s.calls != s.ok+s.notAdmitted+s.unknown+s.rejected+s.superseded+s.other {
+		t.Errorf("outcome conservation failed: %s", s)
+	}
+	if s.calls != s.leaderCalls+s.forwardedCalls || s.calls != s.deadlineCalls+s.cancelCalls {
+		t.Errorf("coverage conservation failed: %s", s)
+	}
+	if s.okButNotApplied != 0 || s.other != 0 || s.lateReturn != 0 {
+		t.Errorf("invalid outcomes: %s", s)
+	}
+	if s.leaderCalls == 0 || s.forwardedCalls == 0 {
+		t.Errorf("missing local/forwarded success coverage: %s", s)
+	}
+	if deadlines && (s.leaderOK == 0 || s.forwardedOK == 0 || s.deadline == 0 || s.canceled == 0 || s.deadlineCalls == 0 || s.cancelCalls == 0) {
+		t.Errorf("missing expiry/cancellation coverage: %s", s)
+	}
+	t.Logf("unexplained receipt correlations=%d", s.unexplainedCorrelation)
+	if s.unexplainedCorrelation != 0 {
+		t.Errorf("unexplained receipt correlations: %d", s.unexplainedCorrelation)
+	}
+	if s.appliedBeforeExpiryButFailed != s.businessAppliedUnpublished+s.businessAppliedPublished+s.businessAppliedNoReceipt {
+		t.Errorf("business apply correlation did not conserve: %s", s)
+	}
+}
+
+// Events are immutable copies recorded at the same lock boundary as the
+// transition. A consumed channel value cannot erase publication evidence.
+type stressReceiptEvent struct {
+	phase   string
+	at      time.Time
+	receipt receipt
+	err     error
+}
+
+func (s *stressStorage) observeReceipt(r receipt, phase string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.traces[r.lastLogId()] = append(s.traces[r.lastLogId()], stressReceiptEvent{phase, time.Now(), r, err})
+}
+
+type stressForwardEvent struct {
+	phase     string
+	at        time.Time
+	valueType string
+}
+
+func (w *stressForwardWait) timeline(id string) []stressForwardEvent {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]stressForwardEvent(nil), w.events[id]...)
 }
