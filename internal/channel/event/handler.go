@@ -168,7 +168,7 @@ func (c *channelHandler) checkAndUpdateLeaderIdChange() error {
 func (c *channelHandler) isTimeout() bool {
 	c.pending.RLock()
 	defer c.pending.RUnlock()
-	if c.processing.Load() || len(c.pending.retryEvents) > 0 || c.processingIndex < c.pending.eventQueue.LastIndex() {
+	if c.processing.Load() || len(c.pending.retryEvents) > 0 || (c.pending.eventQueue != nil && c.processingIndex < c.pending.eventQueue.LastIndex()) {
 		return false
 	}
 	now, lastActive := fasttime.UnixTimestamp(), c.lastActive
