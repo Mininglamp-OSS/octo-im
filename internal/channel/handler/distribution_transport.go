@@ -3,6 +3,7 @@ package handler
 import (
 	"container/list"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -110,7 +111,19 @@ func decodeDistribution(data []byte) (*distributionRequest, error) {
 		return nil, errInvalidDistribution
 	}
 	for _, event := range r.events {
-		if event.Type != eventbus.EventChannelDistribute || event.TagKey != r.key || event.MessageId == 0 || !validChannelForwardEvent(event) {
+		if event.Type != eventbus.EventChannelDistribute || event.TagKey != r.key || event.Conn == nil {
+			return nil, errInvalidDistribution
+		}
+		switch frame := event.Frame.(type) {
+		case *wkproto.SendPacket:
+			if frame == nil || event.MessageId == 0 {
+				return nil, errInvalidDistribution
+			}
+		case *wkproto.EventPacket:
+			if frame == nil || frame.Id == "" {
+				return nil, errInvalidDistribution
+			}
+		default:
 			return nil, errInvalidDistribution
 		}
 	}
@@ -122,6 +135,22 @@ type distributionID struct {
 	channel     string
 	channelType uint8
 	message     int64
+	streamEvent [32]byte
+}
+
+// distributionEventID separates stream events sharing a parent message ID.
+func distributionEventID(r *distributionRequest, event *eventbus.Event) distributionID {
+	id := distributionID{source: r.source, channel: r.channel, channelType: r.channelType, message: event.MessageId}
+	if frame, ok := event.Frame.(*wkproto.EventPacket); ok {
+		hash := sha256.New()
+		_, _ = hash.Write([]byte(frame.Id))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(frame.Type))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write(frame.Data)
+		copy(id.streamEvent[:], hash.Sum(nil))
+	}
+	return id
 }
 
 type distributionReceipt struct {
@@ -155,7 +184,7 @@ func (h *Handler) acceptDistribution(data []byte) proto.Status {
 	fresh := make([]*eventbus.Event, 0, len(r.events))
 	batchIDs := make(map[distributionID]struct{}, len(r.events))
 	for _, event := range r.events {
-		id := distributionID{r.source, r.channel, r.channelType, event.MessageId}
+		id := distributionEventID(r, event)
 		if entry := h.distributionReceipts[id]; entry != nil {
 			if entry.Value.(distributionReceipt).version != r.key {
 				return forward.StatusInvalid
@@ -178,7 +207,7 @@ func (h *Handler) acceptDistribution(data []byte) proto.Status {
 	tag := &types.Tag{Key: r.key, ChannelId: r.channel, ChannelType: r.channelType,
 		Nodes: []*types.Node{{LeaderId: r.target, Uids: r.uids}}}
 	for _, event := range fresh {
-		id := distributionID{r.source, r.channel, r.channelType, event.MessageId}
+		id := distributionEventID(r, event)
 		h.distributionReceipts[id] = h.distributionOrder.PushBack(distributionReceipt{id, r.key, now.Add(distributionAdmissionTTL)})
 		event.SourceNodeId = r.source
 		event.Distribution = &eventbus.DistributionState{Snapshot: tag, Deadline: now.Add(distributionRetryTimeout)}
