@@ -171,7 +171,9 @@ func (c *channelHandler) isTimeout() bool {
 	if c.processing.Load() || len(c.pending.retryEvents) > 0 || c.processingIndex < c.pending.eventQueue.LastIndex() {
 		return false
 	}
-	return fasttime.UnixTimestamp()-c.lastActive > uint64(options.G.Poller.ChannelTimeout.Seconds())
+	now, lastActive := fasttime.UnixTimestamp(), c.lastActive
+	// Avoid unsigned underflow when the wall clock moves backwards.
+	return now > lastActive && now-lastActive > uint64(options.G.Poller.ChannelTimeout.Seconds())
 }
 
 // groupByType 将待处理事件按照事件类型分组
