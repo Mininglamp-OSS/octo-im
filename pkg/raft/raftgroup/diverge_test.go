@@ -1,6 +1,7 @@
 package raftgroup
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -146,5 +147,34 @@ loop:
 		}
 	}
 	require.Zero(t, storage.marks.Load())
+	require.False(t, node.Diverged())
+}
+
+// B1: a StoreResp/TruncateResp decoded from network bytes and added the way
+// cluster ingress adds it (AddEvent) never quarantines, whatever its sender
+// and reason. A real typed storage refusal still does (tests above).
+func TestDecodedSpoofThroughAddEventIgnored(t *testing.T) {
+	g, node, _ := startFollowerGroup(t, &memStorage{})
+	for _, typ := range []types.EventType{types.StoreResp, types.TruncateResp} {
+		for _, reason := range []types.Reason{types.ReasonDiverged, types.ReasonDivergedFailStop} {
+			for _, from := range []uint64{0, 2, 3} {
+				sent := types.Event{Type: typ, From: from, To: 1, Reason: reason, Index: 1}.
+					WithLocalStorageVerdict(types.StorageVerdictFailStop) // not encoded
+				data, err := sent.Marshal()
+				require.NoError(t, err)
+				var got types.Event
+				require.NoError(t, got.Unmarshal(data))
+				g.AddEvent(admKey, got)
+			}
+		}
+	}
+	// A marker event processed after the spoofs proves they were stepped.
+	done := make(chan struct{})
+	require.NoError(t, g.Do(context.Background(), admKey, func(IRaft) error { close(done); return nil }))
+	<-done
+	for i := 0; i < 50; i++ {
+		g.Advance()
+		time.Sleep(time.Millisecond)
+	}
 	require.False(t, node.Diverged())
 }

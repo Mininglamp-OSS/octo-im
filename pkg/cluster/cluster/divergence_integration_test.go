@@ -311,10 +311,22 @@ func TestDivergenceQuarantinedFollowerAtOpen(t *testing.T) {
 	})
 }
 
+// injectLocalStorageRefusal is an in-process-only test seam: it hands the
+// slot raft a storage result that carries the local, never-encoded storage
+// verdict, as raftgroup does after a refused truncation. It cannot be
+// produced from the network. No storage refusal and no marker write happen;
+// those are covered by the slot storage and raftgroup tests, and the
+// marker-at-open path by TestDivergenceQuarantinedFollowerAtOpen.
+func injectLocalStorageRefusal(s *Server, slotId uint32) {
+	s.AddSlotEvent(slot.SlotIdToKey(slotId), rafttypes.Event{Type: rafttypes.TruncateResp, Reason: rafttypes.ReasonDiverged}.
+		WithLocalStorageVerdict(rafttypes.StorageVerdictDiverged))
+}
+
 // The slot leader replica is quarantined. A running leader cannot reach
 // this through storage (it never truncates and only appends at its tail),
-// so the transition is injected at the Raft event boundary as the storage
-// result. Everything after the injection runs unmodified code.
+// so the transition comes from injectLocalStorageRefusal. Everything after
+// the injection runs unmodified code. Coverage limit: the leader writes no
+// marker and runs no storage refusal in this test.
 func TestDivergenceQuarantinedSlotLeader(t *testing.T) {
 	c := newDivCluster(t)
 	const S, H = uint32(3), uint32(0)
@@ -355,7 +367,7 @@ func TestDivergenceQuarantinedSlotLeader(t *testing.T) {
 		return out
 	}
 
-	leader.AddSlotEvent(slot.SlotIdToKey(S), rafttypes.Event{Type: rafttypes.TruncateResp, Reason: rafttypes.ReasonDiverged})
+	injectLocalStorageRefusal(leader, S)
 	require.Eventually(t, func() bool { return leader.slotServer.ReplicaState(S) == slot.ReplicaQuarantined }, 5*time.Second, time.Millisecond)
 	require.Eventually(t, func() bool {
 		r := leader.slotServer.GetSlotRaft(S)

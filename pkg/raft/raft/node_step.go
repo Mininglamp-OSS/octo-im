@@ -10,17 +10,16 @@ func (n *Node) Step(e types.Event) error {
 	// Storage refused a truncation or an append that would have left the
 	// applied state inconsistent with the log. Quarantine before anything
 	// else can act on the in-memory log.
-	// Only local storage results carry these reasons; a peer cannot send them.
-	if (e.Type == types.TruncateResp || e.Type == types.StoreResp) && e.From == None {
-		if state, ok := divergeReason(e.Reason); ok {
-			if e.Type == types.StoreResp {
-				n.queue.appending = false
-			} else {
-				n.truncating = false
-			}
-			n.quarantine(state, "storage refused "+e.Type.String())
-			return nil
+	// Only the in-process storage verdict counts. From, Type and Reason are
+	// all peer-controlled on the wire and are not provenance.
+	if state, ok := localDivergence(e); ok {
+		if e.Type == types.StoreResp {
+			n.queue.appending = false
+		} else {
+			n.truncating = false
 		}
+		n.quarantine(state, "storage refused "+e.Type.String())
+		return nil
 	}
 	if n.Diverged() {
 		return n.stepDiverged(e)

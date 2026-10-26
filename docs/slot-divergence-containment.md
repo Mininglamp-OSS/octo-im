@@ -51,9 +51,9 @@ These are deliberate and fail closed. None of them is a false success.
   - Affected paths: message send and sync routing, CMD subscriber distribution, plugin routes, and new channel raft starts for that slot.
   - Channel rafts already running keep serving with the config they loaded.
   - The slot has no writer. Nothing elects a new leader automatically; see P2.
-- **Quarantined follower.** The slot loses one replica, and that node takes no part in channel elections for the slot. Channel failover then needs a quorum of the other replicas and fails closed without one.
+- **Quarantined follower.** The slot loses one replica, and that node takes no part in channel elections for the slot. Channel failover then needs a quorum of the other replicas and fails closed without one. Every proposal for the slot that **enters that node** is refused before admission (`ErrSlotDiverged`, not admitted), **even though the slot leader elsewhere is healthy**. Writes for the slot must enter through another node. Every slot-owned read of the slot on that node fails too.
 - **Slot 0.** On the affected node, system-UID, tester and plugin-user reads fail for every user and channel.
-- **Leader role switches are disabled for slot Raft.** Leadership moves only by election, so leadership is not rebalanced automatically. A slot migration whose source is the current leader no longer completes by hand-off and stays pending while its target keeps catching up. Completing it needs an operator election (P2), and a learner target cannot be elected directly.
+- **Leader role switches are disabled for every slot, on every node, at all times** — not only for quarantined replicas (approved cost O7). This is an operational change for every cluster. Leadership moves only by election, so it is not rebalanced automatically. Every slot migration whose source is the current leader (including automatic rebalancing after a node rejoins) no longer completes by hand-off and stays pending while its target keeps catching up. Completing it needs an operator election (P2), and a learner target cannot be elected directly. Channel and Config Raft are unaffected.
 - **Rolling upgrade is unsupported.** With strict parsing, the default, a node that predates the extension counts as unknown in slot elections, so slots that depend on it cannot elect. Upgrade the whole tier.
 
 ## Metrics
@@ -96,7 +96,17 @@ Every transition logs `slot replica fenced` (slot server) and `replica quarantin
 
 ## Unfenced reads (by design)
 
-These are allow-listed and enforced by `TestRawDBReadsAreFenced`. They make no completeness or authority claim and must not feed correctness decisions.
+These are allow-listed in `TestRawDBReadsAreFenced`. They make no completeness or authority claim and must not feed correctness decisions.
+
+### What the lint does and does not prove
+
+`TestRawDBReadsAreFenced` is a **lexical** check, not a proof of complete semantics:
+
+- It accepts any slot-owned read written anywhere inside a `readOwned` / `readConversations` / `icluster.FencedRead*` call. It does **not** check that the slot passed to the fence is the slot that owns the rows (a wrong selector passes). Selector correctness is covered by the parity test `TestStoreReadFenceSelectorParity` for the `Store` reads, and by review for the cluster sites.
+- It recognises the raw handles by their syntactic form (`s.wdb`, `s.db`, `opts.DB`, `<…Store>.DB()`, `WKDB()`). A handle stored in another variable (`d := service.Store.DB(); d.GetUser(…)`) or passed through a function is not seen.
+- It classifies by method name.
+
+So it stops new unfenced reads written in the existing style. It does not replace review of new database access.
 
 - **Admin scans across all slots:**
   - `SearchChannels`, `SearchConversation`, `SearchUser`, `SearchDevice`, `SearchChannelClusterConfig`
@@ -109,6 +119,11 @@ These are allow-listed and enforced by `TestRawDBReadsAreFenced`. They make no c
   - the plugin table (`Store.DB()`, plugin server only)
   - the notify queue
 
+## Error collapse that remains (triaged, unchanged)
+
+- `SystemAccountManager.IsSystemAccount` returns `bool`. When the slot-0 system-UID load is fenced (or fails for any reason), it logs the error and answers `false`, and the load is retried on the next call (`LoadIfNeed` returns the error and does not mark the set loaded). This is a **conservative denial, not successful error propagation**: a system sender is then treated as an ordinary sender and may receive a permission or allowlist reason instead of a system error. It never grants access. Changing it would change a widely used API and permission behaviour, which is outside this change.
+- By contrast, `UserIsAI` now returns its error and does not cache `false`, and the permission checks return `ReasonSystemError` with the error.
+
 ## Not addressed
 
 - Already-divergent retained data, including channel configs loaded before detection.
@@ -116,3 +131,4 @@ These are allow-listed and enforced by `TestRawDBReadsAreFenced`. They make no c
 - Stale reads from a replaced but unaware healthy leader.
 - Restart exposure after a failed marker write (A4).
 - Ambiguous (timed-out) send outcomes.
+- Peers on the cluster port remain trusted for ordinary Raft messages, as before. Only the divergence path was made non-spoofable: a replica is quarantined solely by the in-process storage verdict, which is not part of the wire format.

@@ -58,7 +58,7 @@ func TestRefusedTruncationQuarantinesReplica(t *testing.T) {
 				require.True(t, ok)
 
 				committedBefore, lastBefore := n.queue.committedIndex, n.queue.lastLogIndex
-				n.Step(types.Event{Type: types.TruncateResp, Reason: reason, Index: trunc.Index})
+				n.Step(localRefusal(types.Event{Type: types.TruncateResp, Reason: reason, Index: trunc.Index}))
 				require.Equal(t, reason == types.ReasonDivergedFailStop, n.FailStopped())
 				require.EqualValues(t, lastBefore, n.queue.lastLogIndex, "no in-memory truncation")
 				require.EqualValues(t, committedBefore, n.queue.committedIndex)
@@ -76,7 +76,7 @@ func TestRefusedAppendQuarantinesReplica(t *testing.T) {
 	n.Step(types.Event{Type: types.SyncResp, Term: 2, From: 2, Reason: types.ReasonOk, Logs: termLogs(2, 1, 5)})
 	store, ok := findEvent(collectEvents(n), types.StoreReq)
 	require.True(t, ok)
-	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged, Index: store.Logs[len(store.Logs)-1].Index})
+	n.Step(localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged, Index: store.Logs[len(store.Logs)-1].Index}))
 	require.False(t, n.queue.appending)
 	require.EqualValues(t, 0, n.queue.storedIndex, "nothing marked stored")
 	requireFenced(t, n)
@@ -86,11 +86,11 @@ func TestRefusedAppendQuarantinesReplica(t *testing.T) {
 func TestQuarantineIsSticky(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeFollower(n, 2, 2)
-	n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged})
+	n.Step(localRefusal(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged}))
 	require.False(t, n.FailStopped())
-	n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonDivergedFailStop})
+	n.Step(localRefusal(types.Event{Type: types.TruncateResp, Reason: types.ReasonDivergedFailStop}))
 	require.True(t, n.FailStopped())
-	n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged})
+	n.Step(localRefusal(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged}))
 	require.True(t, n.FailStopped())
 	// A ConfChange naming another leader is bookkeeping only.
 	require.NoError(t, n.Step(types.Event{Type: types.ConfChange, Config: types.Config{Replicas: []uint64{1, 2, 3}, Leader: 3, Role: types.RoleFollower, Term: 3, Version: 9}}))
@@ -107,7 +107,7 @@ func TestDivergedLeaderStepsDown(t *testing.T) {
 	_, err := n.Admit([]types.Log{{Data: []byte("a")}})
 	require.NoError(t, err)
 	clearEvents(n)
-	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged, Index: 1})
+	n.Step(localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged, Index: 1}))
 	fence, ok := findEvent(n.events, types.ProposalFence)
 	require.True(t, ok, "leader waiters are fenced")
 	require.EqualValues(t, 4, fence.Term)
@@ -240,14 +240,81 @@ func TestLearnerToFollowerStillAllowedWithRoleSwitchDisabled(t *testing.T) {
 	require.True(t, ok)
 }
 
-// Diverge reasons are local storage results; one that arrives from a peer is
-// not acted on.
-func TestDivergeReasonFromPeerIgnored(t *testing.T) {
+// localRefusal is how the raftgroup storage handlers deliver a refusal: the
+// in-process verdict next to the reason.
+func localRefusal(e types.Event) types.Event {
+	switch e.Reason {
+	case types.ReasonDiverged:
+		return e.WithLocalStorageVerdict(types.StorageVerdictDiverged)
+	case types.ReasonDivergedFailStop:
+		return e.WithLocalStorageVerdict(types.StorageVerdictFailStop)
+	}
+	return e
+}
+
+// wireRoundTrip encodes and decodes an event exactly as peer ingress does.
+func wireRoundTrip(t *testing.T, e types.Event) types.Event {
+	t.Helper()
+	data, err := e.Marshal()
+	require.NoError(t, err)
+	var got types.Event
+	require.NoError(t, got.Unmarshal(data))
+	return got
+}
+
+// B1: StoreResp/TruncateResp with either divergence reason, from sender 0
+// or any other sender, decoded from the wire, never quarantines a healthy
+// replica, in any role. The verdict does not survive encoding, even when the
+// sender built the event with one.
+func TestDivergeReasonFromWireIgnored(t *testing.T) {
+	roles := map[string]func(n *Node){
+		"follower": func(n *Node) { makeFollower(n, 2, 2) },
+		"learner":  func(n *Node) { makeLearner(n, 2, 2) },
+		"leader":   func(n *Node) { n.BecomeLeader(2); clearEvents(n) },
+	}
+	for role, become := range roles {
+		for _, typ := range []types.EventType{types.StoreResp, types.TruncateResp} {
+			for _, reason := range []types.Reason{types.ReasonDiverged, types.ReasonDivergedFailStop} {
+				for _, from := range []uint64{0, 2, 3} {
+					for _, withVerdict := range []bool{false, true} {
+						n := newTestNode(1, []uint64{1, 2, 3})
+						become(n)
+						sent := types.Event{Type: typ, From: from, To: 1, Reason: reason, Index: 1}
+						if withVerdict {
+							sent = localRefusal(sent)
+						}
+						got := wireRoundTrip(t, sent)
+						require.Equal(t, from, got.From)
+						require.Equal(t, typ, got.Type)
+						require.Equal(t, reason, got.Reason)
+						require.Equal(t, types.StorageVerdictNone, got.LocalStorageVerdict(), "verdict must not be encoded")
+						n.Step(got)
+						require.False(t, n.Diverged(), "%s %s %s from=%d verdict=%v", role, typ, reason, from, withVerdict)
+					}
+				}
+			}
+		}
+	}
+}
+
+// Decoding into a reused event clears a verdict it held.
+func TestUnmarshalClearsVerdict(t *testing.T) {
+	data, err := types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged}.Marshal()
+	require.NoError(t, err)
+	e := localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged})
+	require.NoError(t, e.Unmarshal(data))
+	require.Equal(t, types.StorageVerdictNone, e.LocalStorageVerdict())
+}
+
+// A divergence reason without the local verdict is an ordinary failed
+// result: it does not quarantine, and a local refusal still does.
+func TestLocalRefusalStillQuarantines(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeFollower(n, 2, 2)
-	n.Step(types.Event{Type: types.TruncateResp, From: 2, Term: 2, Reason: types.ReasonDiverged})
-	n.Step(types.Event{Type: types.StoreResp, From: 3, Term: 2, Reason: types.ReasonDivergedFailStop})
+	n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged})
 	require.False(t, n.Diverged())
+	n.Step(localRefusal(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged}))
+	require.True(t, n.Diverged())
 }
 
 // The owner observes every quarantine transition.
@@ -256,8 +323,8 @@ func TestOnQuarantineCallback(t *testing.T) {
 	opts := NewOptions(WithNodeId(1), WithReplicas([]uint64{1, 2, 3}), WithOnQuarantine(func(failStop bool, _ string) { calls = append(calls, failStop) }))
 	n := NewNode(0, types.RaftState{}, opts)
 	n.BecomeFollower(2, 2)
-	n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged})
-	n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged})
-	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonDivergedFailStop})
+	n.Step(localRefusal(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged}))
+	n.Step(localRefusal(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged}))
+	n.Step(localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDivergedFailStop}))
 	require.Equal(t, []bool{false, true}, calls)
 }

@@ -28,11 +28,17 @@ func (n *Node) FailStopped() bool {
 	return n.divergeState.Load() == divergeFailStopped
 }
 
-func divergeReason(r types.Reason) (uint32, bool) {
-	switch r {
-	case types.ReasonDiverged:
+// localDivergence maps the in-process storage verdict of a StoreResp or
+// TruncateResp to a quarantine state. The verdict is never encoded, so an
+// event from a peer (whatever its From, Type and Reason) never maps.
+func localDivergence(e types.Event) (uint32, bool) {
+	if e.Type != types.TruncateResp && e.Type != types.StoreResp {
+		return divergeNone, false
+	}
+	switch e.LocalStorageVerdict() {
+	case types.StorageVerdictDiverged:
 		return divergeQuarantined, true
-	case types.ReasonDivergedFailStop:
+	case types.StorageVerdictFailStop:
 		return divergeFailStopped, true
 	}
 	return divergeNone, false

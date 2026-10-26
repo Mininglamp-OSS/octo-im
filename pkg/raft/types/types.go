@@ -22,13 +22,14 @@ const (
 	ReasonTruncate
 	// ReasonOnlySync 只是同步, 不做截断判断
 	ReasonOnlySync
-	// ReasonDiverged is local only: storage refused a truncate or append that
-	// would leave the applied state inconsistent with the log, and the
-	// divergence marker was persisted. The replica is quarantined.
+	// ReasonDiverged: storage refused a truncate or append that would leave
+	// the applied state inconsistent with the log, and the divergence marker
+	// was persisted. Informational only: a reason is peer-controlled on the
+	// wire, so a replica is quarantined only by the in-process
+	// StorageVerdict, never by this value.
 	ReasonDiverged
-	// ReasonDivergedFailStop is local only: as ReasonDiverged, but persisting
-	// the divergence marker failed. The replica is fail-stopped for this
-	// process lifetime.
+	// ReasonDivergedFailStop: as ReasonDiverged, but persisting the
+	// divergence marker failed. Informational only, as above.
 	ReasonDivergedFailStop
 )
 
@@ -233,6 +234,36 @@ type Event struct {
 	TermStartIndexInfo *TermStartIndexInfo
 	StartIndex         uint64
 	EndIndex           uint64
+
+	// storageVerdict is never encoded: Unmarshal always leaves it unset, so
+	// a peer cannot produce it. Only local storage handlers set it.
+	storageVerdict StorageVerdict
+}
+
+// StorageVerdict is the local storage's refusal of a truncation or append
+// that would leave the applied state inconsistent with the log.
+type StorageVerdict uint8
+
+const (
+	StorageVerdictNone StorageVerdict = iota
+	// StorageVerdictDiverged: refused, divergence marker persisted.
+	StorageVerdictDiverged
+	// StorageVerdictFailStop: refused, divergence marker not persisted.
+	StorageVerdictFailStop
+)
+
+// WithLocalStorageVerdict returns a copy of e carrying a local storage
+// verdict. It exists only in process memory and is not part of the wire
+// format.
+func (e Event) WithLocalStorageVerdict(v StorageVerdict) Event {
+	e.storageVerdict = v
+	return e
+}
+
+// LocalStorageVerdict reports the local storage verdict of e. An event
+// decoded from the network never carries one.
+func (e Event) LocalStorageVerdict() StorageVerdict {
+	return e.storageVerdict
 }
 
 const (
@@ -325,6 +356,8 @@ func (e Event) Marshal() ([]byte, error) {
 }
 
 func (e *Event) Unmarshal(data []byte) error {
+	// Provenance is local only; a decoded event never carries a verdict.
+	e.storageVerdict = StorageVerdictNone
 	dec := wkproto.NewDecoder(data)
 	flag, err := dec.Uint32()
 	if err != nil {

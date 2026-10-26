@@ -23,12 +23,12 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 			reason = rg.markDiverged(r.Key(), err)
 		}
 
-		rg.AddEvent(r.Key(), types.Event{
+		rg.AddEvent(r.Key(), localStorageResult(types.Event{
 			Type:   types.StoreResp,
 			Index:  e.Logs[len(e.Logs)-1].Index,
 			Logs:   e.Logs,
 			Reason: reason,
-		})
+		}))
 		rg.Advance()
 	})
 	if err != nil {
@@ -67,6 +67,19 @@ func (rg *RaftGroup) markDiverged(key string, cause error) types.Reason {
 		return types.ReasonDivergedFailStop
 	}
 	return types.ReasonDiverged
+}
+
+// localStorageResult attaches the in-process storage verdict for a divergence
+// reason. The node acts only on the verdict, which is never encoded, so the
+// same Type and Reason arriving from a peer cannot quarantine a replica.
+func localStorageResult(e types.Event) types.Event {
+	switch e.Reason {
+	case types.ReasonDiverged:
+		return e.WithLocalStorageVerdict(types.StorageVerdictDiverged)
+	case types.ReasonDivergedFailStop:
+		return e.WithLocalStorageVerdict(types.StorageVerdictFailStop)
+	}
+	return e
 }
 
 func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
@@ -157,11 +170,11 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 			} else {
 				rg.Error("truncate logs failed", zap.Error(err))
 			}
-			rg.AddEvent(r.Key(), types.Event{
+			rg.AddEvent(r.Key(), localStorageResult(types.Event{
 				Type:   types.TruncateResp,
 				Index:  e.Index,
 				Reason: reason,
-			})
+			}))
 			rg.Advance()
 			return
 		}
