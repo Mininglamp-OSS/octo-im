@@ -43,6 +43,7 @@ type wireCluster struct {
 	mu         sync.RWMutex
 	clients    map[uint64]*client.Client
 	requests   atomic.Int32
+	completed  atomic.Int32
 	tagLookups atomic.Int32
 	delay      bool
 	release    <-chan struct{}
@@ -68,6 +69,7 @@ func (c *wireCluster) Route(path string, fn wkserver.Handler) {
 				}
 			}
 			fn(ctx)
+			c.completed.Add(1)
 		})
 		return
 	}
@@ -119,6 +121,7 @@ type wireReady struct{ HTTP, RPC string }
 type wireStats struct {
 	Counts       map[int64]map[string]int
 	Requests     int32
+	Completed    int32
 	TagLookups   int32
 	OldAvailable bool
 }
@@ -244,7 +247,7 @@ func TestDistributionIntegrationNode(t *testing.T) {
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
 		pusher.mu.Lock()
 		defer pusher.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(wireStats{pusher.counts, c.requests.Load(), c.tagLookups.Load(), m.Exist("A")})
+		_ = json.NewEncoder(w).Encode(wireStats{Counts: pusher.counts, Requests: c.requests.Load(), Completed: c.completed.Load(), TagLookups: c.tagLookups.Load(), OldAvailable: m.Exist("A")})
 	})
 	control := httptest.NewServer(mux)
 	defer control.Close()
@@ -369,6 +372,7 @@ func TestDistributionThreeNodeSlowPeerAndVersionEviction(t *testing.T) {
 	wireControl(t, nodes[0], "/send", int64(102), nil)
 	waitWireStats(t, nodes[1], func(s wireStats) bool { return s.Counts[101]["2-fixed"] == 1 && s.Counts[102]["2-new"] == 1 })
 	wireControl(t, nodes[1], "/release", nil, nil)
+	waitWireStats(t, nodes[1], func(s wireStats) bool { return s.Completed >= 3 })
 	for index, node := range nodes {
 		uid := fmt.Sprintf("%d-fixed", index+1)
 		stats := waitWireStats(t, node, func(s wireStats) bool { return s.Counts[101][uid] == 1 && s.Counts[102][uid] == 1 })
