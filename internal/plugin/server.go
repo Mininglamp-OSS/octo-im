@@ -148,18 +148,19 @@ func (s *Server) Plugin(no string) types.Plugin {
 	return pg
 }
 
-func (s *Server) UserIsAI(uid string) bool {
+func (s *Server) UserIsAI(uid string) (bool, error) {
 	isAi, ok := s.isAiFromCache(uid)
 	if ok {
-		return isAi
+		return isAi, nil
 	}
-	exist, err := service.Store.DB().ExistPluginByUid(uid)
+	exist, err := service.Store.ExistPluginUser(uid)
 	if err != nil {
+		// Not cached: a failed lookup must not become a remembered "not AI".
 		s.Error("查询用户AI插件失败！", zap.Error(err), zap.String("uid", uid))
-		return false
+		return false, err
 	}
 	s.setIsAiToCache(uid, exist)
-	return exist
+	return exist, nil
 }
 
 func (s *Server) GetUserPluginNo(uid string) (string, error) {
@@ -167,7 +168,7 @@ func (s *Server) GetUserPluginNo(uid string) (string, error) {
 	if ok {
 		return pluginNo, nil
 	}
-	pluginNo, err := service.Store.DB().GetHighestPriorityPluginByUid(uid)
+	pluginNo, err := service.Store.GetHighestPriorityPluginByUid(uid)
 	if err != nil {
 		s.Error("获取用户AI插件编号失败！", zap.Error(err), zap.String("uid", uid))
 		return "", err

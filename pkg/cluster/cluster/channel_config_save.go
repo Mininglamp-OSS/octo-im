@@ -19,6 +19,11 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		// A quarantined local replica fails before anything is proposed;
+		// its read state could otherwise only end in retries.
+		if err := s.slotServer.CheckSlotReadable(slotID); err != nil {
+			return 0, err
+		}
 		before, err := s.slotServer.ReadLeaderState(ctx, slotID)
 		if err != nil {
 			return 0, err
@@ -31,7 +36,7 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 				if s.cfgServer.SlotLeaderId(slotID) != s.opts.ConfigOptions.NodeId {
 					return ErrConversationReadRetry
 				}
-				current, err := s.db.GetChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
+				current, err := s.fencedChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
 				if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
 					return err
 				}

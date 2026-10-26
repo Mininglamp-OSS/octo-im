@@ -28,6 +28,7 @@ type Server struct {
 	genLogId *snowflake.Node
 
 	slotUpdateLock sync.Mutex
+	divergence     divergence
 	stopOnce       sync.Once
 	stopDone       chan struct{}
 	stopErr        error
@@ -60,6 +61,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
+	s.registerDivergenceMetrics()
 
 	slots := s.opts.Node.Slots()
 	for _, slot := range slots {

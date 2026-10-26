@@ -49,7 +49,7 @@ func (s *Server) channelMigrate(c *wkhttp.Context) {
 	}
 
 	// 获取频道的分布式配置
-	clusterConfig, err := s.db.GetChannelClusterConfig(channelId, channelType)
+	clusterConfig, err := s.fencedChannelClusterConfig(channelId, channelType)
 	if err != nil {
 		s.Error("channelMigrate: getChannelClusterConfig error", zap.Error(err))
 		c.ResponseError(err)
@@ -153,7 +153,7 @@ func (s *Server) channelClusterConfig(c *wkhttp.Context) {
 		return
 	}
 
-	clusterConfig, err := s.db.GetChannelClusterConfig(channelId, channelType)
+	clusterConfig, err := s.fencedChannelClusterConfig(channelId, channelType)
 	if err != nil {
 		s.Error("getChannelClusterConfig error", zap.Error(err))
 		c.ResponseError(err)
@@ -304,7 +304,7 @@ func (s *Server) channelReplicas(c *wkhttp.Context) {
 		return
 	}
 
-	channelClusterConfig, err := s.db.GetChannelClusterConfig(channelId, channelType)
+	channelClusterConfig, err := s.fencedChannelClusterConfig(channelId, channelType)
 	if err != nil {
 		s.Error("getChannelClusterConfig error", zap.Error(err))
 		c.ResponseError(err)

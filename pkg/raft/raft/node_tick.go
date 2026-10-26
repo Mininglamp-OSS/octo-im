@@ -6,6 +6,10 @@ import (
 )
 
 func (n *Node) Tick() {
+	if n.Diverged() {
+		// No sync, heartbeat, election or apply retry once quarantined.
+		return
+	}
 	if n.applyRetryTicks > 0 {
 		n.applyRetryTicks--
 	}

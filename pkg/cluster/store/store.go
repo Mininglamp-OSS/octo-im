@@ -1,6 +1,7 @@
 package store
 
 import (
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/lni/goutils/syncutil"
@@ -17,6 +18,11 @@ type Store struct {
 }
 
 func New(opts *Options) *Store {
+	if opts.ReadFence == nil {
+		if fence, ok := opts.Slot.(icluster.SlotReadFence); ok {
+			opts.ReadFence = fence
+		}
+	}
 	s := &Store{
 		opts:         opts,
 		Log:          wklog.NewWKLog("store"),
@@ -32,6 +38,10 @@ func (s *Store) NextPrimaryKey() uint64 {
 	return s.wdb.NextPrimaryKey()
 }
 
+// DB exposes the raw business database. Reads of slot-owned tables must go
+// through the fenced Store methods instead; only node-local tables (the plugin
+// table) and channel-raft-owned data may be read through it. The allow-list is
+// enforced by TestRawDBReadsAreFenced.
 func (s *Store) DB() wkdb.DB {
 	return s.wdb
 }

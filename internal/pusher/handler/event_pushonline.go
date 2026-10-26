@@ -285,10 +285,15 @@ func (h *Handler) processAIPush(uid string, e *eventbus.Event) {
 	}
 }
 
-// 是否是AI
+// 是否是AI. A failed lookup skips the AI push for this recipient; it is
+// logged and not remembered as "not AI".
 func (h *Handler) isAI(uid string) bool {
-
-	return service.PluginManager.UserIsAI(uid)
+	isAI, err := service.PluginManager.UserIsAI(uid)
+	if err != nil {
+		h.Error("AI user lookup failed, AI push skipped", zap.Error(err), zap.String("uid", uid))
+		return false
+	}
+	return isAI
 }
 
 // 获取用户AI插件编号

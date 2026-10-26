@@ -493,7 +493,7 @@ func (s *Server) forwardSearchPluginUsers(url string, nodeId uint64) ([]*pluginU
 }
 
 func (s *Server) searchPluginUsers(req wkdb.SearchPluginUserReq) ([]*pluginUserResp, error) {
-	pluginUsers, err := service.Store.DB().SearchPluginUsers(req)
+	pluginUsers, err := service.Store.SearchPluginUsers(req)
 	if err != nil {
 		return nil, err
 	}

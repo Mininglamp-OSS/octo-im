@@ -1,6 +1,7 @@
 package slot
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -163,23 +164,22 @@ func (p *PebbleShardLogStorage) GetState(shardNo string) (types.RaftState, error
 		return types.RaftState{}, err
 	}
 
-	// 检测并修复不一致状态：appliedIndex > lastLogIndex
-	// 这种情况可能由 Apply 和 Truncate 并发执行导致
-	if applied > lastLogIndex {
-		p.Warn("detected inconsistent state: appliedIndex > lastLogIndex, auto-fixing",
+	marked, err := p.DivergedMarker(shardNo)
+	if err != nil {
+		return types.RaftState{}, err
+	}
+
+	// appliedIndex > lastLogIndex means applied state exists that the log no
+	// longer holds. It is reported, never "fixed": rewinding the applied
+	// index would replay different entries on top of state that already
+	// reflects the lost ones. The replica opens quarantined instead.
+	diverged := marked || applied > lastLogIndex
+	if diverged {
+		p.Error("slot replica opens quarantined",
 			zap.String("shardNo", shardNo),
+			zap.Bool("marker", marked),
 			zap.Uint64("appliedIndex", applied),
 			zap.Uint64("lastLogIndex", lastLogIndex))
-
-		// 将 appliedIndex 回退到 lastLogIndex
-		applied = lastLogIndex
-		if err := p.SetAppliedIndex(shardNo, lastLogIndex); err != nil {
-			p.Error("failed to fix appliedIndex", zap.Error(err))
-			return types.RaftState{}, err
-		}
-		p.Info("appliedIndex fixed successfully",
-			zap.String("shardNo", shardNo),
-			zap.Uint64("newAppliedIndex", applied))
 	}
 
 	state, err := p.hardState(shardNo)
@@ -192,6 +192,7 @@ func (p *PebbleShardLogStorage) GetState(shardNo string) (types.RaftState, error
 		LastLogIndex: lastLogIndex,
 		LastTerm:     lastLogTerm,
 		AppliedIndex: applied,
+		Diverged:     diverged,
 	}, nil
 }
 
@@ -201,17 +202,29 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 	lock.Lock()
 	defer lock.Unlock()
 
-	batch := p.shardBatchDB(shardNo).NewBatch()
-
-	if termStartIndexInfo != nil {
-		err := p.SetLeaderTermStartIndex(shardNo, termStartIndexInfo.Term, termStartIndexInfo.Index)
-		if err != nil {
-			p.Panic("SetLeaderTermStartIndex failed", zap.Error(err))
-			return err
-		}
+	if len(logs) == 0 && termStartIndexInfo == nil {
+		return nil
 	}
 
-	for _, lg := range logs {
+	// Validate the whole batch before writing anything. An entry at or below
+	// the applied index is already reflected in the state machine: it is
+	// skipped when it equals the stored entry on (Term, Id, Data), and any
+	// other value rejects the batch.
+	write, err := p.validateAppend(shardNo, logs)
+	if err != nil {
+		return err
+	}
+
+	batch := p.shardBatchDB(shardNo).NewBatch()
+
+	// The term start index is part of the same atomic batch as the logs.
+	if termStartIndexInfo != nil {
+		var indexData = make([]byte, 8)
+		binary.BigEndian.PutUint64(indexData, termStartIndexInfo.Index)
+		batch.Set(key.NewLeaderTermStartIndexKey(shardNo, termStartIndexInfo.Term), indexData)
+	}
+
+	for _, lg := range write {
 		logData, err := lg.Marshal()
 		if err != nil {
 			p.Panic("log marshal failed", zap.Error(err))
@@ -228,6 +241,95 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 	}
 
 	return batch.CommitWait()
+}
+
+// validateAppend returns the logs that must be written. It must be called
+// with the slot lock held. Only indexes that already hold a stored entry are
+// read, so a plain tail append costs one applied-index read and one seek.
+func (p *PebbleShardLogStorage) validateAppend(shardNo string, logs []types.Log) ([]types.Log, error) {
+	if len(logs) == 0 {
+		return nil, nil
+	}
+	applied, err := p.AppliedIndex(shardNo)
+	if err != nil {
+		return nil, err
+	}
+	lastIndex, err := p.LastIndex(shardNo)
+	if err != nil {
+		return nil, err
+	}
+	if logs[0].Index > lastIndex && logs[0].Index > applied {
+		return logs, nil
+	}
+	write := make([]types.Log, 0, len(logs))
+	for _, lg := range logs {
+		if lg.Index > lastIndex && lg.Index > applied {
+			write = append(write, lg)
+			continue
+		}
+		stored, exists, err := p.storedLog(shardNo, lg.Index)
+		if err != nil {
+			return nil, err
+		}
+		if lg.Index <= applied {
+			if exists && sameLogEntry(stored, lg) {
+				continue // replay of an applied entry: nothing to write
+			}
+			p.divergence().appendOverlapConflict.Add(1)
+			p.Error("refused conflicting append at or below the applied index",
+				zap.String("shardNo", shardNo),
+				zap.Uint64("index", lg.Index),
+				zap.Uint64("appliedIndex", applied),
+				zap.Bool("storedExists", exists),
+				zap.Uint32("storedTerm", stored.Term),
+				zap.Uint32("incomingTerm", lg.Term),
+				zap.Uint64("storedId", stored.Id),
+				zap.Uint64("incomingId", lg.Id))
+			return nil, fmt.Errorf("%w: slot %s index %d applied %d", types.ErrAppendBelowApplied, shardNo, lg.Index, applied)
+		}
+		// Above the applied index a replacement is ordinary Raft log repair.
+		// A different entry in the same term breaks Log Matching; it is only
+		// counted here and does not change the outcome.
+		if exists && stored.Term == lg.Term && !sameLogEntry(stored, lg) {
+			p.divergence().sameTermConflict.Add(1)
+			p.Warn("same-term log entry replaced above the applied index",
+				zap.String("shardNo", shardNo),
+				zap.Uint64("index", lg.Index),
+				zap.Uint32("term", lg.Term),
+				zap.Uint64("storedId", stored.Id),
+				zap.Uint64("incomingId", lg.Id))
+		}
+		write = append(write, lg)
+	}
+	return write, nil
+}
+
+// sameLogEntry compares the replicated identity of two entries. The stored
+// time suffix and in-memory bookkeeping are not part of it.
+func sameLogEntry(a, b types.Log) bool {
+	return a.Index == b.Index && a.Term == b.Term && a.Id == b.Id && bytes.Equal(a.Data, b.Data)
+}
+
+// storedLog reads one entry and reports whether it exists.
+func (p *PebbleShardLogStorage) storedLog(shardNo string, index uint64) (types.Log, bool, error) {
+	data, closer, err := p.shardDB(shardNo).Get(key.NewLogKey(shardNo, index))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return types.Log{}, false, nil
+		}
+		return types.Log{}, false, err
+	}
+	defer closer.Close()
+	if len(data) < 8 {
+		return types.Log{}, false, fmt.Errorf("slot %s log %d: stored value too short", shardNo, index)
+	}
+	raw := make([]byte, len(data)-8)
+	copy(raw, data[:len(data)-8])
+	var lg types.Log
+	if err := lg.Unmarshal(raw); err != nil {
+		return types.Log{}, false, err
+	}
+	return lg, true, nil
 }
 
 // TruncateLogTo 截断日志
@@ -257,8 +359,11 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 		return err
 	}
 	if index < appliedIdx {
-		p.Foucs("applied must be less than index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx), zap.Uint64("lastIndex", lastIndex), zap.String("shardNo", shardNo))
-		return nil
+		// Removing entries the state machine has applied would leave state
+		// that no log entry explains. Refuse without mutating anything.
+		p.divergence().truncateRefused.Add(1)
+		p.Error("refused truncation below the applied index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx), zap.Uint64("lastIndex", lastIndex), zap.String("shardNo", shardNo))
+		return fmt.Errorf("%w: slot %s index %d applied %d last %d", types.ErrTruncateBelowApplied, shardNo, index, appliedIdx, lastIndex)
 	}
 
 	keyData := key.NewLogKey(shardNo, index+1)

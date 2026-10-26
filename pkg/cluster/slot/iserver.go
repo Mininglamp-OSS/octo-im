@@ -23,7 +23,20 @@ func (s *Server) SlotLeaderId(slotId uint32) uint64 {
 
 }
 
+// checkProposable refuses, before admission, any proposal for a slot whose
+// local replica is quarantined or fail-stopped. Nothing is submitted, so the
+// caller may treat it as not admitted.
+func (s *Server) checkProposable(slotId uint32) error {
+	if err := s.CheckSlotReadable(slotId); err != nil {
+		return fmt.Errorf("%w: %w", types.ErrProposalNotAdmitted, err)
+	}
+	return nil
+}
+
 func (s *Server) Propose(slotId uint32, data []byte) (*types.ProposeResp, error) {
+	if err := s.checkProposable(slotId); err != nil {
+		return nil, err
+	}
 	shardNo := SlotIdToKey(slotId)
 	logId := s.GenLogId()
 	return s.raftGroup.Propose(shardNo, logId, data)
@@ -41,6 +54,9 @@ func (s *Server) ProposeUntilApplied(slotId uint32, data []byte) (*types.Propose
 		}
 	}()
 
+	if err := s.checkProposable(slotId); err != nil {
+		return nil, err
+	}
 	shardNo := SlotIdToKey(slotId)
 	logId := s.GenLogId()
 	return s.raftGroup.ProposeUntilApplied(shardNo, logId, data)
@@ -58,6 +74,9 @@ func (s *Server) ProposeUntilAppliedTimeout(ctx context.Context, slotId uint32, 
 		}
 	}()
 
+	if err := s.checkProposable(slotId); err != nil {
+		return nil, err
+	}
 	slotConfig := s.opts.Node.Slot(slotId)
 	if slotConfig == nil {
 		return nil, fmt.Errorf("slot[%d] config not found", slotId)
@@ -100,6 +119,9 @@ func (s *Server) ProposeUntilAppliedTimeout(ctx context.Context, slotId uint32, 
 }
 
 func (s *Server) ProposeUntilAppliedTimeoutForLocal(ctx context.Context, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+	if err := s.checkProposable(slotId); err != nil {
+		return nil, err
+	}
 	shardNo := SlotIdToKey(slotId)
 
 	resps, err := s.raftGroup.ProposeBatchUntilAppliedTimeout(ctx, shardNo, reqs)

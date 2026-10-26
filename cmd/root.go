@@ -299,6 +299,7 @@ func addCommand(cmd CMD) {
 func Execute() {
 	ctx := &WuKongIMContext{}
 	addCommand(newStopCMD(ctx))
+	addCommand(newSlotScanCMD(ctx))
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

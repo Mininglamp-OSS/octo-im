@@ -14,12 +14,13 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 
 	err := rg.submit(func() {
 		err := rg.opts.Storage.AppendLogs(r.Key(), e.Logs, e.TermStartIndexInfo)
-		if err != nil {
-			rg.Panic("append logs failed", zap.Error(err))
-		}
 		reason := types.ReasonOk
 		if err != nil {
-			reason = types.ReasonError
+			if !isDivergence(err) {
+				rg.Panic("append logs failed", zap.Error(err))
+			}
+			// Nothing was written. Fence the replica instead of crashing.
+			reason = rg.markDiverged(r.Key(), err)
 		}
 
 		rg.AddEvent(r.Key(), types.Event{
@@ -38,6 +39,34 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 		})
 		rg.Advance()
 	}
+}
+
+// DivergenceMarker is implemented by storage that can durably mark a replica
+// as diverged. MarkDiverged must fence the replica in memory before it
+// writes, and return an error only when the marker was not persisted.
+type DivergenceMarker interface {
+	MarkDiverged(key string, cause error) error
+}
+
+func isDivergence(err error) bool {
+	return errors.Is(err, types.ErrTruncateBelowApplied) || errors.Is(err, types.ErrAppendBelowApplied)
+}
+
+// markDiverged persists the divergence marker for a typed storage refusal
+// and returns the local reason for the node: ReasonDiverged when the marker
+// is durable, ReasonDivergedFailStop when it is not (or cannot be) written.
+func (rg *RaftGroup) markDiverged(key string, cause error) types.Reason {
+	rg.Error("storage refused a request below the applied index; quarantining replica", zap.String("key", key), zap.Error(cause))
+	marker, ok := rg.opts.Storage.(DivergenceMarker)
+	if !ok {
+		rg.Error("storage cannot persist a divergence marker; replica fail-stopped", zap.String("key", key))
+		return types.ReasonDivergedFailStop
+	}
+	if err := marker.MarkDiverged(key, cause); err != nil {
+		rg.Error("divergence marker not persisted; replica fail-stopped", zap.String("key", key), zap.Error(err))
+		return types.ReasonDivergedFailStop
+	}
+	return types.ReasonDiverged
 }
 
 func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
@@ -119,11 +148,21 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 	err := rg.submit(func() {
 		err := rg.opts.Storage.TruncateLogTo(r.Key(), e.Index)
 		if err != nil {
-			rg.Error("truncate logs failed", zap.Error(err))
+			reason := types.ReasonError
+			if isDivergence(err) {
+				// The refusal mutated nothing. Newer leader term start
+				// indexes are kept: deleting them would be the second half
+				// of a truncation that did not happen.
+				reason = rg.markDiverged(r.Key(), err)
+			} else {
+				rg.Error("truncate logs failed", zap.Error(err))
+			}
 			rg.AddEvent(r.Key(), types.Event{
 				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
+				Index:  e.Index,
+				Reason: reason,
 			})
+			rg.Advance()
 			return
 		}
 		// 删除本地的leader term start index

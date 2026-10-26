@@ -18,6 +18,17 @@ var (
 	ErrProposalStaleTerm = errors.New("leader-local proposal term is not the current term")
 )
 
+// Divergence containment. Storage returns the first two when it refuses a
+// request that would leave the applied state inconsistent with the log; the
+// replica is then quarantined and every fenced read, proposal and election
+// path of that replica reports ErrSlotDiverged. ErrSlotDiverged never wraps
+// or equals a not-found error, so callers cannot mistake it for absence.
+var (
+	ErrTruncateBelowApplied = errors.New("log truncation below the applied index refused")
+	ErrAppendBelowApplied   = errors.New("conflicting log append at or below the applied index refused")
+	ErrSlotDiverged         = errors.New("slot replica diverged: local replica is quarantined")
+)
+
 // Proposal outcomes reported by RaftGroup. They are process-local and are
 // usually wrapped together with the cause (context error, ErrGroupStopped,
 // ErrNotLeader, ...), so errors.Is matches both the outcome and the cause.

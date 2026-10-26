@@ -536,7 +536,30 @@ type SlotInfo struct {
 	LogIndex uint64 // 最后一条日志下标
 	LogTerm  uint32 // 最后一条日志任期
 	Term     uint32 // 领导任期
+
+	// Divergence extension. Diverged and Applied travel in a trailing
+	// section that older decoders ignore. ExtState records how the section
+	// decoded and is never encoded.
+	Diverged bool
+	Applied  uint64
+	ExtState SlotInfoExtState
 }
+
+// SlotInfoExtState is how the divergence extension of one responder decoded.
+type SlotInfoExtState uint8
+
+const (
+	// SlotInfoExtValid: the section was present and well-formed.
+	SlotInfoExtValid SlotInfoExtState = iota
+	// SlotInfoExtMissing: the responder predates the extension.
+	SlotInfoExtMissing
+	// SlotInfoExtInvalid: the section was present but malformed.
+	SlotInfoExtInvalid
+)
+
+// slotLogInfoExtVersion tags the trailing section:
+// u8 version=1, u16 n, n x {u8 diverged, u64 applied}, in Slots order.
+const slotLogInfoExtVersion uint8 = 1
 
 type SlotLogInfoResp struct {
 	NodeId uint64
@@ -553,6 +576,16 @@ func (s *SlotLogInfoResp) Marshal() ([]byte, error) {
 		enc.WriteUint64(slot.LogIndex)
 		enc.WriteUint32(slot.LogTerm)
 		enc.WriteUint32(slot.Term)
+	}
+	enc.WriteUint8(slotLogInfoExtVersion)
+	enc.WriteUint16(uint16(len(s.Slots)))
+	for _, slot := range s.Slots {
+		var diverged uint8
+		if slot.Diverged {
+			diverged = 1
+		}
+		enc.WriteUint8(diverged)
+		enc.WriteUint64(slot.Applied)
 	}
 	return enc.Bytes(), nil
 }
@@ -584,7 +617,52 @@ func (s *SlotLogInfoResp) Unmarshal(data []byte) error {
 			}
 		}
 	}
+	s.decodeExt(dec)
 	return nil
+}
+
+// decodeExt reads the divergence extension. A missing or malformed section
+// never fails the decode; it is recorded per slot so the election decides.
+func (s *SlotLogInfoResp) decodeExt(dec *wkproto.Decoder) {
+	mark := func(st SlotInfoExtState) {
+		for i := range s.Slots {
+			s.Slots[i].ExtState = st
+			s.Slots[i].Diverged = false
+			s.Slots[i].Applied = 0
+		}
+	}
+	if dec.Len() == 0 {
+		mark(SlotInfoExtMissing)
+		return
+	}
+	version, err := dec.Uint8()
+	if err != nil || version != slotLogInfoExtVersion {
+		mark(SlotInfoExtInvalid)
+		return
+	}
+	n, err := dec.Uint16()
+	if err != nil || int(n) != len(s.Slots) {
+		mark(SlotInfoExtInvalid)
+		return
+	}
+	for i := range s.Slots {
+		diverged, err := dec.Uint8()
+		if err != nil || diverged > 1 {
+			mark(SlotInfoExtInvalid)
+			return
+		}
+		applied, err := dec.Uint64()
+		if err != nil {
+			mark(SlotInfoExtInvalid)
+			return
+		}
+		s.Slots[i].Diverged = diverged == 1
+		s.Slots[i].Applied = applied
+		s.Slots[i].ExtState = SlotInfoExtValid
+	}
+	if dec.Len() != 0 {
+		mark(SlotInfoExtInvalid)
+	}
 }
 
 type ClusterJoinReq struct {

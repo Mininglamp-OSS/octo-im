@@ -50,7 +50,7 @@ func (s *Server) getOrCreateChannelClusterConfigAttempt(ctx context.Context, cha
 		return wkdb.EmptyChannelClusterConfig, errors.New("not slot leader")
 	}
 
-	cfg, err := s.db.GetChannelClusterConfig(channelId, channelType)
+	cfg, err := s.fencedChannelClusterConfig(channelId, channelType)
 	if err != nil && err != wkdb.ErrNotFound {
 		return wkdb.EmptyChannelClusterConfig, err
 	}

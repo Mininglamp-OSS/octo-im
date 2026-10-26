@@ -22,6 +22,14 @@ const (
 	ReasonTruncate
 	// ReasonOnlySync 只是同步, 不做截断判断
 	ReasonOnlySync
+	// ReasonDiverged is local only: storage refused a truncate or append that
+	// would leave the applied state inconsistent with the log, and the
+	// divergence marker was persisted. The replica is quarantined.
+	ReasonDiverged
+	// ReasonDivergedFailStop is local only: as ReasonDiverged, but persisting
+	// the divergence marker failed. The replica is fail-stopped for this
+	// process lifetime.
+	ReasonDivergedFailStop
 )
 
 func (r Reason) Uint8() uint8 {
@@ -38,6 +46,10 @@ func (r Reason) String() string {
 		return "ReasonTruncate"
 	case ReasonOnlySync:
 		return "ReasonOnlySync"
+	case ReasonDiverged:
+		return "ReasonDiverged"
+	case ReasonDivergedFailStop:
+		return "ReasonDivergedFailStop"
 	default:
 		return fmt.Sprintf("ReasonUnknown[%d]", r)
 	}
@@ -762,6 +774,10 @@ type RaftState struct {
 	LastTerm uint32
 	// AppliedIndex 已应用的日志下标
 	AppliedIndex uint64
+	// Diverged reports that the replica must open quarantined: either its
+	// applied index is beyond its last log index, or a durable divergence
+	// marker is set. AppliedIndex is reported as stored, never adjusted.
+	Diverged bool
 }
 
 // ProposeResp 提案返回

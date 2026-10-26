@@ -11,8 +11,9 @@ type IPluginManager interface {
 	Plugins(methods ...types.PluginMethod) []types.Plugin
 	// Plugin 获取指定编号的插件
 	Plugin(no string) types.Plugin
-	// UserIsAI 判断用户是否是AI
-	UserIsAI(uid string) bool
+	// UserIsAI 判断用户是否是AI. A lookup error is returned, never reported
+	// as false.
+	UserIsAI(uid string) (bool, error)
 	// GetUserPluginNo 获取用户插件编号
 	GetUserPluginNo(uid string) (string, error)
 }
