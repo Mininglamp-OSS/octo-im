@@ -99,6 +99,9 @@ func (h *Handler) distributeVersions(ctx *eventbus.ChannelContext, onlineCmd boo
 			h.retainDistribution(ctx, events, ctx.Events[end:], err)
 			return
 		}
+		for _, event := range events {
+			finishDistribution(event)
+		}
 		start = end
 	}
 }
@@ -158,6 +161,7 @@ func (h *Handler) retainDistribution(ctx *eventbus.ChannelContext, failed, tail 
 		state.Attempts++
 		if state.Attempts >= distributionMaxAttempts || !now.Before(state.Deadline) || errors.Is(cause, errInvalidDistribution) {
 			h.Error("distribution retry exhausted", zap.Error(cause), zap.Int64("messageId", event.MessageId), zap.String("tagKey", event.TagKey), zap.String("channelId", ctx.ChannelId), zap.Uint64("sourceNodeId", event.SourceNodeId), zap.Int("attempt", state.Attempts))
+			finishDistribution(event)
 			continue
 		}
 		retryDelay := time.Duration(50<<min(state.Attempts-1, 4)) * time.Millisecond
@@ -169,6 +173,16 @@ func (h *Handler) retainDistribution(ctx *eventbus.ChannelContext, failed, tail 
 	}
 	ctx.RetryEvents = append(ctx.RetryEvents, tail...)
 	ctx.RetryAt = now.Add(delay)
+}
+
+func finishDistribution(event *eventbus.Event) {
+	if state := event.Distribution; state != nil {
+		if state.Release != nil {
+			state.Release()
+			state.Release = nil
+		}
+		state.Snapshot = nil
+	}
 }
 
 // cmd消息分发

@@ -14,4 +14,5 @@ type DistributionState struct {
 	DeliveredNodes map[uint64]struct{} // DeliveredNodes records acknowledged remote admissions.
 	Attempts       int                 // Attempts bounds retry work for this message.
 	Deadline       time.Time           // Deadline uses the local monotonic clock.
+	Release        func()              // Release returns receiver snapshot capacity exactly once.
 }

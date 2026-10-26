@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -24,6 +25,7 @@ const (
 	distributionAdmissionLimit = 65536
 	distributionAdmissionTTL   = 2 * distributionRetryTimeout
 	distributionMaxBody        = 32 << 20
+	distributionSnapshotBudget = 64 << 20
 )
 
 var errInvalidDistribution = errors.New("invalid distribution admission")
@@ -204,13 +206,33 @@ func (h *Handler) acceptDistribution(data []byte) proto.Status {
 	if len(h.distributionReceipts)+len(fresh) > limit {
 		return forward.StatusRetry
 	}
+	reservation := len(data) + len(r.uids)*32 + len(fresh)*512
+	byteLimit := h.distributionByteLimit
+	if byteLimit == 0 {
+		byteLimit = distributionSnapshotBudget
+	}
+	if len(fresh) > 0 && reservation > byteLimit-h.distributionBytes {
+		return forward.StatusRetry
+	}
+	var remaining atomic.Int64
+	remaining.Store(int64(len(fresh)))
+	if len(fresh) > 0 {
+		h.distributionBytes += reservation
+	}
+	release := func() {
+		if remaining.Add(-1) == 0 {
+			h.distributionMu.Lock()
+			h.distributionBytes -= reservation
+			h.distributionMu.Unlock()
+		}
+	}
 	tag := &types.Tag{Key: r.key, ChannelId: r.channel, ChannelType: r.channelType,
 		Nodes: []*types.Node{{LeaderId: r.target, Uids: r.uids}}}
 	for _, event := range fresh {
 		id := distributionEventID(r, event)
 		h.distributionReceipts[id] = h.distributionOrder.PushBack(distributionReceipt{id, r.key, now.Add(distributionAdmissionTTL)})
 		event.SourceNodeId = r.source
-		event.Distribution = &eventbus.DistributionState{Snapshot: tag, Deadline: now.Add(distributionRetryTimeout)}
+		event.Distribution = &eventbus.DistributionState{Snapshot: tag, Deadline: now.Add(distributionRetryTimeout), Release: release}
 		eventbus.Channel.AddEvent(r.channel, r.channelType, event)
 	}
 	if len(fresh) > 0 {

@@ -18,11 +18,13 @@ import (
 )
 
 type Handler struct {
-	distributionMu       sync.Mutex // distributionMu serializes bounded snapshot admission.
-	distributionReceipts map[distributionID]*list.Element
-	distributionOrder    *list.List
-	distributionLimit    int              // distributionLimit caps live deduplication receipts.
-	distributionNow      func() time.Time // distributionNow supplies a monotonic clock.
+	distributionMu        sync.Mutex // distributionMu serializes bounded snapshot admission.
+	distributionReceipts  map[distributionID]*list.Element
+	distributionOrder     *list.List
+	distributionLimit     int              // distributionLimit caps live deduplication receipts.
+	distributionBytes     int              // distributionBytes accounts for queued snapshot reservations.
+	distributionByteLimit int              // distributionByteLimit bounds estimated retained snapshot bytes.
+	distributionNow       func() time.Time // distributionNow supplies a monotonic clock.
 	wklog.Log
 	client              *ingress.Client
 	commonService       *common.Service
