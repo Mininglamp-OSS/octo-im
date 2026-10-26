@@ -19,14 +19,8 @@ import (
 // 跳过会话更新的频道类型
 var skipConversationUpdateChannelTypes = []uint8{wkproto.ChannelTypeData, wkproto.ChannelTypeTemp, wkproto.ChannelTypeLive}
 
-// 消息分发
-// 流程1：（分发在频道的槽领导的节点上进行的）
-// 1. 获取或创建tag（tag记录了用户所属节点）
-// 2. 打上tagKey
-// 3. 根据tag push消息（如果用户在本节点上则处理，不在本节点上则转发到对应节点）
-// 流程2: (分发在用户所属的节点上进行的)
-// 1. 通过tagKey获取tag或者向频道的槽领导请求tag（不能创建tag，只有频道槽领导有权限创建）
-// 2. 根据tag push消息（只处理本节点上的用户，不需要转发）
+// 消息分发按连续的成员版本处理。领导节点固定快照，远端在确认接收前
+// 持有自己的收件人快照；旧协议消息仍按原 key 查询，不回退当前成员。
 func (h *Handler) distribute(ctx *eventbus.ChannelContext) {
 
 	// 记录消息轨迹
@@ -135,7 +129,7 @@ func (h *Handler) deliverVersion(ctx *eventbus.ChannelContext, tag *types.Tag, e
 			continue
 		}
 		if err := h.forwardDistribution(node.LeaderId, tag, ctx.ChannelId, ctx.ChannelType, pending); err != nil {
-			return err
+			return &distributionTargetError{node: node.LeaderId, err: err}
 		}
 		for _, event := range pending {
 			if event.Distribution.DeliveredNodes == nil {
@@ -147,9 +141,22 @@ func (h *Handler) deliverVersion(ctx *eventbus.ChannelContext, tag *types.Tag, e
 	return nil
 }
 
+type distributionTargetError struct {
+	node uint64
+	err  error
+}
+
+func (e *distributionTargetError) Error() string { return e.err.Error() }
+func (e *distributionTargetError) Unwrap() error { return e.err }
+
 func (h *Handler) retainDistribution(ctx *eventbus.ChannelContext, failed, tail []*eventbus.Event, cause error) {
 	now := h.distributionTime()
 	delay := 50 * time.Millisecond
+	target := ctx.SlotLeaderId
+	var targetError *distributionTargetError
+	if errors.As(cause, &targetError) {
+		target = targetError.node
+	}
 	for _, event := range failed {
 		if event.Distribution == nil {
 			event.Distribution = &eventbus.DistributionState{}
@@ -159,8 +166,9 @@ func (h *Handler) retainDistribution(ctx *eventbus.ChannelContext, failed, tail 
 			state.Deadline = now.Add(distributionRetryTimeout)
 		}
 		state.Attempts++
+		fields := []zap.Field{zap.Error(cause), zap.Int64("messageId", event.MessageId), zap.String("tagKey", event.TagKey), zap.String("channelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType), zap.Uint64("nodeId", options.G.Cluster.NodeId), zap.Uint64("sourceNodeId", event.SourceNodeId), zap.Uint64("targetNodeId", target), zap.Int("attempt", state.Attempts)}
 		if state.Attempts >= distributionMaxAttempts || !now.Before(state.Deadline) || errors.Is(cause, errInvalidDistribution) {
-			h.Error("distribution retry exhausted", zap.Error(cause), zap.Int64("messageId", event.MessageId), zap.String("tagKey", event.TagKey), zap.String("channelId", ctx.ChannelId), zap.Uint64("sourceNodeId", event.SourceNodeId), zap.Int("attempt", state.Attempts))
+			h.Error("distribution retry exhausted", fields...)
 			finishDistribution(event)
 			continue
 		}
@@ -168,7 +176,7 @@ func (h *Handler) retainDistribution(ctx *eventbus.ChannelContext, failed, tail 
 		if retryDelay > delay {
 			delay = retryDelay
 		}
-		h.Warn("distribution retained for retry", zap.Error(cause), zap.Int64("messageId", event.MessageId), zap.String("tagKey", event.TagKey), zap.String("channelId", ctx.ChannelId), zap.Uint64("sourceNodeId", event.SourceNodeId), zap.Int("attempt", state.Attempts))
+		h.Warn("distribution retained for retry", fields...)
 		ctx.RetryEvents = append(ctx.RetryEvents, event)
 	}
 	ctx.RetryEvents = append(ctx.RetryEvents, tail...)
@@ -188,15 +196,6 @@ func finishDistribution(event *eventbus.Event) {
 // cmd消息分发
 func (h *Handler) distributeOnlineCmd(ctx *eventbus.ChannelContext) {
 	h.distributeVersions(ctx, true)
-}
-
-// 按照tagKey分组事件
-func (h *Handler) groupEventsByTagKey(events []*eventbus.Event) map[string][]*eventbus.Event {
-	tagKeyEvents := make(map[string][]*eventbus.Event)
-	for _, e := range events {
-		tagKeyEvents[e.TagKey] = append(tagKeyEvents[e.TagKey], e)
-	}
-	return tagKeyEvents
 }
 
 func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId string, channelType uint8, events []*eventbus.Event) {
@@ -306,6 +305,7 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 			filteredOfflineUids = wkutil.RemoveRepeatedElement(filteredOfflineUids)
 
 			cloneEvent := event.Clone()
+			cloneEvent.Distribution = nil
 			cloneEvent.OfflineUsers = filteredOfflineUids
 			cloneEvent.Type = eventbus.EventPushOffline
 			offlineEvents = append(offlineEvents, cloneEvent)
@@ -324,16 +324,6 @@ func (h *Handler) isSkipConversationUpdate(channelType uint8) bool {
 		}
 	}
 	return false
-}
-
-func (h *Handler) distributeToNode(leaderId uint64, channelId string, channelType uint8, events []*eventbus.Event) {
-	for _, event := range events {
-		if event.SourceNodeId != 0 && event.SourceNodeId == leaderId {
-			h.Foucs("distributeToNode: sourceNode is forward node, not distribute", zap.Uint64("sourceNodeId", event.SourceNodeId), zap.Uint64("leaderId", leaderId), zap.String("fakeChannelId", channelId), zap.Uint8("channelType", channelType))
-			return
-		}
-	}
-	h.forwardsToNode(leaderId, channelId, channelType, events)
 }
 
 func (h *Handler) getCommonTag(ctx *eventbus.ChannelContext) (*types.Tag, error) {

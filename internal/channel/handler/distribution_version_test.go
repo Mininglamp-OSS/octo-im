@@ -110,3 +110,28 @@ func TestDistributionHomogeneousBatch(t *testing.T) { versionTestDistributeBatch
 func TestDistributionMixedTagBatchKeepsRecipients(t *testing.T) {
 	versionTestDistributeBatch(t, "B")
 }
+
+func TestDistributionVersionRunsPreserveRecipientOrder(t *testing.T) {
+	for _, onlineCmd := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "onlineCMD"}[onlineCmd], func(t *testing.T) {
+			m, p := versionTestFixture(t)
+			if _, err := m.MakeTagWithTagKey("B", []string{"fixed", "new"}); err != nil {
+				t.Fatal(err)
+			}
+			ctx := &eventbus.ChannelContext{ChannelId: "channel", ChannelType: wkproto.ChannelTypeData, SlotLeaderId: 2}
+			for i, key := range []string{"A", "B", "A"} {
+				ctx.Events = append(ctx.Events, &eventbus.Event{Type: eventbus.EventChannelDistribute, MessageId: int64(i + 1), TagKey: key,
+					Conn: &eventbus.Conn{Uid: "sender"}, Frame: &wkproto.SendPacket{}})
+			}
+			NewHandler().distributeVersions(ctx, onlineCmd)
+			got := make(map[string][]int64)
+			for _, event := range p.events {
+				got[event.ToUid] = append(got[event.ToUid], event.MessageId)
+			}
+			want := map[string][]int64{"fixed": {1, 2, 3}, "removed": {1, 3}, "new": {2}}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("recipient order: got %v; want %v", got, want)
+			}
+		})
+	}
+}
