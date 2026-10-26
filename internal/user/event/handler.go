@@ -140,7 +140,10 @@ func (u *userHandler) tick() {
 // 检查连无效连接
 func (u *userHandler) checkInvalidConn(conns []*eventbus.Conn) {
 	for _, conn := range conns {
-		if fasttime.UnixTimestamp()-conn.LastActive > uint64(options.G.ConnIdleTime.Seconds()) {
+		now, lastActive := fasttime.UnixTimestamp(), conn.LastActive
+		// A cached clock or a wall-clock rollback can put activity in the
+		// future. Do not let unsigned subtraction turn that into an idle expiry.
+		if now > lastActive && now-lastActive > uint64(options.G.ConnIdleTime.Seconds()) {
 			u.addEvent(&eventbus.Event{
 				Type: eventbus.EventConnRemove,
 				Conn: conn,
@@ -163,7 +166,9 @@ func (u *userHandler) addConn(conn *eventbus.Conn) {
 
 // isTimeout 判断用户是否超时
 func (u *userHandler) isTimeout() bool {
-	return fasttime.UnixTimestamp()-u.lastActive > uint64(options.G.Poller.UserTimeout.Seconds())
+	now, lastActive := fasttime.UnixTimestamp(), u.lastActive
+	// Avoid unsigned underflow when the wall clock moves backwards.
+	return now > lastActive && now-lastActive > uint64(options.G.Poller.UserTimeout.Seconds())
 }
 
 // groupByType 将待处理事件按照事件类型分组

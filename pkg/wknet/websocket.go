@@ -3,11 +3,13 @@ package wknet
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/WuKongIM/crypto/tls"
@@ -34,12 +36,14 @@ type WSConn struct {
 	*DefaultConn
 	upgraded         bool
 	tmpInboundBuffer InboundBuffer // inboundBuffer InboundBuffer
+	decoder          clientMessageDecoder
 }
 
 func NewWSConn(d *DefaultConn) *WSConn {
 	w := &WSConn{
 		DefaultConn:      d,
 		tmpInboundBuffer: d.eg.eventHandler.OnNewInboundConn(d, d.eg),
+		decoder:          clientMessageDecoder{maxSize: d.eg.options.MaxReadBufferSize},
 	}
 	return w
 }
@@ -52,6 +56,11 @@ func (w *WSConn) ReadToInboundBuffer() (int, error) {
 	}
 	if w.eg.options.Event.OnReadBytes != nil {
 		w.eg.options.Event.OnReadBytes(n)
+	}
+	// 与普通 TCP 连接的 overflowForInbound 一致：已收到但未处理完的数据不能超过 MaxReadBufferSize
+	staged := w.tmpInboundBuffer.BoundBufferSize() + len(w.decoder.fragData) + w.inboundBuffer.BoundBufferSize()
+	if wsInboundOverflow(w.eg.options.MaxReadBufferSize, staged, n) {
+		return 0, fmt.Errorf("websocket inbound buffer overflow, fd: %d staged: %d n: %d maxSize: %d", w.fd, staged, n, w.eg.options.MaxReadBufferSize)
 	}
 	_, err = w.tmpInboundBuffer.Write(readBuffer[:n])
 	if err != nil {
@@ -119,44 +128,100 @@ func (w *WSConn) decode() ([]wsutil.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(buff) < ws.MinHeaderSize { // 数据不完整
-		w.Debug("数据不完整", zap.Int("len", len(buff)))
-		return nil, nil
-	}
-	tmpReader := bytes.NewReader(buff)
-	header, err := ws.ReadHeader(tmpReader)
+	messages, consumed, err := w.decoder.decode(buff)
 	if err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF { //数据不完整
-			return nil, nil
-		}
-		w.Debug("发送错误，丢弃数据", zap.Error(err))
+		w.Warn("read client message error", zap.Error(err))
 		w.DiscardFromTemp(len(buff)) // 发送错误，丢弃数据
 		return nil, err
 	}
-	dataLen := header.Length
-	if dataLen > int64(tmpReader.Len()) { // 数据不完整
-		w.Debug("数据不完整", zap.Int64("dataLen", dataLen), zap.Int64("tmpReader.Len()", int64(tmpReader.Len())))
-		return nil, nil
-	}
+	w.DiscardFromTemp(consumed)
+	return messages, nil
+}
 
-	if header.Fin { // 当前 frame 已经是最后一个frame
-		var messages []wsutil.Message
-		tmpReader.Reset(buff)
-		remLen := tmpReader.Len()
-		for tmpReader.Len() > 0 {
-			messages, err = wsutil.ReadClientMessage(tmpReader, messages)
-			if err != nil {
-				w.Warn("read client message error", zap.Error(err))
+// errWSMessageTooLarge 单个帧声明的长度或分片消息的累计长度超过上限
+var errWSMessageTooLarge = errors.New("websocket message too large")
+
+// wsInboundOverflow 判断再收到 n 字节后，连接上已收到但未处理完的数据是否超过上限（maxSize <= 0 表示不限制）
+func wsInboundOverflow(maxSize, staged, n int) bool {
+	return maxSize > 0 && staged+n > maxSize
+}
+
+// clientMessageDecoder 按帧增量解码客户端发来的 WebSocket 消息。
+// 每个连接一个，只在该连接的读协程中使用。
+type clientMessageDecoder struct {
+	maxSize    int       // 单条消息（分片消息按累计长度）的最大字节数，<= 0 表示不限制
+	fragmented bool      // 是否正在接收分片消息（已收到非 FIN 的数据帧，还没收到 FIN）
+	fragOpCode ws.OpCode // 分片消息的类型，取自第一个分片
+	fragData   []byte    // 分片消息已到达部分的数据（已去掩码）
+}
+
+// decode 解码 buff 开头所有完整到达的帧，返回解出的消息和消费的字节数。
+// 每个完整的帧都会立即被消费：控制帧马上返回（包括分片消息中间插入的控制帧），
+// 分片数据先累积在解码器中，等 FIN 到达后合成一条消息；
+// 只有末尾不完整的帧留在 buff 中，等后续数据到达后再解码，
+// 避免一次读取到“完整帧 + 后续半帧”时把半帧丢掉，导致后续帧边界错乱。
+func (d *clientMessageDecoder) decode(buff []byte) ([]wsutil.Message, int, error) {
+	var messages []wsutil.Message
+	offset := 0
+	reader := bytes.NewReader(nil)
+	for offset < len(buff) {
+		reader.Reset(buff[offset:])
+		header, err := ws.ReadHeader(reader)
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF { // 帧头不完整
 				break
 			}
+			return nil, 0, err
 		}
-		remLen = remLen - tmpReader.Len()
-		w.DiscardFromTemp(remLen)
-		return messages, nil
-	} else {
-		w.Debug("ws header not is fin", zap.Int("len", len(buff)))
+		state := ws.StateServerSide
+		if d.fragmented {
+			state = state.Set(ws.StateFragmented)
+		}
+		if err = ws.CheckHeader(header, state); err != nil {
+			return nil, 0, err
+		}
+		// 按帧头声明的长度检查，不等数据到齐；分片消息的数据帧按累计长度计算
+		size := header.Length
+		if d.fragmented && !header.OpCode.IsControl() {
+			size += int64(len(d.fragData))
+		}
+		if d.maxSize > 0 && size > int64(d.maxSize) {
+			return nil, 0, errWSMessageTooLarge
+		}
+		if header.Length > int64(reader.Len()) { // 帧数据不完整
+			break
+		}
+		payloadStart := len(buff) - reader.Len()
+		offset = payloadStart + int(header.Length)
+		// 复制一份：buff 中已消费的部分随后会被丢弃
+		payload := make([]byte, header.Length)
+		copy(payload, buff[payloadStart:offset])
+		ws.Cipher(payload, header.Mask, 0)
+
+		if header.OpCode.IsControl() {
+			messages = append(messages, wsutil.Message{OpCode: header.OpCode, Payload: payload})
+			continue
+		}
+		if !header.Fin {
+			if !d.fragmented {
+				d.fragmented = true
+				d.fragOpCode = header.OpCode
+			}
+			d.fragData = append(d.fragData, payload...)
+			continue
+		}
+		opCode := header.OpCode
+		if d.fragmented {
+			opCode = d.fragOpCode
+			payload = append(d.fragData, payload...)
+			d.fragmented, d.fragData = false, nil
+		}
+		if opCode == ws.OpText && !utf8.Valid(payload) {
+			return nil, 0, wsutil.ErrInvalidUTF8
+		}
+		messages = append(messages, wsutil.Message{OpCode: opCode, Payload: payload})
 	}
-	return nil, nil
+	return messages, offset, nil
 }
 
 func (w *WSConn) upgrade() error {
@@ -270,12 +335,14 @@ type WSSConn struct {
 	upgraded bool
 
 	wsTmpInboundBuffer InboundBuffer // inboundBuffer InboundBuffer
+	decoder            clientMessageDecoder
 }
 
 func NewWSSConn(tlsConn *TLSConn) *WSSConn {
 	return &WSSConn{
 		TLSConn:            tlsConn,
 		wsTmpInboundBuffer: tlsConn.d.eg.eventHandler.OnNewInboundConn(tlsConn.d, tlsConn.d.eg), // tls解码后的数据
+		decoder:            clientMessageDecoder{maxSize: tlsConn.d.eg.options.MaxReadBufferSize},
 	}
 }
 
@@ -287,6 +354,11 @@ func (w *WSSConn) ReadToInboundBuffer() (int, error) {
 	}
 	if w.d.eg.options.Event.OnReadBytes != nil {
 		w.d.eg.options.Event.OnReadBytes(n)
+	}
+	// 与普通 TCP 连接的 overflowForInbound 一致：已收到但未处理完的数据（含未解密部分）不能超过 MaxReadBufferSize
+	staged := w.tmpInboundBuffer.BoundBufferSize() + w.wsTmpInboundBuffer.BoundBufferSize() + len(w.decoder.fragData) + w.d.inboundBuffer.BoundBufferSize()
+	if wsInboundOverflow(w.d.eg.options.MaxReadBufferSize, staged, n) {
+		return 0, fmt.Errorf("websocket inbound buffer overflow, fd: %d staged: %d n: %d maxSize: %d", w.d.fd, staged, n, w.d.eg.options.MaxReadBufferSize)
 	}
 
 	_, err = w.tmpInboundBuffer.Write(readBuffer[:n])
@@ -434,42 +506,12 @@ func (w *WSSConn) decode() ([]wsutil.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(buff) < ws.MinHeaderSize { // 数据不完整
-		w.d.Debug("数据还没读完", zap.Int("len", len(buff)))
-		return nil, nil
-	}
-	tmpReader := bytes.NewReader(buff)
-	header, err := ws.ReadHeader(tmpReader)
+	messages, consumed, err := w.decoder.decode(buff)
 	if err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF { //数据不完整
-			return nil, nil
-		}
-		w.d.Debug("wss: 发送错误，丢弃数据", zap.Error(err))
+		w.d.Warn("read client message error", zap.Error(err))
 		w.discardFromWSTemp(len(buff)) // 发送错误，丢弃数据
 		return nil, err
 	}
-	dataLen := header.Length
-	if dataLen > int64(tmpReader.Len()) { // 数据不完整
-		w.d.Debug("wss: 数据还没读完....", zap.Int("dataLen", int(dataLen)), zap.Int("tmpReader.Len()", int(tmpReader.Len())))
-		return nil, nil
-	}
-	if header.Fin { // 当前 frame 已经是最后一个frame
-
-		var messages []wsutil.Message
-		tmpReader.Reset(buff)
-		remLen := tmpReader.Len()
-		for tmpReader.Len() > 0 {
-			messages, err = wsutil.ReadClientMessage(tmpReader, messages)
-			if err != nil {
-				w.d.Warn("read client message error", zap.Error(err))
-				break
-			}
-		}
-		remLen = remLen - tmpReader.Len()
-		w.discardFromWSTemp(remLen)
-		return messages, nil
-	} else {
-		w.d.Debug("wss: ws header not is fin", zap.Int("len", len(buff)))
-	}
-	return nil, nil
+	w.discardFromWSTemp(consumed)
+	return messages, nil
 }

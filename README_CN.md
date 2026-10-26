@@ -191,6 +191,8 @@ sudo docker compose up -d
 源码开发
 ---------------
 
+GitHub Actions 手动与自动构建镜像，参见[镜像构建说明](docs/guides/image-build.md)。
+
 ### 单机
 
 ```shell
