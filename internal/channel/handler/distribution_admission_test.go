@@ -84,6 +84,22 @@ func TestDistributionAdmissionBoundsReceiptsAndExpiresThem(t *testing.T) {
 	require.Len(t, sink.events, 3)
 }
 
+func TestDistributionAdmissionBackpressuresUntilSnapshotReleased(t *testing.T) {
+	versionTestFixture(t)
+	old := eventbus.Channel
+	t.Cleanup(func() { eventbus.Channel = old })
+	sink := &forwardChannel{}
+	eventbus.RegisterChannel(sink)
+	h := NewHandler()
+	h.distributionByteLimit = 1024
+	require.Equal(t, proto.StatusOK, h.acceptDistribution(distributionTestBody(t, 2, "A", 101)))
+	require.NotEqual(t, proto.StatusOK, h.acceptDistribution(distributionTestBody(t, 2, "A", 102)))
+	require.Len(t, sink.events, 1)
+	h.distributeCommon(&eventbus.ChannelContext{ChannelId: "channel", ChannelType: wkproto.ChannelTypeData, SlotLeaderId: 1, Events: sink.events})
+	require.Equal(t, proto.StatusOK, h.acceptDistribution(distributionTestBody(t, 2, "A", 102)), "finishing admitted work must release snapshot capacity")
+	require.Len(t, sink.events, 2)
+}
+
 func TestDistributionAdmissionRejectsTruncation(t *testing.T) {
 	versionTestFixture(t)
 	old := eventbus.Channel
