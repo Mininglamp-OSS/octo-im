@@ -69,3 +69,17 @@ func TestChannelTagNoOpKeepsVersion(t *testing.T) {
 	require.NoError(t, update.UpdateChannelTag("g1", 2, []string{"absent"}, true))
 	require.Equal(t, "tag", m.GetChannelTag("g1", 2))
 }
+
+func TestChannelTagHistoryIsBoundedWithoutMutatingHeldSnapshot(t *testing.T) {
+	m := newSnapshotTestTagManager(t, []string{"fixed"})
+	m.retiredLimit = 2
+	held := m.Get("tag")
+	for i := 0; i < 12; i++ {
+		require.NoError(t, m.UpdateChannelTag("g1", 2, []string{fmt.Sprint(i)}, false))
+	}
+	require.Len(t, m.GetAllTags(), 3)
+	require.Equal(t, 2, m.retired.Len())
+	require.Nil(t, m.Get("tag"))
+	require.Equal(t, []string{"fixed"}, held.GetUsers())
+	require.NotNil(t, m.Get(m.GetChannelTag("g1", 2)))
+}
