@@ -77,6 +77,7 @@ func (e EventType) Uint8() uint8 {
 }
 
 type Event struct {
+	Distribution *DistributionState // Distribution is local progress, never legacy wire data.
 	// Forwarding metadata is carried by the versioned RPC envelope, not legacy events.
 	ForwardDeadline int64
 	ForwardHops     uint8
@@ -106,6 +107,7 @@ type Event struct {
 
 func (e *Event) Clone() *Event {
 	return &Event{
+		Distribution:              e.Distribution,
 		ForwardDeadline:           e.ForwardDeadline,
 		ForwardHops:               e.ForwardHops,
 		Type:                      e.Type,

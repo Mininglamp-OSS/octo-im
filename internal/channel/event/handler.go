@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
@@ -24,7 +25,9 @@ type channelHandler struct {
 	lastActive   uint64 // 最后活跃时间
 	pending      struct {
 		sync.RWMutex
-		eventQueue *eventbus.EventQueue
+		eventQueue  *eventbus.EventQueue
+		retryEvents []*eventbus.Event // retryEvents is a bounded previously dequeued batch.
+		retryAt     time.Time         // retryAt schedules retries before reading newer work.
 	}
 	poller  *poller
 	handler eventbus.ChannelEventHandler
@@ -65,12 +68,23 @@ func (c *channelHandler) hasEvent() bool {
 	if c.processing.Load() {
 		return false
 	}
+	if len(c.pending.retryEvents) > 0 {
+		return !time.Now().Before(c.pending.retryAt)
+	}
 	return c.processingIndex < c.pending.eventQueue.LastIndex()
 }
 
 func (u *channelHandler) events() []*eventbus.Event {
 	u.pending.Lock()
 	defer u.pending.Unlock()
+	if len(u.pending.retryEvents) > 0 {
+		if time.Now().Before(u.pending.retryAt) {
+			return nil
+		}
+		events := u.pending.retryEvents
+		u.pending.retryEvents = nil
+		return events
+	}
 	events := u.pending.eventQueue.SliceWithSize(u.processingIndex+1, u.pending.eventQueue.LastIndex()+1, options.G.Poller.ChannelEventMaxSizePerBatch)
 	if len(events) == 0 {
 		return nil
@@ -111,13 +125,24 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 		ctx.SlotLeaderId = c.slotLeaderId
 		// 处理事件
 		c.handler.OnEvent(ctx)
+		if len(ctx.RetryEvents) > 0 {
+			c.pending.Lock()
+			c.pending.retryEvents = append(c.pending.retryEvents, ctx.RetryEvents...)
+			if ctx.RetryAt.After(c.pending.retryAt) {
+				c.pending.retryAt = ctx.RetryAt
+			}
+			c.pending.Unlock()
+		}
 
 		// 释放上下文
 		c.poller.putContext(ctx)
 	}
 
 	// 推进事件
-	if c.pending.eventQueue.Len() > 0 {
+	c.pending.RLock()
+	hasPending := c.pending.eventQueue.Len() > 0 || len(c.pending.retryEvents) > 0
+	c.pending.RUnlock()
+	if hasPending {
 		c.poller.advance()
 	}
 }
@@ -141,6 +166,11 @@ func (c *channelHandler) checkAndUpdateLeaderIdChange() error {
 
 // isTimeout 判断用户是否超时
 func (c *channelHandler) isTimeout() bool {
+	c.pending.RLock()
+	defer c.pending.RUnlock()
+	if c.processing.Load() || len(c.pending.retryEvents) > 0 || c.processingIndex < c.pending.eventQueue.LastIndex() {
+		return false
+	}
 	return fasttime.UnixTimestamp()-c.lastActive > uint64(options.G.Poller.ChannelTimeout.Seconds())
 }
 

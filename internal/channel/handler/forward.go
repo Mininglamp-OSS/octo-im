@@ -11,6 +11,7 @@ import (
 )
 
 func (h *Handler) SetForwardRoutes() {
+	service.Cluster.Route(distributionPath, func(c *wkserver.Context) { c.WriteStatus(h.acceptDistribution(c.Body())) })
 	service.Cluster.Route(forward.ChannelPath, func(c *wkserver.Context) { c.WriteStatus(h.acceptForward(c.Body())) })
 }
 

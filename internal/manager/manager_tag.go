@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"container/list"
 	"hash/fnv"
 	"slices"
 	"sync"
@@ -17,7 +18,11 @@ import (
 )
 
 type TagManager struct {
-	bluckets []*tagBlucket
+	// Retired versions are bounded; admitted distribution tasks own their snapshots.
+	retired      *list.List
+	retiredKeys  map[string]*list.Element
+	retiredLimit int
+	bluckets     []*tagBlucket
 	// 获取当前节点版本号
 	nodeVersion func() uint64
 	wklog.Log
@@ -26,8 +31,11 @@ type TagManager struct {
 
 func NewTagManager(blucketCount int, nodeVersion func() uint64) *TagManager {
 	tg := &TagManager{
-		nodeVersion: nodeVersion,
-		Log:         wklog.NewWKLog("TagManager"),
+		retired:      list.New(),
+		retiredKeys:  make(map[string]*list.Element),
+		retiredLimit: 4096,
+		nodeVersion:  nodeVersion,
+		Log:          wklog.NewWKLog("TagManager"),
 	}
 	tg.bluckets = make([]*tagBlucket, blucketCount)
 	for i := 0; i < blucketCount; i++ {
@@ -103,7 +111,15 @@ func (t *TagManager) AddUsers(tagKey string, uids []string) error {
 	if err != nil {
 		return err
 	}
-	leaders := make(map[string]uint64, len(uids))
+	if updated := addUsersToTag(tag, nodes); updated != tag {
+		t.setTag(updated)
+	}
+	return nil
+}
+
+// addUsersToTag preserves every published node and returns tag on a no-op.
+func addUsersToTag(tag *types.Tag, nodes []*types.Node) *types.Tag {
+	leaders := make(map[string]uint64, countNodeUsers(nodes))
 	for _, node := range nodes {
 		for _, uid := range node.Uids {
 			leaders[uid] = node.LeaderId
@@ -124,13 +140,20 @@ func (t *TagManager) AddUsers(tagKey string, uids []string) error {
 		}
 	}
 	if !changed {
-		return nil
+		return tag
 	}
 	newTag := copyTag(tag)
 	newTag.Nodes = newNodes
-	t.setTag(newTag)
+	return newTag
 
-	return nil
+}
+
+func countNodeUsers(nodes []*types.Node) int {
+	count := 0
+	for _, node := range nodes {
+		count += len(node.Uids)
+	}
+	return count
 }
 
 // copyTag returns an unpublished copy of tag that keeps its access state. It
@@ -236,6 +259,14 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 		return errors.TagNotExist(tagKey)
 	}
 
+	if updated := removeUsersFromTag(tag, uids); updated != tag {
+		t.setTag(updated)
+	}
+	return nil
+}
+
+// removeUsersFromTag never changes a node published by another version.
+func removeUsersFromTag(tag *types.Tag, uids []string) *types.Tag {
 	// 先算出每个节点要删除的位置。按节点里实际存的用户删除，不依赖槽位领导：
 	// 领导选举期间也能删，领导迁移后还留在旧领导节点下的用户也能删掉
 	drops := make(map[uint64]map[int]struct{})
@@ -259,7 +290,7 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 		}
 	}
 	if len(drops) == 0 {
-		return nil
+		return tag
 	}
 	// 发布出去的tag可能正在被分发遍历：只替换有变化的节点
 	newTag := copyTag(tag)
@@ -270,8 +301,60 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 		}
 		newTag.Nodes = append(newTag.Nodes, node)
 	}
-	t.setTag(newTag)
+	return newTag
+}
+
+// UpdateChannelTag publishes membership and the channel pointer under one lock.
+// Historical keys continue to identify their original recipient set. Queued
+// distribution tasks carry the snapshot and remain valid after cache eviction.
+func (t *TagManager) UpdateChannelTag(channelId string, channelType uint8, uids []string, remove bool) error {
+	var nodes []*types.Node
+	var err error
+	if !remove {
+		nodes, err = t.calcUsersInNode(uids)
+	}
+	t.Lock()
+	defer t.Unlock()
+	key := t.GetChannelTag(channelId, channelType)
+	tag := t.getTag(key)
+	if tag == nil {
+		return nil
+	} // A cold channel rebuilds from persisted subscribers.
+	if err != nil {
+		return err
+	}
+	var updated *types.Tag
+	if remove {
+		updated = removeUsersFromTag(tag, uids)
+	} else {
+		updated = addUsersToTag(tag, nodes)
+	}
+	if updated == tag {
+		return nil
+	}
+	now := time.Now()
+	next := &types.Tag{Key: wkutil.GenUUID(), ChannelId: channelId, ChannelType: channelType,
+		Nodes: updated.Nodes, NodeVersion: tag.NodeVersion, CreatedAt: now, LastGetTime: now}
+	next.Touch()
+	t.setTag(next)
+	t.getBlucketByChannel(channelId, channelType).setChannelTag(channelId, channelType, next.Key)
+	t.retainVersionLocked(key)
 	return nil
+}
+
+// retainVersionLocked bounds cache-only historical versions independently of
+// pending tasks, which keep immutable snapshots rather than cache references.
+func (t *TagManager) retainVersionLocked(key string) {
+	if _, exists := t.retiredKeys[key]; !exists {
+		t.retiredKeys[key] = t.retired.PushBack(key)
+	}
+	for t.retired.Len() > t.retiredLimit {
+		first := t.retired.Front()
+		old := first.Value.(string)
+		t.retired.Remove(first)
+		delete(t.retiredKeys, old)
+		t.removeTag(old)
+	}
 }
 
 func (t *TagManager) RemoveTag(tagKey string) {
@@ -333,6 +416,10 @@ func (t *TagManager) RenameTag(oldTagKey, newTagKey string) error {
 func (t *TagManager) SetChannelTag(fakeChannelId string, channelType uint8, tagKey string) {
 	t.Lock()
 	defer t.Unlock()
+	if entry := t.retiredKeys[tagKey]; entry != nil {
+		t.retired.Remove(entry)
+		delete(t.retiredKeys, tagKey)
+	}
 	// Publish the tag with its channel first, so a reader that finds the new
 	// mapping also finds the tag labelled with this channel.
 	tag := t.getTag(tagKey)

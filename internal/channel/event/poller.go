@@ -64,6 +64,7 @@ func (p *poller) start() error {
 
 func (p *poller) stop() {
 	p.stopper.Stop()
+	_ = p.handlePool.ReleaseTimeout(5 * time.Second)
 }
 
 func (p *poller) addEvent(channelId string, channelType uint8, event *eventbus.Event) {
