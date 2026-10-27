@@ -24,6 +24,7 @@ import (
 	channelevent "github.com/WuKongIM/WuKongIM/internal/channel/event"
 	"github.com/WuKongIM/WuKongIM/internal/channel/handler"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/forward"
 	"github.com/WuKongIM/WuKongIM/internal/manager"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
@@ -32,6 +33,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/client"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
+	"github.com/panjf2000/gnet/v2"
 )
 
 // These subprocesses isolate the application's node-global services while using
@@ -137,6 +139,9 @@ func TestDistributionIntegrationNode(t *testing.T) {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
+	if os.Getenv("WK_TEST_DISTRIBUTION_FAIL_CLEANUP") == "1" {
+		t.Cleanup(func() { t.Error("injected child cleanup failure") })
+	}
 	options.G = options.New()
 	options.G.Cluster.NodeId = node
 	options.G.Poller.ChannelCount = 1
@@ -149,17 +154,30 @@ func TestDistributionIntegrationNode(t *testing.T) {
 	service.Cluster = c
 	m := manager.NewTagManager(4, func() uint64 { return 0 })
 	service.TagManager = m
+	oldPeer := os.Getenv("WK_TEST_DISTRIBUTION_OLD_NODE") == nodeText
 	if node == 1 {
 		if _, err := m.MakeTagWithTagKey("A", []string{"1-fixed", "2-fixed", "2-removed", "3-fixed"}); err != nil {
 			t.Fatal(err)
 		}
 		m.SetChannelTag("room", wkproto.ChannelTypeData, "A")
 	}
+	if oldPeer {
+		if _, err := m.MakeTagWithTagKey("A", []string{"2-fixed"}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	eventbus.RegisterUser(recoveryUsers{})
 	pusher := &wirePusher{counts: make(map[int64]map[string]int)}
 	eventbus.RegisterPusher(pusher)
 	h := handler.NewHandler()
-	h.SetForwardRoutes()
+	if oldPeer {
+		// An old node can support the generic v1 capability, while lacking
+		// the newer distribution route. The two capabilities are distinct.
+		forward.RegisterCapabilityRoute()
+		c.server.OnMessage(func(_ gnet.Conn, msg *proto.Message) { h.OnMessage(msg) })
+	} else {
+		h.SetForwardRoutes()
+	}
 	pool := channelevent.NewEventPool(h)
 	eventbus.RegisterChannel(pool)
 	if err := c.server.Start(); err != nil {
@@ -394,5 +412,39 @@ func TestDistributionThreeNodeSlowPeerAndVersionEviction(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestDistributionThreeNodeMixedVersion(t *testing.T) {
+	t.Setenv("WK_TEST_DISTRIBUTION_OLD_NODE", "2")
+	nodes := []wireReady{startWireNode(t, 1), startWireNode(t, 2), startWireNode(t, 3)}
+	peers := map[uint64]string{1: nodes[0].RPC, 2: nodes[1].RPC, 3: nodes[2].RPC}
+	for _, node := range nodes {
+		wireControl(t, node, "/peers", peers, nil)
+	}
+	wireControl(t, nodes[0], "/send", int64(101), nil)
+	for index, node := range nodes {
+		uid := fmt.Sprintf("%d-fixed", index+1)
+		waitWireStats(t, node, func(s wireStats) bool { return s.Counts[101][uid] == 1 })
+	}
+}
+
+// The outer process must see a parent-test failure when a node exits nonzero
+// during cleanup, even if every functional assertion already passed.
+func TestDistributionIntegrationChildExitIsPropagated(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDistributionIntegrationParentExitProbe$", "-test.timeout=15s")
+	cmd.Env = append(os.Environ(), "WK_TEST_DISTRIBUTION_EXIT_PROBE=1", "WK_TEST_DISTRIBUTION_FAIL_CLEANUP=1")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("parent passed despite failing child cleanup:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("injected child cleanup failure")) {
+		t.Fatalf("child diagnostics were lost:\n%s", output)
+	}
+}
+
+func TestDistributionIntegrationParentExitProbe(t *testing.T) {
+	if os.Getenv("WK_TEST_DISTRIBUTION_EXIT_PROBE") == "1" {
+		startWireNode(t, 1)
 	}
 }
