@@ -39,6 +39,8 @@ type Raft struct {
 	stopped        syncatomic.Bool
 	stopOnce       sync.Once
 	stopBegin      sync.Once
+	joinOnce       sync.Once
+	joined         chan struct{}
 	view           syncatomic.Value
 	forwardMu      sync.Mutex
 	forwardPending map[string]forwardRegistration
@@ -67,6 +69,7 @@ func New(opts *Options) *Raft {
 
 	r := &Raft{
 		stopper:           syncutil.NewStopper(),
+		joined:            make(chan struct{}),
 		opts:              opts,
 		node:              NewNode(lastTermStartLogIndex, raftState, opts),
 		advanceC:          make(chan struct{}, 1),

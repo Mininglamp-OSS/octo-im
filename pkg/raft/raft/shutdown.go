@@ -32,23 +32,50 @@ func (r *Raft) submitWorker(work func()) error {
 }
 
 // WaitQuiescence initiates Stop and waits for actual worker exit, independently
-// of caller settlement. It cannot terminate synchronous Storage I/O. A nil
-// result permits the storage owner to close dependent resources; an incomplete
-// result preserves context error compatibility and can be queried again after
-// I/O returns. No detached join goroutine is created.
+// of caller settlement. It cannot terminate synchronous Storage I/O, including a
+// hard-state write inside the event loop. The loop join therefore runs in one
+// tracked lifecycle shared by every call, and ctx bounds only the wait for it.
+// A nil result permits the storage owner to close dependent resources; an
+// incomplete result preserves context error compatibility and can be queried
+// again after I/O returns.
 func (r *Raft) WaitQuiescence(ctx context.Context) error {
-	r.Stop()
+	r.BeginStop()
+	joined := r.joinStop()
 	tick := time.NewTicker(time.Millisecond)
 	defer tick.Stop()
 	for {
-		if r.pool.Running() == 0 {
+		if r.quiesced(joined) {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
+			if r.quiesced(joined) {
+				return nil
+			}
 			return fmt.Errorf("%w: %w", ErrIncompleteQuiescence, ctx.Err())
 		case <-tick.C:
 		}
+	}
+}
+
+// joinStop starts the single Stop join and returns its completion signal. The
+// goroutine exits as soon as the loop and its workers return.
+func (r *Raft) joinStop() <-chan struct{} {
+	r.joinOnce.Do(func() {
+		go func() {
+			r.Stop()
+			close(r.joined)
+		}()
+	})
+	return r.joined
+}
+
+func (r *Raft) quiesced(joined <-chan struct{}) bool {
+	select {
+	case <-joined:
+		return r.pool.Running() == 0
+	default:
+		return false
 	}
 }
 
