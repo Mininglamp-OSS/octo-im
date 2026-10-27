@@ -62,6 +62,11 @@ func (r *Raft) cancelProposal(p *configProposal, cause error) error {
 	if p.err != nil {
 		return p.err
 	}
+	if !p.waitApplied {
+		// Admission is all an admission-only caller waits for, and it
+		// succeeded: keep the assigned indexes.
+		return nil
+	}
 	if p.waiter != nil {
 		if err, done := r.wait.detach(p.waiter); done {
 			return err
