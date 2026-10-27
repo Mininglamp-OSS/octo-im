@@ -229,3 +229,66 @@ func TestForwardedLeaderEchoesToken(t *testing.T) {
 	require.Equal(t, tok.Index, rej.Logs[0].Index)
 	require.Equal(t, tok.Id, rej.Logs[0].Id)
 }
+
+// The admission-only API has no receipt to check, so an uncorrelated
+// zero-header response can never be its proof of admission. An earlier
+// attempt reused the request IDs with other data; its delayed legacy response
+// (indexes 1-2, "old-a") must not complete the newer call (indexes 3-4).
+func TestForwardedLegacyAdmissionOnlyStaysUnknown(t *testing.T) {
+	old := types.ProposeReqSet{{Id: 400, Data: []byte("old-a")}, {Id: 500, Data: []byte("b")}}
+	next := types.ProposeReqSet{{Id: 400, Data: []byte("new-a")}, {Id: 500, Data: []byte("b")}}
+	for _, legacy := range []bool{true, false} {
+		t.Run(map[bool]string{true: "legacy", false: "tokenized"}[legacy], func(t *testing.T) {
+			fp := newForwardPair(t, 5*time.Second)
+			fp.transport.legacy.Store(legacy)
+			fp.transport.holdResps.Store(true)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			_, err := fp.follower.ProposeBatchTimeout(ctx, admKey, old)
+			cancel()
+			require.ErrorIs(t, err, types.ErrProposalOutcomeUnknown)
+			type result struct {
+				resps types.ProposeRespSet
+				err   error
+			}
+			out := make(chan result, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				resps, err := fp.follower.ProposeBatchTimeout(ctx, admKey, next)
+				out <- result{resps, err}
+			}()
+			fp.leaderStorage.waitApplied(t, 4)
+			fp.transport.holdResps.Store(false)
+			fp.transport.release()
+			res := <-out
+			if legacy {
+				require.ErrorIs(t, res.err, types.ErrProposalOutcomeUnknown, "resps=%v", res.resps)
+				require.Nil(t, res.resps)
+				st := fp.follower.ForwardStats()
+				require.Zero(t, st.Pending)
+				return
+			}
+			require.NoError(t, res.err)
+			require.Len(t, res.resps, 2)
+			require.EqualValues(t, 3, res.resps[0].Index)
+			require.EqualValues(t, 4, res.resps[1].Index)
+			fp.followerStorage.waitApplied(t, 4)
+			requireAppliedAs(t, fp.followerStorage, next, res.resps)
+		})
+	}
+}
+
+// A fresh legacy admission-only forward is uncorrelated as well: it stays
+// unknown rather than trusting the zero-header indexes.
+func TestForwardedLegacyAdmissionOnlyFreshIDIsUnknown(t *testing.T) {
+	fp := newForwardPair(t, 5*time.Second)
+	fp.transport.legacy.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := fp.follower.ProposeBatchTimeout(ctx, admKey, types.ProposeReqSet{{Id: 810, Data: []byte("a")}})
+	require.ErrorIs(t, err, types.ErrProposalOutcomeUnknown)
+	require.NotErrorIs(t, err, types.ErrProposalNotAdmitted)
+	st := fp.follower.ForwardStats()
+	require.EqualValues(t, 1, st.LegacySettled)
+	require.Zero(t, st.Pending)
+}

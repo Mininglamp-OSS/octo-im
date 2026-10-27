@@ -3,6 +3,7 @@ package raftgroup
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -29,11 +30,21 @@ import (
 // Mixed versions: older followers send a zero header and the leader echoes
 // it, so their behaviour is unchanged. A leader that predates the token
 // answers with a zero header; its response settles the registration for the
-// key, as before, if it came from the registered leader. Receipts verify the
-// Id and Data of every entry in the returned range, so a misattributed legacy
-// response ends as superseded or unknown, never as a false success. Any other
-// header version is dropped.
+// key, as before, if it came from the registered leader. Nothing ties it to
+// this attempt: a delayed response of an earlier attempt that reused the
+// request IDs looks the same. Receipts verify the Id and Data of every entry
+// in the returned range, so for ProposeBatchUntilAppliedTimeout a
+// misattributed legacy response ends as superseded or unknown, never as a
+// false success. The admission-only ProposeBatchTimeout has no receipt to
+// check, so it returns ErrProposalOutcomeUnknown for a legacy success
+// response instead of its indexes. Any other header version is dropped.
 const forwardTokenVersion uint32 = 1
+
+// legacyForwardResps is a success response settled by request ID alone,
+// from a leader that predates the token.
+type legacyForwardResps types.ProposeRespSet
+
+var errLegacyForwardUncorrelated = errors.New("raftgroup: leader predates forwarding tokens; its admission response is not correlated with this attempt")
 
 // forwardPeerLimit bounds per-sender warning state; senders are cluster nodes.
 const forwardPeerLimit = 1024

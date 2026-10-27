@@ -59,7 +59,9 @@ func (rg *RaftGroup) ProposeTimeout(ctx context.Context, raftKey string, id uint
 // Apply. ErrProposalNotAdmitted means the proposal definitely did not enter
 // the log. Once the leader admitted it, a local caller gets success even if
 // ctx expires meanwhile; a forwarding caller whose ctx expires gets
-// ErrProposalOutcomeUnknown. Callers must not blindly replay such proposals.
+// ErrProposalOutcomeUnknown, as does a forwarding caller answered by a leader
+// that predates forwarding tokens (nothing correlates that answer with this
+// attempt). Callers must not blindly replay such proposals.
 func (rg *RaftGroup) ProposeBatchTimeout(ctx context.Context, raftKey string, reqs types.ProposeReqSet) (resps types.ProposeRespSet, err error) {
 	var r receipt
 	defer func() { rg.recordOutcome(raftKey, r, err) }()
@@ -77,7 +79,7 @@ func (rg *RaftGroup) ProposeBatchTimeout(ctx context.Context, raftKey string, re
 	}
 	if !raft.IsLeader() {
 		r.forwarded = true
-		resps, err := rg.fowardPropose(ctx, raft, reqs)
+		resps, err := rg.fowardPropose(ctx, raft, reqs, false)
 		return resps, err
 	}
 	resps, _, err = rg.proposeBatchTimeout(ctx, raft, reqs, false)
@@ -104,7 +106,7 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 	if !raft.IsLeader() {
 		// 如果不是leader，则转发给leader
 		r.forwarded = true
-		resps, err = rg.fowardPropose(ctx, raft, reqs)
+		resps, err = rg.fowardPropose(ctx, raft, reqs, true)
 		if err != nil {
 			return nil, err
 		}
@@ -290,7 +292,10 @@ func (rg *RaftGroup) admitProposal(raft IRaft, e Event) {
 	p.admitC <- admitResult{adm: adm, waiter: waiter}
 }
 
-func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.ProposeReqSet) ([]*types.ProposeResp, error) {
+// fowardPropose sends reqs to the leader and returns its admitted range.
+// verified tells whether the caller checks a receipt for the returned range;
+// without one, an uncorrelated legacy response is not proof of admission.
+func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.ProposeReqSet, verified bool) ([]*types.ProposeResp, error) {
 	if len(reqs) == 0 {
 		return nil, errors.New("raftgroup: empty proposal batch")
 	}
@@ -322,11 +327,18 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 
 	select {
 	case result := <-reg.resultC:
-		err, ok := result.(error)
-		if ok {
-			return nil, err
+		var resps types.ProposeRespSet
+		switch result := result.(type) {
+		case error:
+			return nil, result
+		case legacyForwardResps:
+			if !verified {
+				return nil, proposalOutcomeUnknown(errLegacyForwardUncorrelated)
+			}
+			resps = types.ProposeRespSet(result)
+		case types.ProposeRespSet:
+			resps = result
 		}
-		resps := result.(types.ProposeRespSet)
 		if !forwardRespsMatch(reqs, resps) {
 			return nil, proposalOutcomeUnknown(errors.New("raftgroup: forwarded propose response does not match the request"))
 		}
@@ -472,6 +484,10 @@ func (rg *RaftGroup) handleSendProposeResp(raftKey string, e types.Event) {
 	if e.Reason == types.ReasonError {
 		rg.Error("handleSendProposeResp: receive propose resp error", zap.Uint64("from", e.From))
 		rg.settleForwardLocked(key, reg, proposalOutcomeUnknown(types.ErrForwardRejected))
+		return
+	}
+	if h.Term == 0 {
+		rg.settleForwardLocked(key, reg, legacyForwardResps(resps))
 		return
 	}
 	rg.settleForwardLocked(key, reg, resps)
