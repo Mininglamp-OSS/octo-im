@@ -14,8 +14,8 @@ var errGroupNotStopped = errors.New("raftgroup: not stopped")
 var ErrIncompleteQuiescence = errors.New("raftgroup: storage quiescence incomplete")
 
 // submit runs fn on the bounded nonblocking pool. Every pool task may touch
-// Storage, so each accepted task is counted until it exits and submission is
-// fenced by Stop. WaitQuiescence joins the counted tasks.
+// Storage, so each accepted task is counted until it exits, and submission
+// is refused from BeginStop on. WaitQuiescence joins the counted tasks.
 func (rg *RaftGroup) submit(fn func()) error {
 	rg.verificationMu.Lock()
 	if rg.verificationStopped {
@@ -38,13 +38,14 @@ func (rg *RaftGroup) poolTaskDone() {
 	rg.verificationMu.Lock()
 	defer rg.verificationMu.Unlock()
 	rg.poolTasks--
-	if rg.verificationStopped && rg.poolTasks == 0 {
+	if rg.loopJoined && rg.poolTasks == 0 {
 		close(rg.poolIdle)
 	}
 }
 
 // WaitQuiescence waits, after Stop or BeginStop, until the event loop has
-// exited and no pool task can touch Storage. Storage I/O cannot be
+// exited and every pool task accepted before the fence has exited. After it
+// returns nil the group never touches Storage again. Storage I/O cannot be
 // interrupted: on error the owner must keep Storage open and may call
 // WaitQuiescence again.
 func (rg *RaftGroup) WaitQuiescence(ctx context.Context) error {

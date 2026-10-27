@@ -49,12 +49,16 @@ type RaftGroup struct {
 	stopBegun     atomic.Bool
 	// loopDone closes once the shutdown lifecycle joined the event loop,
 	// fenced pool submission and settled receipts.
-	loopDone            chan struct{}
-	verificationMu      sync.Mutex
+	loopDone       chan struct{}
+	verificationMu sync.Mutex
+	// verificationStopped fences pool submission. BeginStop sets it before it
+	// joins anything, so no storage task is accepted once shutdown began.
 	verificationStopped bool
+	// loopJoined is set once the event loop has exited.
+	loopJoined          bool
 	verificationWorkers atomic.Int64
 	// poolTasks counts accepted pool tasks, all of which may touch Storage.
-	// poolIdle closes once Stop has fenced submission and the count is zero.
+	// poolIdle closes once the loop is joined and the count is zero.
 	poolTasks int
 	poolIdle  chan struct{}
 	// beforeAdmit, if set by a test, runs on the event loop after a proposal
@@ -137,26 +141,37 @@ func (rg *RaftGroup) Start() error {
 	return nil
 }
 
-// Stop runs the shutdown lifecycle and waits until it joined the event loop,
-// fenced pool submission and settled receipts. It does not wait for pool tasks
-// already inside Storage; see WaitQuiescence.
+// Stop runs the shutdown lifecycle and waits until it joined the event loop
+// and settled receipts. Submission is fenced from BeginStop on. Stop does not
+// wait for pool tasks accepted before the fence, which may still be inside
+// Storage: a caller that releases Storage must use WaitQuiescence. Because Stop
+// never joins pool tasks, a task that hands its result to the loop cannot
+// deadlock it.
 func (rg *RaftGroup) Stop() {
 	rg.BeginStop()
 	<-rg.loopDone
 }
 
 // BeginStop starts the single shutdown lifecycle without waiting for it.
-// Callers blocked on the group observe the stop signal immediately; the event
-// loop may still be inside synchronous Storage I/O such as SaveHardState, so
-// its join runs on the lifecycle goroutine and WaitQuiescence bounds it.
+// On return no pool task can be accepted any more and AddEventWait refuses,
+// so no storage task starts after this point; tasks accepted before stay
+// owned until WaitQuiescence. Callers blocked on the group observe the stop
+// signal immediately; the event loop may still be inside synchronous Storage
+// I/O such as SaveHardState, so its join runs on the lifecycle goroutine and
+// WaitQuiescence bounds it.
 func (rg *RaftGroup) BeginStop() {
 	rg.stopOnce.Do(func() {
+		rg.verificationMu.Lock()
+		rg.verificationStopped = true
 		rg.stopBegun.Store(true)
+		rg.verificationMu.Unlock()
 		go func() {
-			// The loop exits first so it never sees its own storage work refused.
+			// Storage work the loop requests from here on is refused and
+			// answered with ReasonError, which it never steps: it exits at its
+			// next iteration.
 			rg.stopper.Stop()
 			rg.verificationMu.Lock()
-			rg.verificationStopped = true
+			rg.loopJoined = true
 			if rg.poolTasks == 0 {
 				close(rg.poolIdle)
 			}
@@ -212,14 +227,32 @@ func (rg *RaftGroup) AddEvent(raftKey string, e types.Event) {
 	})
 }
 
+// AddEventWait steps e on the event loop and returns its result. It returns
+// ErrGroupStopped, and e is never stepped, if shutdown began before the loop
+// took the event; a result the loop already produced is kept.
 func (rg *RaftGroup) AddEventWait(raftKey string, e types.Event) error {
+	if rg.stopBegun.Load() {
+		return ErrGroupStopped
+	}
 	waitC := make(chan error, 1)
+	claim := new(atomic.Bool)
 	rg.mq.MustAdd(Event{
 		RaftKey: raftKey,
 		Event:   e,
 		WaitC:   waitC,
+		claim:   claim,
 	})
 	rg.Advance()
+	select {
+	case err := <-waitC:
+		return err
+	case <-rg.stopper.ShouldStop():
+	}
+	if claim.CompareAndSwap(false, true) {
+		// The loop never took the event and now never will.
+		return ErrGroupStopped
+	}
+	// The loop is handling it in memory; its result follows.
 	return <-waitC
 }
 
@@ -241,6 +274,10 @@ func (rg *RaftGroup) TryAddEvent(raftKey string, e types.Event) {
 func (rg *RaftGroup) loopEvent() {
 	tk := time.NewTicker(rg.opts.TickInterval)
 	for !rg.stopped {
+		if rg.stopBegun.Load() {
+			// Storage submission is fenced; do not step its refusals.
+			return
+		}
 		rg.readyEvents()
 		select {
 		case <-tk.C:
@@ -286,6 +323,9 @@ func (rg *RaftGroup) handleReceivedEvents() bool {
 	}
 	hasEvent := false
 	for _, e := range events {
+		if e.claim != nil && !e.claim.CompareAndSwap(false, true) {
+			continue // abandoned by its waiter after shutdown began
+		}
 		raft := rg.raftList.get(e.RaftKey)
 		if e.Proposal != nil {
 			if raft == nil {
