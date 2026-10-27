@@ -113,7 +113,7 @@ probe.
 | Capability state | Send behaviour |
 | --- | --- |
 | Leader answered OK within 30 s | Submit without probing |
-| Leader answered OK 30 s to 5 min ago | Submit; one send refreshes the probe and no send waits for it. A refresh without an answer does not extend the 5 min limit |
+| Leader answered OK 30 s to 5 min ago | Submit. The send that starts the refresh runs the probe first: it waits at most for the probe ladder (250 ms + 1 s), capped so half of its remaining budget is left for the send. Other sends during the refresh do not wait. A refresh without an answer still submits, and does not extend the 5 min limit |
 | Leader answered with a non-OK status within 5 s | HTTP 503, log `reason=capability_unsupported` |
 | No answer to either attempt (timeout, connection not authenticated, no connection) | HTTP 503 for this send only, log `reason=capability_inconclusive`. Nothing is cached; the next send probes again |
 

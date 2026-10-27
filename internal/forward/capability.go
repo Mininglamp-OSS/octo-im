@@ -111,7 +111,8 @@ func (c *CapabilityCache) Check(ctx context.Context, node uint64) CapabilityVerd
 		c.mu.Unlock()
 		return CapabilityVerdict{Supported: true, Cached: true}
 	case !st.okAt.IsZero():
-		// Stale positive: one caller refreshes, nobody waits for it.
+		// Stale positive: one caller refreshes and waits for its probe,
+		// bounded by the ladder and the send reserve; others do not wait.
 		if st.inflight != nil {
 			c.mu.Unlock()
 			c.staleServed()

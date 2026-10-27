@@ -128,7 +128,7 @@ func TestCapabilityConcurrentColdCallersShareOneProbe(t *testing.T) {
 	}
 }
 
-func TestCapabilityStalePositiveIsServedWithoutWaitingUntilHardExpiry(t *testing.T) {
+func TestCapabilityStalePositiveConcurrentCallersDoNotWaitForRefresh(t *testing.T) {
 	var calls atomic.Int32
 	var mode atomic.Int32 // 0 ok, 1 blocking timeout, 2 fast timeout
 	entered, release := make(chan struct{}, 1), make(chan struct{})
@@ -159,7 +159,7 @@ func TestCapabilityStalePositiveIsServedWithoutWaitingUntilHardExpiry(t *testing
 	<-entered
 	start := time.Now()
 	v := cache.Check(context.Background(), 2)
-	require.Less(t, time.Since(start), 100*time.Millisecond, "a stale caller never waits for the refresh")
+	require.Less(t, time.Since(start), 100*time.Millisecond, "a concurrent stale caller does not wait for the refresh")
 	require.Equal(t, CapabilityVerdict{Supported: true, Cached: true, Stale: true}, v)
 	release <- struct{}{} // first ladder step times out
 	<-entered
@@ -183,6 +183,39 @@ func TestCapabilityStalePositiveIsServedWithoutWaitingUntilHardExpiry(t *testing
 	clock.Advance(time.Minute)
 	require.True(t, cache.Check(context.Background(), 2).Supported)
 	require.Equal(t, CapabilityVerdict{Supported: true, Cached: true}, cache.Check(context.Background(), 2))
+}
+
+// The caller that starts a stale-positive refresh runs the probe ladder
+// before its own send. The wait is bounded by the ladder and leaves the send
+// reserve of its budget; an inconclusive refresh still serves the positive.
+func TestCapabilityStaleRefreshInitiatorWaitIsBoundedBySendReserve(t *testing.T) {
+	var refreshing atomic.Bool
+	cache, clock := newPolicyCache(func(ctx context.Context, _ uint64, _ string) (*proto.Response, error) {
+		if !refreshing.Load() {
+			return okResponse(), nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	require.True(t, cache.Check(context.Background(), 2).Supported)
+	clock.Advance(31 * time.Second)
+	refreshing.Store(true)
+
+	budget, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	v := cache.Check(budget, 2)
+	waited := time.Since(start)
+	require.Equal(t, CapabilityVerdict{Supported: true, Cached: true, Stale: true, ErrClass: ProbeTimeout}, v)
+	require.GreaterOrEqual(t, waited, 150*time.Millisecond, "the initiator waits for its probe")
+	require.Less(t, waited, 350*time.Millisecond)
+	require.NoError(t, budget.Err(), "the refresh never consumes the send reserve")
+
+	// Without a deadline the wait is the full ladder, 250 ms + 1 s here.
+	start = time.Now()
+	v = cache.Check(context.Background(), 2)
+	require.True(t, v.Stale)
+	require.InDelta(t, 1250*time.Millisecond, time.Since(start), float64(150*time.Millisecond))
 }
 
 func TestCapabilityStaleRefreshDefinitiveNegativeStopsServing(t *testing.T) {
