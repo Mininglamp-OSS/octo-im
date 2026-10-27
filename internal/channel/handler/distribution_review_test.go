@@ -237,3 +237,40 @@ func TestDistributionReviewLegacyPersonReusesStableTag(t *testing.T) {
 	}
 	require.Len(t, m.GetAllTags(), 2) // The fixture's A and the stable person tag.
 }
+
+func TestDistributionReviewConversationKeepsSnapshotMembersAfterEviction(t *testing.T) {
+	m, _ := versionTestFixture(t)
+	held := m.Get("A")
+	_, err := m.MakeTagWithTagKey("B", []string{"new", "sender"})
+	require.NoError(t, err)
+	m.SetChannelTag("room", wkproto.ChannelTypePerson, "B")
+	m.RemoveTag("A")
+	event := &eventbus.Event{MessageSeq: 1, Conn: &eventbus.Conn{Uid: "sender"}, Frame: &wkproto.SendPacket{}, Distribution: &eventbus.DistributionState{Snapshot: held}}
+	snapshots := manager.NewConversationManager(1)
+	snapshots.Push("room", wkproto.ChannelTypePerson, "A", []*eventbus.Event{event})
+	for _, uid := range []string{"fixed", "removed"} {
+		channels, err := snapshots.GetUserChannelsFromCache(uid, wkdb.ConversationTypeChat)
+		require.NoError(t, err)
+		require.Len(t, channels, 1)
+	}
+	channels, err := snapshots.GetUserChannelsFromCache("new", wkdb.ConversationTypeChat)
+	require.NoError(t, err)
+	require.Empty(t, channels, "an evicted snapshot must not substitute current members")
+	// Existing callers without a snapshot retain cache-based conversation updates.
+	event.Distribution = nil
+	legacy := manager.NewConversationManager(1)
+	legacy.Push("room", wkproto.ChannelTypePerson, "B", []*eventbus.Event{event})
+	channels, err = legacy.GetUserChannelsFromCache("sender", wkdb.ConversationTypeChat)
+	require.NoError(t, err)
+	require.Len(t, channels, 1)
+}
+
+func TestDistributionReviewConversationSkipsUnknownRecipients(t *testing.T) {
+	m, _ := versionTestFixture(t)
+	m.RemoveTag("A")
+	conversations := manager.NewConversationManager(1)
+	conversations.Push("room", wkproto.ChannelTypePerson, "unknown", []*eventbus.Event{{MessageSeq: 1, Conn: &eventbus.Conn{Uid: "sender"}, Frame: &wkproto.SendPacket{}}})
+	channels, err := conversations.GetUserChannelsFromCache("fixed", wkdb.ConversationTypeChat)
+	require.NoError(t, err)
+	require.Empty(t, channels)
+}
