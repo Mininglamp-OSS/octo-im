@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/network"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
@@ -254,7 +255,9 @@ func (s *Server) subscribersGet(c *wkhttp.Context) {
 		c.Forward(fmt.Sprintf("%s%s", leaderNode.ApiServerAddr, c.Request.URL.Path))
 		return
 	}
-	subscribers, err := s.db.GetSubscribers(channelId, channelType)
+	subscribers, err := icluster.FencedRead(s.slotServer, s.getSlotId(channelId), func() ([]wkdb.Member, error) {
+		return s.db.GetSubscribers(channelId, channelType)
+	})
 	if err != nil {
 		s.Error("GetSubscribers error", zap.Error(err))
 		c.ResponseError(err)
@@ -282,7 +285,9 @@ func (s *Server) denylistGet(c *wkhttp.Context) {
 		c.Forward(fmt.Sprintf("%s%s", leaderNode.ApiServerAddr, c.Request.URL.Path))
 		return
 	}
-	members, err := s.db.GetDenylist(channelId, channelType)
+	members, err := icluster.FencedRead(s.slotServer, s.getSlotId(channelId), func() ([]wkdb.Member, error) {
+		return s.db.GetDenylist(channelId, channelType)
+	})
 	if err != nil {
 		s.Error("GetDenylist error", zap.Error(err))
 		c.ResponseError(err)
@@ -310,7 +315,9 @@ func (s *Server) allowlistGet(c *wkhttp.Context) {
 		c.Forward(fmt.Sprintf("%s%s", leaderNode.ApiServerAddr, c.Request.URL.Path))
 		return
 	}
-	allowlist, err := s.db.GetAllowlist(channelId, channelType)
+	allowlist, err := icluster.FencedRead(s.slotServer, s.getSlotId(channelId), func() ([]wkdb.Member, error) {
+		return s.db.GetAllowlist(channelId, channelType)
+	})
 	if err != nil {
 		s.Error("GetAllowlist error", zap.Error(err))
 		c.ResponseError(err)

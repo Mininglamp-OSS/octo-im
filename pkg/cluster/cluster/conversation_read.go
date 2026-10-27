@@ -291,7 +291,7 @@ func (s *Server) loadConversationConfigLocal(ctx context.Context, id string, typ
 		state: func(ctx context.Context) (raftgroup.ReadState, error) {
 			return s.slotServer.ReadLeaderState(ctx, slotID)
 		},
-		load: func() (wkdb.ChannelClusterConfig, error) { return s.db.GetChannelClusterConfig(id, typ) },
+		load: func() (wkdb.ChannelClusterConfig, error) { return s.fencedChannelClusterConfig(id, typ) },
 	}
 	cfg, err := reader.read(ctx)
 	if err != nil {

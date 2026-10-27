@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
-	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
@@ -15,7 +15,7 @@ func (s *Store) AddOrUpdateConversations(conversations []wkdb.Conversation) erro
 	slotConversationsMap := make(map[uint32][]wkdb.Conversation)
 
 	for _, c := range conversations {
-		slotId := s.opts.Slot.GetSlotId(c.Uid)
+		slotId := s.uidSlot(c.Uid)
 		slotConversationsMap[slotId] = append(slotConversationsMap[slotId], c)
 	}
 
@@ -74,7 +74,7 @@ func (s *Store) AddOrUpdateUserConversations(uid string, conversations []wkdb.Co
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(uid)
+	slotId := s.uidSlot(uid)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
@@ -86,7 +86,9 @@ func (s *Store) AddConversationsIfNotExist(conversations []wkdb.Conversation) er
 	slotConversationsMap := make(map[uint32][]wkdb.Conversation)
 
 	for _, c := range conversations {
-		exist, err := s.wdb.ExistConversation(c.Uid, c.ChannelId, c.ChannelType)
+		exist, err := icluster.FencedReadSlots(s.fence(), s.conversationSlots(c.Uid, c.ChannelId, c.ChannelType), func() (bool, error) {
+			return s.wdb.ExistConversation(c.Uid, c.ChannelId, c.ChannelType)
+		})
 		if err != nil {
 			return err
 		}
@@ -96,7 +98,7 @@ func (s *Store) AddConversationsIfNotExist(conversations []wkdb.Conversation) er
 		if c.Id == 0 {
 			c.Id = s.wdb.NextPrimaryKey()
 		}
-		slotId := s.opts.Slot.GetSlotId(c.Uid)
+		slotId := s.uidSlot(c.Uid)
 		slotConversationsMap[slotId] = append(slotConversationsMap[slotId], c)
 	}
 
@@ -133,7 +135,7 @@ func (s *Store) UpdateConversationDeletedAtMsgSeq(uid string, channelId string, 
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(uid)
+	slotId := s.uidSlot(uid)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	if err != nil {
 		s.Error("UpdateConversationDeletedAtMsgSeq failed", zap.Error(err), zap.String("uid", uid), zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Uint64("deletedAtMsgSeq", deletedAtMsgSeq))
@@ -190,7 +192,7 @@ func (s *Store) DeleteConversation(uid string, channelID string, channelType uin
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(uid)
+	slotId := s.uidSlot(uid)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
@@ -206,7 +208,7 @@ func (s *Store) DeleteConversationAsync(uid string, channelID string, channelTyp
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(uid)
+	slotId := s.uidSlot(uid)
 	_, err = s.opts.Slot.Propose(slotId, cmdData)
 	return err
 }
@@ -218,26 +220,33 @@ func (s *Store) DeleteConversations(uid string, channels []wkdb.Channel) error {
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(uid)
+	slotId := s.uidSlot(uid)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
 
 func (s *Store) GetConversations(uid string) ([]wkdb.Conversation, error) {
-	return s.wdb.GetConversations(uid)
+	return s.readConversations(uid, func() ([]wkdb.Conversation, error) {
+		return s.wdb.GetConversations(uid)
+	})
 }
 
 func (s *Store) GetConversationsByType(uid string, tp wkdb.ConversationType) ([]wkdb.Conversation, error) {
-	return s.wdb.GetConversationsByType(uid, tp)
+	return s.readConversations(uid, func() ([]wkdb.Conversation, error) {
+		return s.wdb.GetConversationsByType(uid, tp)
+	})
 }
 
 func (s *Store) GetConversation(uid string, channelId string, channelType uint8) (wkdb.Conversation, error) {
-	return s.wdb.GetConversation(uid, channelId, channelType)
+	return icluster.FencedReadSlots(s.fence(), s.conversationSlots(uid, channelId, channelType), func() (wkdb.Conversation, error) {
+		return s.wdb.GetConversation(uid, channelId, channelType)
+	})
 }
 
 func (s *Store) GetLastConversations(uid string, tp wkdb.ConversationType, updatedAt uint64, excludeChannelTypes []uint8, limit int) ([]wkdb.Conversation, error) {
-
-	return s.wdb.GetLastConversations(uid, tp, updatedAt, excludeChannelTypes, limit)
+	return s.readConversations(uid, func() ([]wkdb.Conversation, error) {
+		return s.wdb.GetLastConversations(uid, tp, updatedAt, excludeChannelTypes, limit)
+	})
 }
 
 func (s *Store) GetChannelLastMessageSeq(channelId string, channelType uint8) (uint64, error) {
@@ -258,15 +267,8 @@ func (s *Store) UpdateConversationIfSeqGreaterAsync(uid string, channelId string
 		return err
 	}
 
-	// 根据channelType判断获取slotId的方式
-	var slotId uint32
-	if channelType == wkproto.ChannelTypePerson {
-		// 个人频道根据uid获取slotId
-		slotId = s.opts.Slot.GetSlotId(uid)
-	} else {
-		// 其他频道根据channelId获取slotId
-		slotId = s.opts.Slot.GetSlotId(channelId)
-	}
+	// 个人频道根据uid获取slotId，其他频道根据channelId获取slotId
+	slotId := s.conversationSeqSlot(uid, channelId, channelType)
 
 	_, err = s.opts.Slot.Propose(slotId, cmdData)
 	if err != nil {

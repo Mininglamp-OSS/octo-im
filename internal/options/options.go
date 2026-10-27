@@ -244,6 +244,11 @@ type Options struct {
 		SlotReactorSubCount         int // 槽reactor sub的数量
 
 		PongMaxTick int // 节点超过多少tick没有回应心跳就认为是掉线
+
+		// SlotDivergeStrictExtension makes slot elections ignore responders
+		// without a valid divergence extension (default true). Disable only
+		// as an emergency override; see docs/slot-divergence-containment.md.
+		SlotDivergeStrictExtension bool
 	}
 
 	Trace struct {
@@ -580,6 +585,7 @@ func New(op ...Option) *Options {
 			ChannelDestoryAfterIdleTick int
 			SlotReactorSubCount         int
 			PongMaxTick                 int
+			SlotDivergeStrictExtension  bool
 		}{
 			NodeId:                      1001,
 			Addr:                        "tcp://0.0.0.0:11110",
@@ -598,6 +604,7 @@ func New(op ...Option) *Options {
 			ChannelDestoryAfterIdleTick: (1000 / 150) * 60 * 10, // 10分钟 (150表示tick间隔时间)
 			SlotReactorSubCount:         16,
 			PongMaxTick:                 30,
+			SlotDivergeStrictExtension:  true,
 		},
 		Trace: struct {
 			ServiceName      string
@@ -1008,6 +1015,7 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.Cluster.ChannelDestoryAfterIdleTick = o.getInt("cluster.channelDestoryAfterIdleTick", o.Cluster.ChannelDestoryAfterIdleTick)
 	o.Cluster.SlotReactorSubCount = o.getInt("cluster.slotReactorSubCount", o.Cluster.SlotReactorSubCount)
 	o.Cluster.APIUrl = o.getString("cluster.apiUrl", o.Cluster.APIUrl)
+	o.Cluster.SlotDivergeStrictExtension = o.getBool("cluster.slotDivergeStrictExtension", o.Cluster.SlotDivergeStrictExtension)
 
 	// =================== trace ===================
 	o.Trace.ServiceName = o.getString("trace.serviceName", o.Trace.ServiceName)

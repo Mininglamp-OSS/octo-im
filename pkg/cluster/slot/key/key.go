@@ -83,3 +83,12 @@ func NewHardStateKey(shardNo string) []byte {
 	k[0], k[1] = 0x5, 0x5
 	return k
 }
+
+// NewDivergedMarkerKey is the per-slot divergence marker. It is written once,
+// with a synced single-key write, when the replica is quarantined, and is never
+// cleared by this process.
+func NewDivergedMarkerKey(shardNo string) []byte {
+	k := NewAppliedIndexKey(shardNo)
+	k[0], k[1] = 0x6, 0x6
+	return k
+}

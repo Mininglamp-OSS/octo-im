@@ -57,6 +57,8 @@ type Node struct {
 
 	idleTick atomic.Int64 // KeepAlive is also called by proposal goroutines
 
+	divergeState atomic.Uint32 // divergeNone, divergeQuarantined or divergeFailStopped; see node_diverge.go
+
 	proposeRejects proposeRejectStats // 被拒绝的本地提案
 
 	syncing             bool // 正在同步
@@ -69,7 +71,10 @@ func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Opti
 		Log:  wklog.NewWKLog(fmt.Sprintf("raft.node[%s]", opts.Key)),
 	}
 
-	if raftState.AppliedIndex > raftState.LastLogIndex {
+	// Storage that supports containment reports applied > last as Diverged
+	// and the replica opens quarantined. Any other storage keeps the old
+	// invariant check.
+	if raftState.AppliedIndex > raftState.LastLogIndex && !raftState.Diverged {
 		n.Panic("applied index > last log index", zap.Uint64("appliedIndex", raftState.AppliedIndex), zap.Uint64("lastLogIndex", raftState.LastLogIndex))
 	}
 
@@ -101,6 +106,14 @@ func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Opti
 		if n.cfg.Replicas[0] == opts.NodeId {
 			onlySelf = true
 		}
+	}
+
+	if raftState.Diverged {
+		if len(n.cfg.Replicas) > 0 {
+			n.BecomeFollower(n.cfg.Term, None)
+		}
+		n.quarantine(divergeQuarantined, "opened with a divergence marker or applied index beyond the last log index")
+		return n
 	}
 
 	if onlySelf {
@@ -141,6 +154,9 @@ func (n *Node) HasReady() bool {
 	if n.hasUnpersistedHardState() {
 		return true
 	}
+	if n.Diverged() {
+		return len(n.events) > 0
+	}
 	if !n.storeHeldForTruncate() && n.queue.hasNextStoreLogs() {
 		return true
 	}
@@ -167,6 +183,13 @@ func (n *Node) Ready() []types.Event {
 			return nil
 		}
 		n.persistedHardState = state
+	}
+
+	if n.Diverged() {
+		// A quarantined replica stores and applies nothing.
+		events := n.events
+		n.events = n.events[:0]
+		return events
 	}
 
 	if !n.storeHeldForTruncate() && n.queue.hasNextStoreLogs() {

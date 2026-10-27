@@ -217,6 +217,7 @@ func New(opts *options.Options) *Server {
 			cluster.WithAuth(s.opts.Auth),
 			cluster.WithIsCmdChannel(s.opts.IsCmdChannel),
 			cluster.WithAppVersion(version.Version),
+			cluster.WithSlotDivergeStrictExtension(s.opts.Cluster.SlotDivergeStrictExtension),
 		),
 
 		// cluster.WithOnChannelMetaApply(func(channelID string, channelType uint8, logs []replica.Log) error {

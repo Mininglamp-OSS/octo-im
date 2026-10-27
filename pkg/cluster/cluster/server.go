@@ -173,6 +173,7 @@ func New(opts *Options) *Server {
 
 func (s *Server) Start() error {
 
+	registerElectionMetrics()
 	s.channelKeyLock.StartCleanLoop()
 
 	err := s.db.Open()

@@ -58,6 +58,12 @@ type Options struct {
 	AppVersion string
 
 	IsCmdChannel func(channel string) bool
+
+	// SlotDivergeStrictExtension makes a slot election treat a responder
+	// without a well-formed divergence extension as unknown: it neither
+	// counts towards the quorum nor can be elected. Turning it off is an
+	// emergency override for mixed-version clusters only.
+	SlotDivergeStrictExtension bool
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -78,7 +84,8 @@ func NewOptions(opt ...Option) *Options {
 			SlotShardNum:     8,
 			SlotMemTableSize: 16 * 1024 * 1024,
 		},
-		PageSize: 20,
+		PageSize:                   20,
+		SlotDivergeStrictExtension: true,
 	}
 	for _, o := range opt {
 		o(opts)
@@ -211,5 +218,11 @@ func WithAppVersion(appVersion string) Option {
 func WithIsCmdChannel(isCmdChannel func(channel string) bool) Option {
 	return func(o *Options) {
 		o.IsCmdChannel = isCmdChannel
+	}
+}
+
+func WithSlotDivergeStrictExtension(strict bool) Option {
+	return func(o *Options) {
+		o.SlotDivergeStrictExtension = strict
 	}
 }

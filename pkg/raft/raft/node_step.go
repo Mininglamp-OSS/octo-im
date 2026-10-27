@@ -7,6 +7,23 @@ import (
 )
 
 func (n *Node) Step(e types.Event) error {
+	// Storage refused a truncation or an append that would have left the
+	// applied state inconsistent with the log. Quarantine before anything
+	// else can act on the in-memory log.
+	// Only the in-process storage verdict counts. From, Type and Reason are
+	// all peer-controlled on the wire and are not provenance.
+	if state, ok := localDivergence(e); ok {
+		if e.Type == types.StoreResp {
+			n.queue.appending = false
+		} else {
+			n.truncating = false
+		}
+		n.quarantine(state, "storage refused "+e.Type.String())
+		return nil
+	}
+	if n.Diverged() {
+		return n.stepDiverged(e)
+	}
 	// Election membership discovery does not carry a term or cast a vote.
 	// Process it separately so a still-local learner cannot raise our term.
 	if (e.Type == types.ConfigReq || e.Type == types.ConfigResp) && e.Reason == types.ReasonOnlySync {
@@ -653,6 +670,11 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 	if isLearner {
 		// 如果迁移的源节点是领导者，那么学习者必须完全追上领导者的日志
 		if n.cfg.MigrateFrom == n.cfg.Leader { // 学习者转领导者
+			if n.opts.LeaderRoleSwitchDisabled {
+				// The hand-off would keep the term. Leadership moves only by
+				// election; the learner keeps catching up meanwhile.
+				return
+			}
 			if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
 				syncInfo.roleSwitching = true // 学习者转让中
 				// 发送学习者转为领导者
@@ -677,6 +699,9 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 			}
 		}
 	} else if n.cfg.MigrateFrom == n.cfg.Leader && n.cfg.MigrateTo == e.From { // // 追随者转为领导者
+		if n.opts.LeaderRoleSwitchDisabled {
+			return
+		}
 		if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
 			syncInfo.roleSwitching = true
 			// 发送追随者转为领导者

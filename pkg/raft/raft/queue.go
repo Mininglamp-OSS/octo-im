@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -99,8 +100,34 @@ func (r *queue) append(incomingLogs ...types.Log) error {
 			zap.Uint64("overlapSize", overlapSize),
 			zap.Int("incomingLogCount", incomingLogCount))
 
-		// 5a. 完全重复的日志：新日志完全在已有范围内
-		if incomingLastIndex <= r.lastLogIndex {
+		// Entries above storedIndex are still held here and are compared on
+		// (Term, Id, Data); only the first mismatch is replaced. Such a cut
+		// is always above storedIndex, hence above appliedIndex.
+		conflict, conflictAt := r.firstInMemoryConflict(incomingLogs)
+
+		if incomingFirstIndex > r.storedIndex {
+			if !conflict {
+				if incomingLastIndex <= r.lastLogIndex {
+					r.Info("ignoring completely duplicate logs",
+						zap.Uint64("incomingRangeFrom", incomingFirstIndex),
+						zap.Uint64("incomingRangeTo", incomingLastIndex),
+						zap.String("action", "no_change_needed"))
+					return nil
+				}
+				// Identical overlap: append only the new tail.
+				return r.append(incomingLogs[r.lastLogIndex-incomingFirstIndex+1:]...)
+			}
+			r.Warn("replacing unstored conflicting logs",
+				zap.Uint64("conflictIndex", conflictAt),
+				zap.Uint64("storedIndex", r.storedIndex),
+				zap.Uint64("appliedIndex", r.appliedIndex))
+			r.truncateLogTo(conflictAt - 1)
+			return r.append(incomingLogs[conflictAt-incomingFirstIndex:]...)
+		}
+
+		// The overlap reaches entries that are already stored and not held
+		// here. Fully covered and identical where comparable: nothing to do.
+		if incomingLastIndex <= r.lastLogIndex && !conflict {
 			r.Info("ignoring completely duplicate logs",
 				zap.Uint64("incomingRangeFrom", incomingFirstIndex),
 				zap.Uint64("incomingRangeTo", incomingLastIndex),
@@ -110,13 +137,18 @@ func (r *queue) append(incomingLogs ...types.Log) error {
 			return nil
 		}
 
-		// 5b. 部分重叠：需要截断现有日志并追加新日志
+		// Otherwise the stored range is resubmitted to storage. Storage
+		// compares every entry at or below the applied index on
+		// (Term, Id, Data): equal entries are skipped, a conflicting one
+		// rejects the whole batch before any write and quarantines the
+		// replica. No applied entry can be rewritten from here.
 		truncateToIndex := incomingFirstIndex - 1
 		originalQueueSize := len(r.logs)
 
 		r.Warn("resolving log conflict by truncation",
 			zap.Uint64("truncateToIndex", truncateToIndex),
 			zap.Uint64("originalQueueLastIndex", r.lastLogIndex),
+			zap.Uint64("appliedIndex", r.appliedIndex),
 			zap.Int("originalQueueSize", originalQueueSize),
 			zap.String("action", "truncate_and_reappend"))
 
@@ -154,6 +186,25 @@ func (r *queue) append(incomingLogs ...types.Log) error {
 
 	return fmt.Errorf("unexpected append scenario: queue_last=%d, incoming_first=%d, incoming_last=%d, count=%d",
 		r.lastLogIndex, incomingFirstIndex, incomingLastIndex, incomingLogCount)
+}
+
+// firstInMemoryConflict compares the incoming entries that overlap the
+// unstored range (storedIndex, lastLogIndex] with the entries held here. It
+// returns the index of the first entry that differs on (Term, Id, Data).
+func (r *queue) firstInMemoryConflict(incoming []types.Log) (bool, uint64) {
+	for _, in := range incoming {
+		if in.Index > r.lastLogIndex {
+			break
+		}
+		if in.Index <= r.storedIndex {
+			continue
+		}
+		held := r.logs[in.Index-r.storedIndex-1]
+		if held.Index != in.Index || held.Term != in.Term || held.Id != in.Id || !bytes.Equal(held.Data, in.Data) {
+			return true, in.Index
+		}
+	}
+	return false, 0
 }
 
 // appendLeaderLocal appends logs proposed by this leader. Unlike append, which

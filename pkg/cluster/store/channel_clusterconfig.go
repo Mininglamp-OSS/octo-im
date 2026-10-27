@@ -17,7 +17,7 @@ func (s *Store) SaveChannelClusterConfig(cfg wkdb.ChannelClusterConfig) (version
 	if err != nil {
 		return 0, err
 	}
-	slotId := s.opts.Slot.GetSlotId(cfg.ChannelId)
+	slotId := s.channelSlot(cfg.ChannelId)
 	resp, err := s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	if err != nil {
 		return 0, err
