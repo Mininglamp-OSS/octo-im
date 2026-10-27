@@ -64,7 +64,7 @@ func TestDistributionStopRejectsLateRetriesAndAdmissions(t *testing.T) {
 	<-handler.entered
 	stopped := make(chan struct{})
 	go func() { pool.Stop(); close(stopped) }()
-	t.Cleanup(func() { close(handler.proceed); <-stopped })
+	t.Cleanup(func() { close(handler.proceed); <-stopped; require.EqualValues(t, 2, released.Load()) })
 	p := pool.pollerByChannel("room", 2)
 	require.Eventually(t, func() bool { p.RLock(); defer p.RUnlock(); return p.stopped }, 500*time.Millisecond, time.Millisecond,
 		"a stopping pool must reject work before waiting for active workers")

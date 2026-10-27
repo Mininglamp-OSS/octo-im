@@ -4,6 +4,7 @@ import (
 	"context"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/forward"
@@ -70,9 +71,20 @@ func TestDistributionReviewCanonicalRetryDoesNotDiscardFreshMessage(t *testing.T
 }
 
 func TestDistributionReviewRecipientSnapshotUpdatesConversation(t *testing.T) {
-	for _, channelType := range []uint8{wkproto.ChannelTypePerson, wkproto.ChannelTypeCustomerService} {
-		t.Run(string(rune('0'+channelType)), func(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		channelType uint8
+		cmd         bool
+	}{
+		{"person", wkproto.ChannelTypePerson, false}, {"customer", wkproto.ChannelTypeCustomerService, false}, {"cmd", wkproto.ChannelTypeGroup, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			m, _ := versionTestFixture(t)
+			channelType, channelID, conversationType := tc.channelType, "room", wkdb.ConversationTypeChat
+			if tc.cmd {
+				channelID = options.G.OrginalConvertCmdChannel(channelID)
+				conversationType = wkdb.ConversationTypeCMD
+			}
 			previousChannel, previousConversations := eventbus.Channel, service.ConversationManager
 			t.Cleanup(func() { eventbus.Channel, service.ConversationManager = previousChannel, previousConversations })
 			sink := &forwardChannel{}
@@ -80,18 +92,71 @@ func TestDistributionReviewRecipientSnapshotUpdatesConversation(t *testing.T) {
 			conversations := manager.NewConversationManager(1)
 			service.ConversationManager = conversations
 			m.RemoveTag("A")
-			request := &distributionRequest{source: 1, target: 2, channel: "room", channelType: channelType, key: "A", uids: []string{"fixed"},
+			request := &distributionRequest{source: 1, target: 2, channel: channelID, channelType: channelType, key: "A", uids: []string{"fixed"},
 				events: eventbus.EventBatch{{Type: eventbus.EventChannelDistribute, MessageId: 101, MessageSeq: 1, TagKey: "A", Conn: &eventbus.Conn{Uid: "sender"}, Frame: &wkproto.SendPacket{}}}}
 			body, err := request.encode()
 			require.NoError(t, err)
 			h := NewHandler()
 			require.Equal(t, proto.StatusOK, h.acceptDistribution(body))
-			h.distributeCommon(&eventbus.ChannelContext{ChannelId: "room", ChannelType: channelType, SlotLeaderId: 1, Events: sink.events})
-			channels, err := conversations.GetUserChannelsFromCache("fixed", wkdb.ConversationTypeChat)
+			h.distributeCommon(&eventbus.ChannelContext{ChannelId: channelID, ChannelType: channelType, SlotLeaderId: 1, Events: sink.events})
+			channels, err := conversations.GetUserChannelsFromCache("fixed", conversationType)
 			require.NoError(t, err)
-			require.Equal(t, []wkproto.Channel{{ChannelID: "room", ChannelType: channelType}}, channels)
+			require.Equal(t, []wkproto.Channel{{ChannelID: channelID, ChannelType: channelType}}, channels)
+			require.Nil(t, m.Get("A"), "conversation updates must not publish unbounded receiver cache entries")
 		})
 	}
+}
+
+func TestDistributionReviewAmbiguousAdmissionNeverDowngrades(t *testing.T) {
+	versionTestFixture(t)
+	options.G.Cluster.NodeId = 1
+	probes, admissions := 0, 0
+	cluster := &reviewDistributionCluster{request: func(_ context.Context, _ uint64, path string, _ []byte) (*proto.Response, error) {
+		if path == distributionCapabilityPath {
+			probes++
+			if probes > 1 {
+				return nil, context.DeadlineExceeded
+			}
+			return &proto.Response{Status: proto.StatusOK}, nil
+		}
+		admissions++
+		if admissions == 1 {
+			return nil, context.DeadlineExceeded
+		}
+		return &proto.Response{Status: proto.StatusOK}, nil
+	}}
+	service.Cluster = cluster
+	h := NewHandler()
+	ctx := progressContext(&types.Tag{Key: "A", Nodes: []*types.Node{{LeaderId: 2, Uids: []string{"fixed"}}}})
+	h.distributeCommon(ctx)
+	require.Len(t, ctx.RetryEvents, 1)
+	h.forwardCapabilities = forward.CapabilityCache{} // Simulate expiry before the next retry.
+	ctx.Events, ctx.RetryEvents = ctx.RetryEvents, nil
+	h.distributeCommon(ctx)
+	require.Empty(t, ctx.RetryEvents)
+	require.Equal(t, 1, probes)
+	require.Equal(t, 2, admissions)
+	require.Zero(t, cluster.sends, "an ambiguous snapshot admission must never switch to legacy")
+}
+
+func TestDistributionReviewCapabilityCacheIsRouteSpecific(t *testing.T) {
+	versionTestFixture(t)
+	options.G.Cluster.NodeId = 1
+	cluster := &reviewDistributionCluster{request: func(_ context.Context, _ uint64, path string, _ []byte) (*proto.Response, error) {
+		if path == forward.CapabilityPath {
+			return &proto.Response{Status: proto.StatusOK}, nil
+		}
+		return nil, context.DeadlineExceeded
+	}}
+	service.Cluster = cluster
+	h := NewHandler()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.True(t, h.forwardCapabilities.Supports(ctx, 2))
+	distribution := progressContext(&types.Tag{Key: "A", Nodes: []*types.Node{{LeaderId: 2, Uids: []string{"fixed"}}}})
+	h.distributeCommon(distribution)
+	require.Empty(t, distribution.RetryEvents)
+	require.Equal(t, 1, cluster.sends, "a generic forwarding capability does not imply snapshot distribution support")
 }
 
 func TestDistributionReviewEmptyOnlineVersionDoesNotBlockTail(t *testing.T) {

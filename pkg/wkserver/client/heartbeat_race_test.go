@@ -9,6 +9,8 @@ import (
 
 func TestHeartbeatCountersConcurrentTrafficAndTick(t *testing.T) {
 	c := New("tcp://127.0.0.1:1", func(o *Options) { o.HeartbeatTick = 1 << 30; o.HeartbeatTimeoutTick = 1 << 30 })
+	defer c.cancel()
+	defer c.pool.Release()
 	// Exercise the actual traffic reset and ticker concurrently without opening
 	// a network connection or reaching heartbeat/reconnect thresholds.
 	var workers sync.WaitGroup
