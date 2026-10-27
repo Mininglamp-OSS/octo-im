@@ -49,7 +49,7 @@ func (o *fakeOwner) stop(ctx context.Context) error {
 }
 
 type shutdownFixture struct {
-	config, slot, channel *fakeOwner
+	workers, config, slot, channel *fakeOwner
 	listener              net.Listener
 	independent, closes   int
 	closeErr              error
@@ -62,12 +62,14 @@ func newShutdownFixture(t *testing.T) *shutdownFixture {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	f := &shutdownFixture{
+		workers:  newFakeOwner(raft.ErrIncompleteQuiescence).finish(nil),
 		config:   newFakeOwner(raft.ErrIncompleteQuiescence),
 		slot:     newFakeOwner(raftgroup.ErrIncompleteQuiescence),
 		channel:  newFakeOwner(raftgroup.ErrIncompleteQuiescence),
 		listener: ln,
 	}
 	f.shutdown = &ownerShutdown{
+		workers: func(ctx context.Context) error { return f.workers.stop(ctx) },
 		config:  func(ctx context.Context) error { return f.config.stop(ctx) },
 		slot:    func(ctx context.Context) error { return f.slot.stop(ctx) },
 		channel: func(ctx context.Context) error { return f.channel.stop(ctx) },
@@ -125,6 +127,24 @@ func TestServerShutdownOwnership(t *testing.T) {
 		f.config.finish(nil)
 		require.NoError(t, f.stop(time.Second), "a later Stop finishes the pending handoff")
 		require.Equal(t, []int{1, 1}, []int{f.slot.calls, f.channel.calls})
+		require.Equal(t, []int{1, 1}, []int{f.independent, f.closes})
+	})
+
+	t.Run("cluster workers timeout", func(t *testing.T) {
+		f := newShutdownFixture(t)
+		f.workers = newFakeOwner(raft.ErrIncompleteQuiescence)
+		f.config.finish(nil)
+		f.slot.finish(nil)
+		f.channel.finish(nil)
+		err := f.stop(20 * time.Millisecond)
+		require.ErrorIs(t, err, raft.ErrIncompleteQuiescence)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Equal(t, []int{0, 0, 0}, []int{f.config.calls, f.slot.calls, f.channel.calls}, "no owner stops under live cluster workers")
+		require.Equal(t, []int{1, 0}, []int{f.independent, f.closes})
+		f.requireListenerReleased(t)
+		f.workers.finish(nil)
+		require.NoError(t, f.stop(time.Second), "a later Stop waits on the same join")
+		require.Equal(t, []int{1, 1, 1}, []int{f.config.calls, f.slot.calls, f.channel.calls})
 		require.Equal(t, []int{1, 1}, []int{f.independent, f.closes})
 	})
 
