@@ -155,7 +155,12 @@ func (m *message) send(c *wkhttp.Context) {
 
 		}
 
-		clientMsgNo := fmt.Sprintf("%s0", wkutil.GenUUID())
+		// A replay must send the same subscribers in the same order: they
+		// name the temporary channel the key is scoped to.
+		clientMsgNo := req.ClientMsgNo
+		if strings.TrimSpace(clientMsgNo) == "" {
+			clientMsgNo = fmt.Sprintf("%s0", wkutil.GenUUID())
+		}
 		// 发送消息
 		_, err := sendMessageToChannel(req, tmpChannelId, tmpChannelType, clientMsgNo)
 		if err != nil {
@@ -314,6 +319,10 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 		FromUID     string              `json:"from_uid"`    // 发送者UID
 		Subscribers []string            `json:"subscribers"` // 订阅者 如果此字段有值，表示消息只发给指定的订阅者
 		Payload     []byte              `json:"payload"`     // 消息内容
+		// ClientMsgNo is the batch retry key. Each subscriber's message is
+		// sent with it in its own person channel, so (sender, subscriber,
+		// key) identifies that message regardless of batch order or subset.
+		ClientMsgNo string `json:"client_msg_no"`
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
@@ -332,6 +341,16 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 		c.ResponseError(errors.New("payload不能为空！"))
 		return
 	}
+	// Without a key, one is generated for the batch. A keyless batch that
+	// lists a subscriber twice keeps sending one message per entry, so it gets
+	// a fresh key per message and no reusable key is returned.
+	batchKey := req.ClientMsgNo
+	if strings.TrimSpace(batchKey) == "" {
+		batchKey = ""
+		if !hasDuplicate(req.Subscribers) {
+			batchKey = fmt.Sprintf("%s0", wkutil.GenUUID())
+		}
+	}
 	// Each subscriber is a separate channel; wait for them concurrently.
 	errs := make([]error, len(req.Subscribers))
 	slots := make(chan struct{}, sendBatchConcurrency)
@@ -341,7 +360,10 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 		slots <- struct{}{}
 		go func(i int, subscriber string) {
 			defer func() { <-slots; wg.Done() }()
-			clientMsgNo := fmt.Sprintf("%s0", wkutil.GenUUID())
+			clientMsgNo := batchKey
+			if clientMsgNo == "" {
+				clientMsgNo = fmt.Sprintf("%s0", wkutil.GenUUID())
+			}
 			_, errs[i] = sendMessageToChannel(messageSendReq{
 				Header:      req.Header,
 				FromUID:     req.FromUID,
@@ -367,19 +389,38 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 	}
 	if len(unknownUids) > 0 {
 		// A subscriber's message may still commit; never report the batch as OK.
-		c.JSON(http.StatusGatewayTimeout, gin.H{
+		resp := gin.H{
 			"msg":          errSendOutcomeUnknown.Error(),
 			"status":       http.StatusGatewayTimeout,
 			"fail_uids":    failUids,
 			"reason":       reasons,
 			"unknown_uids": unknownUids,
-		})
+		}
+		if batchKey != "" {
+			resp["client_msg_no"] = batchKey
+		}
+		c.JSON(http.StatusGatewayTimeout, resp)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"fail_uids": failUids,
 		"reason":    reasons,
-	})
+	}
+	if batchKey != "" {
+		resp["client_msg_no"] = batchKey
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func hasDuplicate(values []string) bool {
+	seen := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		if _, ok := seen[v]; ok {
+			return true
+		}
+		seen[v] = struct{}{}
+	}
+	return false
 }
 
 // 消息同步

@@ -64,7 +64,10 @@ durability and Sync/NoSync settings are unchanged.
 
 Error responses include `data.client_msg_no`, including a server-generated
 one, so the caller can retry idempotently. A missing report is never treated as
-success.
+success. This also applies to the `subscribers` form: a supplied nonblank
+`client_msg_no` is used, and one is generated only when it is missing or
+blank. The subscriber list names its temporary channel, so a replay must send
+the same subscribers in the same order with the same key.
 
 The server makes at most three attempts within the budget. It replays only
 after every earlier attempt has reported a retryable result. Attempts share the
@@ -76,7 +79,22 @@ returns 504.
 `/message/sendbatch` waits for all subscribers, with at most 16 in flight. If
 it has only definite failures, it keeps the existing HTTP 200 `fail_uids` and
 `reason` response. If any subscriber's outcome is unknown, it returns HTTP 504,
-with `unknown_uids` listing those subscribers. NoPersist messages are not
+with `unknown_uids` listing those subscribers.
+
+The batch accepts an optional `client_msg_no`, the batch retry key. Every
+subscriber's message is sent with that key in its own person channel, so
+`(sender, subscriber, client_msg_no)` identifies it independently of order and
+of the other subscribers. A blank key counts as missing; the server then
+generates one for the batch. The key is returned as top-level `client_msg_no`
+in both the 200 and the 504 response. To recover, replay with the same
+`from_uid`, payload and key, for the `unknown_uids` or the whole batch in any
+order. Messages that were committed are found, not sent again; reusing the key
+with another payload is a conflicting retry and that subscriber fails as usual
+(listed in `fail_uids`). A subscriber listed twice in a keyed batch names one
+message. A batch without a key that lists a subscriber twice keeps the previous
+behaviour of one message per entry: each gets its own generated key, no
+`client_msg_no` is returned, and such a batch cannot be replayed
+idempotently. NoPersist messages are not
 stored, so they are still acknowledged once queued. Plugin RPC sends keep the
 asynchronous path.
 

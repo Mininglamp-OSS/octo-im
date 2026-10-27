@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -36,19 +37,27 @@ const (
 )
 
 // fakeLeader models the channel idempotency path: one durable message per
-// (sender, client_msg_no); a replay returns the canonical first message.
+// (channel, sender, client_msg_no); a replay returns the canonical first
+// message and a replay with other content is rejected.
 type fakeLeader struct {
 	mu        sync.Mutex
 	registry  *sendresult.Registry
 	behaviors map[string][]attemptBehavior // per channel; the last one repeats
-	durable   map[string]int64             // client_msg_no -> canonical id
+	durable   map[durableKey]durableMessage
 	seq       uint64
 	submitted []*eventbus.Event
 	reports   sync.WaitGroup
 }
 
+type durableKey struct{ channel, sender, clientMsgNo string }
+
+type durableMessage struct {
+	id      int64
+	payload []byte
+}
+
 func newFakeLeader(registry *sendresult.Registry) *fakeLeader {
-	return &fakeLeader{registry: registry, behaviors: map[string][]attemptBehavior{}, durable: map[string]int64{}}
+	return &fakeLeader{registry: registry, behaviors: map[string][]attemptBehavior{}, durable: map[durableKey]durableMessage{}}
 }
 
 func (l *fakeLeader) attempts(channelId string) int {
@@ -78,12 +87,15 @@ func (l *fakeLeader) submit(channelId string, _ uint8, e *eventbus.Event) {
 	if len(plan) > 0 {
 		behavior = plan[min(n, len(plan)-1)]
 	}
+	k := durableKey{packet.ChannelID, e.Conn.Uid, packet.ClientMsgNo}
+	conflict := false
 	commit := func() (int64, uint64) {
-		if id, ok := l.durable[packet.ClientMsgNo]; ok {
-			return id, 1
+		if m, ok := l.durable[k]; ok {
+			conflict = !bytes.Equal(m.payload, packet.Payload)
+			return m.id, 1
 		}
 		l.seq++
-		l.durable[packet.ClientMsgNo] = e.MessageId
+		l.durable[k] = durableMessage{id: e.MessageId, payload: bytes.Clone(packet.Payload)}
 		return e.MessageId, l.seq
 	}
 	res := sendresult.Result{Key: e.MessageId}
@@ -91,6 +103,9 @@ func (l *fakeLeader) submit(channelId string, _ uint8, e *eventbus.Event) {
 	case persistAttempt:
 		res.MessageId, res.MessageSeq = commit()
 		res.Outcome = sendresult.OutcomePersisted
+		if conflict {
+			res = sendresult.Result{Key: e.MessageId, Outcome: sendresult.OutcomeRejected, Reason: wkproto.ReasonNotAllowSend}
+		}
 	case commitLateUnknown:
 		commit()
 		res.Outcome = sendresult.OutcomeUnknown
