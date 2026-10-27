@@ -84,11 +84,23 @@ func (c *ConversationManager) Push(channelId string, channelType uint8, tagKey s
 	if lastMsgSeq == 0 {
 		return
 	}
+	push := func() {
+		updater := c.updaters[c.getShardIndex(channelId)]
+		if state := events[0].Distribution; state != nil && state.Snapshot != nil && state.Snapshot.Key == tagKey {
+			// Received snapshots need not exist in the tag cache. Consume their
+			// exact local recipients synchronously, before the worker releases them.
+			uids := state.Snapshot.GetNodeUsers(options.G.Cluster.NodeId)
+			if len(uids) > 0 {
+				updater.pushWithRecipients(channelId, channelType, tagKey, lastMsgSeq, senderReadSeqs, uids)
+			}
+			return
+		}
+		updater.push(channelId, channelType, tagKey, lastMsgSeq, senderReadSeqs)
+	}
 
 	// 如果是 CMD 频道，则直接更新会话
 	if options.G.IsCmdChannel(channelId) {
-		index := c.getShardIndex(channelId)
-		c.updaters[index].push(channelId, channelType, tagKey, lastMsgSeq, senderReadSeqs)
+		push()
 		return
 	}
 
@@ -100,8 +112,7 @@ func (c *ConversationManager) Push(channelId string, channelType uint8, tagKey s
 	// 客服频道或个人频道在收到首条消息时需要更新会话
 	if channelType == wkproto.ChannelTypeCustomerService || channelType == wkproto.ChannelTypePerson {
 		if firstMsgSeq == 1 {
-			index := c.getShardIndex(channelId)
-			c.updaters[index].push(channelId, channelType, tagKey, lastMsgSeq, senderReadSeqs)
+			push()
 		}
 	}
 }
@@ -284,6 +295,10 @@ func newConversationUpdater(client *ingress.Client) *conversationUpdater {
 
 // push 添加或更新频道会话信息
 func (c *conversationUpdater) push(channelId string, channelType uint8, tagKey string, lastMsgSeq uint64, senderReadSeqs map[string]uint64) {
+	c.pushWithRecipients(channelId, channelType, tagKey, lastMsgSeq, senderReadSeqs, nil)
+}
+
+func (c *conversationUpdater) pushWithRecipients(channelId string, channelType uint8, tagKey string, lastMsgSeq uint64, senderReadSeqs map[string]uint64, nodeUsers []string) {
 	key := wkutil.ChannelToKey(channelId, channelType)
 
 	c.Lock()
@@ -296,19 +311,20 @@ func (c *conversationUpdater) push(channelId string, channelType uint8, tagKey s
 		}
 	}
 
-	tag := service.TagManager.Get(tagKey)
-	if tag == nil {
-		// 订阅者变更会给频道的tag换新key，变更前开始的投递拿的还是旧key，这里改用频道当前的tag
-		if channelTagKey := service.TagManager.GetChannelTag(channelId, channelType); channelTagKey != "" && channelTagKey != tagKey {
-			tag = service.TagManager.Get(channelTagKey)
+	if nodeUsers == nil {
+		tag := service.TagManager.Get(tagKey)
+		if tag == nil {
+			// 订阅者变更会给频道的tag换新key，变更前开始的投递拿的还是旧key，这里改用频道当前的tag
+			if channelTagKey := service.TagManager.GetChannelTag(channelId, channelType); channelTagKey != "" && channelTagKey != tagKey {
+				tag = service.TagManager.Get(channelTagKey)
+			}
 		}
+		if tag == nil {
+			c.Warn("tag not found, conversation not updated", zap.String("tagKey", tagKey), zap.String("channelId", channelId))
+			return
+		}
+		nodeUsers = tag.GetNodeUsers(options.G.Cluster.NodeId)
 	}
-	if tag == nil {
-		c.Warn("tag not found, conversation not updated", zap.String("tagKey", tagKey), zap.String("channelId", channelId))
-		return
-	}
-
-	nodeUsers := tag.GetNodeUsers(options.G.Cluster.NodeId)
 	if len(nodeUsers) == 0 {
 		return
 	}

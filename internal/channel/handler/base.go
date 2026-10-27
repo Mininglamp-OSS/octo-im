@@ -1,7 +1,10 @@
 package handler
 
 import (
+	"container/list"
 	"context"
+	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/common"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -15,6 +18,13 @@ import (
 )
 
 type Handler struct {
+	distributionMu        sync.Mutex // distributionMu serializes bounded snapshot admission.
+	distributionReceipts  map[distributionID]*list.Element
+	distributionOrder     *list.List
+	distributionLimit     int              // distributionLimit caps live deduplication receipts.
+	distributionBytes     int              // distributionBytes accounts for queued snapshot reservations.
+	distributionByteLimit int              // distributionByteLimit bounds estimated retained snapshot bytes.
+	distributionNow       func() time.Time // distributionNow supplies a monotonic clock.
 	wklog.Log
 	client              *ingress.Client
 	commonService       *common.Service
@@ -146,6 +156,9 @@ func (h *Handler) onForwardChannelEvent(m *proto.Message) {
 	}
 
 	for _, e := range req.events {
+		if e.Type == eventbus.EventChannelDistribute {
+			e.SourceNodeId = req.fromNode
+		}
 		eventbus.Channel.AddEvent(req.channelId, req.channelType, e)
 	}
 	eventbus.Channel.Advance(req.channelId, req.channelType)

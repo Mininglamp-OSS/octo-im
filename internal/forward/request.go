@@ -38,6 +38,11 @@ type capabilityEntry struct {
 	expiresAt time.Time
 }
 
+type capabilityKey struct {
+	node uint64
+	path string
+}
+
 // Gate reserves only a bounded fraction of an event worker pool for forwarding
 // waits. Admission is non-blocking so a peer outage cannot occupy every shared
 // worker and stall unrelated users or channels.
@@ -93,7 +98,7 @@ func OnlyRetryableSends(events []*eventbus.Event) bool {
 // rolling upgrade without guessing after an admission response is lost.
 type CapabilityCache struct {
 	mu      sync.Mutex
-	entries map[uint64]capabilityEntry
+	entries map[capabilityKey]capabilityEntry
 }
 
 func RegisterCapabilityRoute() {
@@ -103,16 +108,22 @@ func RegisterCapabilityRoute() {
 }
 
 func (c *CapabilityCache) Supports(ctx context.Context, node uint64) bool {
+	return c.SupportsPath(ctx, node, CapabilityPath)
+}
+
+// SupportsPath keeps capabilities for independently versioned routes separate.
+func (c *CapabilityCache) SupportsPath(ctx context.Context, node uint64, path string) bool {
 	now := time.Now()
+	key := capabilityKey{node: node, path: path}
 	c.mu.Lock()
-	if entry, ok := c.entries[node]; ok && now.Before(entry.expiresAt) {
+	if entry, ok := c.entries[key]; ok && now.Before(entry.expiresAt) {
 		c.mu.Unlock()
 		return entry.supported
 	}
 	c.mu.Unlock()
 
 	probeCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-	resp, err := service.Cluster.RequestWithContext(probeCtx, node, CapabilityPath, nil)
+	resp, err := service.Cluster.RequestWithContext(probeCtx, node, path, nil)
 	cancel()
 	supported := err == nil && resp != nil && resp.Status == proto.StatusOK
 	if ctx.Err() != nil {
@@ -121,9 +132,9 @@ func (c *CapabilityCache) Supports(ctx context.Context, node uint64) bool {
 
 	c.mu.Lock()
 	if c.entries == nil {
-		c.entries = make(map[uint64]capabilityEntry)
+		c.entries = make(map[capabilityKey]capabilityEntry)
 	}
-	c.entries[node] = capabilityEntry{supported: supported, expiresAt: now.Add(5 * time.Second)}
+	c.entries[key] = capabilityEntry{supported: supported, expiresAt: now.Add(5 * time.Second)}
 	c.mu.Unlock()
 	return supported
 }

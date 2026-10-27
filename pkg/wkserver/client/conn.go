@@ -36,8 +36,8 @@ type conn struct {
 	addr        string // 服务端地址
 	gcMu        sync.RWMutex
 	gc          gnet.Conn
-	idleTick    int // 空闲tick数
-	timeoutTick int
+	idleTick    atomic.Int64 // Shared by traffic workers and the ticker.
+	timeoutTick atomic.Int64
 
 	no string // 唯一编号，每次重连都会变
 
@@ -172,17 +172,14 @@ func (c *conn) sendAuth() error {
 }
 
 func (c *conn) tick() {
-	c.idleTick++
-
 	// 定时发送心跳
-	if c.idleTick >= c.c.opts.HeartbeatTick {
-		c.idleTick = 0
+	if c.idleTick.Inc() >= int64(c.c.opts.HeartbeatTick) {
+		c.idleTick.Store(0)
 		c.sendHeartbeat()
 	}
 
-	c.timeoutTick++
-	if c.timeoutTick >= c.c.opts.HeartbeatTimeoutTick {
-		c.timeoutTick = 0
+	if c.timeoutTick.Inc() >= int64(c.c.opts.HeartbeatTimeoutTick) {
+		c.timeoutTick.Store(0)
 		c.Foucs("node client heartbeat timeout,reconnect")
 		c.reconnect()
 	}

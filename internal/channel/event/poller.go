@@ -29,6 +29,7 @@ type poller struct {
 
 	contextPool *sync.Pool
 	advanceC    chan struct{}
+	stopped     bool // protected by the poller lock
 }
 
 func newPoller(index int, eventPool *EventPool) *poller {
@@ -63,11 +64,44 @@ func (p *poller) start() error {
 }
 
 func (p *poller) stop() {
+	p.Lock()
+	p.stopped = true
+	p.Unlock()
 	p.stopper.Stop()
+	_ = p.handlePool.ReleaseTimeout(5 * time.Second)
+	var abandoned []*eventbus.Event
+	p.Lock()
+	p.waitlist.readHandlers(&p.tmpHandlers)
+	for _, h := range p.tmpHandlers {
+		h.pending.Lock()
+		abandoned = append(abandoned, h.pending.retryEvents...)
+		h.pending.retryEvents = nil
+		last := h.pending.eventQueue.LastIndex()
+		abandoned = append(abandoned, h.pending.eventQueue.SliceWithSize(h.processingIndex+1, last+1, 0)...)
+		h.pending.eventQueue.TruncateTo(last + 1)
+		h.processingIndex = last
+		h.pending.Unlock()
+	}
+	p.tmpHandlers = nil
+	p.Unlock()
+	// Admission holds its own mutex while enqueueing. Never call its release
+	// callback while holding poller or pending locks in the opposite order.
+	for _, event := range abandoned {
+		if event.Distribution != nil {
+			event.Distribution.Finish()
+		}
+	}
 }
 
 func (p *poller) addEvent(channelId string, channelType uint8, event *eventbus.Event) {
 	p.Lock()
+	if p.stopped {
+		p.Unlock()
+		if event.Distribution != nil {
+			event.Distribution.Finish()
+		}
+		return
+	}
 	defer p.Unlock()
 	h := p.handler(channelId, channelType)
 	if h == nil {

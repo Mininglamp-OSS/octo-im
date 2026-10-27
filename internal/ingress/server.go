@@ -11,7 +11,6 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
@@ -180,6 +179,15 @@ func (i *Ingress) handleUpdateTag(c *wkserver.Context) {
 	// 	realFakeChannelId = options.G.CmdChannelConvertOrginalChannel(req.ChannelId)
 	// }
 
+	if req.ChannelTag {
+		if err := service.TagManager.UpdateChannelTag(req.ChannelId, req.ChannelType, req.Uids, req.Remove); err != nil {
+			c.WriteErr(err)
+			return
+		}
+		c.WriteOk()
+		return
+	}
+
 	tagKey := req.TagKey
 	if tagKey == "" {
 		if req.ChannelId != "" {
@@ -199,14 +207,7 @@ func (i *Ingress) handleUpdateTag(c *wkserver.Context) {
 					i.Warn("handleUpdateTag: add users failed", zap.Error(err))
 				}
 			}
-			if req.ChannelTag {
-				newTagKey := wkutil.GenUUID()
-				err = service.TagManager.RenameTag(tagKey, newTagKey)
-				if err != nil {
-					i.Warn("handleUpdateTag: rename tag failed", zap.Error(err))
-				}
-				service.TagManager.SetChannelTag(req.ChannelId, req.ChannelType, newTagKey)
-			}
+
 		}
 	}
 	c.WriteOk()
@@ -280,4 +281,3 @@ func (i *Ingress) handleGetSubscribers(c *wkserver.Context) {
 	}
 	c.Write(data)
 }
-

@@ -19,14 +19,8 @@ import (
 // 跳过会话更新的频道类型
 var skipConversationUpdateChannelTypes = []uint8{wkproto.ChannelTypeData, wkproto.ChannelTypeTemp, wkproto.ChannelTypeLive}
 
-// 消息分发
-// 流程1：（分发在频道的槽领导的节点上进行的）
-// 1. 获取或创建tag（tag记录了用户所属节点）
-// 2. 打上tagKey
-// 3. 根据tag push消息（如果用户在本节点上则处理，不在本节点上则转发到对应节点）
-// 流程2: (分发在用户所属的节点上进行的)
-// 1. 通过tagKey获取tag或者向频道的槽领导请求tag（不能创建tag，只有频道槽领导有权限创建）
-// 2. 根据tag push消息（只处理本节点上的用户，不需要转发）
+// 消息分发按连续的成员版本处理。领导节点固定快照，远端在确认接收前
+// 持有自己的收件人快照；旧协议消息仍按原 key 查询，不回退当前成员。
 func (h *Handler) distribute(ctx *eventbus.ChannelContext) {
 
 	// 记录消息轨迹
@@ -47,81 +41,166 @@ func (h *Handler) distribute(ctx *eventbus.ChannelContext) {
 
 // 普通消息分发
 func (h *Handler) distributeCommon(ctx *eventbus.ChannelContext) {
-	// 获取或创建tag
-	tag, err := h.getCommonTag(ctx)
-	if err != nil {
-		h.Error("distributeCommon: get or make tag failed", zap.Error(err), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-		return
-	}
+	h.distributeVersions(ctx, false)
+}
 
-	if tag == nil {
-		h.Error("distributeCommon: get or make tag failed, tag is nil", zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-		return
+// distributeVersions preserves contiguous version runs, including A/B/A order.
+func (h *Handler) distributeVersions(ctx *eventbus.ChannelContext, onlineCmd bool) {
+	for start := 0; start < len(ctx.Events); {
+		end := start + 1
+		first := ctx.Events[start]
+		for end < len(ctx.Events) && ctx.Events[end].TagKey == first.TagKey {
+			end++
+		}
+		events := ctx.Events[start:end]
+		part := &eventbus.ChannelContext{SlotLeaderId: ctx.SlotLeaderId, ChannelId: ctx.ChannelId, ChannelType: ctx.ChannelType, Events: events}
+		var tag *types.Tag
+		var err error
+		if first.Distribution != nil {
+			tag = first.Distribution.Snapshot
+		}
+		if tag == nil {
+			if onlineCmd {
+				if first.TagKey == "" {
+					err = errInvalidDistribution
+				} else if options.G.IsLocalNode(ctx.SlotLeaderId) {
+					tag = service.TagManager.Get(first.TagKey)
+				} else {
+					tag, err = h.requestTag(ctx.SlotLeaderId, first.TagKey)
+				}
+			} else {
+				tag, err = h.getCommonTag(part)
+			}
+		}
+		if err == nil && tag == nil {
+			err = errInvalidDistribution
+		}
+		if err == nil {
+			now := h.distributionTime()
+			for _, event := range events {
+				event.TagKey = tag.Key
+				if event.Distribution == nil {
+					event.Distribution = &eventbus.DistributionState{}
+				}
+				event.Distribution.Snapshot = tag
+				if event.Distribution.Deadline.IsZero() {
+					event.Distribution.Deadline = now.Add(distributionRetryTimeout)
+				}
+			}
+			err = h.deliverVersion(ctx, tag, events)
+		}
+		if err != nil {
+			h.retainDistribution(ctx, events, ctx.Events[end:], err)
+			return
+		}
+		for _, event := range events {
+			finishDistribution(event)
+		}
+		start = end
 	}
+}
 
-	// 打标签
-	for _, event := range ctx.Events {
-		event.TagKey = tag.Key
+// deliverVersion records partial progress so retries never replay local fan-out
+// or acknowledged destinations. Receipt snapshots survive manager eviction.
+func (h *Handler) deliverVersion(ctx *eventbus.ChannelContext, tag *types.Tag, events []*eventbus.Event) error {
+	local := make([]*eventbus.Event, 0, len(events))
+	for _, event := range events {
+		if !event.Distribution.LocalDone {
+			local = append(local, event)
+		}
 	}
-	// 分发
-	h.distributeByTag(ctx.SlotLeaderId, tag, ctx.ChannelId, ctx.ChannelType, ctx.Events)
+	if len(local) > 0 {
+		h.distributeByTag(options.G.Cluster.NodeId, tag, ctx.ChannelId, ctx.ChannelType, local)
+		for _, event := range local {
+			event.Distribution.LocalDone = true
+		}
+	}
+	for _, node := range tag.Nodes {
+		if node.LeaderId == options.G.Cluster.NodeId || len(node.Uids) == 0 {
+			continue
+		}
+		pending := make([]*eventbus.Event, 0, len(events))
+		for _, event := range events {
+			if event.SourceNodeId != 0 && event.SourceNodeId == node.LeaderId {
+				continue // Legacy recipient tags can also contain the forwarding node.
+			}
+			if _, done := event.Distribution.DeliveredNodes[node.LeaderId]; !done {
+				pending = append(pending, event)
+			}
+		}
+		if len(pending) == 0 {
+			continue
+		}
+		if err := h.forwardDistribution(node.LeaderId, tag, ctx.ChannelId, ctx.ChannelType, pending); err != nil {
+			return &distributionTargetError{node: node.LeaderId, err: err}
+		}
+		for _, event := range pending {
+			if event.Distribution.DeliveredNodes == nil {
+				event.Distribution.DeliveredNodes = make(map[uint64]struct{})
+			}
+			event.Distribution.DeliveredNodes[node.LeaderId] = struct{}{}
+		}
+	}
+	return nil
+}
+
+type distributionTargetError struct {
+	node uint64
+	err  error
+}
+
+func (e *distributionTargetError) Error() string { return e.err.Error() }
+func (e *distributionTargetError) Unwrap() error { return e.err }
+
+func (h *Handler) retainDistribution(ctx *eventbus.ChannelContext, failed, tail []*eventbus.Event, cause error) {
+	now := h.distributionTime()
+	delay := 50 * time.Millisecond
+	target := ctx.SlotLeaderId
+	var targetError *distributionTargetError
+	if errors.As(cause, &targetError) {
+		target = targetError.node
+	}
+	for _, event := range failed {
+		if event.Distribution == nil {
+			event.Distribution = &eventbus.DistributionState{}
+		}
+		state := event.Distribution
+		if state.Deadline.IsZero() {
+			state.Deadline = now.Add(distributionRetryTimeout)
+		}
+		state.Attempts++
+		fields := []zap.Field{zap.Error(cause), zap.Int64("messageId", event.MessageId), zap.String("tagKey", event.TagKey), zap.String("channelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType), zap.Uint64("nodeId", options.G.Cluster.NodeId), zap.Uint64("sourceNodeId", event.SourceNodeId), zap.Uint64("targetNodeId", target), zap.Int("attempt", state.Attempts)}
+		if state.Attempts >= distributionMaxAttempts || !now.Before(state.Deadline) || errors.Is(cause, errInvalidDistribution) {
+			h.Error("distribution retry exhausted", fields...)
+			finishDistribution(event)
+			continue
+		}
+		retryDelay := time.Duration(50<<min(state.Attempts-1, 4)) * time.Millisecond
+		if retryDelay > delay {
+			delay = retryDelay
+		}
+		h.Warn("distribution retained for retry", fields...)
+		ctx.RetryEvents = append(ctx.RetryEvents, event)
+	}
+	ctx.RetryEvents = append(ctx.RetryEvents, tail...)
+	ctx.RetryAt = now.Add(delay)
+}
+
+func finishDistribution(event *eventbus.Event) {
+	if state := event.Distribution; state != nil {
+		state.Finish()
+	}
 }
 
 // cmd消息分发
 func (h *Handler) distributeOnlineCmd(ctx *eventbus.ChannelContext) {
-
-	// // 按照tagKey分组事件
-	tagKeyEvents := h.groupEventsByTagKey(ctx.Events)
-	var err error
-	for tagKey, events := range tagKeyEvents {
-		if tagKey == "" {
-			h.Warn("distributeOnlineCmd: tagKey is nil", zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-			continue
-		}
-		// 获取tag
-		var tag *types.Tag
-		if options.G.IsLocalNode(ctx.SlotLeaderId) {
-			tag = service.TagManager.Get(tagKey)
-		} else {
-			tag, err = h.requestTag(ctx.SlotLeaderId, tagKey)
-			if err != nil {
-				h.Error("distributeOnlineCmd: request tag failed", zap.Error(err), zap.String("tagKey", tagKey), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-				continue
-			}
-		}
-		if tag == nil {
-			h.Error("distributeOnlineCmd: tag not found", zap.String("tagKey", tagKey), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-			continue
-		}
-		// 分发
-		h.distributeByTag(ctx.SlotLeaderId, tag, ctx.ChannelId, ctx.ChannelType, events)
-	}
-}
-
-// 按照tagKey分组事件
-func (h *Handler) groupEventsByTagKey(events []*eventbus.Event) map[string][]*eventbus.Event {
-	tagKeyEvents := make(map[string][]*eventbus.Event)
-	for _, e := range events {
-		tagKeyEvents[e.TagKey] = append(tagKeyEvents[e.TagKey], e)
-	}
-	return tagKeyEvents
+	h.distributeVersions(ctx, true)
 }
 
 func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId string, channelType uint8, events []*eventbus.Event) {
 	if slotLeaderId == 0 {
 		h.Error("distributeByTag: leaderId is 0", zap.String("fakeChannelId", channelId), zap.Uint8("channelType", channelType))
 		return
-	}
-
-	// 如果领导节点是本地节点，则负责转发给节点
-	if options.G.IsLocalNode(slotLeaderId) {
-		for _, node := range tag.Nodes {
-			if node.LeaderId == options.G.Cluster.NodeId {
-				continue
-			}
-			// 转发至对应节点
-			h.distributeToNode(node.LeaderId, channelId, channelType, events)
-		}
 	}
 
 	// 本地分发 （分发本节点上的用户）
@@ -133,6 +212,7 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 				pubshEvents = make([]*eventbus.Event, 0, len(events)*capacity)
 			}
 			cloneMsg := event.Clone()
+			cloneMsg.Distribution = nil
 			cloneMsg.ToUid = uid
 			cloneMsg.ChannelId = channelId
 			cloneMsg.ChannelType = channelType
@@ -224,6 +304,7 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 			filteredOfflineUids = wkutil.RemoveRepeatedElement(filteredOfflineUids)
 
 			cloneEvent := event.Clone()
+			cloneEvent.Distribution = nil
 			cloneEvent.OfflineUsers = filteredOfflineUids
 			cloneEvent.Type = eventbus.EventPushOffline
 			offlineEvents = append(offlineEvents, cloneEvent)
@@ -244,28 +325,11 @@ func (h *Handler) isSkipConversationUpdate(channelType uint8) bool {
 	return false
 }
 
-func (h *Handler) distributeToNode(leaderId uint64, channelId string, channelType uint8, events []*eventbus.Event) {
-	for _, event := range events {
-		if event.SourceNodeId != 0 && event.SourceNodeId == leaderId {
-			h.Foucs("distributeToNode: sourceNode is forward node, not distribute", zap.Uint64("sourceNodeId", event.SourceNodeId), zap.Uint64("leaderId", leaderId), zap.String("fakeChannelId", channelId), zap.Uint8("channelType", channelType))
-			return
-		}
-	}
-	h.forwardsToNode(leaderId, channelId, channelType, events)
-}
-
 func (h *Handler) getCommonTag(ctx *eventbus.ChannelContext) (*types.Tag, error) {
 
-	// 如果当前节点是频道的领导者节点，则可以make tag
-	if options.G.IsLocalNode(ctx.SlotLeaderId) {
-		return h.getOrMakeTagForLeader(ctx.ChannelId, ctx.ChannelType)
-	}
 	tagKey := ctx.Events[0].TagKey
-
-	// 判断当前的频道tag是否等于tagKey,如果不等于则删除旧的tag
-	oldTagKey := service.TagManager.GetChannelTag(ctx.ChannelId, ctx.ChannelType)
-	if oldTagKey != "" && oldTagKey != tagKey {
-		service.TagManager.RemoveTag(oldTagKey)
+	if tagKey == "" && options.G.IsLocalNode(ctx.SlotLeaderId) {
+		return h.getOrMakeTagForLeader(ctx.ChannelId, ctx.ChannelType)
 	}
 	tag, err := h.commonService.GetOrRequestAndMakeTagWithLocal(ctx.ChannelId, ctx.ChannelType, tagKey)
 	if err != nil {
