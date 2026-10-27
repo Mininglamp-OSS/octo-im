@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	"github.com/stretchr/testify/require"
 )
 
 func TestHeartbeatCountersConcurrentTrafficAndTick(t *testing.T) {
@@ -32,4 +33,18 @@ func TestHeartbeatCountersConcurrentTrafficAndTick(t *testing.T) {
 	}()
 	close(start)
 	workers.Wait()
+}
+
+func TestHeartbeatTrafficExtendsConnectionDeadline(t *testing.T) {
+	c := New("tcp://127.0.0.1:1", func(o *Options) { o.HeartbeatTick = 2; o.HeartbeatTimeoutTick = 2 })
+	defer c.cancel()
+	defer c.pool.Release()
+	c.conn().status.Store(authed)
+	c.conn().tick()
+	require.True(t, c.IsAuthed())
+	c.handleData(nil, proto.MsgTypeHeartbeat, "")
+	c.conn().tick()
+	require.True(t, c.IsAuthed(), "received traffic resets the idle deadline")
+	c.conn().tick()
+	require.False(t, c.IsAuthed(), "a peer with no subsequent traffic must reconnect")
 }

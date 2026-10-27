@@ -170,30 +170,32 @@ func TestDistributionReviewEmptyOnlineVersionDoesNotBlockTail(t *testing.T) {
 func TestDistributionReviewLegacyRecipientDoesNotBounceToSource(t *testing.T) {
 	versionTestFixture(t)
 	options.G.Cluster.NodeId = 1
-	cluster := &reviewDistributionCluster{request: func(context.Context, uint64, string, []byte) (*proto.Response, error) {
-		return &proto.Response{Status: proto.StatusOK}, nil
-	}}
-	service.Cluster = cluster
-	tag := &types.Tag{Key: "A", Nodes: []*types.Node{{LeaderId: 1, Uids: []string{"local"}}, {LeaderId: 2, Uids: []string{"source"}}}}
-	ctx := progressContext(tag)
-	ctx.Events[0].SourceNodeId = 2
-	h := NewHandler()
-	// A returning legacy event has no captured snapshot, only an exact tag key.
-	_, err := service.TagManager.MakeTagWithTagKey("legacy", []string{"source"})
-	require.NoError(t, err)
-	ctx.Events[0].Distribution = nil
-	ctx.Events[0].TagKey = "legacy"
-	h.distributeCommon(ctx)
-	require.Zero(t, cluster.sends)
-	// The request count is visible through the callback for both transports.
 	calls := 0
-	cluster.request = func(context.Context, uint64, string, []byte) (*proto.Response, error) {
+	cluster := &reviewDistributionCluster{request: func(context.Context, uint64, string, []byte) (*proto.Response, error) {
 		calls++
 		return &proto.Response{Status: forward.StatusRetry}, nil
-	}
-	ctx.Events[0].Distribution = nil
+	}}
+	service.Cluster = cluster
+	previous := eventbus.Channel
+	t.Cleanup(func() { eventbus.Channel = previous })
+	sink := &forwardChannel{}
+	eventbus.RegisterChannel(sink)
+	h := NewHandler()
+	_, err := service.TagManager.MakeTagWithTagKey("legacy", []string{"source"})
+	require.NoError(t, err)
+	req := &forwardChannelEventReq{fromNode: 2, channelId: "channel", channelType: wkproto.ChannelTypeData, events: eventbus.EventBatch{
+		{Type: eventbus.EventChannelDistribute, MessageId: 101, TagKey: "legacy", Conn: &eventbus.Conn{Uid: "sender"}, Frame: &wkproto.SendPacket{}},
+	}}
+	body, err := req.encode()
+	require.NoError(t, err)
+	h.OnMessage(&proto.Message{MsgType: uint32(msgForwardChannelEvent), Content: body})
+	require.Len(t, sink.events, 1)
+	require.EqualValues(t, 2, sink.events[0].SourceNodeId, "source metadata comes from the actual legacy envelope")
+	ctx := &eventbus.ChannelContext{ChannelId: "channel", ChannelType: wkproto.ChannelTypeData, SlotLeaderId: 1, Events: sink.events}
 	h.distributeCommon(ctx)
+	require.Zero(t, cluster.sends)
 	require.Zero(t, calls, "legacy fan-out must not return to its source")
+	require.Empty(t, ctx.RetryEvents)
 }
 
 func TestDistributionReviewMalformedCountDoesNotAmplifyAllocation(t *testing.T) {
