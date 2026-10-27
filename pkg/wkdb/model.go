@@ -1,7 +1,9 @@
 package wkdb
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -94,6 +96,117 @@ func (m *Message) Marshal() ([]byte, error) {
 	defer enc.End()
 	enc.WriteUint8(wkproto.LatestVersion + fixVersion)
 	enc.WriteUint8(m.version)
+	enc.WriteUint32(uint32(len(data)))
+	enc.WriteBytes(data)
+	enc.WriteUint64(m.Term)
+	return enc.Bytes(), nil
+}
+
+// ChannelLogEmitter identifies the channel raft log emission rule implemented
+// by EncodeChannelLogData. Changing the carrier version requires a new value.
+const ChannelLogEmitter = 1
+
+// channelLogStreamCarrier is the RECV frame version used for entries whose
+// stored StreamNo is non-empty. Frames v2-v4 carry StreamFlag/StreamNo/StreamId
+// under SettingStream, v3 and v4 RECV bodies are byte-identical, and every
+// decoder since proto v1.0.9 reads a v4 frame losslessly. It is a literal on
+// purpose: a proto version bump must not move it.
+const channelLogStreamCarrier uint8 = 4
+
+// The emitter relies on LatestVersion no longer carrying stream fields (>= 5)
+// and on LatestVersion+100 fitting the wrapper byte. Both fail to compile otherwise.
+const (
+	_ = uint8(wkproto.LatestVersion - 5)
+	_ = uint8(wkproto.LatestVersion + 100)
+)
+
+// Reasons reported by ChannelLogFormatError.
+const (
+	ChannelLogHeaderNotRecv          = "header_not_recv"
+	ChannelLogStreamNoWithoutSetting = "streamno_without_setting"
+	ChannelLogTopicWithoutSetting    = "topic_without_setting"
+	ChannelLogStringTooLong          = "string_too_long"
+	ChannelLogFrameTooLarge          = "frame_too_large"
+)
+
+// ErrChannelLogFormat matches every ChannelLogFormatError with errors.Is.
+var ErrChannelLogFormat = errors.New("channel log format")
+
+// ChannelLogFormatError reports a stored message that cannot be emitted as a
+// channel raft log without losing or rewriting a persisted field. No bytes are
+// emitted for it. Key is filled in by the storage that knows the raft key.
+type ChannelLogFormatError struct {
+	Key    string
+	Index  uint64
+	Reason string
+}
+
+func (e *ChannelLogFormatError) Error() string {
+	return fmt.Sprintf("channel log format: key=%s index=%d reason=%s", e.Key, e.Index, e.Reason)
+}
+
+func (e *ChannelLogFormatError) Unwrap() error { return ErrChannelLogFormat }
+
+// ChannelLogEmitVersion is the RECV frame version EncodeChannelLogData uses
+// for m: the stream carrier when StreamNo is set, LatestVersion otherwise.
+func ChannelLogEmitVersion(m *Message) uint8 {
+	if m.StreamNo != "" {
+		return channelLogStreamCarrier
+	}
+	return wkproto.LatestVersion
+}
+
+// ChannelLogBodySize is the RECV body size of m at its emit version. It equals
+// m.Size() for every message without StreamNo.
+func ChannelLogBodySize(m *Message) int {
+	return m.SizeWithProtoVersion(ChannelLogEmitVersion(m))
+}
+
+// checkChannelLog rejects every message whose emission would drop, rewrite or
+// panic on a persisted field. There is no fallback to another version.
+func checkChannelLog(m *Message, version uint8) error {
+	reason := ""
+	switch {
+	case m.Framer.FrameType != wkproto.RECV:
+		// The encoder takes the frame type from RecvPacket, so any other stored
+		// type would be rewritten to RECV.
+		reason = ChannelLogHeaderNotRecv
+	case m.StreamNo != "" && !m.Setting.IsSet(wkproto.SettingStream):
+		reason = ChannelLogStreamNoWithoutSetting
+	case m.Topic != "" && !m.Setting.IsSet(wkproto.SettingTopic):
+		reason = ChannelLogTopicWithoutSetting
+	case len(m.MsgKey) > math.MaxInt16, len(m.FromUID) > math.MaxInt16, len(m.ChannelID) > math.MaxInt16,
+		len(m.ClientMsgNo) > math.MaxInt16, len(m.StreamNo) > math.MaxInt16, len(m.Topic) > math.MaxInt16:
+		// Encoder.WriteBinary panics above MaxInt16.
+		reason = ChannelLogStringTooLong
+	case uint64(m.SizeWithProtoVersion(version)) > uint64(wkproto.MaxRemaingLength):
+		// DecodeFrame on the receiver rejects it.
+		reason = ChannelLogFrameTooLarge
+	}
+	if reason == "" {
+		return nil
+	}
+	return &ChannelLogFormatError{Index: uint64(m.MessageSeq), Reason: reason}
+}
+
+// EncodeChannelLogData encodes a stored channel message as raft log Data for
+// GetLogs. It is a pure function of the stored columns. A message with a
+// non-empty StreamNo is framed at the stream carrier version so a replica that
+// catches up stores the same StreamNo; every other message is byte-identical
+// to Marshal. Marshal itself is unchanged because proposers keep using it.
+func EncodeChannelLogData(m *Message) ([]byte, error) {
+	version := ChannelLogEmitVersion(m)
+	if err := checkChannelLog(m, version); err != nil {
+		return nil, err
+	}
+	data, err := proto.EncodeFrame(&m.RecvPacket, version)
+	if err != nil {
+		return nil, err
+	}
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+	enc.WriteUint8(version + 100)
+	enc.WriteUint8(0) // data version, as written by Marshal for every stored message
 	enc.WriteUint32(uint32(len(data)))
 	enc.WriteBytes(data)
 	enc.WriteUint64(m.Term)

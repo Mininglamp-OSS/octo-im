@@ -26,6 +26,8 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	}
 
 	// ========== 存储消息 ==========
+	waiters := collectSendResultWaiters(events)
+	var storeErr, resultErr error
 	persists := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, events)
 	if len(persists) > 0 {
 
@@ -35,6 +37,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		if err != nil {
 			h.Error("store message failed", zap.Error(err), zap.Int("events", len(persists)), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
 			markPersistFailure(events, err)
+			storeErr = err
 		}
 
 		if err == nil {
@@ -42,6 +45,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 			if err != nil {
 				h.Error("invalid persistence response", zap.Error(err))
 				markPersistFailure(events, err)
+				resultErr = err
 			}
 		}
 		if err == nil {
@@ -49,6 +53,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		}
 
 	}
+	h.reportSendResults(waiters, storeErr, resultErr)
 
 	if options.G.Logger.TraceOn {
 		for _, e := range events {
@@ -63,10 +68,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		for _, e := range events {
 			sendPacket := e.Frame.(*wkproto.SendPacket)
 			if shouldRunPersistSideEffects(e) && !sendPacket.NoPersist {
-				cloneEvent := e.Clone()
-				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
-				cloneEvent.Type = eventbus.EventChannelWebhook
-				eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+				eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, persistSideEffectEvent(e, eventbus.EventChannelWebhook))
 			}
 		}
 	}
@@ -76,14 +78,24 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		if !shouldDistributePersistResult(e) {
 			continue
 		}
-		cloneEvent := e.Clone()
-		cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
-		cloneEvent.Type = eventbus.EventChannelDistribute
-		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, persistSideEffectEvent(e, eventbus.EventChannelDistribute))
 	}
 
 	eventbus.Channel.Advance(ctx.ChannelId, ctx.ChannelType)
 
+}
+
+// persistSideEffectEvent clones a persisted send for webhook or distribution.
+// An API send carries the accepting node in SourceNodeId only so this leader
+// can report the persistence result, which has already happened. Left on the
+// clone, distributeToNode would read it as the origin of the batch and skip
+// forwarding the whole batch to that node, so the clone drops it.
+func persistSideEffectEvent(e *eventbus.Event, eventType eventbus.EventType) *eventbus.Event {
+	cloneEvent := e.Clone()
+	cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
+	cloneEvent.SourceNodeId = 0
+	cloneEvent.Type = eventType
+	return cloneEvent
 }
 
 func markPersistFailure(events []*eventbus.Event, err error) {

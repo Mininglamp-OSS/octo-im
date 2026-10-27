@@ -10,6 +10,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/ingress"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -361,6 +362,12 @@ func (ch *channel) updateTagBySubscribers(channelId string, channelType uint8, s
 	cmdChannelId := options.G.OrginalConvertCmdChannel(channelId)
 	// 获取或请求cmd频道的分布式配置
 	cfg, err := service.Cluster.LoadOnlyChannelClusterConfig(cmdChannelId, channelType)
+	if errors.Is(err, rafttypes.ErrSlotDiverged) {
+		// A fenced slot replica cannot tell whether the cmd channel exists;
+		// report it instead of treating it as "not activated".
+		ch.Error("updateTagByAddSubscribers: cmd channel config fenced", zap.Error(err))
+		return err
+	}
 	if err != nil && err != wkdb.ErrNotFound {
 		ch.Info("updateTagByAddSubscribers: loadOnlyChannelClusterConfig failed", zap.Error(err))
 		return nil

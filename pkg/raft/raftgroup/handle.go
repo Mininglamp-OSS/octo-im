@@ -12,22 +12,23 @@ import (
 // 处理存储请求
 func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 		err := rg.opts.Storage.AppendLogs(r.Key(), e.Logs, e.TermStartIndexInfo)
-		if err != nil {
-			rg.Panic("append logs failed", zap.Error(err))
-		}
 		reason := types.ReasonOk
 		if err != nil {
-			reason = types.ReasonError
+			if !isDivergence(err) {
+				rg.Panic("append logs failed", zap.Error(err))
+			}
+			// Nothing was written. Fence the replica instead of crashing.
+			reason = rg.markDiverged(r.Key(), err)
 		}
 
-		rg.AddEvent(r.Key(), types.Event{
+		rg.AddEvent(r.Key(), localStorageResult(types.Event{
 			Type:   types.StoreResp,
 			Index:  e.Logs[len(e.Logs)-1].Index,
 			Logs:   e.Logs,
 			Reason: reason,
-		})
+		}))
 		rg.Advance()
 	})
 	if err != nil {
@@ -40,10 +41,51 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 	}
 }
 
+// DivergenceMarker is implemented by storage that can durably mark a replica
+// as diverged. MarkDiverged must fence the replica in memory before it
+// writes, and return an error only when the marker was not persisted.
+type DivergenceMarker interface {
+	MarkDiverged(key string, cause error) error
+}
+
+func isDivergence(err error) bool {
+	return errors.Is(err, types.ErrTruncateBelowApplied) || errors.Is(err, types.ErrAppendBelowApplied)
+}
+
+// markDiverged persists the divergence marker for a typed storage refusal
+// and returns the local reason for the node: ReasonDiverged when the marker
+// is durable, ReasonDivergedFailStop when it is not (or cannot be) written.
+func (rg *RaftGroup) markDiverged(key string, cause error) types.Reason {
+	rg.Error("storage refused a request below the applied index; quarantining replica", zap.String("key", key), zap.Error(cause))
+	marker, ok := rg.opts.Storage.(DivergenceMarker)
+	if !ok {
+		rg.Error("storage cannot persist a divergence marker; replica fail-stopped", zap.String("key", key))
+		return types.ReasonDivergedFailStop
+	}
+	if err := marker.MarkDiverged(key, cause); err != nil {
+		rg.Error("divergence marker not persisted; replica fail-stopped", zap.String("key", key), zap.Error(err))
+		return types.ReasonDivergedFailStop
+	}
+	return types.ReasonDiverged
+}
+
+// localStorageResult attaches the in-process storage verdict for a divergence
+// reason. The node acts only on the verdict, which is never encoded, so the
+// same Type and Reason arriving from a peer cannot quarantine a replica.
+func localStorageResult(e types.Event) types.Event {
+	switch e.Reason {
+	case types.ReasonDiverged:
+		return e.WithLocalStorageVerdict(types.StorageVerdictDiverged)
+	case types.ReasonDivergedFailStop:
+		return e.WithLocalStorageVerdict(types.StorageVerdictFailStop)
+	}
+	return e
+}
+
 func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 	// Capture mutable Raft state on its owner before launching storage work.
 	lastIndex := r.LastLogIndex()
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 		// 获取裁断日志下标
 		var (
 			trunctIndex uint64
@@ -116,14 +158,24 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 		err := rg.opts.Storage.TruncateLogTo(r.Key(), e.Index)
 		if err != nil {
-			rg.Error("truncate logs failed", zap.Error(err))
-			rg.AddEvent(r.Key(), types.Event{
+			reason := types.ReasonError
+			if isDivergence(err) {
+				// The refusal mutated nothing. Newer leader term start
+				// indexes are kept: deleting them would be the second half
+				// of a truncation that did not happen.
+				reason = rg.markDiverged(r.Key(), err)
+			} else {
+				rg.Error("truncate logs failed", zap.Error(err))
+			}
+			rg.AddEvent(r.Key(), localStorageResult(types.Event{
 				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
-			})
+				Index:  e.Index,
+				Reason: reason,
+			}))
+			rg.Advance()
 			return
 		}
 		// 删除本地的leader term start index
@@ -152,10 +204,14 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 		// 已提交
 		// rg.wait.didCommit(r.Key(), e.EndIndex-1)
-		var lastLogIndex uint64
+		var (
+			lastLogIndex uint64
+			logs         []types.Log
+			err          error
+		)
 		if storage, ok := rg.opts.Storage.(CommittedRangeApplier); ok && !rg.opts.NotNeedApplied {
 			if err := storage.ApplyCommittedRange(r.Key(), e.StartIndex, e.EndIndex); err != nil {
 				rg.Error("apply committed range failed", zap.Error(err))
@@ -164,7 +220,7 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			}
 			lastLogIndex = e.EndIndex - 1
 		} else if !rg.opts.NotNeedApplied {
-			logs, err := rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, min(e.EndIndex, e.StartIndex+1000), rg.opts.MaxLogSizePerBatch)
+			logs, err = rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, min(e.EndIndex, e.StartIndex+1000), rg.opts.MaxLogSizePerBatch)
 			if err != nil {
 				rg.Error("get logs failed", zap.Error(err))
 				rg.AddEvent(r.Key(), types.Event{
@@ -200,8 +256,8 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			Reason: types.ReasonOk,
 			Index:  lastLogIndex,
 		})
-		// 已应用
-		rg.wait.didApply(r.Key(), lastLogIndex)
+		// 已应用：按回执身份完成等待者（NotNeedApplied 时 logs 为 nil）
+		rg.wait.didApply(r.Key(), lastLogIndex, logs)
 		rg.Advance()
 	})
 	if err != nil {
@@ -269,7 +325,7 @@ func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Eve
 
 func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 
-	err := rg.goPool.Submit(func() {
+	err := rg.submit(func() {
 
 		var (
 			newCfg        types.Config

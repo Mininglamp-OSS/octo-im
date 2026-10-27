@@ -26,7 +26,7 @@ func (s *Store) AppendMessageEventWithState(channelId string, channelType uint8,
 		return nil, nil, err
 	}
 
-	slotID := s.opts.Slot.GetSlotId(channelId)
+	slotID := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotID, cmdData)
 	if err != nil {
 		return nil, nil, err
@@ -36,7 +36,7 @@ func (s *Store) AppendMessageEventWithState(channelId string, channelType uint8,
 	if eventKey == "" {
 		eventKey = wkdb.EventKeyDefault
 	}
-	eventState, err := s.wdb.GetMessageEventState(channelId, channelType, event.ClientMsgNo, eventKey)
+	eventState, err := s.GetMessageEventState(channelId, channelType, event.ClientMsgNo, eventKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -50,21 +50,31 @@ func (s *Store) AppendMessageEventWithState(channelId string, channelType uint8,
 }
 
 func (s *Store) GetMessageEventByEventID(channelId string, channelType uint8, clientMsgNo, eventID string) (*wkdb.MessageEvent, error) {
-	return s.wdb.GetMessageEventByEventID(channelId, channelType, clientMsgNo, eventID)
+	return readOwned(s, s.channelSlot(channelId), func() (*wkdb.MessageEvent, error) {
+		return s.wdb.GetMessageEventByEventID(channelId, channelType, clientMsgNo, eventID)
+	})
 }
 
 func (s *Store) ListMessageEvents(channelId string, channelType uint8, clientMsgNo string, fromMsgEventSeq uint64, eventKey string, limit int) ([]wkdb.MessageEvent, error) {
-	return s.wdb.ListMessageEvents(channelId, channelType, clientMsgNo, fromMsgEventSeq, eventKey, limit)
+	return readOwned(s, s.channelSlot(channelId), func() ([]wkdb.MessageEvent, error) {
+		return s.wdb.ListMessageEvents(channelId, channelType, clientMsgNo, fromMsgEventSeq, eventKey, limit)
+	})
 }
 
 func (s *Store) GetMessageEventStates(channelId string, channelType uint8, clientMsgNo string) ([]wkdb.MessageEventState, error) {
-	return s.wdb.GetMessageEventStates(channelId, channelType, clientMsgNo)
+	return readOwned(s, s.channelSlot(channelId), func() ([]wkdb.MessageEventState, error) {
+		return s.wdb.GetMessageEventStates(channelId, channelType, clientMsgNo)
+	})
 }
 
 func (s *Store) GetMessageEventStatesBatch(channelId string, channelType uint8, clientMsgNos []string) (map[string][]wkdb.MessageEventState, error) {
-	return s.wdb.GetMessageEventStatesBatch(channelId, channelType, clientMsgNos)
+	return readOwned(s, s.channelSlot(channelId), func() (map[string][]wkdb.MessageEventState, error) {
+		return s.wdb.GetMessageEventStatesBatch(channelId, channelType, clientMsgNos)
+	})
 }
 
 func (s *Store) GetMessageEventState(channelId string, channelType uint8, clientMsgNo, eventKey string) (*wkdb.MessageEventState, error) {
-	return s.wdb.GetMessageEventState(channelId, channelType, clientMsgNo, eventKey)
+	return readOwned(s, s.channelSlot(channelId), func() (*wkdb.MessageEventState, error) {
+		return s.wdb.GetMessageEventState(channelId, channelType, clientMsgNo, eventKey)
+	})
 }

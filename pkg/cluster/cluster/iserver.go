@@ -66,7 +66,7 @@ func (s *Server) LoadOnlyChannelClusterConfig(channelId string, channelType uint
 		return wkdb.EmptyChannelClusterConfig, fmt.Errorf("slot[%d] leader not found", slotId)
 	}
 	if s.opts.ConfigOptions.NodeId == slotLeaderId {
-		return s.db.GetChannelClusterConfig(channelId, channelType)
+		return s.fencedChannelClusterConfig(channelId, channelType)
 	}
 
 	return s.rpcClient.RequestGetChannelClusterConfig(slotLeaderId, channelId, channelType)

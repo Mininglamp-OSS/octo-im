@@ -10,6 +10,10 @@ type Options struct {
 
 	Slot icluster.Slot
 
+	// ReadFence fences reads of slot-owned rows. When nil, New uses Slot if
+	// it implements icluster.SlotReadFence.
+	ReadFence icluster.SlotReadFence
+
 	DB wkdb.DB
 
 	Channel icluster.Channel
@@ -38,6 +42,12 @@ func WithOnChannelConfigSaved(fn func(string, uint8)) Option {
 func WithNodeId(nodeId uint64) Option {
 	return func(o *Options) {
 		o.NodeId = nodeId
+	}
+}
+
+func WithReadFence(fence icluster.SlotReadFence) Option {
+	return func(o *Options) {
+		o.ReadFence = fence
 	}
 }
 

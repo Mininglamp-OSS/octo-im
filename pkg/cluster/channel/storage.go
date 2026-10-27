@@ -1,7 +1,12 @@
 package channel
 
 import (
+	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -13,10 +18,71 @@ type storage struct {
 	db wkdb.DB
 	s  *Server
 	wklog.Log
+
+	// Diagnostics for GetLogs emission. Entries whose ChannelId or
+	// ChannelType column differs from the key are emitted as stored.
+	formatErrors            sync.Map // reason -> *atomic.Uint64
+	inconsistentChannelID   atomic.Uint64
+	inconsistentChannelType atomic.Uint64
+	formatLogMu             sync.Mutex
+	formatLogged            map[formatLogKey]*formatLogState
 }
+
+type formatLogKey struct {
+	key    string
+	index  uint64
+	reason string
+}
+
+type formatLogState struct {
+	last       time.Time
+	suppressed uint64
+}
+
+const (
+	formatLogInterval = time.Minute
+	formatLogMaxKeys  = 1024
+)
 
 func newStorage(db wkdb.DB, s *Server) *storage {
 	return &storage{db: db, s: s, Log: wklog.NewWKLog("channel_storage")}
+}
+
+// reportFormatError counts every emission rejection and logs it at most once
+// per (key, index, reason) and interval, because each follower retry of a
+// stalled channel hits the same entry again.
+func (s *storage) reportFormatError(e *wkdb.ChannelLogFormatError) {
+	c, _ := s.formatErrors.LoadOrStore(e.Reason, new(atomic.Uint64))
+	c.(*atomic.Uint64).Add(1)
+
+	now := time.Now()
+	k := formatLogKey{key: e.Key, index: e.Index, reason: e.Reason}
+	s.formatLogMu.Lock()
+	if s.formatLogged == nil || len(s.formatLogged) >= formatLogMaxKeys {
+		s.formatLogged = make(map[formatLogKey]*formatLogState)
+	}
+	st := s.formatLogged[k]
+	if st != nil && now.Sub(st.last) < formatLogInterval {
+		st.suppressed++
+		s.formatLogMu.Unlock()
+		return
+	}
+	var suppressed uint64
+	if st != nil {
+		suppressed = st.suppressed
+	}
+	s.formatLogged[k] = &formatLogState{last: now}
+	s.formatLogMu.Unlock()
+	s.Error("GetLogs: stored message cannot be emitted without loss", zap.String("key", e.Key), zap.Uint64("index", e.Index), zap.String("reason", e.Reason), zap.Uint64("suppressed", suppressed))
+}
+
+// formatErrorCount returns how many emissions were rejected for reason.
+func (s *storage) formatErrorCount(reason string) uint64 {
+	c, ok := s.formatErrors.Load(reason)
+	if !ok {
+		return 0
+	}
+	return c.(*atomic.Uint64).Load()
 }
 
 func (s *storage) GetState(channelId string, channelType uint8) (types.RaftState, error) {
@@ -111,9 +177,23 @@ func (s *storage) GetLogs(key string, startLogIndex uint64, endLogIndex uint64, 
 		return nil, nil
 	}
 	logs := make([]types.Log, len(messages))
-	for i, msg := range messages {
-		data, err := msg.Marshal()
+	for i := range messages {
+		msg := &messages[i]
+		if msg.ChannelID != channelID {
+			s.inconsistentChannelID.Add(1)
+		}
+		if msg.ChannelType != channelType {
+			s.inconsistentChannelType.Add(1)
+		}
+		// Fail the whole call on a format error: no partial batch and no
+		// lossy encoding. The caller answers the follower with ReasonError.
+		data, err := wkdb.EncodeChannelLogData(msg)
 		if err != nil {
+			var formatErr *wkdb.ChannelLogFormatError
+			if errors.As(err, &formatErr) {
+				formatErr.Key = key
+				s.reportFormatError(formatErr)
+			}
 			return nil, err
 		}
 		logs[i] = types.Log{

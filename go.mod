@@ -262,7 +262,7 @@ require (
 	go.opentelemetry.io/collector/semconv v0.105.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.53.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.53.0 // indirect
-	go.uber.org/goleak v1.3.0 // indirect
+	go.uber.org/goleak v1.3.0
 	go4.org/netipx v0.0.0-20230125063823-8449b0a6169f // indirect
 	golang.org/x/exp v0.0.0-20240325151524-a685a6edb6d8 // indirect
 	golang.org/x/mod v0.19.0 // indirect

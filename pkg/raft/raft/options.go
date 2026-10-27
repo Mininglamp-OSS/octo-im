@@ -65,6 +65,20 @@ type Options struct {
 
 	// 空闲多久后销毁
 	DestoryAfterIdleTick int
+
+	// ForwardIncarnation is the durably reserved sender incarnation stamped on
+	// forwarded proposals. It must be unique per process lifetime of the owning
+	// node; zero disables forwarding (see forward_token.go).
+	ForwardIncarnation uint64
+
+	// LeaderRoleSwitchDisabled stops the leader from requesting
+	// FollowerToLeader or LearnerToLeader hand-offs and from pausing
+	// proposals for them. Leadership then changes only by election.
+	LeaderRoleSwitchDisabled bool
+
+	// OnQuarantine is called on the owner loop when the replica becomes
+	// quarantined (failStop false) or fail-stopped (failStop true).
+	OnQuarantine func(failStop bool, why string)
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -222,6 +236,24 @@ func WithAutoDestory(autoDestory bool) Option {
 	}
 }
 
+func WithForwardIncarnation(incarnation uint64) Option {
+	return func(opts *Options) { opts.ForwardIncarnation = incarnation }
+}
+
 func WithSaveHardState(save func(types.HardState) error) Option {
 	return func(opts *Options) { opts.SaveHardState = save }
+}
+
+// WithOnQuarantine observes quarantine transitions of the replica.
+func WithOnQuarantine(fn func(failStop bool, why string)) Option {
+	return func(o *Options) {
+		o.OnQuarantine = fn
+	}
+}
+
+// WithLeaderRoleSwitchDisabled disables leader hand-off by role switch.
+func WithLeaderRoleSwitchDisabled(disabled bool) Option {
+	return func(o *Options) {
+		o.LeaderRoleSwitchDisabled = disabled
+	}
 }

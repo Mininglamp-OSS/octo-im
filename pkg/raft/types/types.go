@@ -22,6 +22,15 @@ const (
 	ReasonTruncate
 	// ReasonOnlySync 只是同步, 不做截断判断
 	ReasonOnlySync
+	// ReasonDiverged: storage refused a truncate or append that would leave
+	// the applied state inconsistent with the log, and the divergence marker
+	// was persisted. Informational only: a reason is peer-controlled on the
+	// wire, so a replica is quarantined only by the in-process
+	// StorageVerdict, never by this value.
+	ReasonDiverged
+	// ReasonDivergedFailStop: as ReasonDiverged, but persisting the
+	// divergence marker failed. Informational only, as above.
+	ReasonDivergedFailStop
 )
 
 func (r Reason) Uint8() uint8 {
@@ -38,6 +47,10 @@ func (r Reason) String() string {
 		return "ReasonTruncate"
 	case ReasonOnlySync:
 		return "ReasonOnlySync"
+	case ReasonDiverged:
+		return "ReasonDiverged"
+	case ReasonDivergedFailStop:
+		return "ReasonDivergedFailStop"
 	default:
 		return fmt.Sprintf("ReasonUnknown[%d]", r)
 	}
@@ -106,6 +119,10 @@ const (
 	ConfigResp
 	// Destory 销毁节点
 	Destory
+	// ProposalFence is a local event emitted when this node stops leading a
+	// term. Proposals admitted in that term can no longer be completed from
+	// local log identity. It is never sent to another node.
+	ProposalFence
 )
 
 func (e EventType) String() string {
@@ -168,6 +185,8 @@ func (e EventType) String() string {
 		return "ConfigResp"
 	case Destory:
 		return "Destory"
+	case ProposalFence:
+		return "ProposalFence"
 	default:
 		return "Unknown"
 	}
@@ -215,6 +234,36 @@ type Event struct {
 	TermStartIndexInfo *TermStartIndexInfo
 	StartIndex         uint64
 	EndIndex           uint64
+
+	// storageVerdict is never encoded: Unmarshal always leaves it unset, so
+	// a peer cannot produce it. Only local storage handlers set it.
+	storageVerdict StorageVerdict
+}
+
+// StorageVerdict is the local storage's refusal of a truncation or append
+// that would leave the applied state inconsistent with the log.
+type StorageVerdict uint8
+
+const (
+	StorageVerdictNone StorageVerdict = iota
+	// StorageVerdictDiverged: refused, divergence marker persisted.
+	StorageVerdictDiverged
+	// StorageVerdictFailStop: refused, divergence marker not persisted.
+	StorageVerdictFailStop
+)
+
+// WithLocalStorageVerdict returns a copy of e carrying a local storage
+// verdict. It exists only in process memory and is not part of the wire
+// format.
+func (e Event) WithLocalStorageVerdict(v StorageVerdict) Event {
+	e.storageVerdict = v
+	return e
+}
+
+// LocalStorageVerdict reports the local storage verdict of e. An event
+// decoded from the network never carries one.
+func (e Event) LocalStorageVerdict() StorageVerdict {
+	return e.storageVerdict
 }
 
 const (
@@ -307,6 +356,8 @@ func (e Event) Marshal() ([]byte, error) {
 }
 
 func (e *Event) Unmarshal(data []byte) error {
+	// Provenance is local only; a decoded event never carries a verdict.
+	e.storageVerdict = StorageVerdictNone
 	dec := wkproto.NewDecoder(data)
 	flag, err := dec.Uint32()
 	if err != nil {
@@ -756,6 +807,10 @@ type RaftState struct {
 	LastTerm uint32
 	// AppliedIndex 已应用的日志下标
 	AppliedIndex uint64
+	// Diverged reports that the replica must open quarantined: either its
+	// applied index is beyond its last log index, or a durable divergence
+	// marker is set. AppliedIndex is reported as stored, never adjusted.
+	Diverged bool
 }
 
 // ProposeResp 提案返回

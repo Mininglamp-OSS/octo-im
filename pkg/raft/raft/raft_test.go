@@ -2,6 +2,7 @@ package raft_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -119,9 +120,12 @@ func TestPropose(t *testing.T) {
 	raft2.WaitUtilCommit(timeoutCtx, 1)
 	raft3.WaitUtilCommit(timeoutCtx, 1)
 
-	node1Logs := raft1.Options().Storage.(*testStorage).logs
-	node2Logs := raft2.Options().Storage.(*testStorage).logs
-	node3Logs := raft3.Options().Storage.(*testStorage).logs
+	node1Logs, err := raft1.Options().Storage.GetLogs(1, 2, 0)
+	assert.NoError(t, err)
+	node2Logs, err := raft2.Options().Storage.GetLogs(1, 2, 0)
+	assert.NoError(t, err)
+	node3Logs, err := raft3.Options().Storage.GetLogs(1, 2, 0)
+	assert.NoError(t, err)
 
 	assert.Equal(t, 1, len(node1Logs))
 	assert.Equal(t, 1, len(node2Logs))
@@ -320,9 +324,12 @@ func TestProposeUntilApplied(t *testing.T) {
 	raft2.WaitUtilCommit(timeoutCtx, 1)
 	raft3.WaitUtilCommit(timeoutCtx, 1)
 
-	node1Logs := raft1.Options().Storage.(*testStorage).logs
-	node2Logs := raft2.Options().Storage.(*testStorage).logs
-	node3Logs := raft3.Options().Storage.(*testStorage).logs
+	node1Logs, err := raft1.Options().Storage.GetLogs(1, 2, 0)
+	assert.NoError(t, err)
+	node2Logs, err := raft2.Options().Storage.GetLogs(1, 2, 0)
+	assert.NoError(t, err)
+	node3Logs, err := raft3.Options().Storage.GetLogs(1, 2, 0)
+	assert.NoError(t, err)
 
 	assert.Equal(t, 1, len(node1Logs))
 	assert.Equal(t, 1, len(node2Logs))
@@ -349,10 +356,12 @@ func (t *testTransport) Send(event types.Event) {
 	if !ok {
 		return
 	}
+	event.Logs = copyTestLogs(event.Logs)
 	r.Step(event)
 }
 
 type testStorage struct {
+	mu              sync.Mutex
 	hardState       types.HardState
 	nodeId          uint64
 	logs            []types.Log
@@ -366,7 +375,9 @@ func newTestStorage(nodeId uint64) *testStorage {
 }
 
 func (s *testStorage) AppendLogs(logs []types.Log, termStartIndex *types.TermStartIndexInfo) error {
-	s.logs = append(s.logs, logs...)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logs = append(s.logs, copyTestLogs(logs)...)
 	if termStartIndex != nil {
 		s.termStartIndexs = append(s.termStartIndexs, termStartIndex)
 	}
@@ -374,14 +385,20 @@ func (s *testStorage) AppendLogs(logs []types.Log, termStartIndex *types.TermSta
 }
 
 func (s *testStorage) saveTermStartIndex(termStartIndex *types.TermStartIndexInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.termStartIndexs = append(s.termStartIndexs, termStartIndex)
 }
 
 func (s *testStorage) GetLogs(start, end uint64, limitSize uint64) ([]types.Log, error) {
-	return s.logs[start-1:], nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return copyTestLogs(s.logs[start-1:]), nil
 }
 
 func (s *testStorage) GetState() (types.RaftState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.logs) == 0 {
 		return types.RaftState{HardState: s.hardState}, nil
 	}
@@ -395,6 +412,8 @@ func (s *testStorage) GetState() (types.RaftState, error) {
 }
 
 func (s *testStorage) GetTermStartIndex(term uint32) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, tsi := range s.termStartIndexs {
 		if tsi.Term == term {
 			return tsi.Index, nil
@@ -404,6 +423,8 @@ func (s *testStorage) GetTermStartIndex(term uint32) (uint64, error) {
 }
 
 func (s *testStorage) TruncateLogTo(index uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if int(index) > len(s.logs) {
 		return nil
 	}
@@ -412,6 +433,8 @@ func (s *testStorage) TruncateLogTo(index uint64) error {
 }
 
 func (s *testStorage) DeleteLeaderTermStartIndexGreaterThanTerm(term uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	newTermStartIndexs := make([]*types.TermStartIndexInfo, 0)
 	for _, tsi := range s.termStartIndexs {
 		if tsi.Term <= term {
@@ -423,6 +446,8 @@ func (s *testStorage) DeleteLeaderTermStartIndexGreaterThanTerm(term uint32) err
 }
 
 func (s *testStorage) LeaderTermGreaterEqThan(term uint32) (uint32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	for _, tsi := range s.termStartIndexs {
 		if tsi.Term >= term {
@@ -433,6 +458,8 @@ func (s *testStorage) LeaderTermGreaterEqThan(term uint32) (uint32, error) {
 }
 
 func (s *testStorage) LeaderLastTerm() (uint32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.termStartIndexs) == 0 {
 		return 0, nil
 	}
@@ -536,4 +563,17 @@ func raftStop(rafts ...*raft.Raft) {
 	}
 }
 
-func (s *testStorage) SaveHardState(state types.HardState) error { s.hardState = state; return nil }
+func (s *testStorage) SaveHardState(state types.HardState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hardState = state
+	return nil
+}
+
+func copyTestLogs(logs []types.Log) []types.Log {
+	out := append([]types.Log(nil), logs...)
+	for i := range out {
+		out[i].Data = append([]byte(nil), out[i].Data...)
+	}
+	return out
+}

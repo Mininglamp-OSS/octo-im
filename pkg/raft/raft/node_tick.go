@@ -6,13 +6,17 @@ import (
 )
 
 func (n *Node) Tick() {
+	if n.Diverged() {
+		// No sync, heartbeat, election or apply retry once quarantined.
+		return
+	}
 	if n.applyRetryTicks > 0 {
 		n.applyRetryTicks--
 	}
-	n.idleTick++
+	idleTick := n.idleTick.Add(1)
 	if n.opts.AutoDestory {
-		if n.idleTick > n.opts.DestoryAfterIdleTick {
-			n.idleTick = 0
+		if idleTick > int64(n.opts.DestoryAfterIdleTick) {
+			n.idleTick.Store(0)
 			n.Debug("auto destory")
 			n.sendDestory()
 		}

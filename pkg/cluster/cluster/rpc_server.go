@@ -21,7 +21,21 @@ import (
 const (
 	channelProposalUnavailable    proto.Status = 3
 	channelProposalOutcomeUnknown proto.Status = 4
+	// slotReplicaDiverged answers a request the serving node refused because
+	// its local replica of the owning slot is quarantined. Older callers see
+	// a plain failed request.
+	slotReplicaDiverged proto.Status = 5
 )
+
+// writeRPCErr preserves the divergence fence across the RPC boundary; every
+// other error keeps the existing generic status.
+func writeRPCErr(c *wkserver.Context, err error) {
+	if errors.Is(err, rafttypes.ErrSlotDiverged) {
+		c.WriteErrorAndStatus(err, slotReplicaDiverged)
+		return
+	}
+	c.WriteErr(err)
+}
 
 type rpcServer struct {
 	s *Server
@@ -122,7 +136,7 @@ func (r *rpcServer) handleSlotPropose(c *wkserver.Context) {
 	resps, err := r.s.slotServer.ProposeUntilAppliedTimeoutForLocal(timeoutCtx, req.SlotId, req.reqs)
 	if err != nil {
 		r.Error("slot propose failed", zap.Error(err), zap.Uint32("slotId", req.SlotId), zap.Uint64("nodeId", r.s.opts.ConfigOptions.NodeId))
-		c.WriteErr(err)
+		writeRPCErr(c, err)
 		return
 	}
 	data, err := resps.Marshal()
@@ -144,7 +158,7 @@ func (r *rpcServer) handleGetOrCreateChannelConfig(c *wkserver.Context) {
 	cfg, err := r.s.getOrCreateChannelClusterConfigFromLocal(req.channelId, req.channelType)
 	if err != nil {
 		r.Error("get channel config failed", zap.Error(err))
-		c.WriteErr(err)
+		writeRPCErr(c, err)
 		return
 	}
 
@@ -165,10 +179,10 @@ func (r *rpcServer) handleChannelConfig(c *wkserver.Context) {
 		c.WriteErr(err)
 		return
 	}
-	cfg, err := r.s.db.GetChannelClusterConfig(req.channelId, req.channelType)
+	cfg, err := r.s.fencedChannelClusterConfig(req.channelId, req.channelType)
 	if err != nil && err != wkdb.ErrNotFound {
 		r.Error("get channel config failed", zap.Error(err))
-		c.WriteErr(err)
+		writeRPCErr(c, err)
 		return
 	}
 	data, err := cfg.Marshal()
@@ -208,25 +222,7 @@ func (r *rpcServer) handleSlotLastLogInfo(c *wkserver.Context) {
 }
 
 func (r *rpcServer) slotInfos(slotIds []uint32) ([]SlotInfo, error) {
-	slotInfos := make([]SlotInfo, 0, len(slotIds))
-	for _, slotId := range slotIds {
-		st := r.s.slotServer.GetSlotRaft(slotId)
-		if st == nil {
-			continue
-		}
-		lastLog, err := r.s.slotServer.LastLog(slotId)
-		if err != nil {
-			r.Error("get slot last log error", zap.Error(err))
-			continue
-		}
-		slotInfos = append(slotInfos, SlotInfo{
-			SlotId:   slotId,
-			LogIndex: lastLog.Index,
-			LogTerm:  lastLog.Term,
-			Term:     st.LastTerm(),
-		})
-	}
-	return slotInfos, nil
+	return r.s.slotInfos(slotIds)
 }
 
 type channelProposeReq struct {
@@ -318,7 +314,7 @@ func (r *rpcServer) handleChannelLastLogInfo(c *wkserver.Context) {
 	resp, err := r.s.getChannelLastLogInfo(ctx, req.channelId, req.channelType)
 	if err != nil {
 		r.Error("get channel last log info failed", zap.Error(err))
-		c.WriteErr(err)
+		writeRPCErr(c, err)
 		return
 	}
 
@@ -341,7 +337,7 @@ func (s *Server) getChannelLastLogInfo(ctx context.Context, channelId string, ch
 		return nil, err
 	}
 
-	cfg, err := s.db.GetChannelClusterConfig(channelId, channelType)
+	cfg, err := s.fencedChannelClusterConfig(channelId, channelType)
 	if err != nil && err != wkdb.ErrNotFound {
 		return nil, err
 	}

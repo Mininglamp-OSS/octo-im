@@ -31,7 +31,7 @@ func newConversationConsistencyServer(t *testing.T, decorate func(*Server)) (*Se
 		decorate(s)
 	}
 	require.NoError(t, s.Start())
-	t.Cleanup(s.Stop)
+	t.Cleanup(func() { require.NoError(t, s.Stop()) })
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 	require.NoError(t, s.WaitAllSlotReady(ctx, 1))
@@ -41,9 +41,13 @@ func consistencyConfig() wkdb.ChannelClusterConfig {
 	return wkdb.ChannelClusterConfig{ChannelId: "analysis-channel", ChannelType: 2, LeaderId: 1, Term: 1,
 		ConfVersion: 1, ReplicaMaxCount: 1, Replicas: []uint64{1}, Status: wkdb.ChannelClusterStatusNormal}
 }
+
+// consistencyMessage is written straight to the column store, so it must carry
+// the RECV header that the raft append path always stores; GetLogs refuses to
+// rewrite any other header.
 func consistencyMessage(seq uint32) wkdb.Message {
-	return wkdb.Message{Term: 1, RecvPacket: wkproto.RecvPacket{ChannelID: "analysis-channel", ChannelType: 2,
-		MessageID: int64(seq), MessageSeq: seq, Payload: []byte("diagnostic")}}
+	return wkdb.Message{Term: 1, RecvPacket: wkproto.RecvPacket{Framer: wkproto.Framer{FrameType: wkproto.RECV},
+		ChannelID: "analysis-channel", ChannelType: 2, MessageID: int64(seq), MessageSeq: seq, Payload: []byte("diagnostic")}}
 }
 
 func TestConversationDormantOrphanLearner(t *testing.T) {

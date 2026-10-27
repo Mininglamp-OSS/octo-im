@@ -15,13 +15,15 @@ func (s *Store) AddSubscribers(channelId string, channelType uint8, subscribers 
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
 
 func (s *Store) ExistSubscriber(channelId string, channelType uint8, uid string) (bool, error) {
-	return s.wdb.ExistSubscriber(channelId, channelType, uid)
+	return readOwned(s, s.channelSlot(channelId), func() (bool, error) {
+		return s.wdb.ExistSubscriber(channelId, channelType, uid)
+	})
 }
 
 // RemoveSubscribers 移除订阅者
@@ -37,7 +39,7 @@ func (s *Store) RemoveSubscribers(channelId string, channelType uint8, subscribe
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
@@ -49,13 +51,15 @@ func (s *Store) RemoveAllSubscriber(channelId string, channelType uint8) error {
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
 
 func (s *Store) GetSubscribers(channelID string, channelType uint8) ([]wkdb.Member, error) {
-	return s.wdb.GetSubscribers(channelID, channelType)
+	return readOwned(s, s.channelSlot(channelID), func() ([]wkdb.Member, error) {
+		return s.wdb.GetSubscribers(channelID, channelType)
+	})
 }
 
 // AddOrUpdateChannel add or update channel
@@ -69,7 +73,7 @@ func (s *Store) AddChannelInfo(channelInfo wkdb.ChannelInfo) error {
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelInfo.ChannelId)
+	slotId := s.channelSlot(channelInfo.ChannelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
@@ -84,7 +88,7 @@ func (s *Store) UpdateChannelInfo(channelInfo wkdb.ChannelInfo) error {
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelInfo.ChannelId)
+	slotId := s.channelSlot(channelInfo.ChannelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
@@ -96,17 +100,21 @@ func (s *Store) DeleteChannel(channelId string, channelType uint8) error {
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
 
 func (s *Store) GetChannel(channelId string, channelType uint8) (wkdb.ChannelInfo, error) {
-	return s.wdb.GetChannel(channelId, channelType)
+	return readOwned(s, s.channelSlot(channelId), func() (wkdb.ChannelInfo, error) {
+		return s.wdb.GetChannel(channelId, channelType)
+	})
 }
 
 func (s *Store) ExistChannel(channelId string, channelType uint8) (bool, error) {
-	return s.wdb.ExistChannel(channelId, channelType)
+	return readOwned(s, s.channelSlot(channelId), func() (bool, error) {
+		return s.wdb.ExistChannel(channelId, channelType)
+	})
 }
 
 func (s *Store) AddDenylist(channelId string, channelType uint8, members []wkdb.Member) error {
@@ -121,19 +129,22 @@ func (s *Store) AddDenylist(channelId string, channelType uint8, members []wkdb.
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 
 }
 
 func (s *Store) GetDenylist(channelId string, channelType uint8) ([]wkdb.Member, error) {
-	return s.wdb.GetDenylist(channelId, channelType)
+	return readOwned(s, s.channelSlot(channelId), func() ([]wkdb.Member, error) {
+		return s.wdb.GetDenylist(channelId, channelType)
+	})
 }
 
 func (s *Store) ExistDenylist(channelId string, channelType uint8, uid string) (bool, error) {
-
-	return s.wdb.ExistDenylist(channelId, channelType, uid)
+	return readOwned(s, s.channelSlot(channelId), func() (bool, error) {
+		return s.wdb.ExistDenylist(channelId, channelType, uid)
+	})
 }
 
 func (s *Store) RemoveAllDenylist(channelId string, channelType uint8) error {
@@ -143,7 +154,7 @@ func (s *Store) RemoveAllDenylist(channelId string, channelType uint8) error {
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
@@ -160,7 +171,7 @@ func (s *Store) RemoveDenylist(channelId string, channelType uint8, uids []strin
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
@@ -177,17 +188,21 @@ func (s *Store) AddAllowlist(channelId string, channelType uint8, members []wkdb
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
 
 func (s *Store) GetAllowlist(channelID string, channelType uint8) ([]wkdb.Member, error) {
-	return s.wdb.GetAllowlist(channelID, channelType)
+	return readOwned(s, s.channelSlot(channelID), func() ([]wkdb.Member, error) {
+		return s.wdb.GetAllowlist(channelID, channelType)
+	})
 }
 
 func (s *Store) ExistAllowlist(channelId string, channelType uint8, uid string) (bool, error) {
-	return s.wdb.ExistAllowlist(channelId, channelType, uid)
+	return readOwned(s, s.channelSlot(channelId), func() (bool, error) {
+		return s.wdb.ExistAllowlist(channelId, channelType, uid)
+	})
 }
 
 func (s *Store) RemoveAllAllowlist(channelId string, channelType uint8) error {
@@ -197,7 +212,7 @@ func (s *Store) RemoveAllAllowlist(channelId string, channelType uint8) error {
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
@@ -214,12 +229,14 @@ func (s *Store) RemoveAllowlist(channelId string, channelType uint8, uids []stri
 	if err != nil {
 		return err
 	}
-	slotId := s.opts.Slot.GetSlotId(channelId)
+	slotId := s.channelSlot(channelId)
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }
 
 // 是否存在白名单
 func (s *Store) HasAllowlist(channelId string, channelType uint8) (bool, error) {
-	return s.wdb.HasAllowlist(channelId, channelType)
+	return readOwned(s, s.channelSlot(channelId), func() (bool, error) {
+		return s.wdb.HasAllowlist(channelId, channelType)
+	})
 }

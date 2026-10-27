@@ -50,7 +50,7 @@ func messageBoundarySetup(t *testing.T, d *messageBoundaryDB) *Server {
 	t.Cleanup(func() { require.NoError(t, d.Close()) })
 	s := NewServer(NewOptions(WithNodeId(1), WithDB(d), WithGroupCount(1)))
 	require.NoError(t, s.Start())
-	t.Cleanup(s.Stop)
+	t.Cleanup(func() { stopServer(t, s) })
 	return s
 }
 func messageBoundaryWake(t *testing.T, s *Server, id string) {
