@@ -29,6 +29,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
+	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/client"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
@@ -137,6 +138,10 @@ func TestDistributionIntegrationNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Match application startup: configure logging before concurrent clients.
+	logOptions := wklog.NewOptions()
+	logOptions.LogDir = t.TempDir()
+	wklog.Configure(logOptions)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 	if os.Getenv("WK_TEST_DISTRIBUTION_FAIL_CLEANUP") == "1" {
