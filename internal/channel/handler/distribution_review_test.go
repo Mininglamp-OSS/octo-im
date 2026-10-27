@@ -149,3 +149,26 @@ func TestDistributionReviewMalformedCountDoesNotAmplifyAllocation(t *testing.T) 
 	require.Error(t, err)
 	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(512*1024), "invalid count must not allocate megabytes before its first uid is validated")
 }
+
+func TestDistributionReviewMissingOnlineVersionIsTerminal(t *testing.T) {
+	versionTestFixture(t)
+	ctx := &eventbus.ChannelContext{ChannelId: "channel", ChannelType: wkproto.ChannelTypeData, SlotLeaderId: 2,
+		Events: []*eventbus.Event{{Type: eventbus.EventChannelDistribute, MessageId: 101, TagKey: "evicted", Conn: &eventbus.Conn{Uid: "sender"}, Frame: &wkproto.SendPacket{}}}}
+	NewHandler().distributeOnlineCmd(ctx)
+	require.Empty(t, ctx.RetryEvents, "a missing local online-CMD version must not block the global queue")
+}
+
+func TestDistributionReviewLegacyPersonReusesStableTag(t *testing.T) {
+	m, _ := versionTestFixture(t)
+	h := NewHandler()
+	ctx := &eventbus.ChannelContext{ChannelId: "sender@recipient", ChannelType: wkproto.ChannelTypePerson, SlotLeaderId: 1,
+		Events: []*eventbus.Event{{TagKey: "foreign-version"}}}
+	first, err := h.getCommonTag(ctx)
+	require.NoError(t, err)
+	for i := 0; i < 64; i++ {
+		next, err := h.getCommonTag(ctx)
+		require.NoError(t, err)
+		require.Equal(t, first.Key, next.Key, "a stable Person channel must not mint a local tag per legacy event")
+	}
+	require.Len(t, m.GetAllTags(), 2) // The fixture's A and the stable person tag.
+}
