@@ -20,6 +20,7 @@ import (
 
 const (
 	distributionPath           = "/wk/forward/distribution/v1"
+	distributionCapabilityPath = "/wk/forward/distribution/capability/v1"
 	distributionRetryTimeout   = 30 * time.Second
 	distributionMaxAttempts    = 12
 	distributionAdmissionLimit = 65536
@@ -93,7 +94,8 @@ func decodeDistribution(data []byte) (*distributionRequest, error) {
 	if err != nil || uint64(count) > uint64(len(data))/2 {
 		return nil, errInvalidDistribution
 	}
-	r.uids = make([]string, 0, count)
+	// Validate elements before growing toward a peer-controlled count.
+	r.uids = make([]string, 0, min(count, 4096))
 	for i := uint32(0); i < count; i++ {
 		uid, err := d.String()
 		if err != nil || uid == "" {
@@ -168,6 +170,22 @@ func (h *Handler) acceptDistribution(data []byte) proto.Status {
 	if err != nil || r.target != options.G.Cluster.NodeId {
 		return forward.StatusInvalid
 	}
+	fresh, status := h.reserveDistribution(r, len(data))
+	if status != proto.StatusOK {
+		return status
+	}
+	// Enqueue outside the receipt mutex: a stopped queue may synchronously
+	// release the reservation, which takes that same mutex.
+	for _, event := range fresh {
+		eventbus.Channel.AddEvent(r.channel, r.channelType, event)
+	}
+	if len(fresh) > 0 {
+		eventbus.Channel.Advance(r.channel, r.channelType)
+	}
+	return proto.StatusOK
+}
+
+func (h *Handler) reserveDistribution(r *distributionRequest, bodySize int) ([]*eventbus.Event, proto.Status) {
 	h.distributionMu.Lock()
 	defer h.distributionMu.Unlock()
 	now := h.distributionTime()
@@ -188,9 +206,9 @@ func (h *Handler) acceptDistribution(data []byte) proto.Status {
 	for _, event := range r.events {
 		id := distributionEventID(r, event)
 		if entry := h.distributionReceipts[id]; entry != nil {
-			if entry.Value.(distributionReceipt).version != r.key {
-				return forward.StatusInvalid
-			}
+			// Persistence retries reuse the canonical message ID after membership
+			// changes. Keep its original admission, without rejecting fresh peers
+			// in the same batch or dispatching it again under the newer version.
 			continue
 		}
 		if _, duplicate := batchIDs[id]; duplicate {
@@ -204,15 +222,15 @@ func (h *Handler) acceptDistribution(data []byte) proto.Status {
 		limit = distributionAdmissionLimit
 	}
 	if len(h.distributionReceipts)+len(fresh) > limit {
-		return forward.StatusRetry
+		return nil, forward.StatusRetry
 	}
-	reservation := len(data) + len(r.uids)*32 + len(fresh)*512
+	reservation := bodySize + len(r.uids)*32 + len(fresh)*512
 	byteLimit := h.distributionByteLimit
 	if byteLimit == 0 {
 		byteLimit = distributionSnapshotBudget
 	}
 	if len(fresh) > 0 && reservation > byteLimit-h.distributionBytes {
-		return forward.StatusRetry
+		return nil, forward.StatusRetry
 	}
 	var remaining atomic.Int64
 	remaining.Store(int64(len(fresh)))
@@ -233,12 +251,8 @@ func (h *Handler) acceptDistribution(data []byte) proto.Status {
 		h.distributionReceipts[id] = h.distributionOrder.PushBack(distributionReceipt{id, r.key, now.Add(distributionAdmissionTTL)})
 		event.SourceNodeId = r.source
 		event.Distribution = &eventbus.DistributionState{Snapshot: tag, Deadline: now.Add(distributionRetryTimeout), Release: release}
-		eventbus.Channel.AddEvent(r.channel, r.channelType, event)
 	}
-	if len(fresh) > 0 {
-		eventbus.Channel.Advance(r.channel, r.channelType)
-	}
-	return proto.StatusOK
+	return fresh, proto.StatusOK
 }
 
 func (h *Handler) distributionTime() time.Time {
@@ -248,8 +262,8 @@ func (h *Handler) distributionTime() time.Time {
 	return time.Now()
 }
 
-// forwardDistribution retries an ambiguous outcome only through the idempotent
-// snapshot route. An explicit missing-route response can safely use legacy Send.
+// forwardDistribution negotiates a route-specific capability before admission.
+// Once a snapshot RPC is attempted, even later probe failures cannot downgrade it.
 func (h *Handler) forwardDistribution(node uint64, tag *types.Tag, channel string, channelType uint8, events []*eventbus.Event) error {
 	r := &distributionRequest{source: options.G.Cluster.NodeId, target: node,
 		channel: channel, channelType: channelType, key: tag.Key, uids: tag.GetNodeUsers(node), events: events}
@@ -269,20 +283,38 @@ func (h *Handler) forwardDistribution(node uint64, tag *types.Tag, channel strin
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	resp, err := service.Cluster.RequestWithContext(ctx, node, distributionPath, body)
-	if err != nil {
-		return err
+	attempted := false
+	for _, event := range events {
+		if event.Distribution != nil {
+			_, pinned := event.Distribution.SnapshotNodes[node]
+			attempted = attempted || pinned
+		}
 	}
-	if resp == nil {
-		return forward.ErrOutcomeUnknown
-	}
-	if resp.Status == proto.StatusNotFound {
+	if !attempted && !h.forwardCapabilities.SupportsPath(ctx, node, distributionCapabilityPath) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		legacy := &forwardChannelEventReq{fromNode: options.G.Cluster.NodeId, channelId: channel, channelType: channelType, events: events}
 		data, err := legacy.encode()
 		if err != nil {
 			return err
 		}
 		return h.sendToNode(node, &proto.Message{MsgType: uint32(msgForwardChannelEvent), Content: data})
+	}
+	for _, event := range events {
+		if event.Distribution != nil {
+			if event.Distribution.SnapshotNodes == nil {
+				event.Distribution.SnapshotNodes = make(map[uint64]struct{})
+			}
+			event.Distribution.SnapshotNodes[node] = struct{}{}
+		}
+	}
+	resp, err := service.Cluster.RequestWithContext(ctx, node, distributionPath, body)
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return forward.ErrOutcomeUnknown
 	}
 	if resp.Status == forward.StatusInvalid {
 		return errInvalidDistribution

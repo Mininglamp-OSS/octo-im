@@ -62,7 +62,7 @@ func (h *Handler) distributeVersions(ctx *eventbus.ChannelContext, onlineCmd boo
 		if tag == nil {
 			if onlineCmd {
 				if first.TagKey == "" {
-					err = errors.New("online CMD distribution has no version")
+					err = errInvalidDistribution
 				} else if options.G.IsLocalNode(ctx.SlotLeaderId) {
 					tag = service.TagManager.Get(first.TagKey)
 				} else {
@@ -121,6 +121,9 @@ func (h *Handler) deliverVersion(ctx *eventbus.ChannelContext, tag *types.Tag, e
 		}
 		pending := make([]*eventbus.Event, 0, len(events))
 		for _, event := range events {
+			if event.SourceNodeId != 0 && event.SourceNodeId == node.LeaderId {
+				continue // Legacy recipient tags can also contain the forwarding node.
+			}
 			if _, done := event.Distribution.DeliveredNodes[node.LeaderId]; !done {
 				pending = append(pending, event)
 			}
@@ -185,11 +188,7 @@ func (h *Handler) retainDistribution(ctx *eventbus.ChannelContext, failed, tail 
 
 func finishDistribution(event *eventbus.Event) {
 	if state := event.Distribution; state != nil {
-		if state.Release != nil {
-			state.Release()
-			state.Release = nil
-		}
-		state.Snapshot = nil
+		state.Finish()
 	}
 }
 

@@ -156,6 +156,9 @@ func (h *Handler) onForwardChannelEvent(m *proto.Message) {
 	}
 
 	for _, e := range req.events {
+		if e.Type == eventbus.EventChannelDistribute {
+			e.SourceNodeId = req.fromNode
+		}
 		eventbus.Channel.AddEvent(req.channelId, req.channelType, e)
 	}
 	eventbus.Channel.Advance(req.channelId, req.channelType)

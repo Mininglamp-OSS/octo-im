@@ -19,12 +19,19 @@ import (
 
 type progressCluster struct {
 	icluster.ICluster
-	calls  map[uint64]int
-	legacy int
-	status proto.Status
+	calls             map[uint64]int
+	legacy            int
+	status            proto.Status
+	capabilityMissing bool
 }
 
-func (c *progressCluster) RequestWithContext(_ context.Context, node uint64, _ string, _ []byte) (*proto.Response, error) {
+func (c *progressCluster) RequestWithContext(_ context.Context, node uint64, path string, _ []byte) (*proto.Response, error) {
+	if path == distributionCapabilityPath {
+		if c.capabilityMissing {
+			return nil, context.DeadlineExceeded
+		}
+		return &proto.Response{Status: proto.StatusOK}, nil
+	}
 	c.calls[node]++
 	if c.status != 0 {
 		return &proto.Response{Status: c.status}, nil
@@ -63,12 +70,12 @@ func TestDistributionRetrySkipsCompletedDestinations(t *testing.T) {
 	require.Len(t, pusher.events, 1, "local recipients must not be replayed")
 }
 
-func TestDistributionLegacyFallbackRequiresMissingRoute(t *testing.T) {
+func TestDistributionLegacyFallbackProbesBeforeAdmission(t *testing.T) {
 	for _, status := range []proto.Status{proto.StatusNotFound, 99} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			versionTestFixture(t)
 			options.G.Cluster.NodeId = 1
-			c := &progressCluster{calls: make(map[uint64]int), status: status}
+			c := &progressCluster{calls: make(map[uint64]int), status: status, capabilityMissing: status == proto.StatusNotFound}
 			service.Cluster = c
 			tag := &types.Tag{Key: "A", Nodes: []*types.Node{{LeaderId: 2, Uids: []string{"remote"}}}}
 			ctx := progressContext(tag)

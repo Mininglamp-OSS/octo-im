@@ -134,7 +134,7 @@ func TestDistributionAdmissionPreservesDistinctStreamEvents(t *testing.T) {
 	require.Len(t, sink.events, 2, "two deltas of the same parent message are distinct, replay is not")
 }
 
-func TestDistributionAdmissionRejectsWrongTargetAndVersionConflict(t *testing.T) {
+func TestDistributionAdmissionRejectsWrongTargetAndCoalescesVersionRetry(t *testing.T) {
 	versionTestFixture(t)
 	old := eventbus.Channel
 	t.Cleanup(func() { eventbus.Channel = old })
@@ -145,6 +145,6 @@ func TestDistributionAdmissionRejectsWrongTargetAndVersionConflict(t *testing.T)
 	require.NotEqual(t, proto.StatusOK, a.acceptDistribution(distributionTestBody(t, 3, "A", 101)))
 	require.Empty(t, sink.events)
 	require.Equal(t, proto.StatusOK, a.acceptDistribution(distributionTestBody(t, 2, "A", 101)))
-	require.NotEqual(t, proto.StatusOK, a.acceptDistribution(distributionTestBody(t, 2, "B", 101)))
+	require.Equal(t, proto.StatusOK, a.acceptDistribution(distributionTestBody(t, 2, "B", 101)))
 	require.Len(t, sink.events, 1)
 }

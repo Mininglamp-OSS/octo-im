@@ -288,25 +288,43 @@ func startWireNode(t *testing.T, id int) wireReady {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(done) }()
+	readDone := make(chan struct{})
+	var waitErr, scanErr error
+	var diagnostics bytes.Buffer
+	go func() { <-readDone; waitErr = cmd.Wait(); close(done) }()
 	t.Cleanup(func() {
-		_ = cmd.Process.Signal(os.Interrupt)
+		select {
+		case <-done:
+			t.Errorf("node %d exited unexpectedly: %v\n%s", id, waitErr, diagnostics.String())
+			return
+		default:
+		}
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			t.Errorf("node %d interrupt failed: %v", id, err)
+		}
 		select {
 		case <-done:
 		case <-time.After(3 * time.Second):
 			_ = cmd.Process.Kill()
 			<-done
+			t.Errorf("node %d required forced termination", id)
+		}
+		if waitErr != nil || scanErr != nil {
+			t.Errorf("node %d failed: exit=%v scan=%v\n%s", id, waitErr, scanErr, diagnostics.String())
 		}
 	})
 	ready := make(chan wireReady, 1)
 	go func() {
+		defer close(readDone)
 		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 4096), 1024*1024)
 		for scanner.Scan() {
+			fmt.Fprintln(&diagnostics, scanner.Text())
 			if line := scanner.Text(); strings.HasPrefix(line, "DISTRIBUTION_NODE_READY ") {
 				var node wireReady
 				if json.Unmarshal([]byte(strings.TrimPrefix(line, "DISTRIBUTION_NODE_READY ")), &node) == nil {
@@ -314,6 +332,7 @@ func startWireNode(t *testing.T, id int) wireReady {
 				}
 			}
 		}
+		scanErr = scanner.Err()
 	}()
 	select {
 	case node := <-ready:

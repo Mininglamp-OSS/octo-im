@@ -69,6 +69,8 @@ func (c *channelHandler) hasEvent() bool {
 		return false
 	}
 	if len(c.pending.retryEvents) > 0 {
+		// Preserve channel order: newer work waits behind the bounded retry batch,
+		// including its backoff, trading queue fairness for delivery ordering.
 		return !time.Now().Before(c.pending.retryAt)
 	}
 	return c.processingIndex < c.pending.eventQueue.LastIndex()
