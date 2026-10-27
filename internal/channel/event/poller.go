@@ -64,11 +64,13 @@ func (p *poller) start() error {
 }
 
 func (p *poller) stop() {
+	p.Lock()
+	p.stopped = true
+	p.Unlock()
 	p.stopper.Stop()
 	_ = p.handlePool.ReleaseTimeout(5 * time.Second)
 	var abandoned []*eventbus.Event
 	p.Lock()
-	p.stopped = true
 	p.waitlist.readHandlers(&p.tmpHandlers)
 	for _, h := range p.tmpHandlers {
 		h.pending.Lock()

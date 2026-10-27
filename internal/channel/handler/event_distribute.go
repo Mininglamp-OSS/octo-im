@@ -73,7 +73,7 @@ func (h *Handler) distributeVersions(ctx *eventbus.ChannelContext, onlineCmd boo
 			}
 		}
 		if err == nil && tag == nil {
-			err = errors.New("distribution recipient version unavailable")
+			err = errInvalidDistribution
 		}
 		if err == nil {
 			now := h.distributionTime()

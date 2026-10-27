@@ -130,6 +130,11 @@ func (s *Service) GetOrRequestAndMakeTagWithLocal(fakeChannelId string, channelT
 
 // 获取个人频道的投递tag
 func (s *Service) getOrMakePersonTag(fakeChannelId string) (*types.Tag, error) {
+	if key := service.TagManager.GetChannelTag(fakeChannelId, wkproto.ChannelTypePerson); key != "" {
+		if tag := service.TagManager.Get(key); tag != nil {
+			return tag, nil
+		}
+	}
 
 	realFakeChannelId := fakeChannelId
 	if options.G.IsCmdChannel(fakeChannelId) {

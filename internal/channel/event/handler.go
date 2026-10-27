@@ -128,12 +128,24 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 		// 处理事件
 		c.handler.OnEvent(ctx)
 		if len(ctx.RetryEvents) > 0 {
-			c.pending.Lock()
-			c.pending.retryEvents = append(c.pending.retryEvents, ctx.RetryEvents...)
-			if ctx.RetryAt.After(c.pending.retryAt) {
-				c.pending.retryAt = ctx.RetryAt
+			c.poller.RLock()
+			stopped := c.poller.stopped
+			if !stopped {
+				c.pending.Lock()
+				c.pending.retryEvents = append(c.pending.retryEvents, ctx.RetryEvents...)
+				if ctx.RetryAt.After(c.pending.retryAt) {
+					c.pending.retryAt = ctx.RetryAt
+				}
+				c.pending.Unlock()
 			}
-			c.pending.Unlock()
+			c.poller.RUnlock()
+			if stopped {
+				for _, event := range ctx.RetryEvents {
+					if event.Distribution != nil {
+						event.Distribution.Finish()
+					}
+				}
+			}
 		}
 
 		// 释放上下文
