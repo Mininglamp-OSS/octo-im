@@ -3,12 +3,82 @@ package cluster
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDormantChannelLeaderRestoresRebuiltReplicasWithoutSending(t *testing.T) {
+	servers, ctx := newConfigRPCServers(t, 3)
+	leader := servers[0]
+	id := "dormant-surviving-leader"
+	for leader.cfgServer.SlotLeaderId(leader.getSlotId(id)) != 1 {
+		id += "x"
+	}
+	cfg := wkdb.ChannelClusterConfig{ChannelId: id, ChannelType: 2, LeaderId: 1,
+		Term: 1, ReplicaMaxCount: 3, Replicas: []uint64{1, 2, 3}}
+	version, err := leader.saveChannelConfig(ctx, cfg)
+	require.NoError(t, err)
+	cfg.ConfVersion = version
+	var history []wkdb.Message
+	for seq := uint32(1); seq <= 4; seq++ {
+		m := consistencyMessage(seq)
+		m.ChannelID = id
+		history = append(history, m)
+	}
+	require.NoError(t, leader.db.AppendMessages(id, 2, history))
+	require.False(t, leader.channelServer.ExistChannel(id, 2), "the surviving leader starts dormant")
+	_, err = leader.reconcileLocalChannelConfig(ctx, cfg)
+	require.NoError(t, err)
+	require.True(t, leader.channelServer.ExistChannel(id, 2), "background reconciliation must wake a data-bearing dormant leader to repair empty replicas")
+	require.Eventually(t, func() bool {
+		for _, s := range servers {
+			messages, err := s.db.LoadLastMsgs(id, 2, 100)
+			if err != nil || len(messages) != len(history) {
+				return false
+			}
+			for i, message := range messages {
+				if message.MessageID != history[i].MessageID || message.MessageSeq != history[i].MessageSeq || string(message.Payload) != string(history[i].Payload) {
+					return false
+				}
+			}
+		}
+		return true
+	}, 5*time.Second, 10*time.Millisecond, "all actual replicas must restore old messages without another send")
+	stored, err := leader.loadConversationConfig(ctx, id, 2)
+	require.NoError(t, err)
+	require.Equal(t, cfg.ConfVersion, stored.ConfVersion, "catch-up must not churn metadata")
+}
+
+func TestDormantChannelLeaderKeepsCaughtUpReplicasIdle(t *testing.T) {
+	servers, ctx := newConfigRPCServers(t, 3)
+	leader := servers[0]
+	id := "dormant-caught-up-leader"
+	for leader.cfgServer.SlotLeaderId(leader.getSlotId(id)) != 1 {
+		id += "x"
+	}
+	cfg := wkdb.ChannelClusterConfig{ChannelId: id, ChannelType: 2, LeaderId: 1,
+		Term: 1, ReplicaMaxCount: 3, Replicas: []uint64{1, 2, 3}}
+	version, err := leader.saveChannelConfig(ctx, cfg)
+	require.NoError(t, err)
+	cfg.ConfVersion = version
+	message := consistencyMessage(1)
+	message.ChannelID = id
+	for _, s := range servers {
+		require.NoError(t, s.db.AppendMessages(id, 2, []wkdb.Message{message}))
+	}
+	_, err = leader.reconcileLocalChannelConfig(ctx, cfg)
+	require.NoError(t, err)
+	for _, s := range servers {
+		require.False(t, s.channelServer.ExistChannel(id, 2), "caught-up dormant replicas must stay dormant")
+	}
+	stored, err := leader.loadConversationConfig(ctx, id, 2)
+	require.NoError(t, err)
+	require.Equal(t, cfg.ConfVersion, stored.ConfVersion)
+}
 
 func TestEmptyRejoinedChannelLeaderRecoversFromSurvivingReplica(t *testing.T) {
 	servers, ctx := newConfigRPCServers(t, 3)

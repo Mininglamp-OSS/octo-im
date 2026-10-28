@@ -17,7 +17,8 @@ func (s *Server) ReconcileConfig(ctx context.Context, cfg wkdb.ChannelClusterCon
 	if !icluster.ValidChannelReadConfig(cfg, cfg.ChannelId, cfg.ChannelType) || cfg.LeaderId != s.opts.NodeId {
 		return false, ErrConfigConflict
 	}
-	if err := s.prepareLeaderStart(ctx, cfg); err != nil {
+	wakeForRecovery, err := s.prepareLeaderStart(ctx, cfg)
+	if err != nil {
 		return false, err
 	}
 	if err := s.wakeLeaderLock.LockContext(ctx, cfg.ChannelId); err != nil {
@@ -31,7 +32,7 @@ func (s *Server) ReconcileConfig(ctx context.Context, cfg wkdb.ChannelClusterCon
 	rg := s.getRaftGroup(key)
 	r := rg.GetRaft(key)
 	if r == nil {
-		if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 {
+		if !wakeForRecovery && len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 {
 			return true, nil
 		}
 		return false, s.createAndApplyConfig(ctx, cfg)

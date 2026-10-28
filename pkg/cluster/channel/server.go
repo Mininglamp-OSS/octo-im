@@ -80,7 +80,7 @@ func (s *Server) Stop() {
 func (s *Server) WakeLeaderIfNeed(clusterConfig wkdb.ChannelClusterConfig) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := s.prepareLeaderStart(ctx, clusterConfig); err != nil {
+	if _, err := s.prepareLeaderStart(ctx, clusterConfig); err != nil {
 		return err
 	}
 
@@ -109,7 +109,7 @@ func (s *Server) WakeFollowerfNeed(channelId string, channelType uint8) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := s.prepareLeaderStart(ctx, clusterConfig); err != nil {
+	if _, err := s.prepareLeaderStart(ctx, clusterConfig); err != nil {
 		return err
 	}
 	s.wakeLeaderLock.Lock(channelId)
@@ -148,9 +148,9 @@ func (s *Server) WakeFollowerfNeed(channelId string, channelType uint8) error {
 }
 
 // Recovery may call peers and the slot owner, so run it before channel locks.
-func (s *Server) prepareLeaderStart(ctx context.Context, cfg wkdb.ChannelClusterConfig) error {
+func (s *Server) prepareLeaderStart(ctx context.Context, cfg wkdb.ChannelClusterConfig) (bool, error) {
 	if s.opts.BeforeLeaderStart == nil || cfg.LeaderId != s.opts.NodeId || s.ExistChannel(cfg.ChannelId, cfg.ChannelType) {
-		return nil
+		return false, nil
 	}
 	return s.opts.BeforeLeaderStart(ctx, cfg)
 }

@@ -12,17 +12,18 @@ import (
 // A rejoined ID can still be the metadata leader after losing its local disk.
 // Before activating an empty leader, ask the existing voters for their durable
 // logs and move leadership to a surviving log through the slot owner's CAS.
-// Nonempty and already active leaders retain their existing startup path.
-func (s *Server) recoverEmptyChannelLeader(ctx context.Context, cfg wkdb.ChannelClusterConfig) error {
+// A surviving dormant leader also needs to wake when rebuilt replicas report
+// shorter logs. Healthy dormant channels and already active leaders stay idle.
+func (s *Server) recoverEmptyChannelLeader(ctx context.Context, cfg wkdb.ChannelClusterConfig) (bool, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if cfg.LeaderId != s.opts.ConfigOptions.NodeId || len(cfg.Replicas) <= 1 {
-		return nil
+		return false, nil
 	}
 	lastIndex, _, err := s.channelServer.LastLogIndexAndTerm(cfg.ChannelId, cfg.ChannelType)
-	if err != nil || lastIndex != 0 {
-		return err
+	if err != nil {
+		return false, err
 	}
 	voters := make([]uint64, 0, len(cfg.Replicas))
 	for _, id := range cfg.Replicas {
@@ -32,32 +33,43 @@ func (s *Server) recoverEmptyChannelLeader(ctx context.Context, cfg wkdb.Channel
 	}
 	infos, err := s.requestChannelLastLogInfos(ctx, voters, cfg.ChannelId, cfg.ChannelType)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if lastIndex > 0 {
+		// Existing data-bearing leadership is authoritative. A missing peer
+		// must not block its normal activation; a known lagging peer needs a
+		// live Raft leader so ordinary replication can restore its history.
+		for _, id := range voters {
+			if info := infos[id]; info != nil && info.LogIndex < uint64(lastIndex) {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
 	// A majority can have lost its disks together. Its empty logs cannot prove
 	// that the absent voter does not hold the only surviving history.
 	for _, id := range voters {
 		if infos[id] == nil {
-			return ErrConversationReadRetry
+			return false, ErrConversationReadRetry
 		}
 	}
 	next := cfg.Clone()
 	if _, err := electChannelLeader(&next, infos); err != nil {
-		return err
+		return false, err
 	}
 	if infos[next.LeaderId].LogIndex == 0 {
 		// Every voter confirms an actually unused channel. Keep its chosen leader
 		// and leave it dormant until a real write needs it.
-		return nil
+		return false, nil
 	}
 	_, err = s.saveChannelConfigTransition(ctx, cfg.ChannelId, cfg.ChannelType, rafttype.Config{
 		Version: cfg.ConfVersion, Term: next.Term, Leader: next.LeaderId,
 		Replicas: cfg.Replicas, Learners: cfg.Learners, MigrateFrom: cfg.MigrateFrom, MigrateTo: cfg.MigrateTo,
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	// The caller reloads the new authority; the empty old leader must not start
 	// accepting writes against the configuration it just replaced.
-	return raft.ErrConfigVersionStale
+	return false, raft.ErrConfigVersionStale
 }
