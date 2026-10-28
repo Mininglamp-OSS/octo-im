@@ -47,10 +47,11 @@ func (s *Store) GetChannelShardIndex(channelId string, channelType uint8) uint32
 }
 
 func (s *Store) Start() error {
-	for i := 0; i < 50; i++ {
-		go s.loopSaveChannelClusterConfig()
-	}
-	// s.stopper.RunWorker(s.loopSaveChannelClusterConfig)
+	// Replay may queue several versions of one channel before waiting for
+	// their writes. A single batching consumer preserves that order through
+	// both persistence and cache publication. Parallel consumers can commit an
+	// older configuration last while the slot still advances AppliedIndex.
+	s.stopper.RunWorker(s.loopSaveChannelClusterConfig)
 	return nil
 }
 
