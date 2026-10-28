@@ -2,6 +2,9 @@ package cluster
 
 import (
 	"context"
+	"fmt"
+	"math"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -98,18 +101,24 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 		}
 		slot := getSlot(slotId)
 		if slot != nil {
-			if slot.Leader != newLeaderId {
-				newSlot := slot.Clone()
-				newSlot.Leader = newLeaderId
-				newSlot.Term++
-				newSlot.ExpectLeader = 0
-				newSlot.Status = types.SlotStatus_SlotStatusNormal // 槽状态变更正常
-				s.Info("slot leader election success", zap.Uint32("slotId", slotId), zap.Uint64("newLeader", newLeaderId))
-				if newSlot.MigrateTo != 0 && newSlot.MigrateTo == newLeaderId {
-					newSlot.MigrateFrom = 0
-					newSlot.MigrateTo = 0
-					newSlot.Learners = wkutil.RemoveUint64(newSlot.Learners, newLeaderId)
+			if slot.Status == types.SlotStatus_SlotStatusCandidate && slot.ExpectLeader == slot.Leader {
+				complete := true
+				for _, id := range slot.Replicas {
+					if _, ok := replicaLastLogInfoMap[id][slotId]; !ok {
+						complete = false
+						break
+					}
 				}
+				if !complete {
+					continue
+				}
+			}
+			if slot.Leader != newLeaderId || slot.Status == types.SlotStatus_SlotStatusCandidate {
+				newSlot, err := slotElectionConfig(slot, newLeaderId, replicaLastLogInfoMap)
+				if err != nil {
+					return err
+				}
+				s.Info("slot leader election success", zap.Uint32("slotId", slotId), zap.Uint64("newLeader", newLeaderId))
 				newSlots = append(newSlots, newSlot)
 			}
 		}
@@ -125,9 +134,35 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 	return nil
 }
 
+func slotElectionConfig(slot *types.Slot, leader uint64, infos map[uint64]map[uint32]SlotInfo) (*types.Slot, error) {
+	term := slot.Term
+	for _, id := range slot.Replicas {
+		if info, ok := infos[id][slot.Id]; ok {
+			term = max(term, info.Term, info.LogTerm)
+		}
+	}
+	if term == math.MaxUint32 {
+		return nil, fmt.Errorf("slot %d election term exhausted", slot.Id)
+	}
+	next := slot.Clone()
+	next.Leader, next.Term = leader, term+1
+	next.ExpectLeader = 0
+	next.Status = types.SlotStatus_SlotStatusNormal
+	recovering := slot.Status == types.SlotStatus_SlotStatusCandidate && slot.ExpectLeader == slot.Leader
+	// Recovery supersedes a previous leadership transfer. A real membership
+	// migration still has a learner and must continue through normal catch-up.
+	if next.MigrateTo != 0 && (next.MigrateTo == leader || recovering &&
+		wkutil.ArrayContainsUint64(next.Replicas, next.MigrateTo) && !wkutil.ArrayContainsUint64(next.Learners, next.MigrateTo)) {
+		next.MigrateFrom, next.MigrateTo = 0, 0
+		next.Learners = wkutil.RemoveUint64(next.Learners, leader)
+	}
+	return next, nil
+}
+
 // 请求槽的日志高度
 func (s *Server) requestSlotInfos(waitElectionSlots map[uint64][]uint32) ([]*SlotLogInfoResp, error) {
 	slotInfoResps := make([]*SlotLogInfoResp, 0, len(waitElectionSlots))
+	var responsesMu sync.Mutex
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*4)
 	defer cancel()
 	requestGroup, _ := errgroup.WithContext(timeoutCtx)
@@ -138,22 +173,26 @@ func (s *Server) requestSlotInfos(waitElectionSlots map[uint64][]uint32) ([]*Slo
 				s.Error("get slot infos error", zap.Error(err))
 				continue
 			}
+			responsesMu.Lock()
 			slotInfoResps = append(slotInfoResps, &SlotLogInfoResp{
 				NodeId: nodeId,
 				Slots:  slotInfos,
 			})
+			responsesMu.Unlock()
 			continue
 		} else {
 			requestGroup.Go(func(nID uint64, sids []uint32) func() error {
 				return func() error {
 					resp, err := s.rpcClient.RequestSlotLastLogInfo(nID, &SlotLogInfoReq{
-						SlotIds: slotIds,
+						SlotIds: sids,
 					})
 					if err != nil {
 						s.Warn("request slot log info error", zap.Error(err))
 						return nil
 					}
+					responsesMu.Lock()
 					slotInfoResps = append(slotInfoResps, resp)
+					responsesMu.Unlock()
 					return nil
 				}
 			}(nodeId, slotIds))
@@ -229,7 +268,6 @@ func (s *Server) electionSlotLeaderBySlot(slotLogInfos map[uint64]map[uint32]Slo
 	var expectLeader uint64 // 期望领导
 	var lastLogIndex uint64 // 最新一条日志下标
 	var lastLogTerm uint32  // 最新一条日志任期
-	var leaderTerm uint32   // 领导任期
 	st := s.cfgServer.Slot(slotId)
 
 	// 如果槽正在进行领导者转移，则优先计算转移节点的日志信息
@@ -243,18 +281,13 @@ func (s *Server) electionSlotLeaderBySlot(slotLogInfos map[uint64]map[uint32]Slo
 				expectLeader = replicaId
 				lastLogIndex = slotInfo.LogIndex
 				lastLogTerm = slotInfo.LogTerm
-				leaderTerm = slotInfo.Term
 				break
 			}
 		}
 	}
 
-	/**
-	候选者的任期号（Term）不小于自身的当前任期号。
-	候选者的日志至少和自己的日志一样新，即：
-	候选者的最后日志条目的任期号较大，或者
-	如果任期号相同，候选者的日志更长。
-		**/
+	// Durable log freshness chooses the leader. A higher runtime term on an
+	// empty restarted replica must not outrank the only surviving log.
 	for replicaId, logIndexMap := range slotLogInfos {
 		candidate, ok := logIndexMap[slotId]
 		if !ok {
@@ -264,29 +297,16 @@ func (s *Server) electionSlotLeaderBySlot(slotLogInfos map[uint64]map[uint32]Slo
 			expectLeader = replicaId
 			lastLogIndex = candidate.LogIndex
 			lastLogTerm = candidate.LogTerm
-			leaderTerm = candidate.Term
 			continue
 		}
 
-		// 候选者的任期号（Term）不小于自身的当前任期号。
-		if candidate.Term < leaderTerm {
-			continue
-		}
-
-		// 候选者的最后日志条目的任期号较大，或者
-		// 如果任期号相同，候选者的日志更长。
-		if candidate.LogTerm > lastLogTerm {
+		preferred := st != nil && st.ExpectLeader != 0 && st.ExpectLeader != st.Leader
+		tieWins := candidate.LogTerm == lastLogTerm && candidate.LogIndex == lastLogIndex &&
+			(!preferred || expectLeader != st.ExpectLeader) && replicaId < expectLeader
+		if candidate.LogTerm > lastLogTerm || candidate.LogTerm == lastLogTerm && candidate.LogIndex > lastLogIndex || tieWins {
 			expectLeader = replicaId
 			lastLogIndex = candidate.LogIndex
 			lastLogTerm = candidate.LogTerm
-			leaderTerm = candidate.Term
-		} else if candidate.LogTerm == lastLogTerm {
-			if candidate.LogIndex > lastLogIndex {
-				expectLeader = replicaId
-				lastLogIndex = candidate.LogIndex
-				lastLogTerm = candidate.LogTerm
-				leaderTerm = candidate.Term
-			}
 		}
 
 	}

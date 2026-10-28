@@ -44,17 +44,30 @@ func (s *Server) AddOrUpdateSlotRaft(slot *types.Slot) {
 
 		s.raftGroup.AddEvent(shardNo, rafttype.Event{
 			Type:   rafttype.ConfChange,
-			Config: s.slotToConfig(slot),
+			Config: s.slotRuntimeConfig(slot, slotNode),
 		})
 	} else { // 更新slot的分布式配置
 		raftSlot := rft.(*Slot)
 		if raftSlot.needUpdate(slot) {
 			s.raftGroup.AddEvent(shardNo, rafttype.Event{
 				Type:   rafttype.ConfChange,
-				Config: s.slotToConfig(slot),
+				Config: s.slotRuntimeConfig(slot, raftSlot),
 			})
 		}
 	}
+}
+
+func (s *Server) slotRuntimeConfig(st *types.Slot, local *Slot) rafttype.Config {
+	cfg := s.slotToConfig(st)
+	if local.recoveryTerm != 0 {
+		if st.Leader != s.opts.NodeId || st.Term > local.recoveryTerm {
+			local.recoveryTerm = 0
+		} else {
+			cfg.Leader = 0
+			cfg.Role = rafttype.RoleFollower
+		}
+	}
+	return cfg
 }
 
 func (s *Server) slotToConfig(st *types.Slot) rafttype.Config {
@@ -80,6 +93,12 @@ func (s *Server) slotToConfig(st *types.Slot) rafttype.Config {
 		Term:        st.Term,
 		Leader:      st.Leader,
 		Role:        role,
+	}
+	if st.Status == types.SlotStatus_SlotStatusCandidate {
+		// The controller owns this election; fence the old leader while it
+		// compares durable logs rather than retaining a local leader identity.
+		cfg.Leader = 0
+		cfg.Role = rafttype.RoleFollower
 	}
 
 	return cfg

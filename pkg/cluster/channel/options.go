@@ -1,6 +1,8 @@
 package channel
 
 import (
+	"context"
+
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -31,6 +33,8 @@ type Options struct {
 
 	// OnSaveConfig 保存频道配置
 	OnSaveConfig func(channelId string, channelType uint8, cfg types.Config) error
+	// BeforeLeaderStart verifies recovery before a dormant local leader starts.
+	BeforeLeaderStart func(context.Context, wkdb.ChannelClusterConfig) error
 
 	//DestoryAfterIdleTick 频道空闲多久后销毁（如果TickInterval是100ms, 那么10 * 60 * 30这个值是30分钟，具体时间根据TickInterval来定）
 	DestoryAfterIdleTick int
@@ -107,6 +111,13 @@ func WithRPC(rpc icluster.RPC) Option {
 func WithOnSaveConfig(fn func(channelId string, channelType uint8, cfg types.Config) error) Option {
 	return func(o *Options) {
 		o.OnSaveConfig = fn
+	}
+}
+
+// WithBeforeLeaderStart installs the cold-leader recovery check.
+func WithBeforeLeaderStart(fn func(context.Context, wkdb.ChannelClusterConfig) error) Option {
+	return func(o *Options) {
+		o.BeforeLeaderStart = fn
 	}
 }
 

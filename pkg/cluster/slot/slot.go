@@ -12,6 +12,8 @@ type Slot struct {
 	*raft.Node
 	slot    *types.Slot
 	shardNo string
+	// recoveryTerm fences inherited empty leadership until a new election.
+	recoveryTerm uint32
 	wklog.Log
 }
 
@@ -25,6 +27,9 @@ func newSlot(slot *types.Slot, s *Server) *Slot {
 	state, err := s.storage.GetState(shardNo)
 	if err != nil {
 		st.Panic("get state failed", zap.Error(err))
+	}
+	if s.opts.Recovering && slot.Leader == s.opts.NodeId && state.LastLogIndex == 0 {
+		st.recoveryTerm = slot.Term
 	}
 	lastLogIndex, err := s.storage.GetTermStartIndex(shardNo, state.LastTerm)
 	if err != nil {

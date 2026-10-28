@@ -137,13 +137,32 @@ func (s *Server) handleNodeJoining() error {
 
 	}
 
-	if len(migrateSlots) > 0 {
-		err := s.cfgServer.ProposeJoined(joiningNode.Id, migrateSlots)
-		if err != nil {
-			return err
+	// Reusing an ID does not prove its old slot logs survived. Re-elect slots
+	// led by the returning node so a surviving log supplies their metadata.
+	for _, slot := range slots {
+		if slot.Leader != joiningNode.Id {
+			continue
 		}
+		var updated *types.Slot
+		for _, planned := range migrateSlots {
+			if planned.Id == slot.Id {
+				updated = planned
+				break
+			}
+		}
+		if updated == nil {
+			updated = slot.Clone()
+			migrateSlots = append(migrateSlots, updated)
+		}
+		updated.Status = types.SlotStatus_SlotStatusCandidate
+		// Expecting the previous leader identifies recovery: every voter must
+		// report its log before an empty returning majority can be trusted.
+		updated.ExpectLeader = slot.Leader
 	}
 
-	return nil
+	// Joining already means the configuration Raft group promoted this node.
+	// A returning node may still own all its slots, so no migration is needed.
+	// Persist completion independently of the migration plan in that case.
+	return s.cfgServer.ProposeJoined(joiningNode.Id, migrateSlots)
 
 }

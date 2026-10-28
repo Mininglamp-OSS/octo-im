@@ -44,8 +44,14 @@ func (s *Server) needJoin() (bool, error) {
 		return false, nil
 	}
 	seedNodeId, _, err := seedNode(s.opts.Seed)
+	if err != nil {
+		return false, err
+	}
+	if s.freshSeededStart {
+		return true, nil
+	}
 	seedNode := s.cfgServer.Node(seedNodeId)
-	return seedNode == nil, err
+	return seedNode == nil, nil
 }
 
 func seedNode(seed string) (uint64, string, error) {
