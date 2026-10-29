@@ -1,7 +1,10 @@
 package cluster
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"testing"
 	"time"
 
@@ -20,7 +23,7 @@ func TestDormantChannelLeaderRestoresRebuiltReplicasWithoutSending(t *testing.T)
 	}
 	cfg := wkdb.ChannelClusterConfig{ChannelId: id, ChannelType: 2, LeaderId: 1,
 		Term: 1, ReplicaMaxCount: 3, Replicas: []uint64{1, 2, 3}}
-	version, err := leader.saveChannelConfig(ctx, cfg)
+	version, err := saveRecoveryTestConfig(t, leader, ctx, cfg)
 	require.NoError(t, err)
 	cfg.ConfVersion = version
 	var history []wkdb.Message
@@ -48,7 +51,7 @@ func TestDormantChannelLeaderRestoresRebuiltReplicasWithoutSending(t *testing.T)
 		}
 		return true
 	}, 5*time.Second, 10*time.Millisecond, "all actual replicas must restore old messages without another send")
-	stored, err := leader.loadConversationConfig(ctx, id, 2)
+	stored, err := loadRecoveryTestConfig(t, leader, ctx, id, 2)
 	require.NoError(t, err)
 	require.Equal(t, cfg.ConfVersion, stored.ConfVersion, "catch-up must not churn metadata")
 }
@@ -62,7 +65,7 @@ func TestDormantChannelLeaderKeepsCaughtUpReplicasIdle(t *testing.T) {
 	}
 	cfg := wkdb.ChannelClusterConfig{ChannelId: id, ChannelType: 2, LeaderId: 1,
 		Term: 1, ReplicaMaxCount: 3, Replicas: []uint64{1, 2, 3}}
-	version, err := leader.saveChannelConfig(ctx, cfg)
+	version, err := saveRecoveryTestConfig(t, leader, ctx, cfg)
 	require.NoError(t, err)
 	cfg.ConfVersion = version
 	message := consistencyMessage(1)
@@ -75,7 +78,7 @@ func TestDormantChannelLeaderKeepsCaughtUpReplicasIdle(t *testing.T) {
 	for _, s := range servers {
 		require.False(t, s.channelServer.ExistChannel(id, 2), "caught-up dormant replicas must stay dormant")
 	}
-	stored, err := leader.loadConversationConfig(ctx, id, 2)
+	stored, err := loadRecoveryTestConfig(t, leader, ctx, id, 2)
 	require.NoError(t, err)
 	require.Equal(t, cfg.ConfVersion, stored.ConfVersion)
 }
@@ -91,7 +94,7 @@ func TestEmptyRejoinedChannelLeaderRecoversFromSurvivingReplica(t *testing.T) {
 			}
 			cfg := wkdb.ChannelClusterConfig{ChannelId: id, ChannelType: 2, LeaderId: 2,
 				Term: 1, ReplicaMaxCount: 3, Replicas: []uint64{1, 2, 3}}
-			version, err := owner.saveChannelConfig(ctx, cfg)
+			version, err := saveRecoveryTestConfig(t, owner, ctx, cfg)
 			require.NoError(t, err)
 			cfg.ConfVersion = version
 			if mode != "empty-control" {
@@ -114,18 +117,18 @@ func TestEmptyRejoinedChannelLeaderRecoversFromSurvivingReplica(t *testing.T) {
 			}
 			if mode == "missing-voter" {
 				require.ErrorIs(t, err, ErrConversationReadRetry)
-				stored, loadErr := owner.loadConversationConfig(ctx, id, 2)
+				stored, loadErr := loadRecoveryTestConfig(t, owner, ctx, id, 2)
 				require.NoError(t, loadErr)
 				require.Equal(t, cfg.ConfVersion, stored.ConfVersion, "partial probes cannot authorize an empty leader")
 			} else if mode == "empty-control" || mode == "nonempty-control" {
 				require.NoError(t, err)
-				stored, loadErr := owner.loadConversationConfig(ctx, id, 2)
+				stored, loadErr := loadRecoveryTestConfig(t, owner, ctx, id, 2)
 				require.NoError(t, loadErr)
 				require.Equal(t, uint64(2), stored.LeaderId)
 				require.Equal(t, cfg.ConfVersion, stored.ConfVersion)
 			} else {
 				require.ErrorIs(t, err, raft.ErrConfigVersionStale)
-				stored, loadErr := owner.loadConversationConfig(ctx, id, 2)
+				stored, loadErr := loadRecoveryTestConfig(t, owner, ctx, id, 2)
 				require.NoError(t, loadErr)
 				require.Equal(t, uint64(1), stored.LeaderId, "the surviving data-bearing voter must lead")
 				require.Greater(t, stored.Term, cfg.Term)
@@ -134,4 +137,31 @@ func TestEmptyRejoinedChannelLeaderRecoversFromSurvivingReplica(t *testing.T) {
 			require.False(t, empty.channelServer.ExistChannel(id, 2), "an empty returning leader must not accept new writes before recovery")
 		})
 	}
+}
+
+// Recovery is reconciled asynchronously in production. Retry only documented
+// transient leadership/apply barriers while setting up and observing fixtures;
+// the recovery decision and message-history assertions remain single and strict.
+func retryRecoveryTestBarrier(t *testing.T, fn func() error) error {
+	t.Helper()
+	var err error
+	require.Eventually(t, func() bool {
+		err = fn()
+		return err == nil || !errors.Is(err, ErrConversationReadRetry) && !errors.Is(err, rafttype.ErrNotLeader)
+	}, 3*time.Second, 10*time.Millisecond)
+	return err
+}
+
+func saveRecoveryTestConfig(t *testing.T, s *Server, ctx context.Context, cfg wkdb.ChannelClusterConfig) (uint64, error) {
+	t.Helper()
+	var version uint64
+	err := retryRecoveryTestBarrier(t, func() error { var err error; version, err = s.saveChannelConfig(ctx, cfg); return err })
+	return version, err
+}
+
+func loadRecoveryTestConfig(t *testing.T, s *Server, ctx context.Context, id string, typ uint8) (wkdb.ChannelClusterConfig, error) {
+	t.Helper()
+	var cfg wkdb.ChannelClusterConfig
+	err := retryRecoveryTestBarrier(t, func() error { var err error; cfg, err = s.loadConversationConfig(ctx, id, typ); return err })
+	return cfg, err
 }

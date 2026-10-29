@@ -136,25 +136,27 @@ func (s *Server) ProposeJoining(nodeId uint64) error {
 
 // ProposeJoin 提案节点加入
 func (s *Server) ProposeJoin(node *pb.Node) error {
+	_, err := s.ProposeJoinWithVersion(node)
+	return err
+}
 
+// ProposeJoinWithVersion returns the applied join command's exact log index.
+// A recovering process uses it to distinguish its own rejoin from replay.
+func (s *Server) ProposeJoinWithVersion(node *pb.Node) (uint64, error) {
 	data, err := node.Marshal()
 	if err != nil {
-		return err
+		return 0, err
 	}
-
 	cmd := NewCMD(CMDTypeNodeJoin, data)
 	cmdBytes, err := cmd.Marshal()
 	if err != nil {
-		return err
+		return 0, err
 	}
-
-	logId := s.genConfigId()
-	_, err = s.ProposeUntilApplied(logId, cmdBytes)
+	resp, err := s.ProposeUntilApplied(s.genConfigId(), cmdBytes)
 	if err != nil {
-		s.Error("ProposeJoin failed", zap.Error(err))
-		return err
+		return 0, err
 	}
-	return nil
+	return resp.Index, nil
 }
 
 // ProposeMigrateSlot 提案槽迁移

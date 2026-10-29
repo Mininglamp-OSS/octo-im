@@ -2,9 +2,11 @@ package slot
 
 import (
 	"context"
+	nodetypes "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"path"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -26,6 +28,11 @@ type Server struct {
 	genLogId *snowflake.Node
 
 	slotUpdateLock sync.Mutex
+	// The owner checks this boundary against each queued config version, so
+	// old replay events cannot use a newly published recovery decision.
+	recoveryBoundary    atomic.Uint64
+	recoveryJoinVersion uint64            // guarded by slotUpdateLock
+	recoveryConfig      *nodetypes.Config // latest applied snapshot, guarded by slotUpdateLock
 }
 
 func NewServer(opts *Options) *Server {
