@@ -1,195 +1,77 @@
 name: Docker Publish
-run-name: Image ${{ github.ref_name }} (${{ github.event_name }})
+run-name: Publish v2.2.5-20261029 from 8fc476c5
 
 on:
-  push:
-    branches:
-      - v2.2.5-20260422-fix1
-    tags:
-      - v2.2.5-*-fix1
-      - v2.2.5-*-fix1.*
-      - v2.2.5-*-fix1-*
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Optional test-* image tag; defaults to test-<commit SHA>'
-        required: false
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: fix1-image-${{ github.ref }}
+  group: publish-octo-im-v2.2.5-20261029
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Validate source and image tags
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
-      version: ${{ steps.meta.outputs.version }}
-      revision: ${{ steps.meta.outputs.revision }}
-      commit_date: ${{ steps.meta.outputs.commit_date }}
-      tags: ${{ steps.meta.outputs.tags }}
-    steps:
-      - name: Checkout triggered commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Test image metadata
-        run: python3 -B -m unittest discover -s test/ci -p 'test_*.py' -v
-      - name: Prepare image metadata
-        id: meta
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
-        run: bash .github/scripts/image-metadata.sh
-
-  build:
-    name: Build native ${{ matrix.platform }}
-    needs: prepare
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-24.04
-            arch: amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            arch: arm64
-    steps:
-      - name: Checkout triggered commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: .
-          file: ./Dockerfile.pr
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.prepare.outputs.revision }}
-            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
-          build-args: |
-            SOURCE_REVISION=${{ needs.prepare.outputs.revision }}
-            SOURCE_DATE=${{ needs.prepare.outputs.commit_date }}
-            SOURCE_VERSION=${{ needs.prepare.outputs.version }}
-          cache-from: type=gha,scope=fix1-image-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=fix1-image-${{ matrix.arch }}
-          provenance: false
-      - name: Export platform digest
-        env:
-          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo '::error::Build returned an invalid digest.'
-            exit 1
-          fi
-          mkdir -p "$RUNNER_TEMP/digests"
-          touch "$RUNNER_TEMP/digests/${BUILD_DIGEST#sha256:}"
-      - name: Upload platform digest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: fix1-digest-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  merge:
-    name: Publish multi-architecture manifest
-    needs: [prepare, build]
+  publish:
+    name: Publish and verify dated image tag
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Download platform digests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: fix1-digest-*
-          merge-multiple: true
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish and verify manifest
-        id: manifest
-        working-directory: ${{ runner.temp }}/digests
+      - name: Verify source, publish tag, and read back manifest
         env:
-          IMAGE: ${{ needs.prepare.outputs.image }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TAGS: ${{ needs.prepare.outputs.tags }}
+          IMAGE: ghcr.io/mininglamp-oss/octo-im
+          VERSION: v2.2.5-20261029
+          REVISION: 8fc476c5373d79e18594b15b2313f2879cc3a8e4
+          DIGEST: sha256:3f38219bcead0be7bdc685685d5b2a9713d53f58def51190678321afd1592eb4
         run: |
           set -euo pipefail
-          tags=()
-          while IFS= read -r tag; do
-            [ -z "$tag" ] || tags+=(-t "$tag")
-          done <<< "$TAGS"
-          if [ "${#tags[@]}" -eq 0 ]; then
-            echo '::error::No image tags were generated.'
-            exit 1
-          fi
-          sources=()
-          for file in *; do
-            if [[ ! "$file" =~ ^[0-9a-f]{64}$ ]]; then
-              echo '::error::Invalid digest artifact.'
+          source="${IMAGE}@${DIGEST}"
+          target="${IMAGE}:${VERSION}"
+          docker buildx imagetools inspect "$source" --format '{{json .Manifest}}' > source-manifest.json
+          jq -e --arg digest "$DIGEST" '.digest == $digest and ([.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"])' source-manifest.json
+          while IFS=$'\t' read -r arch child_digest; do
+            docker buildx imagetools inspect "${IMAGE}@${child_digest}" --format '{{json .Image}}' > "config-${arch}.json"
+            jq -e --arg revision "$REVISION" --arg arch "$arch" '.architecture == $arch and .os == "linux" and .config.Labels["org.opencontainers.image.revision"] == $revision and .config.Labels["org.opencontainers.image.source"] == "https://github.com/Mininglamp-OSS/octo-im"' "config-${arch}.json"
+          done < <(jq -r '.manifests[] | [.platform.architecture, .digest] | @tsv' source-manifest.json)
+          if docker buildx imagetools inspect "$target" --format '{{json .Manifest}}' > target-before.json 2> target-before.err; then
+            jq -e --arg digest "$DIGEST" '.digest == $digest' target-before.json
+          else
+            if ! grep -Eiq 'not found|manifest unknown|MANIFEST_UNKNOWN' target-before.err; then
+              cat target-before.err >&2
               exit 1
             fi
-            sources+=("${IMAGE}@sha256:${file}")
-          done
-          if [ "${#sources[@]}" -ne 2 ]; then
-            echo '::error::Both platform digests are required.'
-            exit 1
+            docker buildx imagetools create --tag "$target" "$source"
           fi
-          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
-          docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' > "$RUNNER_TEMP/manifest.json"
-          jq -e '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]' "$RUNNER_TEMP/manifest.json"
-          digest="$(jq -r '.digest' "$RUNNER_TEMP/manifest.json")"
-          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo '::error::Manifest returned an invalid digest.'
-            exit 1
-          fi
-          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
-      - name: Summarize published image
-        env:
-          IMAGE: ${{ needs.prepare.outputs.image }}
-          TAGS: ${{ needs.prepare.outputs.tags }}
-          DIGEST: ${{ steps.manifest.outputs.digest }}
-          REVISION: ${{ needs.prepare.outputs.revision }}
-        run: |
-          # Backticks in these printf formats are literal Markdown delimiters.
-          # shellcheck disable=SC2016
+          docker buildx imagetools inspect "$target" --format '{{json .Manifest}}' > published-manifest.json
+          jq -e --arg digest "$DIGEST" '.digest == $digest and ([.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"])' published-manifest.json
+          jq -n --arg image "$target" --arg digest "$DIGEST" --arg revision "$REVISION" --arg build_run "https://github.com/Mininglamp-OSS/octo-im/actions/runs/40852200243" '{image: $image, digest: $digest, source_revision: $revision, build_run: $build_run}' > publication.json
+          cat publication.json
           {
-            printf 'Source: `%s`\n\nPlatforms: `linux/amd64`, `linux/arm64`\n\n' "$REVISION"
-            printf 'Pull by digest: `docker pull %s@%s`\n\n' "$IMAGE" "$DIGEST"
-            printf 'Tags:\n```text\n%s\n```\n' "$TAGS"
+            echo "Image: $target"
+            echo "Digest: $DIGEST"
+            echo "Source: $REVISION"
+            echo "Platforms: linux/amd64, linux/arm64"
+            echo "Build: https://github.com/Mininglamp-OSS/octo-im/actions/runs/40852200243"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload publication evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-v2.2.5-20261029-publication
+          path: |
+            source-manifest.json
+            published-manifest.json
+            config-*.json
+            publication.json
+          if-no-files-found: error
+          retention-days: 30
