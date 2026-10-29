@@ -10,12 +10,16 @@ import (
 )
 
 // ReconcileConfig applies metadata already read through the slot's applied
-// barrier. Metadata/network I/O must happen before entering this method.
+// barrier. Recovery I/O finishes before taking channel locks or entering owners.
 // A normal dormant channel stays dormant; unfinished membership work wakes its
 // designated leader so learners can catch up even without another send.
 func (s *Server) ReconcileConfig(ctx context.Context, cfg wkdb.ChannelClusterConfig) (dormant bool, err error) {
 	if !icluster.ValidChannelReadConfig(cfg, cfg.ChannelId, cfg.ChannelType) || cfg.LeaderId != s.opts.NodeId {
 		return false, ErrConfigConflict
+	}
+	wakeForRecovery, err := s.prepareLeaderStart(ctx, cfg)
+	if err != nil {
+		return false, err
 	}
 	if err := s.wakeLeaderLock.LockContext(ctx, cfg.ChannelId); err != nil {
 		return false, err
@@ -28,7 +32,7 @@ func (s *Server) ReconcileConfig(ctx context.Context, cfg wkdb.ChannelClusterCon
 	rg := s.getRaftGroup(key)
 	r := rg.GetRaft(key)
 	if r == nil {
-		if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 {
+		if !wakeForRecovery && len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 {
 			return true, nil
 		}
 		return false, s.createAndApplyConfig(ctx, cfg)

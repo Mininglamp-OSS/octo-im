@@ -61,6 +61,9 @@ type Server struct {
 	onMessagePool *ants.Pool
 	uptime        time.Time // 服务启动时间
 	stopper       *syncutil.Stopper
+	// Capture this before configuration replay can make a fresh seeded node
+	// appear initialized. It still needs an explicit rejoin and slot election.
+	freshSeededStart bool
 
 	channelKeyLock *keylock.KeyLock // 频道锁
 
@@ -120,6 +123,7 @@ func New(opts *Options) *Server {
 
 	// 节点分布式配置服务
 	s.cfgServer = clusterconfig.New(opts.ConfigOptions)
+	s.freshSeededStart = strings.TrimSpace(opts.Seed) != "" && !s.cfgServer.IsInitialized()
 
 	//节点事件服务
 	s.eventServer = event.NewServer(s, opts.ConfigOptions, s.cfgServer)
@@ -130,6 +134,7 @@ func New(opts *Options) *Server {
 		slot.WithDataDir(path.Join(opts.DataDir, "cluster")),
 		slot.WithTransport(opts.SlotTransport),
 		slot.WithNode(s.cfgServer),
+		slot.WithRecovering(s.freshSeededStart),
 		slot.WithOnApply(s.slotApplyLogs),
 		slot.WithOnSaveConfig(s.onSaveSlotConfig),
 		slot.WithRPC(s.rpcClient),
@@ -145,6 +150,7 @@ func New(opts *Options) *Server {
 		channel.WithDB(s.db),
 		channel.WithRPC(s.rpcClient),
 		channel.WithOnSaveConfig(s.onSaveChannelConfig),
+		channel.WithBeforeLeaderStart(s.recoverEmptyChannelLeader),
 		channel.WithDestoryAfterIdleTick(opts.ConfigOptions.ChannelDestoryAfterIdleTick),
 	))
 	s.initChannelConfigReconciler()

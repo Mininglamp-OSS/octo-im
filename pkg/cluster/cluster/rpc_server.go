@@ -403,7 +403,7 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 	}
 	resp.Nodes = nodeInfos
 
-	err := r.s.cfgServer.ProposeJoin(&types.Node{
+	joinVersion, err := r.s.cfgServer.ProposeJoinWithVersion(&types.Node{
 		Id:          req.NodeId,
 		ClusterAddr: req.ServerAddr,
 		Join:        true,
@@ -419,6 +419,7 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 		return
 	}
 
+	resp.JoinVersion = joinVersion
 	result, err := resp.Marshal()
 	if err != nil {
 		r.Error("marshal ClusterJoinResp failed", zap.Error(err))

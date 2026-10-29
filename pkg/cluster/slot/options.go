@@ -9,6 +9,8 @@ import (
 type Options struct {
 	// 节点Id
 	NodeId uint64
+	// Recovering prevents an empty seeded restart from trusting old leadership.
+	Recovering bool
 	// 数据目录
 	DataDir string
 	// 槽位数据库分片数量
@@ -41,6 +43,11 @@ func NewOptions(opt ...Option) *Options {
 }
 
 type Option func(*Options)
+
+// WithRecovering enables the fresh seeded-restart leadership fence.
+func WithRecovering(recovering bool) Option {
+	return func(o *Options) { o.Recovering = recovering }
+}
 
 func WithNodeId(nodeId uint64) Option {
 	return func(o *Options) {

@@ -78,6 +78,11 @@ func (s *Server) Stop() {
 
 // 唤醒频道领导
 func (s *Server) WakeLeaderIfNeed(clusterConfig wkdb.ChannelClusterConfig) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.prepareLeaderStart(ctx, clusterConfig); err != nil {
+		return err
+	}
 
 	s.wakeLeaderLock.Lock(clusterConfig.ChannelId)
 	defer s.wakeLeaderLock.Unlock(clusterConfig.ChannelId)
@@ -94,14 +99,17 @@ func (s *Server) WakeLeaderIfNeed(clusterConfig wkdb.ChannelClusterConfig) error
 	if clusterConfig.LeaderId != s.opts.NodeId {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	return s.createAndApplyConfig(ctx, clusterConfig)
 }
 
 func (s *Server) WakeFollowerfNeed(channelId string, channelType uint8) error {
 	clusterConfig, err := s.opts.Cluster.GetOrCreateChannelClusterConfigFromSlotLeader(channelId, channelType)
 	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.prepareLeaderStart(ctx, clusterConfig); err != nil {
 		return err
 	}
 	s.wakeLeaderLock.Lock(channelId)
@@ -125,8 +133,6 @@ func (s *Server) WakeFollowerfNeed(channelId string, channelType uint8) error {
 	channelKey := wkutil.ChannelToKey(clusterConfig.ChannelId, clusterConfig.ChannelType)
 	rg := s.getRaftGroup(channelKey)
 	if isReplica {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 		err = s.createAndApplyConfig(ctx, clusterConfig)
 		if err != nil {
 			return err
@@ -139,6 +145,14 @@ func (s *Server) WakeFollowerfNeed(channelId string, channelType uint8) error {
 		rg.Advance()
 	}
 	return nil
+}
+
+// Recovery may call peers and the slot owner, so run it before channel locks.
+func (s *Server) prepareLeaderStart(ctx context.Context, cfg wkdb.ChannelClusterConfig) (bool, error) {
+	if s.opts.BeforeLeaderStart == nil || cfg.LeaderId != s.opts.NodeId || s.ExistChannel(cfg.ChannelId, cfg.ChannelType) {
+		return false, nil
+	}
+	return s.opts.BeforeLeaderStart(ctx, cfg)
 }
 
 // 异步唤醒频道副本
