@@ -55,6 +55,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 				rg.AddEvent(r.Key(), types.Event{
 					To:     e.From,
 					Type:   types.GetLogsResp,
+					Term:   e.Term,
 					Reason: treason,
 				})
 				return
@@ -65,6 +66,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			rg.AddEvent(r.Key(), types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  trunctIndex,
 				Reason: types.ReasonTruncate,
 			})
@@ -76,6 +78,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			rg.AddEvent(r.Key(), types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonOk,
 			})
@@ -89,6 +92,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			rg.AddEvent(r.Key(), types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonError,
 			})
@@ -100,6 +104,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		rg.AddEvent(r.Key(), types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Logs:   logs,
 			Reason: types.ReasonOk,
@@ -110,6 +115,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		rg.Error("submit get logs failed", zap.Error(err))
 		rg.AddEvent(r.Key(), types.Event{
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Reason: types.ReasonError,
 		})
 	}

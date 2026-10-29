@@ -2,9 +2,11 @@ package slot
 
 import (
 	"context"
+	nodetypes "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"path"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -26,6 +28,14 @@ type Server struct {
 	genLogId *snowflake.Node
 
 	slotUpdateLock sync.Mutex
+	// Preserve a verified catch-up target across Raft recreation while the
+	// configuration log is replayed on a fresh seeded process.
+	// The join boundary is published atomically, but checked against each
+	// queued ConfChange's version on the owner loop, never just as a boolean.
+	recoveryBoundary    atomic.Uint64
+	recoveryJoinVersion uint64            // guarded by slotUpdateLock
+	recoveryConfig      *nodetypes.Config // latest applied config, guarded by slotUpdateLock
+	recoveryProof       sync.Map          // map[string]uint64, committed prefix reported by a verified peer
 }
 
 func NewServer(opts *Options) *Server {

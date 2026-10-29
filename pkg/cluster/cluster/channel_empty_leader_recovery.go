@@ -21,7 +21,7 @@ func (s *Server) recoverEmptyChannelLeader(ctx context.Context, cfg wkdb.Channel
 	if cfg.LeaderId != s.opts.ConfigOptions.NodeId || len(cfg.Replicas) <= 1 {
 		return false, nil
 	}
-	lastIndex, _, err := s.channelServer.LastLogIndexAndTerm(cfg.ChannelId, cfg.ChannelType)
+	_, lastLogIndex, err := s.channelServer.LastLogIndexAndTerm(cfg.ChannelId, cfg.ChannelType)
 	if err != nil {
 		return false, err
 	}
@@ -35,12 +35,12 @@ func (s *Server) recoverEmptyChannelLeader(ctx context.Context, cfg wkdb.Channel
 	if err != nil {
 		return false, err
 	}
-	if lastIndex > 0 {
+	if lastLogIndex > 0 {
 		// Existing data-bearing leadership is authoritative. A missing peer
 		// must not block its normal activation; a known lagging peer needs a
 		// live Raft leader so ordinary replication can restore its history.
 		for _, id := range voters {
-			if info := infos[id]; info != nil && info.LogIndex < uint64(lastIndex) {
+			if info := infos[id]; info != nil && info.LogIndex < lastLogIndex {
 				return true, nil
 			}
 		}

@@ -2,6 +2,8 @@ package clusterconfig
 
 import (
 	"encoding/binary"
+	"errors"
+	"strings"
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"go.uber.org/zap"
@@ -40,6 +42,35 @@ func (s *Server) ProposeApiServerAddr(nodeId uint64, apiServerAddr string) error
 	_, err = s.ProposeUntilApplied(s.genConfigId(), cmdBytes)
 	if err != nil {
 		s.Error("ProposeApiServerAddr failed", zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+// ProposeClusterAddr 提案节点cluster通讯地址变更
+func (s *Server) ProposeClusterAddr(nodeId uint64, clusterAddr string) error {
+	clusterAddr = strings.TrimSpace(clusterAddr)
+	if clusterAddr == "" {
+		return errors.New("cluster address is empty")
+	}
+	if err := pb.ValidateAdvertiseAddr(clusterAddr); err != nil {
+		return err
+	}
+
+	data, err := EncodeClusterAddrChange(nodeId, clusterAddr)
+	if err != nil {
+		return err
+	}
+
+	cmd := NewCMD(CMDTypeConfigClusterAddrChange, data)
+	cmdBytes, err := cmd.Marshal()
+	if err != nil {
+		return err
+	}
+
+	_, err = s.ProposeUntilApplied(s.genConfigId(), cmdBytes)
+	if err != nil {
+		s.Error("ProposeClusterAddr failed", zap.Error(err))
 		return err
 	}
 	return nil
@@ -136,25 +167,27 @@ func (s *Server) ProposeJoining(nodeId uint64) error {
 
 // ProposeJoin 提案节点加入
 func (s *Server) ProposeJoin(node *pb.Node) error {
+	_, err := s.ProposeJoinWithVersion(node)
+	return err
+}
 
+// ProposeJoinWithVersion returns the applied join command's exact log index.
+// A recovering process uses it to distinguish its own rejoin from replay.
+func (s *Server) ProposeJoinWithVersion(node *pb.Node) (uint64, error) {
 	data, err := node.Marshal()
 	if err != nil {
-		return err
+		return 0, err
 	}
-
 	cmd := NewCMD(CMDTypeNodeJoin, data)
 	cmdBytes, err := cmd.Marshal()
 	if err != nil {
-		return err
+		return 0, err
 	}
-
-	logId := s.genConfigId()
-	_, err = s.ProposeUntilApplied(logId, cmdBytes)
+	resp, err := s.ProposeUntilApplied(s.genConfigId(), cmdBytes)
 	if err != nil {
-		s.Error("ProposeJoin failed", zap.Error(err))
-		return err
+		return 0, err
 	}
-	return nil
+	return resp.Index, nil
 }
 
 // ProposeMigrateSlot 提案槽迁移

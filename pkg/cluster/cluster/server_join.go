@@ -31,6 +31,9 @@ func (s *Server) joinLoop() {
 				}
 				s.addOrUpdateNodes(nodeMap)
 			}
+			// The response may race ahead of or behind configuration replay. The
+			// slot server waits for Joined after this exact fresh command in either case.
+			s.slotServer.SetRecoveryJoinVersion(resp.JoinVersion)
 			return
 		case <-s.stopper.ShouldStop():
 			return

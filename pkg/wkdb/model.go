@@ -2,6 +2,7 @@ package wkdb
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -499,8 +500,8 @@ func (c *ChannelClusterConfig) Clone() ChannelClusterConfig {
 		ChannelId:       c.ChannelId,
 		ChannelType:     c.ChannelType,
 		ReplicaMaxCount: c.ReplicaMaxCount,
-		Replicas:        c.Replicas,
-		Learners:        c.Learners,
+		Replicas:        slices.Clone(c.Replicas),
+		Learners:        slices.Clone(c.Learners),
 		LeaderId:        c.LeaderId,
 		Term:            c.Term,
 		MigrateFrom:     c.MigrateFrom,

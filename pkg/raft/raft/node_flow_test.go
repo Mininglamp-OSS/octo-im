@@ -588,6 +588,10 @@ func TestFlow_PingUpdatesFollowerCommit(t *testing.T) {
 	follower.queue.storeTo(3)
 
 	assert.Equal(t, uint64(0), follower.CommittedIndex(), "follower committedIndex should be 0 initially")
+	// Establish that this leader has verified the stored prefix before
+	// testing how later heartbeats clamp their commit bound.
+	follower.Step(types.Event{Type: types.SyncResp, From: 1, To: 2, Term: 2,
+		Index: 4, Reason: types.ReasonOk})
 
 	// Leader sends Ping with committedIndex=2
 	follower.Step(types.Event{

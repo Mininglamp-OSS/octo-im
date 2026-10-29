@@ -26,3 +26,9 @@ func (n *Node) ResumeReplication() {
 // LogRevision fences off-owner lookups against replacement as well as appends.
 // Call only on the owner loop. Store/apply progress does not change log content.
 func (n *Node) LogRevision() uint64 { return n.queue.revision }
+
+// StoredPrefixReady is owner-only. Recovery must wait for the verified peer's
+// committed prefix to reach disk, including when it spans several batches.
+func (n *Node) StoredPrefixReady(index uint64) bool {
+	return !n.truncating && !n.queue.appending && n.queue.storedIndex >= index
+}

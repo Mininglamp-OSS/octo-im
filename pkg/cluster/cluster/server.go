@@ -325,6 +325,10 @@ func (s *Server) addOrUpdateNodes(nodeMap map[uint64]string) {
 		if nodeId == s.opts.ConfigOptions.NodeId {
 			continue
 		}
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
 
 		existNode := s.nodeManager.node(nodeId)
 

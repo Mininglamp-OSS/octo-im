@@ -182,6 +182,17 @@ func (c *Config) updateApiServerAddr(nodeId uint64, addr string) {
 	}
 }
 
+func (c *Config) updateClusterAddr(nodeId uint64, addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, node := range c.cfg.Nodes {
+		if node.Id == nodeId {
+			node.ClusterAddr = addr
+			return
+		}
+	}
+}
+
 func (c *Config) updateNodeOnlineStatus(nodeId uint64, online bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

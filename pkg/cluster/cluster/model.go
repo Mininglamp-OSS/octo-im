@@ -622,6 +622,9 @@ func (c *ClusterJoinReq) Unmarshal(data []byte) error {
 
 type ClusterJoinResp struct {
 	Nodes []*NodeInfo
+	// JoinVersion is the committed configuration-log index of this RPC's join.
+	// Zero from an older seed cannot authorize release of the startup fence.
+	JoinVersion uint64
 }
 
 func (c *ClusterJoinResp) Marshal() ([]byte, error) {
@@ -632,6 +635,7 @@ func (c *ClusterJoinResp) Marshal() ([]byte, error) {
 		enc.WriteUint64(node.NodeId)
 		enc.WriteString(node.ServerAddr)
 	}
+	enc.WriteUint64(c.JoinVersion)
 	return enc.Bytes(), nil
 }
 
@@ -653,6 +657,12 @@ func (c *ClusterJoinResp) Unmarshal(data []byte) error {
 				return err
 			}
 			c.Nodes[i] = node
+		}
+	}
+	c.JoinVersion = 0
+	if dec.Len() > 0 {
+		if c.JoinVersion, err = dec.Uint64(); err != nil {
+			return err
 		}
 	}
 	return nil

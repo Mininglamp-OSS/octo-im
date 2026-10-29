@@ -277,6 +277,8 @@ func TestMembershipBroadcastCommitClampedToDurableLogs(t *testing.T) {
 		follower := newTestNode(ping.To, []uint64{1, 2, 3})
 		makeFollower(follower, 2, 1)
 		follower.queue.lastLogIndex, follower.queue.storedIndex = 10, 8
+		require.NoError(t, follower.Step(types.Event{Type: types.SyncResp, From: 1, Term: 2,
+			Index: 9, Reason: types.ReasonOk}))
 		require.NoError(t, follower.Step(ping))
 		require.Equal(t, uint64(8), follower.queue.committedIndex)
 	}

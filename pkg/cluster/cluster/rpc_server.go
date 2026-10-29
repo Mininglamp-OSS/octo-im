@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
@@ -369,6 +370,15 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 		c.WriteErr(err)
 		return
 	}
+	req.ServerAddr = strings.TrimSpace(req.ServerAddr)
+	if req.ServerAddr == "" {
+		c.WriteErr(errors.New("cluster join requires a nonempty server address"))
+		return
+	}
+	if err := types.ValidateAdvertiseAddr(req.ServerAddr); err != nil {
+		c.WriteErr(err)
+		return
+	}
 
 	if !r.s.cfgServer.IsLeader() {
 		resp, err := r.s.rpcClient.RequestClusterJoin(r.s.cfgServer.LeaderId(), req)
@@ -403,7 +413,7 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 	}
 	resp.Nodes = nodeInfos
 
-	err := r.s.cfgServer.ProposeJoin(&types.Node{
+	joinVersion, err := r.s.cfgServer.ProposeJoinWithVersion(&types.Node{
 		Id:          req.NodeId,
 		ClusterAddr: req.ServerAddr,
 		Join:        true,
@@ -419,6 +429,7 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 		return
 	}
 
+	resp.JoinVersion = joinVersion
 	result, err := resp.Marshal()
 	if err != nil {
 		r.Error("marshal ClusterJoinResp failed", zap.Error(err))
