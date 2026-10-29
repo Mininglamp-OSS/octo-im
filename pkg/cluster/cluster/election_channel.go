@@ -102,26 +102,30 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 
 // 视情况是否需要加入新的副本
 func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, error) {
-	if len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
-		return false, nil
-	}
-	// An interrupted expansion can leave equal, nonzero migration endpoints
-	// after its learner disappeared. If the target is not a replica either,
-	// no member can complete that migration. Select eligible learners below and
-	// replace the stale markers in the same version-fenced metadata write.
-	// Preserve real learners, transfers, partial markers and existing replicas.
-	orphanedExpansion := len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 &&
+	// A vanished expansion target cannot finish its self-migration. Repair
+	// this metadata even when capacity is already satisfied (notably target=1).
+	// Real learners, transfers and partially populated markers remain intact.
+	changed := len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 &&
 		cfg.MigrateFrom == cfg.MigrateTo && !wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo)
-	if len(cfg.Learners) > 0 || (cfg.MigrateFrom != 0 || cfg.MigrateTo != 0) && !orphanedExpansion {
+	if changed {
+		cfg.MigrateFrom, cfg.MigrateTo = 0, 0
+	}
+	if len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
+		return changed, nil
+	}
+	if len(cfg.Learners) > 0 || cfg.MigrateFrom != 0 || cfg.MigrateTo != 0 {
 		return false, nil
 	}
 	allowVoteNodes := s.cfgServer.AllowVoteAndJoinedOnlineNodes()
 	if len(allowVoteNodes) == 0 {
+		if changed {
+			return true, nil
+		}
 		return false, errors.New("no allow vote nodes")
 	}
 
 	if len(cfg.Replicas) >= len(allowVoteNodes) { // 如果当前已集群的副本数大于等于允许投票的节点数，则不需要加入新的副本
-		return false, nil
+		return changed, nil
 	}
 
 	newReplicaIds := make([]uint64, 0, len(allowVoteNodes)-len(cfg.Replicas))

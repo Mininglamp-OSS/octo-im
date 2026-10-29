@@ -205,6 +205,10 @@ func (s *Server) handleBatchMessage(conn gnet.Conn, data []byte) {
 			s.Warn("Null message in batch", zap.Int("index", i))
 			continue
 		}
+		if !s.opts.MessagePoolOn {
+			s.handleMessage(conn, msg)
+			continue
+		}
 
 		// 根据消息类型分发处理
 		err := s.processSingleMessage(conn, msg)
