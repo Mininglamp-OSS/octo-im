@@ -566,9 +566,11 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 		if err != nil {
 
 			r.stepC <- stepReq{event: types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
+				Type:          respEventType,
+				From:          e.From,
+				Term:          e.Term,
+				ConfigVersion: e.ConfigVersion,
+				Reason:        types.ReasonError,
 			}}
 			return
 		}
@@ -577,17 +579,21 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 		if err != nil {
 			r.Error("change role failed", zap.Error(err))
 			r.stepC <- stepReq{event: types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
+				Type:          respEventType,
+				From:          e.From,
+				Term:          e.Term,
+				ConfigVersion: e.ConfigVersion,
+				Reason:        types.ReasonError,
 			}}
 			return
 		}
 		r.stepC <- stepReq{event: types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonOk,
-			Config: newCfg,
+			Type:          respEventType,
+			From:          e.From,
+			Term:          e.Term,
+			ConfigVersion: e.ConfigVersion,
+			Reason:        types.ReasonOk,
+			Config:        newCfg,
 		}}
 	})
 	if err != nil {
@@ -604,9 +610,11 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 			respEventType = types.FollowerToLeaderResp
 		}
 		r.stepC <- stepReq{event: types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonError,
+			Type:          respEventType,
+			From:          e.From,
+			Term:          e.Term,
+			ConfigVersion: e.ConfigVersion,
+			Reason:        types.ReasonError,
 		}}
 	}
 }

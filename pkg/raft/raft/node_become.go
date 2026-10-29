@@ -85,6 +85,8 @@ func (n *Node) reset() {
 		votes: make(map[uint64]bool),
 	}
 	n.stopPropose = false
+	n.leaderTransferTo = 0
+	n.leaderTransferVersion = 0
 	n.syncState.replicaSync = make(map[uint64]*SyncInfo)
 	n.onlySync = false
 	n.suspend = false
