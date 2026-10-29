@@ -173,7 +173,6 @@ func (n *Node) Ready() []types.Event {
 						Index: log.Index,
 					}
 					n.updateLastTermStartIndex(log.Term, log.Index)
-					break
 				}
 			}
 			n.sendStoreReq(logs, termStartIndexInfo)

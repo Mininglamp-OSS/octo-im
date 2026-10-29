@@ -3,6 +3,7 @@ package clusterconfig
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -77,9 +78,19 @@ func (p *PebbleShardLogStorage) AppendLogs(logs []types.Log, termStartIndexInfo 
 		}
 	}
 
-	if termStartIndexInfo != nil {
-		err := p.SetLeaderTermStartIndex(termStartIndexInfo.Term, termStartIndexInfo.Index)
-		if err != nil {
+	for i, start := range types.LogTermStarts(logs) {
+		if i == 0 {
+			existing, err := p.GetTermStartIndex(start.Term)
+			if err != nil {
+				return err
+			}
+			if existing != 0 && existing < start.Index {
+				start.Index = existing
+			}
+		}
+		data := make([]byte, 8)
+		binary.BigEndian.PutUint64(data, start.Index)
+		if err := batch.Set(key.NewLeaderTermStartIndexKey(start.Term), data, p.noSync); err != nil {
 			return err
 		}
 	}
@@ -131,8 +142,7 @@ func (p *PebbleShardLogStorage) TruncateLogTo(index uint64) error {
 		return err
 	}
 	if index < appliedIdx {
-		p.Error("index must be less than  applied index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx))
-		return nil
+		return fmt.Errorf("cannot truncate config log to %d below applied index %d", index, appliedIdx)
 	}
 
 	keyData := key.NewLogKey(index + 1)

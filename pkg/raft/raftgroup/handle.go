@@ -55,6 +55,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 				rg.AddEvent(r.Key(), types.Event{
 					To:     e.From,
 					Type:   types.GetLogsResp,
+					Term:   e.Term,
 					Reason: treason,
 				})
 				return
@@ -65,6 +66,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			rg.AddEvent(r.Key(), types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  trunctIndex,
 				Reason: types.ReasonTruncate,
 			})
@@ -76,6 +78,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			rg.AddEvent(r.Key(), types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonOk,
 			})
@@ -89,6 +92,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			rg.AddEvent(r.Key(), types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonError,
 			})
@@ -100,6 +104,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		rg.AddEvent(r.Key(), types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Logs:   logs,
 			Reason: types.ReasonOk,
@@ -110,12 +115,14 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		rg.Error("submit get logs failed", zap.Error(err))
 		rg.AddEvent(r.Key(), types.Event{
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Reason: types.ReasonError,
 		})
 	}
 }
 
 func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
+	lastIndex := r.LastLogIndex() // owner-only fallback for older storage adapters
 	err := rg.goPool.Submit(func() {
 		err := rg.opts.Storage.TruncateLogTo(r.Key(), e.Index)
 		if err != nil {
@@ -126,8 +133,31 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 			})
 			return
 		}
-		// 删除本地的leader term start index
-		err = rg.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(r.Key(), e.LastLogTerm)
+		// The request carries the old tail term. Read the retained log instead:
+		// an entire term may have disappeared with the discarded suffix.
+		// A leader may ask to retain a prefix longer than this follower has.
+		// Truncation is then a no-op, so use the actual local tail.
+		if reader, ok := rg.opts.Storage.(interface {
+			LastIndex(string) (uint64, error)
+		}); ok {
+			lastIndex, err = reader.LastIndex(r.Key())
+		}
+		index := min(e.Index, lastIndex)
+		var start types.TermStartIndexInfo
+		if err == nil && index > 0 {
+			var logs []types.Log
+			logs, err = rg.opts.Storage.GetLogs(r.Key(), index, index+1, 0)
+			if err == nil && (len(logs) != 1 || logs[0].Index != index) {
+				err = fmt.Errorf("retained log %d is missing after truncation", index)
+			}
+			if err == nil {
+				start.Term = logs[0].Term
+				start.Index, err = rg.opts.Storage.GetTermStartIndex(r.Key(), start.Term)
+			}
+		}
+		if err == nil {
+			err = rg.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(r.Key(), start.Term)
+		}
 		if err != nil {
 			rg.Error("delete leader term start index failed", zap.Error(err), zap.Uint32("LastLogTerm", e.LastLogTerm))
 			rg.AddEvent(r.Key(), types.Event{
@@ -137,9 +167,10 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 			return
 		}
 		rg.AddEvent(r.Key(), types.Event{
-			Type:   types.TruncateResp,
-			Index:  e.Index,
-			Reason: types.ReasonOk,
+			Type:               types.TruncateResp,
+			Index:              index,
+			Reason:             types.ReasonOk,
+			TermStartIndexInfo: &start,
 		})
 	})
 	if err != nil {
