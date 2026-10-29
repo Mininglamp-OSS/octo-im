@@ -48,7 +48,7 @@ tokenAuthOn: false                # Token 认证
 ```yaml
 cluster:
   nodeId: 1001                    # 节点 ID
-  serverAddr: "0.0.0.0:11110"     # 集群通信地址
+  serverAddr: "127.0.0.1:11110"   # 集群通信地址（对端可拨到的内网地址，勿写 0.0.0.0）
   initNodes:                      # 初始节点
     1001: "127.0.0.1:11110"
     1002: "127.0.0.1:11111"
