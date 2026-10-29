@@ -207,6 +207,7 @@ type ChannelDB interface {
 	AddChannel(channelInfo ChannelInfo) (uint64, error)
 	// UpdateChannel 更新channel
 	UpdateChannel(channelInfo ChannelInfo) error
+	UpdateChannelInfoBatch(infos []ChannelInfo) error
 
 	// GetChannel 获取channel
 	GetChannel(channelId string, channelType uint8) (ChannelInfo, error)
