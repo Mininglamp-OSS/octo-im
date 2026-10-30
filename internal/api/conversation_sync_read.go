@@ -344,14 +344,19 @@ func (s *request) requestSyncMessage(ctx context.Context, nodeID uint64, channel
 	if err != nil {
 		return nil, err
 	}
-	resp, err := rest.SendWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages/v2", Body: data})
+	request := rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages/v2", Body: data}
+	if token := options.G.ManagerToken; token != "" {
+		request.Headers = map[string]string{"token": token}
+	}
+	resp, err := rest.SendWithContext(ctx, request)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		// Old peers have no v2 route. Only route absence permits downgrade;
 		// a v2 failure or malformed response must not bypass its read fences.
-		resp, err = rest.SendWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages", Body: data})
+		request.BaseURL = node.ApiServerAddr + "/conversation/syncMessages"
+		resp, err = rest.SendWithContext(ctx, request)
 		if err != nil {
 			return nil, err
 		}
