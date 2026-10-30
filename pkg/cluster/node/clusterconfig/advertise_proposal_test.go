@@ -10,7 +10,7 @@ import (
 func TestAddressProposalsRejectInvalidBeforeRaft(t *testing.T) {
 	// No running Raft is needed: invalid values must be rejected before admission.
 	s := &Server{}
-	for _, addr := range []string{"0.0.0.0:11110", "[::]:11110", "node.internal", ":11110", "node.internal:", "node.internal:abc", "node.internal:0", "node.internal:-1", "node.internal:65536", "node.internal: 11110", "node .internal:11110"} {
+	for _, addr := range []string{"0.0.0.0:11110", "[::]:11110", "[::%lo]:11110", "tcp://[0:0:0:0:0:0:0:0%eth0]:11110", "[::ffff:0.0.0.0%lo]:11110", "[::%]:11110", "node.internal", ":11110", "node.internal:", "node.internal:abc", "node.internal:0", "node.internal:-1", "node.internal:65536", "node.internal: 11110", "node .internal:11110"} {
 		t.Run(addr, func(t *testing.T) {
 			require.Error(t, s.ProposeClusterAddr(1, addr))
 			require.Error(t, s.ProposeJoin(&pb.Node{Id: 2, ClusterAddr: addr}))

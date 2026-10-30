@@ -228,10 +228,7 @@ func (s *Server) LeaderId() uint64 {
 }
 
 func (s *Server) GetClusterConfig() *types.Config {
-	if s.config.cfg == nil {
-		return nil
-	}
-	return s.config.cfg
+	return s.config.config()
 }
 
 // 是否已初始化
@@ -331,12 +328,14 @@ func (s *Server) genConfigId() uint64 {
 }
 
 func (s *Server) configToRaftConfig(cfg *Config) rafttypes.Config {
-
-	nodes := cfg.nodes()
+	cfg.mu.RLock()
+	defer cfg.mu.RUnlock()
+	snapshot := cfg.cfg
+	nodes := snapshot.Nodes
 
 	replicas := make([]uint64, 0, len(nodes))
 	for _, node := range nodes {
-		if node.AllowVote && node.Role == pb.NodeRole_NodeRoleReplica && !wkutil.ArrayContainsUint64(cfg.cfg.Learners, node.Id) {
+		if node.AllowVote && node.Role == pb.NodeRole_NodeRoleReplica && !wkutil.ArrayContainsUint64(snapshot.Learners, node.Id) {
 			replicas = append(replicas, node.Id)
 			continue
 		}
@@ -348,11 +347,11 @@ func (s *Server) configToRaftConfig(cfg *Config) rafttypes.Config {
 	}
 
 	return rafttypes.Config{
-		Version:     cfg.version(),
+		Version:     snapshot.Version,
 		Replicas:    replicas,
-		MigrateFrom: cfg.cfg.MigrateFrom,
-		MigrateTo:   cfg.cfg.MigrateTo,
-		Learners:    cfg.cfg.Learners,
+		MigrateFrom: snapshot.MigrateFrom,
+		MigrateTo:   snapshot.MigrateTo,
+		Learners:    append([]uint64(nil), snapshot.Learners...),
 		Leader:      leader,
 		// Term:        cfg.cfg.Term, // 不需要设置term，不设置表示使用当前term，Config的term只是应用的最新的term，不表示是日志的term
 	}

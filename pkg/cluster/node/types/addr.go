@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"unicode"
@@ -41,8 +42,13 @@ func ValidateAdvertiseAddr(addr string) error {
 	if err != nil || portNumber == 0 {
 		return errors.New("port must be a decimal integer in 1..65535")
 	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
-		return fmt.Errorf("host %q is a bind-all address, not a dial target; use the intranet IP peers can reach", host)
+	ip, parseErr := netip.ParseAddr(host)
+	if parseErr == nil {
+		if ip.WithZone("").Unmap().IsUnspecified() {
+			return fmt.Errorf("host %q is a bind-all address, not a dial target; use the intranet IP peers can reach", host)
+		}
+	} else if strings.ContainsAny(host, ":%") {
+		return fmt.Errorf("invalid IP literal %q: %w", host, parseErr)
 	}
 	return nil
 }
