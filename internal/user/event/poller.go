@@ -117,7 +117,7 @@ func (p *poller) tick() {
 		}
 	}
 
-	p.loopHandlers = p.loopHandlers[:0]
+	p.resetLoopHandlers()
 }
 
 func (p *poller) handleEvents() {
@@ -135,10 +135,18 @@ func (p *poller) handleEvents() {
 			}
 		}
 	}
-	p.loopHandlers = p.loopHandlers[:0]
-	if cap(p.loopHandlers) > 1024 {
+	p.resetLoopHandlers()
+}
+
+func (p *poller) resetLoopHandlers() {
+	// The event loop owns this scratch slice. Clear references before reuse so
+	// removed handlers can be collected even when peak capacity is retained.
+	if len(p.loopHandlers) == 0 {
 		p.loopHandlers = nil
+		return
 	}
+	clear(p.loopHandlers)
+	p.loopHandlers = p.loopHandlers[:0]
 }
 
 func (p *poller) handler(uid string) *userHandler {
