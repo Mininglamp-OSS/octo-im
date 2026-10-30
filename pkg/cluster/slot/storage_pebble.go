@@ -203,12 +203,19 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 
 	batch := p.shardBatchDB(shardNo).NewBatch()
 
-	if termStartIndexInfo != nil {
-		err := p.SetLeaderTermStartIndex(shardNo, termStartIndexInfo.Term, termStartIndexInfo.Index)
-		if err != nil {
-			p.Panic("SetLeaderTermStartIndex failed", zap.Error(err))
-			return err
+	for i, start := range types.LogTermStarts(logs) {
+		if i == 0 {
+			existing, err := p.GetTermStartIndex(shardNo, start.Term)
+			if err != nil {
+				return err
+			}
+			if existing != 0 && existing < start.Index {
+				start.Index = existing
+			}
 		}
+		data := make([]byte, 8)
+		binary.BigEndian.PutUint64(data, start.Index)
+		batch.Set(key.NewLeaderTermStartIndexKey(shardNo, start.Term), data)
 	}
 
 	for _, lg := range logs {
@@ -257,8 +264,7 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 		return err
 	}
 	if index < appliedIdx {
-		p.Foucs("applied must be less than index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx), zap.Uint64("lastIndex", lastIndex), zap.String("shardNo", shardNo))
-		return nil
+		return fmt.Errorf("cannot truncate slot %s to %d below applied index %d", shardNo, index, appliedIdx)
 	}
 
 	keyData := key.NewLogKey(shardNo, index+1)

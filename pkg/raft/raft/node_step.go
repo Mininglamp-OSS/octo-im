@@ -132,18 +132,26 @@ func (n *Node) stepLeader(e types.Event) error {
 		n.idleTick = 0
 		isLearner := n.isLearner(e.From) // 当前同步节点是否是学习者
 		n.updateSyncInfo(e)              // 更新副本同步信息
-		if !isLearner {
-			n.updateLeaderCommittedIndex() // 更新领导的提交索引
+		if !isLearner && e.Reason == types.ReasonOnlySync {
+			n.updateLeaderCommittedIndex() // only a verified prefix acknowledges our entries
 		}
 		// if n.Key() == "40" {
 		// 	n.Info("sync...", zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.String("reason", e.Reason.String()), zap.Uint64("storedIndex", e.StoredIndex), zap.Uint64("lastLogIndex", n.queue.lastLogIndex))
 		// }
 		syncInfo := n.replicaSync[e.From]
 
-		// 根据需要切换角色
-		n.roleSwitchIfNeed(e)
+		// A full sync request may describe a conflicting suffix. It cannot
+		// authorize promotion or transfer until the prefix check has succeeded.
+		if e.Reason == types.ReasonOnlySync {
+			n.roleSwitchIfNeed(e)
+		}
 
 		// 无数据可同步
+		if n.queue.storedIndex == 0 && e.Index > 1 {
+			// Pending local storage cannot certify a nonempty peer's prefix.
+			n.sendSyncResp(e.From, e.Index, nil, types.ReasonError, types.SpeedFast)
+			return nil
+		}
 		if (e.Reason == types.ReasonOnlySync && e.Index > n.queue.storedIndex) || n.queue.storedIndex == 0 {
 
 			var speed types.Speed
@@ -203,7 +211,32 @@ func (n *Node) stepLeader(e types.Event) error {
 		types.LearnerToLeaderResp,
 		types.FollowerToLeaderResp:
 
-		n.stopPropose = false
+		if n.leaderTransferTo != 0 {
+			if e.Type == types.FollowerToLeaderResp || e.Type == types.LearnerToLeaderResp {
+				if e.From != n.leaderTransferTo || e.Term != n.cfg.Term || e.ConfigVersion != n.leaderTransferVersion {
+					return nil
+				}
+				if e.Reason != types.ReasonOk {
+					n.leaderTransferTo, n.leaderTransferVersion = 0, 0
+					n.stopPropose = false
+				}
+			}
+			// A successful SaveConfig can precede this owner's ConfChange.
+			// Keep rejecting proposals until that role transition resets the fence.
+		} else {
+			n.stopPropose = false
+		}
+		// SaveConfig has published the promotion before this response. The
+		// configuration change may have cleared replicaSync, so wake remaining
+		// learners before looking up that transient bookkeeping. All intentionally
+		// targets voters only and cannot perform this wakeup.
+		if e.Reason == types.ReasonOk {
+			for _, id := range n.cfg.Learners {
+				if id != n.opts.NodeId {
+					n.sendNotifySync(id)
+				}
+			}
+		}
 		syncInfo := n.replicaSync[e.From]
 		if syncInfo == nil {
 			if n.queue.lastLogIndex > 0 {
@@ -230,7 +263,11 @@ func (n *Node) stepFollower(e types.Event) error {
 		if n.cfg.Leader == None {
 			n.BecomeFollower(e.Term, e.From)
 		}
-		n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
+		// A heartbeat does not verify the new leader's log prefix. Until its
+		// first successful sync check, our durable suffix may be conflicting.
+		if n.onlySync && !n.truncating {
+			n.updateFollowCommittedIndex(e.CommittedIndex)
+		}
 		n.idleTick = 0
 		// 如果领导的配置版本大于本地配置版本，那么请求配置
 		if e.ConfigVersion > n.cfg.Version {
@@ -249,12 +286,9 @@ func (n *Node) stepFollower(e types.Event) error {
 		n.idleTick = 0
 		n.syncRespTimeoutTick = 0
 		n.syncing = false
-		if !n.onlySync {
-			n.onlySync = true
-		}
-
 		switch e.Reason {
 		case types.ReasonOk:
+			n.onlySync = true
 			// if n.Key() == "clusterconfig" {
 			// 	n.Info("SyncResp...", zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.Int("len", len(e.Logs)))
 			// }
@@ -273,6 +307,7 @@ func (n *Node) stepFollower(e types.Event) error {
 			n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
 
 		case types.ReasonTruncate:
+			n.onlySync = false
 			// if n.Key() == "clusterconfig" {
 			// 	n.Info("truncating...", zap.Bool("truncating", n.truncating), zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.Int("len", len(e.Logs)))
 			// }
@@ -292,6 +327,12 @@ func (n *Node) stepFollower(e types.Event) error {
 			if e.Index < n.queue.lastLogIndex {
 				n.queue.truncateLogTo(e.Index)
 			}
+			if e.TermStartIndexInfo != nil {
+				n.lastTermStartIndex = *e.TermStartIndexInfo
+			}
+			// The leader verified this retained prefix and storage has now
+			// acknowledged its truncation. Subsequent sync may append directly.
+			n.onlySync = true
 			n.sendSyncReq()
 			n.advance()
 		}
@@ -337,7 +378,9 @@ func (n *Node) stepLearner(e types.Event) error {
 		if n.cfg.Leader == None {
 			n.BecomeLearner(e.Term, e.From)
 		}
-		n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
+		if n.onlySync && !n.truncating {
+			n.updateFollowCommittedIndex(e.CommittedIndex)
+		}
 		n.idleTick = 0
 		// 如果领导的配置版本大于本地配置版本，那么请求配置
 		if e.ConfigVersion > n.cfg.Version {
@@ -353,11 +396,8 @@ func (n *Node) stepLearner(e types.Event) error {
 		n.idleTick = 0
 		n.syncRespTimeoutTick = 0
 		n.syncing = false
-		if !n.onlySync {
-			n.onlySync = true
-		}
-
 		if e.Reason == types.ReasonOk {
+			n.onlySync = true
 			// if n.Key() == "clusterconfig" {
 			// 	n.Info("SyncResp...", zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.Int("len", len(e.Logs)))
 			// }
@@ -375,6 +415,7 @@ func (n *Node) stepLearner(e types.Event) error {
 			n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
 
 		} else if e.Reason == types.ReasonTruncate {
+			n.onlySync = false
 			// if n.Key() == "clusterconfig" {
 			// 	n.Info("truncating...", zap.Bool("truncating", n.truncating), zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.Int("len", len(e.Logs)))
 			// }
@@ -393,6 +434,10 @@ func (n *Node) stepLearner(e types.Event) error {
 			if e.Index < n.queue.lastLogIndex {
 				n.queue.truncateLogTo(e.Index)
 			}
+			if e.TermStartIndexInfo != nil {
+				n.lastTermStartIndex = *e.TermStartIndexInfo
+			}
+			n.onlySync = true
 			n.sendSyncReq()
 			n.advance()
 		}
@@ -501,8 +546,13 @@ func (n *Node) updateSyncInfo(e types.Event) {
 		n.replicaSync[e.From] = syncInfo
 	}
 	syncInfo.SyncTick = 0
-	syncInfo.LastSyncIndex = e.Index
-	syncInfo.StoredIndex = e.StoredIndex
+	if e.Reason == types.ReasonOnlySync {
+		syncInfo.LastSyncIndex = e.Index
+		syncInfo.StoredIndex = e.StoredIndex
+	} else {
+		// A restarting or divergent peer invalidates its previous match too.
+		syncInfo.LastSyncIndex, syncInfo.StoredIndex = 0, 0
+	}
 }
 
 // 更新领导的提交索引
@@ -601,6 +651,9 @@ func (n *Node) committedIndexForFollow(leaderCommittedIndex uint64) uint64 {
 }
 
 func (n *Node) roleSwitchIfNeed(e types.Event) {
+	if n.leaderTransferTo != 0 {
+		return
+	}
 	if !n.isLearner(e.From) && !n.isVoter(e.From) {
 		return
 	}
@@ -656,6 +709,8 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 		if n.cfg.MigrateFrom == n.cfg.Leader { // 学习者转领导者
 			if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
 				syncInfo.roleSwitching = true // 学习者转让中
+				n.stopPropose = true
+				n.leaderTransferTo, n.leaderTransferVersion = e.From, n.cfg.Version
 				// 发送学习者转为领导者
 				n.sendLearnerToLeaderReq(e.From)
 			} else if e.Index+n.opts.LearnerToLeaderMinLogGap > n.queue.lastLogIndex { // 如果日志差距达到预期，则当前领导停止接受任何提案，等待学习者日志完全追赶上
@@ -680,6 +735,8 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 	} else if n.cfg.MigrateFrom == n.cfg.Leader && n.cfg.MigrateTo == e.From { // // 追随者转为领导者
 		if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
 			syncInfo.roleSwitching = true
+			n.stopPropose = true
+			n.leaderTransferTo, n.leaderTransferVersion = e.From, n.cfg.Version
 			// 发送追随者转为领导者
 			n.sendFollowToLeaderReq(e.From)
 		} else if e.Index+n.opts.FollowerToLeaderMinLogGap > n.queue.lastLogIndex { // 如果日志差距达到预期，则当前领导停止接受任何提案，等待学习者日志完全追赶上

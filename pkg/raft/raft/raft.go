@@ -307,6 +307,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 				r.stepC <- stepReq{event: types.Event{
 					To:     e.From,
 					Type:   types.GetLogsResp,
+					Term:   e.Term,
 					Index:  e.Index,
 					Reason: treason,
 				}}
@@ -319,6 +320,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 			r.stepC <- stepReq{event: types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  trunctIndex,
 				Reason: types.ReasonTruncate,
 			}}
@@ -332,6 +334,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 			r.stepC <- stepReq{event: types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonError,
 			}}
@@ -340,6 +343,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		r.stepC <- stepReq{event: types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Logs:   logs,
 			Reason: types.ReasonOk,
@@ -350,6 +354,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		r.stepC <- stepReq{event: types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Reason: types.ReasonError,
 		}}
@@ -368,8 +373,24 @@ func (r *Raft) handleTruncateReq(e types.Event) {
 			}}
 			return
 		}
-		// 删除本地的leader term start index
-		err = r.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(e.LastLogTerm)
+		// The old tail term may be entirely in the discarded suffix.
+		state, err := r.opts.Storage.GetState()
+		index := min(e.Index, state.LastLogIndex)
+		var start types.TermStartIndexInfo
+		if err == nil && index > 0 {
+			var logs []types.Log
+			logs, err = r.opts.Storage.GetLogs(index, index+1, 0)
+			if err == nil && (len(logs) != 1 || logs[0].Index != index) {
+				err = fmt.Errorf("retained log %d is missing after truncation", index)
+			}
+			if err == nil {
+				start.Term = logs[0].Term
+				start.Index, err = r.opts.Storage.GetTermStartIndex(start.Term)
+			}
+		}
+		if err == nil {
+			err = r.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(start.Term)
+		}
 		if err != nil {
 			r.Error("delete leader term start index failed", zap.Error(err), zap.Uint32("LastLogTerm", e.LastLogTerm))
 			r.stepC <- stepReq{event: types.Event{
@@ -379,9 +400,10 @@ func (r *Raft) handleTruncateReq(e types.Event) {
 			return
 		}
 		r.stepC <- stepReq{event: types.Event{
-			Type:   types.TruncateResp,
-			Index:  e.Index,
-			Reason: types.ReasonOk,
+			Type:               types.TruncateResp,
+			Index:              index,
+			Reason:             types.ReasonOk,
+			TermStartIndexInfo: &start,
 		}}
 	})
 	if err != nil {
@@ -544,9 +566,11 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 		if err != nil {
 
 			r.stepC <- stepReq{event: types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
+				Type:          respEventType,
+				From:          e.From,
+				Term:          e.Term,
+				ConfigVersion: e.ConfigVersion,
+				Reason:        types.ReasonError,
 			}}
 			return
 		}
@@ -555,17 +579,21 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 		if err != nil {
 			r.Error("change role failed", zap.Error(err))
 			r.stepC <- stepReq{event: types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
+				Type:          respEventType,
+				From:          e.From,
+				Term:          e.Term,
+				ConfigVersion: e.ConfigVersion,
+				Reason:        types.ReasonError,
 			}}
 			return
 		}
 		r.stepC <- stepReq{event: types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonOk,
-			Config: newCfg,
+			Type:          respEventType,
+			From:          e.From,
+			Term:          e.Term,
+			ConfigVersion: e.ConfigVersion,
+			Reason:        types.ReasonOk,
+			Config:        newCfg,
 		}}
 	})
 	if err != nil {
@@ -582,9 +610,11 @@ func (r *Raft) handleRoleChangeReq(e types.Event) {
 			respEventType = types.FollowerToLeaderResp
 		}
 		r.stepC <- stepReq{event: types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonError,
+			Type:          respEventType,
+			From:          e.From,
+			Term:          e.Term,
+			ConfigVersion: e.ConfigVersion,
+			Reason:        types.ReasonError,
 		}}
 	}
 }

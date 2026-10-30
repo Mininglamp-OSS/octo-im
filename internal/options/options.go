@@ -13,6 +13,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/auth"
 	"github.com/WuKongIM/WuKongIM/pkg/auth/resource"
+	clustertypes "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/crypto/tls"
 	"github.com/bwmarrin/snowflake"
@@ -970,6 +971,10 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.Cluster.SlotReplicaCount = o.getInt("cluster.slotReplicaCount", o.Cluster.SlotReplicaCount)
 	o.Cluster.ChannelReplicaCount = o.getInt("cluster.channelReplicaCount", o.Cluster.ChannelReplicaCount)
 	o.Cluster.ServerAddr = o.getString("cluster.serverAddr", o.Cluster.ServerAddr)
+	o.Cluster.ServerAddr = strings.TrimSpace(o.Cluster.ServerAddr)
+	if err := clustertypes.ValidateAdvertiseAddr(o.Cluster.ServerAddr); err != nil {
+		wklog.Panic("cluster.serverAddr invalid: " + err.Error())
+	}
 	o.Cluster.PongMaxTick = o.getInt("cluster.pongMaxTick", o.Cluster.PongMaxTick)
 
 	o.Cluster.ReqTimeout = o.getDuration("cluster.reqTimeout", o.Cluster.ReqTimeout)

@@ -2,6 +2,8 @@ package clusterconfig
 
 import (
 	"encoding/binary"
+	"errors"
+	"strings"
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"go.uber.org/zap"
@@ -40,6 +42,35 @@ func (s *Server) ProposeApiServerAddr(nodeId uint64, apiServerAddr string) error
 	_, err = s.ProposeUntilApplied(s.genConfigId(), cmdBytes)
 	if err != nil {
 		s.Error("ProposeApiServerAddr failed", zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+// ProposeClusterAddr 提案节点cluster通讯地址变更
+func (s *Server) ProposeClusterAddr(nodeId uint64, clusterAddr string) error {
+	clusterAddr = strings.TrimSpace(clusterAddr)
+	if clusterAddr == "" {
+		return errors.New("cluster address is empty")
+	}
+	if err := pb.ValidateAdvertiseAddr(clusterAddr); err != nil {
+		return err
+	}
+
+	data, err := EncodeClusterAddrChange(nodeId, clusterAddr)
+	if err != nil {
+		return err
+	}
+
+	cmd := NewCMD(CMDTypeConfigClusterAddrChange, data)
+	cmdBytes, err := cmd.Marshal()
+	if err != nil {
+		return err
+	}
+
+	_, err = s.ProposeUntilApplied(s.genConfigId(), cmdBytes)
+	if err != nil {
+		s.Error("ProposeClusterAddr failed", zap.Error(err))
 		return err
 	}
 	return nil

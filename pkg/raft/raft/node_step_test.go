@@ -268,7 +268,7 @@ func TestLeader_SyncReq_UpdatesSyncInfo(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeLeader(n, 3)
 	n.Step(types.Event{
-		Type: types.SyncReq, Term: 3, From: 2,
+		Type: types.SyncReq, Reason: types.ReasonOnlySync, Term: 3, From: 2,
 		Index: 5, StoredIndex: 3,
 	})
 	syncInfo := n.replicaSync[2]
@@ -351,7 +351,7 @@ func TestLeader_SyncReq_UpdatesCommittedIndex(t *testing.T) {
 	n.replicaSync[2] = &SyncInfo{StoredIndex: 10, LastSyncIndex: 11}
 	// Now node 3 syncs
 	n.Step(types.Event{
-		Type: types.SyncReq, Term: 3, From: 3,
+		Type: types.SyncReq, Reason: types.ReasonOnlySync, Term: 3, From: 3,
 		Index: 11, StoredIndex: 10,
 	})
 	// With 3 nodes and 2 replicas reporting stored=10, committed should advance

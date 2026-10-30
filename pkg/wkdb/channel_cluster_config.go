@@ -142,6 +142,7 @@ func (wk *wukongDB) GetChannelClusterConfig(channelId string, channelType uint8)
 	if config, found := wk.clusterConfigCache.GetChannelClusterConfig(channelId, channelType); found {
 		return config, nil
 	}
+	generation := wk.clusterConfigCache.readGeneration()
 
 	start := time.Now()
 	defer func() {
@@ -159,7 +160,7 @@ func (wk *wukongDB) GetChannelClusterConfig(channelId string, channelType uint8)
 	}
 
 	// 将结果写入缓存
-	wk.clusterConfigCache.SetChannelClusterConfig(config)
+	wk.clusterConfigCache.cacheReadResult(config, generation)
 
 	return config, nil
 }

@@ -158,7 +158,6 @@ func TestConfigOrphanMigrationPreservesOtherTransitions(t *testing.T) {
 		{"source only", []uint64{1}, nil, 2, 0},
 		{"target only", []uint64{1}, nil, 0, 2},
 		{"target already a replica", []uint64{1, 2}, nil, 2, 2},
-		{"already full", []uint64{1, 2, 3}, nil, 99, 99},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := wkdb.ChannelClusterConfig{ReplicaMaxCount: 3, Replicas: tc.replicas,

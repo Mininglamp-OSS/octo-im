@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
@@ -366,6 +367,15 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 	req := &ClusterJoinReq{}
 	if err := req.Unmarshal(c.Body()); err != nil {
 		r.Error("unmarshal ClusterJoinReq failed", zap.Error(err))
+		c.WriteErr(err)
+		return
+	}
+	req.ServerAddr = strings.TrimSpace(req.ServerAddr)
+	if req.ServerAddr == "" {
+		c.WriteErr(errors.New("cluster join requires a nonempty server address"))
+		return
+	}
+	if err := types.ValidateAdvertiseAddr(req.ServerAddr); err != nil {
 		c.WriteErr(err)
 		return
 	}

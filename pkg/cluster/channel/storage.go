@@ -64,9 +64,17 @@ func (s *storage) AppendLogs(key string, logs []types.Log, termStartIndexInfo *t
 	if err != nil {
 		return err
 	}
-	if termStartIndexInfo != nil {
-		err = s.db.SetLeaderTermStartIndex(key, termStartIndexInfo.Term, termStartIndexInfo.Index)
-		if err != nil {
+	for i, start := range types.LogTermStarts(logs) {
+		if i == 0 {
+			existing, err := s.db.LeaderTermStartIndex(key, start.Term)
+			if err != nil {
+				return err
+			}
+			if existing != 0 && existing < start.Index {
+				start.Index = existing
+			}
+		}
+		if err := s.db.SetLeaderTermStartIndex(key, start.Term, start.Index); err != nil {
 			return err
 		}
 	}
