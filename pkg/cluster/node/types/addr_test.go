@@ -31,6 +31,24 @@ func TestValidateAdvertiseAddr(t *testing.T) {
 		{name: "portless bare ip", addr: "10.0.0.1", wantErr: "host:port"},
 		{name: "trailing colon no port", addr: "10.0.0.1:", wantErr: "port"},
 		{name: "leading colon no host", addr: ":11110", wantErr: "host"},
+
+		// TCP 端口必须是十进制数字且在 1..65535 内。
+		{name: "minimum port", addr: "node.internal:1"},
+		{name: "maximum port", addr: "node.internal:65535"},
+		{name: "decimal leading zeros", addr: "node.internal:00080"},
+		{name: "service name port", addr: "node.internal:abc", wantErr: "port"},
+		{name: "zero port", addr: "node.internal:0", wantErr: "port"},
+		{name: "negative port", addr: "node.internal:-1", wantErr: "port"},
+		{name: "signed port", addr: "node.internal:+1", wantErr: "port"},
+		{name: "overflow port", addr: "node.internal:65536", wantErr: "port"},
+		{name: "large overflow port", addr: "node.internal:9999999999999999999999", wantErr: "port"},
+		{name: "hex port", addr: "node.internal:0x50", wantErr: "port"},
+		{name: "non ascii digits", addr: "node.internal:８０", wantErr: "port"},
+		{name: "space before port", addr: "node.internal: 11110", wantErr: "whitespace"},
+		{name: "space after port", addr: "node.internal:11110 ", wantErr: "whitespace"},
+		{name: "tab in port", addr: "node.internal:11\t110", wantErr: "whitespace"},
+		{name: "newline after port", addr: "node.internal:11110\n", wantErr: "whitespace"},
+		{name: "space in host", addr: "node .internal:11110", wantErr: "whitespace"},
 	}
 
 	for _, tc := range cases {

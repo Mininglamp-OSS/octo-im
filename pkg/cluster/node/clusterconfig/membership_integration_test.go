@@ -27,7 +27,7 @@ func TestSingleVoterPromotesLearnerAndKeepsServing(t *testing.T) {
 	defer cancel()
 	require.True(t, waitHasLeader(ctx, s1))
 	require.NoError(t, s1.ProposeConfig(&pb.Config{Nodes: []*pb.Node{{Id: 1, AllowVote: true, Role: pb.NodeRole_NodeRoleReplica, Status: pb.NodeStatus_NodeStatusJoined}}}))
-	require.NoError(t, s1.ProposeJoin(&pb.Node{Id: 2, AllowVote: true, Role: pb.NodeRole_NodeRoleReplica, Status: pb.NodeStatus_NodeStatusWillJoin}))
+	require.NoError(t, s1.ProposeJoin(&pb.Node{Id: 2, ClusterAddr: "127.0.0.1:11111", AllowVote: true, Role: pb.NodeRole_NodeRoleReplica, Status: pb.NodeStatus_NodeStatusWillJoin}))
 	require.Eventually(t, func() bool {
 		node := s2.Node(2)
 		return node != nil && node.Status == pb.NodeStatus_NodeStatusJoining

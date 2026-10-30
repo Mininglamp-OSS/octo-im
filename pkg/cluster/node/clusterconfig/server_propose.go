@@ -168,7 +168,7 @@ func (s *Server) ProposeJoining(nodeId uint64) error {
 
 // ProposeJoin 提案节点加入
 func (s *Server) ProposeJoin(node *pb.Node) error {
-	if err := pb.ValidateAdvertiseAddr(node.ClusterAddr); err != nil {
+	if err := pb.ValidateJoinAddr(node.ClusterAddr); err != nil {
 		return err
 	}
 
