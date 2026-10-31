@@ -170,6 +170,18 @@ func (c *conns) authedConns() []*eventbus.Conn {
 	return conns
 }
 
+// hasAuthedConn checks online presence without allocating a connection snapshot.
+func (c *conns) hasAuthedConn() bool {
+	c.RLock()
+	defer c.RUnlock()
+	for _, conn := range c.conns {
+		if conn.Auth {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *conns) count() int {
 	c.RLock()
 	defer c.RUnlock()

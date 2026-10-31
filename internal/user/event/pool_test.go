@@ -15,7 +15,9 @@ type mockUserEventHandler struct {
 }
 
 func (m *mockUserEventHandler) OnEvent(ctx *eventbus.UserContext) {
-
+	if ctx.EventType == eventbus.EventConnect && m.connectC != nil {
+		m.Connect(ctx)
+	}
 }
 
 func (m *mockUserEventHandler) Connect(ctx *eventbus.UserContext) {
@@ -44,6 +46,7 @@ func TestNewUserEventPool(t *testing.T) {
 func TestUserEventPool_Start(t *testing.T) {
 	handler := &mockUserEventHandler{}
 	pool := NewEventPool(handler)
+	defer pool.Stop()
 
 	err := pool.Start()
 	assert.Nil(t, err)
