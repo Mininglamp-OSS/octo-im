@@ -102,6 +102,34 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 
 // 视情况是否需要加入新的副本
 func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, error) {
+	if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 && s.cfgServer != nil {
+		// Membership cardinality alone does not describe live redundancy. Use
+		// the existing learner migration to replace one failed replica while
+		// preserving the current voters, leader and requested replica count.
+		var failed uint64
+		online := 0
+		for _, id := range cfg.Replicas {
+			node := s.cfgServer.Node(id)
+			if node == nil {
+				continue
+			}
+			if node.Online {
+				online++
+			}
+			if id != cfg.LeaderId && (!node.AllowVote || !node.Online && node.OfflineCount > 0) {
+				failed = id
+			}
+		}
+		if failed != 0 && online >= len(cfg.Replicas)/2+1 {
+			for _, node := range s.cfgServer.AllowVoteAndJoinedOnlineNodes() {
+				if !wkutil.ArrayContainsUint64(cfg.Replicas, node.Id) {
+					cfg.MigrateFrom, cfg.MigrateTo = failed, node.Id
+					cfg.Learners = []uint64{node.Id}
+					return true, nil
+				}
+			}
+		}
+	}
 	if len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
 		return false, nil
 	}

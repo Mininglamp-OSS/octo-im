@@ -148,13 +148,29 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 		s.Error("unmarshal node err", zap.Error(err))
 		return err
 	}
+	// A fresh voting node can replace one confirmed failed voter. Keep the
+	// old quorum until the new learner has durably caught up; promotion below
+	// uses the existing migration endpoints to perform the single replacement.
+	// Recovering the same identity must retain its existing membership.
+	from := newNode.Id
+	// Version 1 is historical expansion-only intent. Replaying an old join
+	// must not retroactively retire a voter just because it was offline then.
+	if cmd.version == 2 && s.config.node(newNode.Id) == nil && newNode.AllowVote && newNode.Role == pb.NodeRole_NodeRoleReplica {
+		for _, node := range s.config.nodes() {
+			if node.AllowVote && node.Role == pb.NodeRole_NodeRoleReplica &&
+				node.Status == pb.NodeStatus_NodeStatusJoined && !node.Online && node.OfflineCount > 0 {
+				from = node.Id
+				break
+			}
+		}
+	}
 	s.config.addOrUpdateNode(newNode)
 
 	// 将新节点加入学习者列表
 	if !wkutil.ArrayContainsUint64(s.config.cfg.Learners, newNode.Id) {
 		s.config.cfg.Learners = append(s.config.cfg.Learners, newNode.Id)
 		// 如果是新加入的节点，就是从自己迁移到自己
-		s.config.cfg.MigrateFrom = newNode.Id
+		s.config.cfg.MigrateFrom = from
 		s.config.cfg.MigrateTo = newNode.Id
 	}
 	return nil
@@ -165,7 +181,7 @@ func (s *Server) handleNodeJoining(cmd *CMD) error {
 		return fmt.Errorf("invalid node joining payload length: %d", len(cmd.Data))
 	}
 	nodeId := binary.BigEndian.Uint64(cmd.Data)
-	s.config.updateNodeJoining(nodeId)
+	s.config.updateNodeJoining(nodeId, cmd.version == 2)
 	return nil
 }
 

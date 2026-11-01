@@ -203,7 +203,21 @@ func (n *Node) stepLeader(e types.Event) error {
 		types.LearnerToLeaderResp,
 		types.FollowerToLeaderResp:
 
-		n.stopPropose = false
+		if n.leaderTransferTo != 0 {
+			if e.Type == types.FollowerToLeaderResp || e.Type == types.LearnerToLeaderResp {
+				if e.From != n.leaderTransferTo || e.Term != n.cfg.Term || e.ConfigVersion != n.leaderTransferVersion {
+					return nil
+				}
+				if e.Reason != types.ReasonOk {
+					n.leaderTransferTo, n.leaderTransferVersion = 0, 0
+					n.stopPropose = false
+				}
+			}
+			// Saving the controller configuration can finish before this owner's
+			// ConfChange. Successful transfer must keep admission closed until then.
+		} else {
+			n.stopPropose = false
+		}
 		syncInfo := n.replicaSync[e.From]
 		if syncInfo == nil {
 			if n.queue.lastLogIndex > 0 {
@@ -601,6 +615,9 @@ func (n *Node) committedIndexForFollow(leaderCommittedIndex uint64) uint64 {
 }
 
 func (n *Node) roleSwitchIfNeed(e types.Event) {
+	if n.leaderTransferTo != 0 {
+		return
+	}
 	if !n.isLearner(e.From) && !n.isVoter(e.From) {
 		return
 	}
@@ -656,6 +673,8 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 		if n.cfg.MigrateFrom == n.cfg.Leader { // 学习者转领导者
 			if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
 				syncInfo.roleSwitching = true // 学习者转让中
+				n.stopPropose = true
+				n.leaderTransferTo, n.leaderTransferVersion = e.From, n.cfg.Version
 				// 发送学习者转为领导者
 				n.sendLearnerToLeaderReq(e.From)
 			} else if e.Index+n.opts.LearnerToLeaderMinLogGap > n.queue.lastLogIndex { // 如果日志差距达到预期，则当前领导停止接受任何提案，等待学习者日志完全追赶上
@@ -680,6 +699,8 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 	} else if n.cfg.MigrateFrom == n.cfg.Leader && n.cfg.MigrateTo == e.From { // // 追随者转为领导者
 		if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
 			syncInfo.roleSwitching = true
+			n.stopPropose = true
+			n.leaderTransferTo, n.leaderTransferVersion = e.From, n.cfg.Version
 			// 发送追随者转为领导者
 			n.sendFollowToLeaderReq(e.From)
 		} else if e.Index+n.opts.FollowerToLeaderMinLogGap > n.queue.lastLogIndex { // 如果日志差距达到预期，则当前领导停止接受任何提案，等待学习者日志完全追赶上
