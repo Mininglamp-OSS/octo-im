@@ -300,9 +300,11 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 
 		if err != nil {
 			rg.AddEvent(r.Key(), types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
+				Type:          respEventType,
+				From:          e.From,
+				Term:          e.Term,
+				ConfigVersion: e.ConfigVersion,
+				Reason:        types.ReasonError,
 			})
 			return
 		}
@@ -313,17 +315,21 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 				rg.Error("change role failed", zap.Error(err), zap.String("key", r.Key()), zap.String("cfg", newCfg.String()))
 			}
 			rg.AddEvent(r.Key(), types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
+				Type:          respEventType,
+				From:          e.From,
+				Term:          e.Term,
+				ConfigVersion: e.ConfigVersion,
+				Reason:        types.ReasonError,
 			})
 			return
 		}
 		rg.AddEvent(r.Key(), types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonOk,
-			Config: newCfg,
+			Type:          respEventType,
+			From:          e.From,
+			Term:          e.Term,
+			ConfigVersion: e.ConfigVersion,
+			Reason:        types.ReasonOk,
+			Config:        newCfg,
 		})
 		rg.Advance()
 	})
@@ -342,9 +348,11 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 		}
 
 		rg.AddEvent(r.Key(), types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonError,
+			Type:          respEventType,
+			From:          e.From,
+			Term:          e.Term,
+			ConfigVersion: e.ConfigVersion,
+			Reason:        types.ReasonError,
 		})
 	}
 }
