@@ -110,6 +110,15 @@ func (p *PebbleShardLogStorage) SaveConfig(cfg types.Config) error {
 
 	for _, willNode := range willNodes {
 		if wkutil.ArrayContainsUint64(cfg.Replicas, willNode.Id) {
+			// Removing and adding voters in separate committed entries keeps an
+			// intersecting quorum. D has caught up as a learner; do not first
+			// turn ABC into ABCD when C is unavailable.
+			if id := offlineVoterForJoin(p.s.Snapshot(), willNode.Id); id != 0 {
+				if err := p.s.proposeNodeRemove(id, willNode.Id); err != nil {
+					return err
+				}
+				return ErrMembershipBusy // retry after D stores the removal too
+			}
 			err := p.s.ProposeJoining(willNode.Id)
 			if err != nil {
 				return err

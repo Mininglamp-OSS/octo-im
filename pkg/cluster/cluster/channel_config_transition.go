@@ -12,6 +12,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
 
 const channelConfigTransitionPath = "/rpc/channel/configTransition/v1"
@@ -72,7 +73,14 @@ func (s *Server) saveChannelConfigTransitionLocal(ctx context.Context, id string
 	if next.Version != current.ConfVersion || next.Term < current.Term {
 		return current, raft.ErrConfigVersionStale
 	}
-	s.updateChannelCfgByConfig(&current, next)
+	current = current.Clone()
+	if current.MigrateFrom != 0 && current.MigrateFrom != current.MigrateTo && current.MigrateFrom != current.LeaderId &&
+		wkutil.ArrayContainsUint64(current.Replicas, current.MigrateFrom) && wkutil.ArrayContainsUint64(current.Learners, current.MigrateTo) &&
+		next.MigrateFrom == 0 && next.MigrateTo == 0 && wkutil.ArrayContainsUint64(next.Replicas, current.MigrateTo) {
+		current.Replicas = wkutil.RemoveUint64(current.Replicas, current.MigrateFrom)
+	} else {
+		s.updateChannelCfgByConfig(&current, next)
+	}
 	if !validConversationConfig(current, id, typ) {
 		return current, ErrConversationReadRetry
 	}

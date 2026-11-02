@@ -102,51 +102,58 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 
 // 视情况是否需要加入新的副本
 func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, error) {
-	if len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
-		return false, nil
+	return planChannelExpansion(cfg, &types.Config{Nodes: s.cfgServer.Nodes()}), nil
+}
+
+func planChannelExpansion(cfg *wkdb.ChannelClusterConfig, cluster *types.Config) bool {
+	online := make(map[uint64]bool, len(cluster.Nodes))
+	var eligible []uint64
+	for _, n := range cluster.Nodes {
+		online[n.Id] = n.Online
+		if n.Online && n.AllowVote && n.Role == types.NodeRole_NodeRoleReplica && n.Status == types.NodeStatus_NodeStatusJoined {
+			eligible = append(eligible, n.Id)
+		}
 	}
-	// An interrupted expansion can leave equal, nonzero migration endpoints
-	// after its learner disappeared. If the target is not a replica either,
-	// no member can complete that migration. Select eligible learners below and
-	// replace the stale markers in the same version-fenced metadata write.
-	// Preserve real learners, transfers, partial markers and existing replicas.
 	orphanedExpansion := len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 &&
 		cfg.MigrateFrom == cfg.MigrateTo && !wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo)
 	if len(cfg.Learners) > 0 || (cfg.MigrateFrom != 0 || cfg.MigrateTo != 0) && !orphanedExpansion {
-		return false, nil
+		if cfg.MigrateTo != 0 && !online[cfg.MigrateTo] && wkutil.ArrayContainsUint64(cfg.Learners, cfg.MigrateTo) {
+			cfg.Learners = wkutil.RemoveUint64(cfg.Learners, cfg.MigrateTo)
+			cfg.MigrateFrom, cfg.MigrateTo = 0, 0
+			return true
+		}
+		return false
 	}
-	allowVoteNodes := s.cfgServer.AllowVoteAndJoinedOnlineNodes()
-	if len(allowVoteNodes) == 0 {
-		return false, errors.New("no allow vote nodes")
-	}
-
-	if len(cfg.Replicas) >= len(allowVoteNodes) { // 如果当前已集群的副本数大于等于允许投票的节点数，则不需要加入新的副本
-		return false, nil
-	}
-
-	newReplicaIds := make([]uint64, 0, len(allowVoteNodes)-len(cfg.Replicas))
-	for _, node := range allowVoteNodes {
-		if !wkutil.ArrayContainsUint64(cfg.Replicas, node.Id) {
-			newReplicaIds = append(newReplicaIds, node.Id)
+	live := 0
+	var offline uint64
+	for _, id := range cfg.Replicas {
+		if online[id] {
+			live++
+		} else if offline == 0 {
+			offline = id
 		}
 	}
-	// 打乱顺序，防止每次都是相同的节点加入
-	rand.Shuffle(len(newReplicaIds), func(i, j int) {
-		newReplicaIds[i], newReplicaIds[j] = newReplicaIds[j], newReplicaIds[i]
-	})
-
-	// 将新节点加入到学习者列表
-	for _, newReplicaId := range newReplicaIds {
-		cfg.MigrateFrom = newReplicaId
-		cfg.MigrateTo = newReplicaId
-		cfg.Learners = append(cfg.Learners, newReplicaId)
-		if len(cfg.Learners)+len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
+	if live >= int(cfg.ReplicaMaxCount) || live < len(cfg.Replicas)/2+1 || !online[cfg.LeaderId] {
+		return false
+	}
+	rand.Shuffle(len(eligible), func(i, j int) { eligible[i], eligible[j] = eligible[j], eligible[i] })
+	for _, id := range eligible {
+		if wkutil.ArrayContainsUint64(cfg.Replicas, id) {
+			continue
+		}
+		cfg.MigrateFrom, cfg.MigrateTo = id, id
+		cfg.Learners = append(cfg.Learners, id)
+		if offline != 0 {
+			// Replace the unavailable follower after catch-up. The healthy
+			// leader chosen above keeps leading throughout this expansion.
+			cfg.MigrateFrom = offline
+			break
+		}
+		if len(cfg.Replicas)+len(cfg.Learners) >= int(cfg.ReplicaMaxCount) {
 			break
 		}
 	}
-
-	return true, nil
-
+	return len(cfg.Learners) > 0
 }
 
 // 视情况是否需要变更领导节点

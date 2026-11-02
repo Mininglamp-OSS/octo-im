@@ -143,6 +143,16 @@ func (s *Server) ProposeJoin(node *pb.Node) error {
 // ProposeJoinWithVersion returns the applied join command's exact log index.
 // A recovering process uses it to distinguish its own rejoin from replay.
 func (s *Server) ProposeJoinWithVersion(node *pb.Node) (uint64, error) {
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	// The Raft migration fields describe one change. A concurrent join must
+	// retry through the same entry point instead of overwriting its target.
+	current := s.Snapshot()
+	for _, pending := range current.Nodes {
+		if pending.Id != node.Id && (pending.Status == pb.NodeStatus_NodeStatusWillJoin || pending.Status == pb.NodeStatus_NodeStatusJoining) {
+			return 0, ErrMembershipBusy
+		}
+	}
 	data, err := node.Marshal()
 	if err != nil {
 		return 0, err

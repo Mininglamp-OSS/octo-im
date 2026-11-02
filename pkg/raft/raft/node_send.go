@@ -53,14 +53,15 @@ func (n *Node) sendSyncReq() {
 		reason = types.ReasonOnlySync
 	}
 	n.events = append(n.events, types.Event{
-		Type:        types.SyncReq,
-		From:        n.opts.NodeId,
-		To:          n.cfg.Leader,
-		Term:        n.cfg.Term,
-		StoredIndex: n.queue.storedIndex + 1,
-		Index:       n.queue.lastLogIndex + 1,
-		LastLogTerm: n.lastTermStartIndex.Term,
-		Reason:      reason,
+		Type:          types.SyncReq,
+		From:          n.opts.NodeId,
+		To:            n.cfg.Leader,
+		Term:          n.cfg.Term,
+		StoredIndex:   n.queue.storedIndex + 1,
+		ConfigVersion: n.cfg.Version,
+		Index:         n.queue.lastLogIndex + 1,
+		LastLogTerm:   n.lastTermStartIndex.Term,
+		Reason:        reason,
 	})
 }
 

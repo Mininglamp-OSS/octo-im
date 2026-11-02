@@ -7,6 +7,14 @@ import (
 )
 
 func (n *Node) Step(e types.Event) error {
+	// Removed peers may return with a stale leader role and a higher term.
+	// Reject their network traffic before it can change terms, sync progress,
+	// or leadership. Re-admission is a committed application membership change.
+	if e.From != 0 && e.From != types.LocalNode && e.From != n.opts.NodeId &&
+		!n.isVoter(e.From) && !n.isLearner(e.From) &&
+		!(n.cfg.Version == 0 && n.isLearner(n.opts.NodeId)) {
+		return nil
+	}
 	// Election membership discovery does not carry a term or cast a vote.
 	// Process it separately so a still-local learner cannot raise our term.
 	if (e.Type == types.ConfigReq || e.Type == types.ConfigResp) && e.Reason == types.ReasonOnlySync {
@@ -130,6 +138,9 @@ func (n *Node) stepLeader(e types.Event) error {
 		n.advance()
 	case types.SyncReq: // 同步
 		n.idleTick = 0
+		if e.ConfigVersion < n.cfg.Version {
+			n.sendConfigResp(e.From, n.cfg.Clone())
+		}
 		isLearner := n.isLearner(e.From) // 当前同步节点是否是学习者
 		n.updateSyncInfo(e)              // 更新副本同步信息
 		if !isLearner {
@@ -266,7 +277,7 @@ func (n *Node) stepFollower(e types.Event) error {
 				// 推进去存储
 				n.advance()
 			} else {
-				if e.Speed == types.SpeedSuspend {
+				if e.Speed == types.SpeedSuspend && len(n.cfg.Learners) == 0 && n.cfg.MigrateFrom == 0 && n.cfg.MigrateTo == 0 {
 					n.suspend = true
 				}
 			}
@@ -368,7 +379,7 @@ func (n *Node) stepLearner(e types.Event) error {
 				}
 				n.advance()
 			} else {
-				if e.Speed == types.SpeedSuspend {
+				if e.Speed == types.SpeedSuspend && len(n.cfg.Learners) == 0 && n.cfg.MigrateFrom == 0 && n.cfg.MigrateTo == 0 {
 					n.suspend = true
 				}
 			}
@@ -503,6 +514,7 @@ func (n *Node) updateSyncInfo(e types.Event) {
 	syncInfo.SyncTick = 0
 	syncInfo.LastSyncIndex = e.Index
 	syncInfo.StoredIndex = e.StoredIndex
+	syncInfo.ConfigVersion = e.ConfigVersion
 }
 
 // 更新领导的提交索引
@@ -609,6 +621,31 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 	if n.isLearner(e.From) && e.StoredIndex <= n.queue.committedIndex {
 		return
 	}
+	completingFollower := !n.isLearner(e.From) && n.cfg.MigrateFrom != n.cfg.MigrateTo && n.cfg.MigrateFrom != n.cfg.Leader && n.isVoter(n.cfg.MigrateFrom)
+	if e.From == n.cfg.MigrateTo && n.cfg.MigrateFrom != 0 && n.cfg.MigrateFrom != n.cfg.MigrateTo &&
+		(completingFollower || n.isLearner(e.From) && !n.isVoter(n.cfg.MigrateFrom)) {
+		// The old follower has been retired in a separate durable metadata
+		// transition. A majority of that intermediate voting set must install
+		// it before the learner is promoted; otherwise an old peer pair could
+		// still accept the removed leader's configuration during propagation.
+		if e.ConfigVersion < n.cfg.Version {
+			return
+		}
+		acked := 1 // the current leader
+		seen := map[uint64]bool{n.opts.NodeId: true}
+		for _, id := range n.cfg.Replicas {
+			if seen[id] || !n.isVoter(id) {
+				continue
+			}
+			seen[id] = true
+			if info := n.replicaSync[id]; info != nil && info.ConfigVersion >= n.cfg.Version && info.StoredIndex > n.queue.committedIndex {
+				acked++
+			}
+		}
+		if acked < n.quorum() {
+			return
+		}
+	}
 
 	// 没有需要切换的配置
 	if n.cfg.MigrateTo == 0 || n.cfg.MigrateFrom == 0 {
@@ -650,6 +687,13 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 	}
 
 	isLearner := n.isLearner(e.From) // 当前同步节点是否是学习者
+	if completingFollower {
+		if e.StoredIndex > n.queue.committedIndex {
+			syncInfo.roleSwitching = true
+			n.sendLearnerToFollowerReq(e.From) // finish the admitted follower migration
+		}
+		return
+	}
 
 	if isLearner {
 		// 如果迁移的源节点是领导者，那么学习者必须完全追上领导者的日志

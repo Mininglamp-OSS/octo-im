@@ -351,10 +351,12 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 
 // 学习者转换
 func (rg *RaftGroup) learnTo(r IRaft, learnerId uint64) (types.Config, error) {
-	if !wkutil.ArrayContainsUint64(r.Config().Learners, learnerId) {
+	cfg := r.Config().Clone()
+	completing := cfg.MigrateTo == learnerId && cfg.MigrateFrom != learnerId && cfg.MigrateFrom != r.LeaderId() &&
+		wkutil.ArrayContainsUint64(cfg.Replicas, learnerId) && wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateFrom)
+	if !wkutil.ArrayContainsUint64(cfg.Learners, learnerId) && !completing {
 		return types.Config{}, errors.New("promotion target is not a learner")
 	}
-	cfg := r.Config().Clone()
 
 	// orphan learner: 前次迁移已完成（MigrateFrom/MigrateTo 都为 0），
 	// 但 learnerId 仍残留在 cfg.Learners 中。此时既无迁移源也无迁移目标，

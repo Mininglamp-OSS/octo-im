@@ -7,6 +7,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -31,6 +32,7 @@ type Server struct {
 	configSavePending   bool
 	configNotifyPending bool
 	listeners           []IEvent // 事件监听器
+	joinMu              sync.Mutex
 	wklog.Log
 }
 

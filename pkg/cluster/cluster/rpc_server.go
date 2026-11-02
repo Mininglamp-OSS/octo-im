@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/clusterconfig"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -66,6 +67,7 @@ func (r *rpcServer) setRoutes() {
 
 	// 节点加入
 	r.s.netServer.Route("/rpc/cluster/join", r.handleClusterJoin)
+	r.s.netServer.Route("/rpc/cluster/join/probe/v1", r.handleClusterJoinProbe)
 
 	// 获取分布式日志
 	r.s.netServer.Route("/rpc/cluster/logs", r.handleClusterLogs)
@@ -363,12 +365,21 @@ func (s *Server) getChannelLastLogInfo(ctx context.Context, channelId string, ch
 }
 
 func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
+	r.handleClusterJoinRequest(c, false)
+}
+
+func (r *rpcServer) handleClusterJoinProbe(c *wkserver.Context) {
+	r.handleClusterJoinRequest(c, true)
+}
+
+func (r *rpcServer) handleClusterJoinRequest(c *wkserver.Context, probe bool) {
 	req := &ClusterJoinReq{}
 	if err := req.Unmarshal(c.Body()); err != nil {
 		r.Error("unmarshal ClusterJoinReq failed", zap.Error(err))
 		c.WriteErr(err)
 		return
 	}
+	req.Probe = probe
 
 	if !r.s.cfgServer.IsLeader() {
 		resp, err := r.s.rpcClient.RequestClusterJoin(r.s.cfgServer.LeaderId(), req)
@@ -387,6 +398,14 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 		return
 	}
 
+	// A discovery probe can arrive immediately after election, before the
+	// bootstrap command commits. It must not replace InitNodes with a partial
+	// one-node join configuration in that window.
+	if !r.s.cfgServer.IsInitialized() {
+		c.WriteErr(clusterconfig.ErrMembershipBusy)
+		return
+	}
+
 	allowVote := false
 	if req.Role == types.NodeRole_NodeRoleReplica {
 		allowVote = true
@@ -402,6 +421,20 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 		})
 	}
 	resp.Nodes = nodeInfos
+	existing := r.s.cfgServer.Node(req.NodeId)
+	if req.Probe && existing != nil {
+		if existing.Status == types.NodeStatus_NodeStatusWillJoin {
+			resp.LeaderID = r.s.cfgServer.LeaderId()
+			resp.Config = r.s.cfgServer.Snapshot()
+		}
+		data, err := resp.Marshal()
+		if err != nil {
+			c.WriteErr(err)
+			return
+		}
+		c.Write(data)
+		return
+	}
 
 	joinVersion, err := r.s.cfgServer.ProposeJoinWithVersion(&types.Node{
 		Id:          req.NodeId,
@@ -420,6 +453,8 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 	}
 
 	resp.JoinVersion = joinVersion
+	resp.LeaderID = r.s.cfgServer.LeaderId()
+	resp.Config = r.s.cfgServer.Snapshot()
 	result, err := resp.Marshal()
 	if err != nil {
 		r.Error("marshal ClusterJoinResp failed", zap.Error(err))

@@ -7,7 +7,6 @@ import (
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
 )
 
@@ -42,8 +41,10 @@ func (s *Server) applyLog(log types.Log) error {
 		}
 		after := s.configToRaftConfig(s.config)
 		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
+		s.config.mu.Lock()
 		s.config.cfg.Term = log.Term
 		s.config.cfg.Version = log.Index
+		s.config.mu.Unlock()
 		s.configSavePending = true
 		s.configNotifyPending = true
 	}
@@ -91,6 +92,10 @@ func (s *Server) handleCmd(cmd *CMD) error {
 		return s.handleSlotMigrate(cmd)
 	case CMDTypeSlotStatusChange: // 槽状态改变
 		return s.handleSlotStatusChange(cmd)
+	case CMDTypeNodeRemove:
+		return s.handleNodeRemove(cmd)
+	case CMDTypeSlotUpdateIfCurrent:
+		return s.handleSlotUpdateIfCurrent(cmd)
 	}
 	return nil
 }
@@ -148,15 +153,7 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 		s.Error("unmarshal node err", zap.Error(err))
 		return err
 	}
-	s.config.addOrUpdateNode(newNode)
-
-	// 将新节点加入学习者列表
-	if !wkutil.ArrayContainsUint64(s.config.cfg.Learners, newNode.Id) {
-		s.config.cfg.Learners = append(s.config.cfg.Learners, newNode.Id)
-		// 如果是新加入的节点，就是从自己迁移到自己
-		s.config.cfg.MigrateFrom = newNode.Id
-		s.config.cfg.MigrateTo = newNode.Id
-	}
+	s.config.addJoiningNode(newNode)
 	return nil
 }
 

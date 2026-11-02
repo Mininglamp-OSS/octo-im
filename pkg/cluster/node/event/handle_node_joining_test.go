@@ -34,7 +34,11 @@ func TestHandleNodeJoiningCompletesWithoutSlotMigration(t *testing.T) {
 	for _, node := range s.cfgServer.Nodes() {
 		require.Equal(t, types.NodeStatus_NodeStatusJoined, node.Status, "node %d must complete rejoin", node.Id)
 	}
-	require.Equal(t, before.Slots, s.cfgServer.Slots(), "an existing assignment must remain unchanged")
+	slots := s.cfgServer.Slots()
+	require.Len(t, slots, len(before.Slots))
+	for i, slot := range slots {
+		require.True(t, slot.Equal(before.Slots[i]), "an existing assignment must remain unchanged")
+	}
 	version := s.cfgServer.GetClusterConfig().Version
 	require.NoError(t, s.handleNodeJoining())
 	require.Equal(t, version, s.cfgServer.GetClusterConfig().Version, "completed joins must not generate more proposals")
@@ -117,4 +121,31 @@ func newJoiningTestServer(t *testing.T, cfg *types.Config) *Server {
 		return false
 	}, 5*time.Second, 10*time.Millisecond)
 	return &Server{cfgServer: leader, cfgOptions: leader.Options()}
+}
+
+func TestReturningConfigurationLeaderMarksItselfOnline(t *testing.T) {
+	cfg := joiningTestConfig(true)
+	for _, n := range cfg.Nodes {
+		n.Status = types.NodeStatus_NodeStatusJoined
+	}
+	base := newJoiningTestServer(t, cfg)
+	leader := base.cfgOptions.NodeId
+	require.NoError(t, base.cfgServer.ProposeNodeOnlineStatus(leader, false))
+	require.False(t, base.cfgServer.NodeIsOnline(leader))
+	s := NewServer(nil, base.cfgOptions, base.cfgServer)
+	s.tick()
+	require.True(t, base.cfgServer.NodeIsOnline(leader), "a leader cannot wait for a heartbeat from itself after restart")
+}
+
+func TestOfflinePromotedNodeDoesNotBlockNextAdmission(t *testing.T) {
+	cfg := joiningTestConfig(false)
+	cfg.Nodes[1].Online = false
+	s := newJoiningTestServer(t, cfg)
+	require.NoError(t, s.handleNodeJoining())
+	require.Equal(t, types.NodeStatus_NodeStatusJoined, s.cfgServer.Node(1002).Status)
+	require.False(t, s.cfgServer.NodeIsOnline(1002))
+	for _, st := range s.cfgServer.Slots() {
+		require.NotContains(t, st.Learners, uint64(1002))
+		require.NotContains(t, st.Replicas, uint64(1002))
+	}
 }

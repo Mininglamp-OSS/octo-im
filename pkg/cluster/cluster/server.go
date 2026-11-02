@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
@@ -64,6 +65,7 @@ type Server struct {
 	// Capture this before configuration replay can make a fresh seeded node
 	// appear initialized. It still needs an explicit rejoin and slot election.
 	freshSeededStart bool
+	joinReady        atomic.Bool
 
 	channelKeyLock *keylock.KeyLock // 频道锁
 
@@ -81,13 +83,18 @@ func New(opts *Options) *Server {
 	}
 	s.cancelCtx, s.cancelFnc = context.WithCancel(context.Background())
 	// 初始化传输层
-	if opts.SlotTransport == nil {
+	// Native transports belong to this server. Reused options after Stop must
+	// not send through the previous server's now-closed connection queues.
+	_, nativeSlot := opts.SlotTransport.(*slotTransport)
+	if opts.SlotTransport == nil || nativeSlot {
 		opts.SlotTransport = newSlotTransport(s)
 	}
-	if opts.ChannelTransport == nil {
+	_, nativeChannel := opts.ChannelTransport.(*channelTransport)
+	if opts.ChannelTransport == nil || nativeChannel {
 		opts.ChannelTransport = newChannelTransport(s)
 	}
-	if opts.ConfigOptions.Transport == nil {
+	_, nativeNode := opts.ConfigOptions.Transport.(*nodeTransport)
+	if opts.ConfigOptions.Transport == nil || nativeNode {
 		opts.ConfigOptions.Transport = newNodeTransport(s)
 	}
 
@@ -247,7 +254,10 @@ func (s *Server) Start() error {
 	}
 	if join { // 需要加入集群
 		s.stopper.RunWorker(s.joinLoop)
+	} else {
+		s.joinReady.Store(true)
 	}
+	s.stopper.RunWorker(s.membershipLoop)
 	s.configReconciler.start()
 
 	return nil
@@ -260,6 +270,7 @@ func (s *Server) Stop() {
 	s.cfgServer.Stop()
 	s.slotServer.Stop()
 	s.channelServer.Stop()
+	s.nodeManager.stop()
 	s.netServer.Stop()
 	s.cancelFnc()
 	s.store.Stop()
@@ -302,6 +313,16 @@ func (s *Server) OnConfigChange(cfg *types.Config) {
 		nodeMap[node.Id] = node.ClusterAddr
 	}
 	s.addOrUpdateNodes(nodeMap)
+	// Only a committed configuration removes connections. Join responses and
+	// temporary seed maps are partial and must never delete unrelated peers.
+	s.Lock()
+	defer s.Unlock()
+	for _, node := range s.nodeManager.nodes() {
+		if _, exists := nodeMap[node.id]; !exists {
+			s.nodeManager.removeNode(node.id)
+			node.Stop()
+		}
+	}
 }
 
 func (s *Server) slotApplyLogs(slotId uint32, logs []rafttype.Log) error {
@@ -374,14 +395,36 @@ func (s *Server) onSaveSlotConfig(slotId uint32, cfg rafttype.Config) error {
 		return errors.New("slot not found")
 	}
 	cloneSlot := slot.Clone()
+	if !validSlotConfigTransition(slot, cfg) {
+		return errors.New("slot membership transition superseded")
+	}
 	// 更新slot的配置
-	s.updateSlotByConfig(cloneSlot, cfg)
+	retiring := slot.MigrateFrom != 0 && slot.MigrateFrom != slot.MigrateTo && slot.MigrateFrom != slot.Leader &&
+		wkutil.ArrayContainsUint64(slot.Replicas, slot.MigrateFrom) && wkutil.ArrayContainsUint64(slot.Learners, slot.MigrateTo)
+	if retiring {
+		if s.cfgServer.NodeIsOnline(slot.MigrateFrom) {
+			// Healthy expansion retains the old voters until D is installed.
+			// A different peer may have crashed before its heartbeat times out.
+			cloneSlot.Replicas = append(cloneSlot.Replicas, slot.MigrateTo)
+			cloneSlot.Learners = wkutil.RemoveUint64(cloneSlot.Learners, slot.MigrateTo)
+		} else {
+			cloneSlot.Replicas = wkutil.RemoveUint64(cloneSlot.Replicas, slot.MigrateFrom)
+		}
+	} else {
+		s.updateSlotByConfig(cloneSlot, cfg)
+	}
 
 	// 提案槽更新（槽更新会触发分布式配置事件，事件会触发slot更新最新的配置，所以这里只需要提案即可，不需要再进行配置切换）
-	err := s.cfgServer.ProposeSlots([]*types.Slot{cloneSlot})
+	err := s.cfgServer.ProposeSlotsIfCurrent([]*types.Slot{slot}, []*types.Slot{cloneSlot})
 	if err != nil {
 		s.Error("onSaveSlotConfig: propose slot failed", zap.Any("oldSlot", slot), zap.Error(err))
 		return err
+	}
+	if current := s.cfgServer.Slot(slotId); current == nil || !current.Equal(cloneSlot) {
+		return errors.New("slot membership transition superseded")
+	}
+	if retiring {
+		return clusterconfig.ErrMembershipBusy
 	}
 
 	return nil
@@ -396,6 +439,7 @@ func (s *Server) onSaveChannelConfig(channelId string, channelType uint8, cfg ra
 		s.Error("onSaveChannelConfig: transition rejected", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(err))
 		return err
 	}
+	retiring := cfg.MigrateTo == 0 && channelCfg.MigrateTo != 0
 
 	// 切换配置
 	if channelCfg.LeaderId == s.opts.ConfigOptions.NodeId {
@@ -405,9 +449,13 @@ func (s *Server) onSaveChannelConfig(channelId string, channelType uint8, cfg ra
 			return err
 		}
 	} else {
-		return s.rpcClient.RequestChannelSwitchConfig(channelCfg.LeaderId, channelCfg)
+		if err := s.rpcClient.RequestChannelSwitchConfig(channelCfg.LeaderId, channelCfg); err != nil {
+			return err
+		}
 	}
-
+	if retiring {
+		return clusterconfig.ErrMembershipBusy
+	}
 	return nil
 }
 

@@ -98,6 +98,10 @@ func (s *Server) addOrUpdateSlotRaft(slot *types.Slot, version uint64, force boo
 				Type:   rafttype.ConfChange,
 				Config: runtimeConfig(raftSlot),
 			})
+			// Compare the last controller assignment scheduled for this raft,
+			// not its creation-time assignment. Unrelated config log entries
+			// must not keep resetting a migration's synchronization progress.
+			raftSlot.slot = slot.Clone()
 		}
 	}
 }

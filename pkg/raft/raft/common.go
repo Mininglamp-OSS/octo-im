@@ -28,6 +28,7 @@ const (
 type SyncInfo struct {
 	LastSyncIndex uint64 //最后一次来同步日志的下标（最新日志 + 1）
 	StoredIndex   uint64 // 副本已存储的日志下标
+	ConfigVersion uint64 // last membership installed by this peer
 	SyncTick      int    // 同步计时器
 	GetingLogs    bool   // 领导是否正在查询此副本的日志中
 	roleSwitching bool   // 角色切换中

@@ -113,13 +113,21 @@ func (c *Config) update(cfg *types.Config) {
 func (c *Config) nodes() []*types.Node {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg.Nodes
+	nodes := make([]*types.Node, len(c.cfg.Nodes))
+	for i, n := range c.cfg.Nodes {
+		nodes[i] = n.Clone()
+	}
+	return nodes
 }
 
 func (c *Config) slots() []*types.Slot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg.Slots
+	slots := make([]*types.Slot, len(c.cfg.Slots))
+	for i, slot := range c.cfg.Slots {
+		slots[i] = slot.Clone()
+	}
+	return slots
 }
 
 // 判断是否有slot
@@ -141,16 +149,24 @@ func (c *Config) hasNode(id uint64) bool {
 	return false
 }
 
-func (c *Config) addOrUpdateNode(node *types.Node) {
+func (c *Config) addJoiningNode(node *types.Node) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	found := false
 	for i, n := range c.cfg.Nodes {
 		if n.Id == node.Id {
 			c.cfg.Nodes[i] = node
-			return
+			found = true
+			break
 		}
 	}
-	c.cfg.Nodes = append(c.cfg.Nodes, node)
+	if !found {
+		c.cfg.Nodes = append(c.cfg.Nodes, node)
+	}
+	if !wkutil.ArrayContainsUint64(c.cfg.Learners, node.Id) {
+		c.cfg.Learners = append(c.cfg.Learners, node.Id)
+		c.cfg.MigrateFrom, c.cfg.MigrateTo = node.Id, node.Id
+	}
 }
 
 // 添加节点
@@ -295,7 +311,7 @@ func (c *Config) updateNodeStatus(nodeId uint64, status types.NodeStatus) {
 func (c *Config) config() *types.Config {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg
+	return c.cfg.Clone()
 }
 
 // 获取slot数量
@@ -317,7 +333,7 @@ func (c *Config) slot(id uint32) *types.Slot {
 	defer c.mu.RUnlock()
 	for _, slot := range c.cfg.Slots {
 		if slot.Id == id {
-			return slot
+			return slot.Clone()
 		}
 	}
 	return nil
@@ -342,7 +358,7 @@ func (c *Config) allowVoteNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, node := range c.cfg.Nodes {
 		if node.AllowVote {
-			nodes = append(nodes, node)
+			nodes = append(nodes, node.Clone())
 		}
 	}
 	return nodes
@@ -355,7 +371,7 @@ func (c *Config) allowVoteAndJoinedNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, node := range c.cfg.Nodes {
 		if node.AllowVote && node.Status == types.NodeStatus_NodeStatusJoined {
-			nodes = append(nodes, node)
+			nodes = append(nodes, node.Clone())
 		}
 	}
 	return nodes
@@ -394,7 +410,7 @@ func (c *Config) allowVoteAndJoinedOnlineNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, node := range c.cfg.Nodes {
 		if node.AllowVote && node.Status == types.NodeStatus_NodeStatusJoined && node.Online {
-			nodes = append(nodes, node)
+			nodes = append(nodes, node.Clone())
 		}
 	}
 	return nodes
@@ -407,7 +423,7 @@ func (c *Config) onlineNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, node := range c.cfg.Nodes {
 		if node.Online {
-			nodes = append(nodes, node)
+			nodes = append(nodes, node.Clone())
 		}
 	}
 	return nodes
@@ -418,7 +434,7 @@ func (c *Config) node(id uint64) *types.Node {
 	defer c.mu.RUnlock()
 	for _, n := range c.cfg.Nodes {
 		if n.Id == id {
-			return n
+			return n.Clone()
 		}
 	}
 	return nil
@@ -453,7 +469,7 @@ func (c *Config) willJoinNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, n := range c.cfg.Nodes {
 		if n.Status == types.NodeStatus_NodeStatusWillJoin {
-			nodes = append(nodes, n)
+			nodes = append(nodes, n.Clone())
 		}
 	}
 	return nodes

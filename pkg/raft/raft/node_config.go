@@ -90,6 +90,12 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 		newCfg.Leader = n.cfg.Leader
 	}
 	n.cfg = newCfg
+	// Membership maintenance must progress without a new business write.
+	// A same-leader config update otherwise leaves quiet followers suspended
+	// and unable to acknowledge the intermediate membership or promote D.
+	if len(newCfg.Learners) > 0 || newCfg.MigrateFrom != 0 || newCfg.MigrateTo != 0 {
+		n.suspend = false
+	}
 
 	return nil
 }
