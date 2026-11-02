@@ -14,6 +14,9 @@ func TestAddressProposalsRejectInvalidBeforeRaft(t *testing.T) {
 		t.Run(addr, func(t *testing.T) {
 			require.Error(t, s.ProposeClusterAddr(1, addr))
 			require.Error(t, s.ProposeJoin(&pb.Node{Id: 2, ClusterAddr: addr}))
+			version, err := s.ProposeJoinWithVersion(&pb.Node{Id: 2, ClusterAddr: addr})
+			require.Error(t, err)
+			require.Zero(t, version)
 			require.Error(t, s.ProposeConfig(&pb.Config{Nodes: []*pb.Node{{Id: 1, ClusterAddr: addr}}}))
 		})
 	}
@@ -24,6 +27,9 @@ func TestJoinProposalRejectsEmptyBeforeRaft(t *testing.T) {
 	for _, addr := range []string{"", "   ", "\t\n"} {
 		t.Run(addr, func(t *testing.T) {
 			require.ErrorContains(t, s.ProposeJoin(&pb.Node{Id: 2, ClusterAddr: addr}), "required")
+			version, err := s.ProposeJoinWithVersion(&pb.Node{Id: 2, ClusterAddr: addr})
+			require.ErrorContains(t, err, "required")
+			require.Zero(t, version)
 		})
 	}
 }

@@ -140,11 +140,12 @@ func TestJoinRPCResponseDuringAddressBackfill(t *testing.T) {
 func TestJoinWithWildcardListenerAndAdvertisedAddress(t *testing.T) {
 	servers, ctx := newConfigRPCServersWithSlots(t, 1, 1)
 	leader := servers[0]
-	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	listener, err := net.Listen("tcp4", "0.0.0.0:0")
 	require.NoError(t, err)
 	listenAddr := listener.Addr().String()
-	_, port, err := net.SplitHostPort(listenAddr)
+	host, port, err := net.SplitHostPort(listenAddr)
 	require.NoError(t, err)
+	require.Equal(t, "0.0.0.0", host)
 	require.NoError(t, listener.Close())
 	advertised := net.JoinHostPort("127.0.0.1", port)
 	seed := "1@" + leader.cfgServer.Node(1).ClusterAddr
