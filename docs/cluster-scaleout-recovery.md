@@ -13,6 +13,10 @@
 
 slot 迁移任务保存在配置日志中，频道任务保存在已有频道元数据中。后台扫描恢复任务；失败的 learner 可以取消并重新选择可用容量。条件 slot 更新和频道版本校验拒绝被新任务、选举或其他配置取代的旧回调。
 
+slot 和频道均在完成回调时重新检查迁出节点的健康状态。C 在 D 同步期间恢复时，保留 C，经历 `ABC + learner D → ABCD → ABD`；四个正式副本只是迁移中间态，目标副本数仍为三。D 和中间配置多数派确认后才能移出 C。若 D 在中间态故障，原正式副本仍在线并满足原多数派及目标容量时，取消 D 并保留迁出节点。
+
+若中间态发生选举、原迁出节点成为新 leader，保留新 leader，优先将故障旧 leader 选为迁出 follower；正常领导权转移不受此规则影响。旧角色的完成回调不能直接清空任务并留下超额副本。进程重启后，任务由现有提示及最长 30 秒一轮的后台扫描重新发现。
+
 D 先完成加入、C 随后才被心跳判离线时，后台仍会按现有健康容量继续完成成员清理。健康容量不足时保留原投票集合。
 
 原配置多数派不可用时，不通过缩小在线节点统计来恢复投票。该流程不提供丢失多数派后的强制恢复。
@@ -23,6 +27,8 @@ C 仍是成员时按正常重连恢复。C 已退出时，通过内部成员探�
 
 已移除节点的 Raft 网络消息在处理任期前被拒绝。只有已提交的成员配置删除对应连接和队列；种子地址或加入响应中的局部节点列表不触发删除。重建 Server 时重新绑定实例自带的 transport，避免复用已停止实例的发送队列。
 
+本地 slot 移除在 Raft 事件循环上完成；以相同编号重新加载前，在循环外等待旧实例已接收的落盘、读日志、截断和 Apply 任务结束，再读取存储状态。所有本地异步完成事件和 slot 配置事件绑定原实例，消费时丢弃已退役实例的事件；旧 Apply 也不能唤醒新实例的等待者。角色配置保存在异步任务前由事件循环快照，SaveConfig 不进入单 slot 的存储等待，以免成员变更回调等待自身。停机先停止接收工作并等待已接收 worker 完成，再关闭存储。
+
 新增两个内部配置日志命令和一个内部探测路由；加入响应扩展可以读取旧响应。执行这些成员变更前应完成所有投票节点的版本升级，不支持用旧二进制应用新增命令。
 
 ## 本地验证
@@ -30,10 +36,15 @@ C 仍是成员时按正常重连恢复。C 已退出时，通过内部成员探�
 ```sh
 go test ./pkg/raft/... ./pkg/cluster/node/... ./pkg/cluster/slot ./pkg/cluster/channel ./pkg/cluster/store -count=1
 go test ./pkg/wkdb -run '^TestChannelConfigCloneDoesNotShareMembership$' -count=1
-go test ./pkg/cluster/cluster -run '^(TestChannelRetirement.*|TestExpansionRecovery.*|TestCommittedRemoval.*|TestClusterJoinResponse.*|TestMembershipProbe.*|TestChannelExpansion.*|TestSlotTransition.*|TestChannelReplicationAfterLeaderConfigChange|TestConfigOrphanMigration.*|TestSeededEmptyDiskRejoinCompletesRecoveryOverTCP)$' -count=1 -timeout=5m
+go test -race ./pkg/raft/raftgroup ./pkg/cluster/slot -run '^(TestRetired.*|TestStorageDrain.*|TestConfigurationCallback.*|TestSlotRecreation.*|TestSlotStop.*)$' -count=5 -timeout=90s
+go test ./pkg/cluster/cluster -run '^(TestChannelRetirement.*|TestChannelRecoveredSource.*|TestChannelFollowerMigration.*|TestExpansionRecovery.*|TestCommittedRemoval.*|TestClusterJoinResponse.*|TestMembershipProbe.*|TestChannelExpansion.*|TestSlotTransition.*|TestChannelReplicationAfterLeaderConfigChange|TestConfigOrphanMigration.*|TestSeededEmptyDiskRejoinCompletesRecoveryOverTCP)$' -count=1 -timeout=10m
 ```
 
 集成用例使用真实 TCP 和独立 Pebble 数据库，覆盖普通节点和配置 leader 故障后新增 D、C 在 D 晋升前恢复、C 在数据同步期间恢复、learner/控制节点重启、配置或数据 learner 崩溃后新增另一节点、C 用原磁盘或空磁盘重新接入，以及加入早于故障心跳超时、恢复节点重新当选 leader、正常重连、空目录 seed 重入、旧回调和资源清理。
+
+频道交错故障回归覆盖 `C 故障 → D 同步 → C 恢复 → B 频道不可达或整机停止 → D 完成`，验证 B 不恢复时仍能提交消息和读取历史；另覆盖四副本中间态的目标节点重启、元数据 owner 重启、消息 leader 故障后原迁出节点当选，以及目标节点故障取消。
+
+slot 生命周期回归暂停真实 Pebble 写入，经过正式配置入口移除再加入相同 slot，确认新实例等待旧任务结束、加载完整历史并继续存储后续日志。另覆盖已入队和延迟到达的旧回调、旧实例销毁、各类存储任务排空、worker 池拒绝、配置回调重入，以及存储和重新加载等待期间停机。
 
 另有独立进程 SIGKILL 验证：64 个 slot、64 个已有频道、64 个用户，初始 512 条消息；恢复后继续发送并停机核对每个正式副本的消息 ID、序号、内容、频道元数据和用户设备数据。HTTP `/message/send` 返回表示请求进入异步发送队列，因此第二次故障的注入点以实际持久化完成为准。
 
