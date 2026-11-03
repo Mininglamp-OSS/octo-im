@@ -41,8 +41,9 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 			// 如果副本的分布式配置的版本小于当前领导的则也不能参与选举，
 			// 这样做的目的防止旧领导slot的状态没更新到Candidate，导致slot继续在接受日志，
 			// 这时候通过日志选举出来的领导肯定不可信
-			if s.cfgServer.NodeConfigVersionFromLeader(replicaId) < s.cfgServer.GetClusterConfig().Version {
-				s.Warn("replica config version < leader config version,stop election", zap.Uint64("replicaCfgVersion", s.cfgServer.NodeConfigVersionFromLeader(replicaId)), zap.Uint64("leaderCfgVersion", s.cfgServer.GetClusterConfig().Version))
+			configVersion := s.cfgServer.ConfigVersion()
+			if s.cfgServer.NodeConfigVersionFromLeader(replicaId) < configVersion {
+				s.Warn("replica config version < leader config version,stop election", zap.Uint64("replicaCfgVersion", s.cfgServer.NodeConfigVersionFromLeader(replicaId)), zap.Uint64("leaderCfgVersion", configVersion))
 				return nil
 			}
 

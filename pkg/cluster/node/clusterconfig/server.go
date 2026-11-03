@@ -231,6 +231,12 @@ func (s *Server) GetClusterConfig() *types.Config {
 	return s.config.config()
 }
 
+// ConfigVersion returns the applied configuration version without copying the
+// cluster configuration. The read uses the configuration lock.
+func (s *Server) ConfigVersion() uint64 {
+	return s.config.version()
+}
+
 // 是否已初始化
 func (s *Server) IsInitialized() bool {
 	return s.config.isInitialized()
