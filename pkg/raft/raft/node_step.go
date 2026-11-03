@@ -204,6 +204,14 @@ func (n *Node) stepLeader(e types.Event) error {
 		types.FollowerToLeaderResp:
 
 		n.stopPropose = false
+		// Applying the role config may already have cleared replicaSync. Wake
+		// remaining learners before the nil check so suspended peers can resume
+		// SyncReq-driven promotion, even when they are no longer migrateTo.
+		for _, learnerID := range n.cfg.Learners {
+			if learnerID != n.opts.NodeId {
+				n.sendNotifySync(learnerID)
+			}
+		}
 		syncInfo := n.replicaSync[e.From]
 		if syncInfo == nil {
 			if n.queue.lastLogIndex > 0 {
