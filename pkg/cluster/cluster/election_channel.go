@@ -102,6 +102,15 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 
 // 视情况是否需要加入新的副本
 func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, error) {
+	// A completed single-replica configuration cannot finish an abandoned
+	// expansion with no learner. Clear only that historical orphan state;
+	// multi-replica repair below must still choose eligible replacement learners.
+	if cfg.ReplicaMaxCount == 1 && len(cfg.Replicas) == 1 && len(cfg.Learners) == 0 &&
+		cfg.MigrateFrom != 0 && cfg.MigrateFrom == cfg.MigrateTo &&
+		!wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo) {
+		cfg.MigrateFrom, cfg.MigrateTo = 0, 0
+		return true, nil
+	}
 	if len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
 		return false, nil
 	}
