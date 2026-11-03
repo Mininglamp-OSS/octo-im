@@ -23,13 +23,16 @@ import (
 // Drop only the joining node's outgoing synchronization requests. All other
 // traffic uses real TCP; these gates make interruption timing reproducible.
 type expansionGroupGate struct {
-	base  raftgroup.ITransport
-	pause atomic.Bool
+	base             raftgroup.ITransport
+	pause            atomic.Bool
+	maxConfigVersion atomic.Uint64 // nonzero: hold acknowledgement of a later membership
 }
 
 func (g *expansionGroupGate) Send(key string, e rafttypes.Event) {
-	if g.pause.Load() && e.Type == rafttypes.SyncReq {
-		return
+	if e.Type == rafttypes.SyncReq {
+		if limit := g.maxConfigVersion.Load(); g.pause.Load() || limit != 0 && e.ConfigVersion > limit {
+			return
+		}
 	}
 	g.base.Send(key, e)
 }

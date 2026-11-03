@@ -114,16 +114,6 @@ func planChannelExpansion(cfg *wkdb.ChannelClusterConfig, cluster *types.Config)
 			eligible = append(eligible, n.Id)
 		}
 	}
-	orphanedExpansion := len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 &&
-		cfg.MigrateFrom == cfg.MigrateTo && !wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo)
-	if len(cfg.Learners) > 0 || (cfg.MigrateFrom != 0 || cfg.MigrateTo != 0) && !orphanedExpansion {
-		if cfg.MigrateTo != 0 && !online[cfg.MigrateTo] && wkutil.ArrayContainsUint64(cfg.Learners, cfg.MigrateTo) {
-			cfg.Learners = wkutil.RemoveUint64(cfg.Learners, cfg.MigrateTo)
-			cfg.MigrateFrom, cfg.MigrateTo = 0, 0
-			return true
-		}
-		return false
-	}
 	live := 0
 	var offline uint64
 	for _, id := range cfg.Replicas {
@@ -132,6 +122,44 @@ func planChannelExpansion(cfg *wkdb.ChannelClusterConfig, cluster *types.Config)
 		} else if offline == 0 {
 			offline = id
 		}
+	}
+	orphanedExpansion := len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 &&
+		cfg.MigrateFrom == cfg.MigrateTo && !wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo)
+	if len(cfg.Learners) > 0 || (cfg.MigrateFrom != 0 || cfg.MigrateTo != 0) && !orphanedExpansion {
+		if cfg.MigrateTo != 0 && !online[cfg.MigrateTo] && wkutil.ArrayContainsUint64(cfg.Learners, cfg.MigrateTo) {
+			cfg.Learners = wkutil.RemoveUint64(cfg.Learners, cfg.MigrateTo)
+			cfg.MigrateFrom, cfg.MigrateTo = 0, 0
+			return true
+		}
+		addFirst := channelAddFirstStage(*cfg) && cfg.MigrateTo != cfg.LeaderId
+		if addFirst && !online[cfg.MigrateTo] && online[cfg.MigrateFrom] &&
+			live >= len(cfg.Replicas)/2+1 && live >= int(cfg.ReplicaMaxCount) {
+			// D failed after the add-first stage. The source still holds its
+			// place; cancel only D after the remaining old voters have quorum.
+			cfg.Replicas = wkutil.RemoveUint64(cfg.Replicas, cfg.MigrateTo)
+			cfg.MigrateFrom, cfg.MigrateTo = 0, 0
+			return true
+		}
+		if addFirst && online[cfg.MigrateTo] && cfg.MigrateFrom == cfg.LeaderId && live >= len(cfg.Replicas)/2+1 {
+			// Failover can elect the recovered source while D is already a
+			// voter. Keep that leader and retire another follower, preferring
+			// the failed old leader. Otherwise this task becomes a leadership
+			// transfer and clears its markers without retiring the extra vote.
+			var from uint64
+			for _, id := range cfg.Replicas {
+				if id == cfg.LeaderId || id == cfg.MigrateTo {
+					continue
+				}
+				if from == 0 || !online[id] && online[from] {
+					from = id
+				}
+			}
+			if from != 0 {
+				cfg.MigrateFrom = from
+				return true
+			}
+		}
+		return false
 	}
 	if live >= int(cfg.ReplicaMaxCount) || live < len(cfg.Replicas)/2+1 || !online[cfg.LeaderId] {
 		return false
