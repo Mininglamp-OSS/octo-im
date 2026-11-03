@@ -380,7 +380,10 @@ func TestClusterSlotMigrateForFollowToLeader(t *testing.T) {
 }
 
 func TestClusterNodeJoin(t *testing.T) {
-	s1, s2 := NewTestClusterServerTwoNode(t)
+	s1, s2 := NewTestClusterServerTwoNode(t, options.WithClusterInitNodes([]*options.Node{
+		{Id: 1001, ServerAddr: "127.0.0.1:11110"},
+		{Id: 1002, ServerAddr: "127.0.0.1:11111"},
+	}))
 	err := s1.Start()
 	assert.Nil(t, err)
 
@@ -399,7 +402,7 @@ func TestClusterNodeJoin(t *testing.T) {
 	assert.Equal(t, 2, len(cfg.Nodes))
 
 	// new server
-	s3 := NewTestServer(t, options.WithDemoOn(false), options.WithClusterSeed("1001@127.0.0.1:11110"), options.WithClusterServerAddr("0.0.0.0:11115"), options.WithWSAddr("ws://0.0.0.0:5250"), options.WithManagerAddr("0.0.0.0:5350"), options.WithAddr("tcp://0.0.0.0:5150"), options.WithHTTPAddr("0.0.0.0:5005"), options.WithClusterAddr("tcp://0.0.0.0:11115"), options.WithClusterNodeId(1005))
+	s3 := NewTestServer(t, options.WithDemoOn(false), options.WithClusterSeed("1001@127.0.0.1:11110"), options.WithClusterServerAddr("127.0.0.1:11115"), options.WithWSAddr("ws://0.0.0.0:5250"), options.WithManagerAddr("0.0.0.0:5350"), options.WithAddr("tcp://0.0.0.0:5150"), options.WithHTTPAddr("0.0.0.0:5005"), options.WithClusterAddr("tcp://0.0.0.0:11115"), options.WithClusterNodeId(1005))
 	err = s3.Start()
 	assert.Nil(t, err)
 	defer s3.StopNoErr()
@@ -425,7 +428,16 @@ func TestClusterNodeJoin(t *testing.T) {
 				}
 			}
 			if !existLearner && existReplica {
-				time.Sleep(time.Second * 1)
+				for _, server := range []*Server{s1, s2, s3} {
+					assert.Eventually(t, func() bool {
+						for _, node := range server.GetClusterConfig().Nodes {
+							if node.Id == s3.opts.Cluster.NodeId {
+								return node.ClusterAddr == "127.0.0.1:11115"
+							}
+						}
+						return false
+					}, 5*time.Second, 10*time.Millisecond)
+				}
 				return
 			}
 
@@ -738,4 +750,3 @@ func TestClusterSaveClusterConfig(t *testing.T) {
 	})
 	assert.Nil(t, err)
 }
-

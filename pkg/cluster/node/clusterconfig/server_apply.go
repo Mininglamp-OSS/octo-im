@@ -7,7 +7,6 @@ import (
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
 )
 
@@ -42,8 +41,7 @@ func (s *Server) applyLog(log types.Log) error {
 		}
 		after := s.configToRaftConfig(s.config)
 		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
-		s.config.cfg.Term = log.Term
-		s.config.cfg.Version = log.Index
+		s.config.setVersionAndTerm(log.Index, log.Term)
 		s.configSavePending = true
 		s.configNotifyPending = true
 	}
@@ -77,6 +75,8 @@ func (s *Server) handleCmd(cmd *CMD) error {
 		return s.handleConfigChange(cmd)
 	case CMDTypeConfigApiServerAddrChange: // 节点api server地址改变
 		return s.handleApiServerAddrChange(cmd)
+	case CMDTypeConfigClusterAddrChange: // 节点cluster通讯地址改变
+		return s.handleClusterAddrChange(cmd)
 	case CMDTypeNodeOnlineStatusChange: // 节点在线状态改变
 		return s.handleNodeOnlineStatusChange(cmd)
 	case CMDTypeSlotUpdate: // 槽更新
@@ -117,6 +117,17 @@ func (s *Server) handleApiServerAddrChange(cmd *CMD) error {
 	return nil
 }
 
+func (s *Server) handleClusterAddrChange(cmd *CMD) error {
+	nodeId, clusterAddr, err := DecodeClusterAddrChange(cmd.Data)
+	if err != nil {
+		s.Error("decode cluster addr change err", zap.Error(err))
+		return err
+	}
+
+	s.config.updateClusterAddr(nodeId, clusterAddr)
+	return nil
+}
+
 func (s *Server) handleNodeOnlineStatusChange(cmd *CMD) error {
 	nodeId, online, err := DecodeNodeOnlineStatusChange(cmd.Data)
 	if err != nil {
@@ -148,15 +159,7 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 		s.Error("unmarshal node err", zap.Error(err))
 		return err
 	}
-	s.config.addOrUpdateNode(newNode)
-
-	// 将新节点加入学习者列表
-	if !wkutil.ArrayContainsUint64(s.config.cfg.Learners, newNode.Id) {
-		s.config.cfg.Learners = append(s.config.cfg.Learners, newNode.Id)
-		// 如果是新加入的节点，就是从自己迁移到自己
-		s.config.cfg.MigrateFrom = newNode.Id
-		s.config.cfg.MigrateTo = newNode.Id
-	}
+	s.config.joinNode(newNode)
 	return nil
 }
 
