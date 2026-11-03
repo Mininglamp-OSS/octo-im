@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -43,7 +45,39 @@ const (
 	admissionUnavailable proto.Status = 5 // definitely not enqueued: closed/full
 	admissionUnknown     proto.Status = 6 // request/response transport failure
 	admissionDenied      proto.Status = 7
+
+	maxHTTPAdmissionWait      = 3 * time.Second
+	maxHTTPAdmissionWaiters   = 4096
+	maxHTTPAdmissionWaitBytes = 64 << 20
 )
+
+// Waiting HTTP requests are separate from work already accepted by a leader.
+// Bound both their number and encoded payloads during a prolonged handoff.
+type httpAdmissionWaiters struct {
+	count atomic.Int64
+	bytes atomic.Int64
+}
+
+func (w *httpAdmissionWaiters) acquire(size int64) bool {
+	if size <= 0 || size > maxHTTPAdmissionWaitBytes {
+		return false
+	}
+	if w.count.Add(1) > maxHTTPAdmissionWaiters {
+		w.count.Add(-1)
+		return false
+	}
+	if w.bytes.Add(size) > maxHTTPAdmissionWaitBytes {
+		w.bytes.Add(-size)
+		w.count.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (w *httpAdmissionWaiters) release(size int64) {
+	w.bytes.Add(-size)
+	w.count.Add(-1)
+}
 
 func (h *Handler) setAdmissionRoutes() {
 	service.Cluster.Route(httpAdmissionPath, func(c *wkserver.Context) {
@@ -59,17 +93,30 @@ func (h *Handler) setAdmissionRoutes() {
 }
 
 func (h *Handler) admitHTTPMessage(ctx context.Context, id string, typ uint8, e *eventbus.Event) error {
+	ctx, cancel := context.WithTimeout(ctx, maxHTTPAdmissionWait)
+	defer cancel()
 	data, err := encodeAdmission(id, typ, e)
 	if err != nil {
 		return err
 	}
-	// Retry only an explicit rejection before enqueue, never a lost response.
-	for attempt := 0; attempt < 3; attempt++ {
-		node, err := service.Cluster.SlotLeaderIdOfChannel(id, typ)
-		if err != nil || node == 0 {
+	waiting := false
+	defer func() {
+		if waiting {
+			h.admissionWaiters.release(int64(len(data)))
+		}
+	}()
+	backoff := 10 * time.Millisecond
+	// Every retry re-resolves the owner and reuses the same message identity.
+	// Only a known rejection before enqueue is retryable, never a lost response.
+	for {
+		if ctx.Err() != nil {
 			return service.ErrMessageAdmissionUnavailable
 		}
-		status := h.requestAdmission(ctx, node, httpAdmissionPath, data)
+		node, err := service.Cluster.SlotLeaderIdOfChannel(id, typ)
+		status := admissionRetry // lookup failed before sending any request
+		if err == nil && node != 0 {
+			status = h.requestAdmission(ctx, node, httpAdmissionPath, data)
+		}
 		switch status {
 		case proto.StatusOK:
 			return nil
@@ -77,20 +124,33 @@ func (h *Handler) admitHTTPMessage(ctx context.Context, id string, typ uint8, e 
 			return service.ErrMessageAdmissionUnknown
 		case admissionDenied:
 			return service.ErrMessageAdmissionDenied
-		case admissionRetry:
+		case admissionRetry, admissionUnavailable:
+			if !waiting {
+				if !h.admissionWaiters.acquire(int64(len(data))) {
+					return service.ErrMessageAdmissionUnavailable
+				}
+				waiting = true
+			}
+			// Back off with jitter; waiting never occupies the Raft owner loop.
+			delay := backoff/2 + time.Duration(rand.Int64N(int64(backoff/2)))
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return service.ErrMessageAdmissionUnavailable
-			case <-time.After(10 * time.Millisecond):
+			case <-timer.C:
 			}
+			backoff = min(2*backoff, 100*time.Millisecond)
 		default:
 			return service.ErrMessageAdmissionUnavailable
 		}
 	}
-	return service.ErrMessageAdmissionUnavailable
 }
 
 func (h *Handler) requestAdmission(ctx context.Context, node uint64, path string, body []byte) proto.Status {
+	if ctx.Err() != nil {
+		return admissionUnavailable // no RPC was sent, so no unknown outcome
+	}
 	if options.G.IsLocalNode(node) {
 		if path == httpAdmissionPath {
 			return h.acceptHTTPAdmission(ctx, body)

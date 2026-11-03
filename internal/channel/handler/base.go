@@ -20,6 +20,7 @@ type Handler struct {
 	commonService       *common.Service
 	forwardCapabilities forward.CapabilityCache
 	forwardGate         *forward.Gate
+	admissionWaiters    httpAdmissionWaiters
 }
 
 func NewHandler() *Handler {
