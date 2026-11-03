@@ -45,10 +45,15 @@ type Node struct {
 	onlySync           bool // 是否只同步,不做截断判断
 	// softState softState // 软状态
 	sync.Mutex
-	truncating            bool   // 截断中
-	stopPropose           bool   // 停止提案
-	leaderTransferTo      uint64 // proposal fence until the owner applies the new leader
-	leaderTransferVersion uint64
+	truncating              bool   // 截断中
+	stopPropose             bool   // 停止提案
+	leaderTransferTo        uint64 // proposal fence until the owner applies the new leader
+	leaderTransferVersion   uint64
+	drainingAdmissions      bool
+	messageAdmissions       map[uint64]struct{}
+	leaderTransferAttempted bool
+	admissionDrainTicks     int
+	admissionDrainCooldown  int
 
 	suspend bool // 挂起
 

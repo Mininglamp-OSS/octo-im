@@ -90,6 +90,17 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 		newCfg.Leader = n.cfg.Leader
 	}
 	n.cfg = newCfg
+	if newCfg.Version > oldCfg.Version {
+		// An authoritative update supersedes a pending callback. If migration
+		// remains active, keep draining and recompute it from the new version.
+		n.leaderTransferTo, n.leaderTransferVersion = 0, 0
+		n.leaderTransferAttempted = false
+		n.admissionDrainTicks = 0
+		if newCfg.MigrateFrom == 0 && newCfg.MigrateTo == 0 && n.IsLeader() {
+			n.drainingAdmissions = false
+			n.stopPropose = false
+		}
+	}
 
 	return nil
 }

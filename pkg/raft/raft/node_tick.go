@@ -10,7 +10,7 @@ func (n *Node) Tick() {
 		n.applyRetryTicks--
 	}
 	n.idleTick++
-	if n.opts.AutoDestory {
+	if n.opts.AutoDestory && len(n.messageAdmissions) == 0 {
 		if n.idleTick > n.opts.DestoryAfterIdleTick {
 			n.idleTick = 0
 			n.Debug("auto destory")
@@ -24,6 +24,7 @@ func (n *Node) Tick() {
 }
 
 func (n *Node) tickLeader() {
+	n.tickAdmissionDrain()
 	n.tickHeartbeat()
 }
 

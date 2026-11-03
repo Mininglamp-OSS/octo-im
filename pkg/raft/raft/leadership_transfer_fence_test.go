@@ -78,12 +78,15 @@ func TestLeadershipTransferSuccessWaitsForOwnerConfiguration(t *testing.T) {
 	require.ErrorIs(t, n.Step(n.NewPropose([]byte("old leader"))), types.ErrNotLeader)
 }
 
-func TestLeadershipTransferFailureRestoresAdmission(t *testing.T) {
+func TestLeadershipTransferFailureKeepsFenceAndAllowsReconciliation(t *testing.T) {
 	n := transferTestLeader(t, false)
 	request := beginTestTransfer(t, n)
 	require.NoError(t, n.Step(types.Event{Type: types.FollowerToLeaderResp, From: 3,
 		Term: request.Term, ConfigVersion: request.ConfigVersion, Reason: types.ReasonError}))
-	require.NoError(t, n.Step(n.NewPropose([]byte("retry after failed configuration save"))))
+	require.ErrorIs(t, n.Step(n.NewPropose([]byte("save may have committed"))), types.ErrProposalDropped)
+	require.ErrorIs(t, n.AdmitMessage(123), types.ErrProposalDropped)
+	// The next sync can retry the same version-checked transition, not writes.
+	beginTestTransfer(t, n)
 }
 
 func TestLeadershipTransferIgnoresUnrelatedCompletion(t *testing.T) {

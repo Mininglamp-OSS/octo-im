@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -159,7 +160,7 @@ func (m *message) send(c *wkhttp.Context) {
 		// 发送消息
 		_, err := sendMessageToChannel(req, tmpChannelId, tmpChannelType, clientMsgNo)
 		if err != nil {
-			c.ResponseError(err)
+			respondMessageSendError(c, err)
 			return
 		}
 		c.ResponseOK()
@@ -175,7 +176,7 @@ func (m *message) send(c *wkhttp.Context) {
 	// 发送消息
 	messageId, err := sendMessageToChannel(req, channelId, channelType, clientMsgNo)
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageSendError(c, err)
 		return
 	}
 
@@ -290,11 +291,32 @@ func sendMessageToChannel(req messageSendReq, channelId string, channelType uint
 			PreStart: time.Now(),
 		},
 	}
-	eventbus.Channel.SendMessage(fakeChannelId, channelType, event)
 	event.Track.Record(track.PositionStart)
+	if !sendPacket.NoPersist {
+		if service.AdmitHTTPMessage == nil {
+			return 0, service.ErrMessageAdmissionUnavailable
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), options.G.Channel.ProcessTimeout)
+		defer cancel()
+		if err := service.AdmitHTTPMessage(ctx, fakeChannelId, channelType, event); err != nil {
+			return 0, err
+		}
+		return messageId, nil
+	}
+	eventbus.Channel.SendMessage(fakeChannelId, channelType, event)
 	eventbus.Channel.Advance(fakeChannelId, channelType)
 
 	return messageId, nil
+}
+
+func respondMessageSendError(c *wkhttp.Context, err error) {
+	status := http.StatusBadRequest
+	if errors.Is(err, service.ErrMessageAdmissionUnavailable) {
+		status = http.StatusServiceUnavailable
+	} else if errors.Is(err, service.ErrMessageAdmissionUnknown) {
+		status = http.StatusGatewayTimeout
+	}
+	c.JSON(status, gin.H{"status": status, "msg": err.Error()})
 }
 
 func (m *message) sendBatch(c *wkhttp.Context) {
