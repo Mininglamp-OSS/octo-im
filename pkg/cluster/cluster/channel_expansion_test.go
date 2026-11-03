@@ -51,11 +51,11 @@ func TestChannelExpansionPreservesHealthyThreeAndRequiresOldQuorum(t *testing.T)
 func TestSlotTransitionRejectsDelayedLearnerCompletion(t *testing.T) {
 	current := &types.Slot{Id: 1, Leader: 1, Term: 2, Replicas: []uint64{1, 2, 3}, Learners: []uint64{4}, MigrateFrom: 3, MigrateTo: 4}
 	next := rafttype.Config{Leader: 1, Term: 2, Replicas: []uint64{1, 2, 4}}
-	require.True(t, validSlotConfigTransition(current, next))
+	require.True(t, validSlotConfigTransition(current, next, 3))
 	current.Learners, current.MigrateTo = []uint64{5}, 5
-	require.False(t, validSlotConfigTransition(current, next), "old D callback cannot overwrite a newer E migration")
+	require.False(t, validSlotConfigTransition(current, next, 3), "old D callback cannot overwrite a newer E migration")
 	current.Learners, current.MigrateTo, current.Leader, current.Term = []uint64{4}, 4, 2, 3
-	require.False(t, validSlotConfigTransition(current, next), "a previous leader cannot restore its term/role")
+	require.False(t, validSlotConfigTransition(current, next, 3), "a previous leader cannot restore its term/role")
 }
 
 func TestChannelRetirementDoesNotMutatePriorCachedMembership(t *testing.T) {

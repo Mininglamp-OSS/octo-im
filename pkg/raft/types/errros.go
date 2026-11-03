@@ -8,4 +8,5 @@ var (
 	ErrNotLeader             = errors.New("not leader")
 	ErrPaused                = errors.New("raft is paused")
 	ErrProposalDropped       = errors.New("proposal dropped")
+	ErrCommittedLogConflict  = errors.New("log conflicts with committed prefix")
 )

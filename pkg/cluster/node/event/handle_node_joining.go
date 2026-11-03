@@ -134,7 +134,8 @@ func planSlotExpansion(cfg *types.Config) []*types.Slot {
 				next.Learners = wkutil.RemoveUint64(next.Learners, next.MigrateTo)
 				next.MigrateFrom, next.MigrateTo = 0, 0
 				planned = append(planned, next)
-			} else if slot.MigrateTo != 0 && !online[slot.MigrateTo] && slot.MigrateFrom != slot.Leader &&
+				continue
+			} else if types.HasExcessReplicas(slot.Replicas, slot.Learners, cfg.SlotReplicaCount) && slot.MigrateTo != 0 && !online[slot.MigrateTo] &&
 				online[slot.MigrateFrom] && wkutil.ArrayContainsUint64(slot.Replicas, slot.MigrateTo) && live >= int(cfg.SlotReplicaCount) {
 				// D failed after the add-first stage. The old follower still
 				// holds its place; retire only D and cancel this migration.
@@ -142,9 +143,22 @@ func planSlotExpansion(cfg *types.Config) []*types.Slot {
 				next.Replicas = wkutil.RemoveUint64(next.Replicas, next.MigrateTo)
 				next.MigrateFrom, next.MigrateTo = 0, 0
 				planned = append(planned, next)
+				continue
+			}
+			if from, to, ok := types.PlanReplicaRetirement(slot.Replicas, slot.Learners, cfg.SlotReplicaCount, slot.Leader, slot.MigrateFrom, slot.MigrateTo, online); ok {
+				next := slot.Clone()
+				next.MigrateFrom, next.MigrateTo = from, to
+				planned = append(planned, next)
 			}
 			continue
 		}
+		if from, to, ok := types.PlanReplicaRetirement(slot.Replicas, slot.Learners, cfg.SlotReplicaCount, slot.Leader, slot.MigrateFrom, slot.MigrateTo, online); ok {
+			next := slot.Clone()
+			next.MigrateFrom, next.MigrateTo = from, to
+			planned = append(planned, next)
+			continue
+		}
+
 		if live >= int(cfg.SlotReplicaCount) {
 			continue
 		}

@@ -31,7 +31,7 @@ func (h *handler) handleSlotChangeByNodeOnlineStatus(nodeId uint64, online bool)
 
 		onlineNodeCount := h.cfgServer.AllowVoteAndJoinedOnlineNodeCount()
 
-		avgSlotLeaderCount := h.cfgServer.GetClusterConfig().SlotCount / uint32(onlineNodeCount) // 平均每个节点的槽领导数量
+		avgSlotLeaderCount := h.cfgServer.SlotCount() / uint32(onlineNodeCount) // 平均每个节点的槽领导数量
 
 		// 每个节点当前的槽领导数量
 		nodeSlotLeaderCountMap := make(map[uint64]uint32)
@@ -86,7 +86,7 @@ func (h *handler) handleSlotChangeByNodeOnlineStatus(nodeId uint64, online bool)
 		h.Info("节点下线", zap.Uint64("nodeId", nodeId))
 		slots := h.cfgServer.Slots()
 		onlineNodeCount := h.cfgServer.AllowVoteAndJoinedOnlineNodeCount()
-		avgSlotLeaderCount := h.cfgServer.GetClusterConfig().SlotCount / uint32(onlineNodeCount) // 平均每个节点的槽领导数量
+		avgSlotLeaderCount := h.cfgServer.SlotCount() / uint32(onlineNodeCount) // 平均每个节点的槽领导数量
 
 		// 每个节点当前的槽领导数量
 		nodeSlotLeaderCountMap := make(map[uint64]uint32)

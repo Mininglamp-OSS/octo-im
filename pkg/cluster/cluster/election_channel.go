@@ -102,10 +102,27 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 
 // 视情况是否需要加入新的副本
 func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, error) {
+	// The single-voter orphan decision is local metadata work; it must not
+	// require a running cluster or inspect health for an already full group.
+	if cfg.ReplicaMaxCount == 1 && len(cfg.Replicas) == 1 {
+		return clearSingleReplicaOrphan(cfg), nil
+	}
 	return planChannelExpansion(cfg, &types.Config{Nodes: s.cfgServer.Nodes()}), nil
 }
 
+func clearSingleReplicaOrphan(cfg *wkdb.ChannelClusterConfig) bool {
+	if len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 && cfg.MigrateFrom == cfg.MigrateTo &&
+		!wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo) {
+		cfg.MigrateFrom, cfg.MigrateTo = 0, 0
+		return true
+	}
+	return false
+}
+
 func planChannelExpansion(cfg *wkdb.ChannelClusterConfig, cluster *types.Config) bool {
+	if cfg.ReplicaMaxCount == 1 && len(cfg.Replicas) == 1 {
+		return clearSingleReplicaOrphan(cfg)
+	}
 	online := make(map[uint64]bool, len(cluster.Nodes))
 	var eligible []uint64
 	for _, n := range cluster.Nodes {
@@ -134,33 +151,21 @@ func planChannelExpansion(cfg *wkdb.ChannelClusterConfig, cluster *types.Config)
 		addFirst := channelAddFirstStage(*cfg) && cfg.MigrateTo != cfg.LeaderId
 		if addFirst && !online[cfg.MigrateTo] && online[cfg.MigrateFrom] &&
 			live >= len(cfg.Replicas)/2+1 && live >= int(cfg.ReplicaMaxCount) {
-			// D failed after the add-first stage. The source still holds its
-			// place; cancel only D after the remaining old voters have quorum.
 			cfg.Replicas = wkutil.RemoveUint64(cfg.Replicas, cfg.MigrateTo)
 			cfg.MigrateFrom, cfg.MigrateTo = 0, 0
 			return true
 		}
-		if addFirst && online[cfg.MigrateTo] && cfg.MigrateFrom == cfg.LeaderId && live >= len(cfg.Replicas)/2+1 {
-			// Failover can elect the recovered source while D is already a
-			// voter. Keep that leader and retire another follower, preferring
-			// the failed old leader. Otherwise this task becomes a leadership
-			// transfer and clears its markers without retiring the extra vote.
-			var from uint64
-			for _, id := range cfg.Replicas {
-				if id == cfg.LeaderId || id == cfg.MigrateTo {
-					continue
-				}
-				if from == 0 || !online[id] && online[from] {
-					from = id
-				}
-			}
-			if from != 0 {
-				cfg.MigrateFrom = from
-				return true
-			}
+		if from, to, ok := types.PlanReplicaRetirement(cfg.Replicas, cfg.Learners, uint32(cfg.ReplicaMaxCount), cfg.LeaderId, cfg.MigrateFrom, cfg.MigrateTo, online); ok {
+			cfg.MigrateFrom, cfg.MigrateTo = from, to
+			return true
 		}
 		return false
 	}
+	if from, to, ok := types.PlanReplicaRetirement(cfg.Replicas, cfg.Learners, uint32(cfg.ReplicaMaxCount), cfg.LeaderId, cfg.MigrateFrom, cfg.MigrateTo, online); ok {
+		cfg.MigrateFrom, cfg.MigrateTo = from, to
+		return true
+	}
+
 	if live >= int(cfg.ReplicaMaxCount) || live < len(cfg.Replicas)/2+1 || !online[cfg.LeaderId] {
 		return false
 	}

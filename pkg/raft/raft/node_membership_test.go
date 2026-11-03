@@ -152,10 +152,10 @@ func TestLearnerPromotionWaitsForDurableCommittedPrefix(t *testing.T) {
 		n.queue.committedIndex = 10
 		n.queue.appliedIndex = 10
 		n.replicaSync[4] = &SyncInfo{}
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: 10})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 11, StoredIndex: 10})
 		require.False(t, n.replicaSync[4].roleSwitching)
 		require.Empty(t, n.Ready())
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: 11})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 11, StoredIndex: 11})
 		require.True(t, n.replicaSync[4].roleSwitching)
 		require.Len(t, n.Ready(), 1)
 	}
@@ -182,10 +182,10 @@ func TestSingleVoterPromotionRequiresStoredTail(t *testing.T) {
 		n.queue.lastLogIndex = 10
 		n.replicaSync[4] = &SyncInfo{}
 		for _, stored := range []uint64{5, 10} {
-			n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: stored})
+			n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 11, StoredIndex: stored})
 			require.False(t, n.replicaSync[4].roleSwitching)
 		}
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: 11})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 11, StoredIndex: 11})
 		require.True(t, n.replicaSync[4].roleSwitching)
 	}
 }
@@ -258,9 +258,9 @@ func TestLearnerPromotionGapRequiresDurableCommittedPrefix(t *testing.T) {
 		n.queue.lastLogIndex, n.queue.storedIndex, n.queue.committedIndex = 100, 100, 90
 		n.opts.LearnerToFollowerMinLogGap = 20
 		n.replicaSync[4] = &SyncInfo{}
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 95, StoredIndex: 90})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 95, StoredIndex: 90})
 		require.False(t, n.replicaSync[4].roleSwitching)
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 95, StoredIndex: 91})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 95, StoredIndex: 91})
 		require.True(t, n.replicaSync[4].roleSwitching)
 	}
 }
@@ -277,6 +277,7 @@ func TestMembershipBroadcastCommitClampedToDurableLogs(t *testing.T) {
 		follower := newTestNode(ping.To, []uint64{1, 2, 3})
 		makeFollower(follower, 2, 1)
 		follower.queue.lastLogIndex, follower.queue.storedIndex = 10, 8
+		require.NoError(t, follower.Step(types.Event{Type: types.SyncResp, From: 1, Term: 2, Index: 11, Reason: types.ReasonOk}))
 		require.NoError(t, follower.Step(ping))
 		require.Equal(t, uint64(8), follower.queue.committedIndex)
 	}
@@ -323,7 +324,7 @@ func TestRetiredReplicaPromotionWaitsForIntermediateMajority(t *testing.T) {
 	n.queue.lastLogIndex, n.queue.storedIndex, n.queue.committedIndex, n.queue.appliedIndex = 7, 7, 7, 7
 	n.replicaSync[4] = &SyncInfo{}
 	n.replicaSync[2] = &SyncInfo{ConfigVersion: 9, StoredIndex: 8}
-	promote := types.Event{From: 4, Index: 8, StoredIndex: 8, ConfigVersion: 10}
+	promote := types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 8, StoredIndex: 8, ConfigVersion: 10}
 	n.roleSwitchIfNeed(promote)
 	require.Empty(t, n.Ready(), "D cannot promote while B still holds the old voting set")
 	n.replicaSync[2].ConfigVersion = 10
@@ -357,7 +358,7 @@ func TestHealthyFollowerMigrationRetiresAfterInstalledQuorum(t *testing.T) {
 	n.queue.lastLogIndex, n.queue.storedIndex, n.queue.committedIndex, n.queue.appliedIndex = 7, 7, 7, 7
 	n.replicaSync[4] = &SyncInfo{ConfigVersion: 10, StoredIndex: 8}
 	n.replicaSync[2] = &SyncInfo{ConfigVersion: 9, StoredIndex: 8}
-	e := types.Event{From: 4, Index: 8, StoredIndex: 8, ConfigVersion: 10}
+	e := types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 8, StoredIndex: 8, ConfigVersion: 10}
 	n.roleSwitchIfNeed(e)
 	require.Empty(t, findEventsOfType(n.Ready(), types.LearnerToFollowerReq), "install the four-voter stage before retiring B")
 	n.replicaSync[2].ConfigVersion = 10

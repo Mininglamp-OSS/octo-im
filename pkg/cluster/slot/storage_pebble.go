@@ -1,6 +1,7 @@
 package slot
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -163,23 +164,10 @@ func (p *PebbleShardLogStorage) GetState(shardNo string) (types.RaftState, error
 		return types.RaftState{}, err
 	}
 
-	// 检测并修复不一致状态：appliedIndex > lastLogIndex
-	// 这种情况可能由 Apply 和 Truncate 并发执行导致
+	// Inconsistent markers require state recovery, not a silent rewind.
 	if applied > lastLogIndex {
-		p.Warn("detected inconsistent state: appliedIndex > lastLogIndex, auto-fixing",
-			zap.String("shardNo", shardNo),
-			zap.Uint64("appliedIndex", applied),
-			zap.Uint64("lastLogIndex", lastLogIndex))
-
-		// 将 appliedIndex 回退到 lastLogIndex
-		applied = lastLogIndex
-		if err := p.SetAppliedIndex(shardNo, lastLogIndex); err != nil {
-			p.Error("failed to fix appliedIndex", zap.Error(err))
-			return types.RaftState{}, err
-		}
-		p.Info("appliedIndex fixed successfully",
-			zap.String("shardNo", shardNo),
-			zap.Uint64("newAppliedIndex", applied))
+		// Lowering a marker cannot undo materialized state-machine writes.
+		return types.RaftState{}, fmt.Errorf("slot %s: applied index %d exceeds last index %d", shardNo, applied, lastLogIndex)
 	}
 
 	state, err := p.hardState(shardNo)
@@ -201,14 +189,29 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 	lock.Lock()
 	defer lock.Unlock()
 
+	applied, err := p.AppliedIndex(shardNo)
+	if err != nil {
+		return err
+	}
+	for _, log := range logs {
+		if log.Index > applied {
+			continue
+		}
+		stored, err := p.getLog(shardNo, log.Index)
+		if err != nil {
+			return err
+		}
+		if !sameLog(stored, log) {
+			return types.ErrCommittedLogConflict
+		}
+	}
+
 	batch := p.shardBatchDB(shardNo).NewBatch()
 
 	if termStartIndexInfo != nil {
-		err := p.SetLeaderTermStartIndex(shardNo, termStartIndexInfo.Term, termStartIndexInfo.Index)
-		if err != nil {
-			p.Panic("SetLeaderTermStartIndex failed", zap.Error(err))
-			return err
-		}
+		indexData := make([]byte, 8)
+		binary.BigEndian.PutUint64(indexData, termStartIndexInfo.Index)
+		batch.Set(key.NewLeaderTermStartIndexKey(shardNo, termStartIndexInfo.Term), indexData)
 	}
 
 	for _, lg := range logs {
@@ -257,8 +260,7 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 		return err
 	}
 	if index < appliedIdx {
-		p.Foucs("applied must be less than index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx), zap.Uint64("lastIndex", lastIndex), zap.String("shardNo", shardNo))
-		return nil
+		return types.ErrCommittedLogConflict
 	}
 
 	keyData := key.NewLogKey(shardNo, index+1)
@@ -342,6 +344,36 @@ func (p *PebbleShardLogStorage) Apply(shardNo string, logs []types.Log) error {
 	lock.Lock()
 	defer lock.Unlock()
 
+	if len(logs) == 0 {
+		return nil
+	}
+	applied, err := p.AppliedIndex(shardNo)
+	if err != nil {
+		return err
+	}
+	if logs[0].Index > applied+1 {
+		return types.ErrLogIndexNotContinuous
+	}
+	for i, log := range logs {
+		if i > 0 && log.Index != logs[i-1].Index+1 {
+			return types.ErrLogIndexNotContinuous
+		}
+		// GetLogs runs off-owner before this lock is acquired. The tail
+		// may have been replaced since that read; never apply stale bytes.
+		stored, err := p.getLog(shardNo, log.Index)
+		if err != nil {
+			return err
+		}
+		if !sameLog(stored, log) {
+			return fmt.Errorf("slot %s: apply log %d no longer matches storage", shardNo, log.Index)
+		}
+	}
+	for len(logs) > 0 && logs[0].Index <= applied {
+		logs = logs[1:]
+	}
+	if len(logs) == 0 {
+		return nil
+	}
 	if p.s.opts.OnApply != nil {
 		slotId := KeyToSlotId(shardNo)
 		err := p.s.opts.OnApply(slotId, logs)
@@ -354,6 +386,10 @@ func (p *PebbleShardLogStorage) Apply(shardNo string, logs []types.Log) error {
 		}
 	}
 	return nil
+}
+
+func sameLog(a, b types.Log) bool {
+	return a.Index == b.Index && a.Term == b.Term && a.Id == b.Id && bytes.Equal(a.Data, b.Data)
 }
 
 func (p *PebbleShardLogStorage) SaveConfig(shardNo string, cfg types.Config) error {

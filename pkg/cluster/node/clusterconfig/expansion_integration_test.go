@@ -108,7 +108,7 @@ func TestExpansionRetiresOfflineVoterBeforePromotion(t *testing.T) {
 			servers[4], active[4] = d, true
 			transport.set(4, d)
 			require.NoError(t, d.Start())
-			joinVersion, err := leader.ProposeJoinWithVersion(&pb.Node{Id: 4, Online: true, AllowVote: true, Join: true, Status: pb.NodeStatus_NodeStatusWillJoin})
+			joinVersion, err := leader.ProposeJoinWithVersion(&pb.Node{Id: 4, ClusterAddr: "127.0.0.1:11114", Online: true, AllowVote: true, Join: true, Status: pb.NodeStatus_NodeStatusWillJoin})
 			require.NoError(t, err)
 			require.Eventually(t, func() bool {
 				n := d.Snapshot()

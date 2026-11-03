@@ -589,6 +589,8 @@ func TestFlow_PingUpdatesFollowerCommit(t *testing.T) {
 
 	assert.Equal(t, uint64(0), follower.CommittedIndex(), "follower committedIndex should be 0 initially")
 
+	// The first successful sync has checked the existing prefix.
+	follower.Step(types.Event{Type: types.SyncResp, From: 1, Term: 2, Index: 4, Reason: types.ReasonOk})
 	// Leader sends Ping with committedIndex=2
 	follower.Step(types.Event{
 		Type:           types.Ping,

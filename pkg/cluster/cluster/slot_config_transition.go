@@ -8,7 +8,11 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
 
-func validSlotConfigTransition(current *types.Slot, next rafttype.Config) bool {
+func validSlotConfigTransition(current *types.Slot, next rafttype.Config, capacity uint32) bool {
+	if types.HasExcessReplicas(current.Replicas, current.Learners, capacity) && current.MigrateFrom != 0 &&
+		(current.MigrateFrom == current.Leader || current.MigrateTo == current.Leader) {
+		return false // maintenance must retarget retirement before any completion
+	}
 	expected := current.Clone()
 	if expected.MigrateTo != 0 && expected.MigrateFrom != 0 {
 		if wkutil.ArrayContainsUint64(expected.Learners, expected.MigrateTo) {

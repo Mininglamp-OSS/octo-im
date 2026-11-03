@@ -112,6 +112,9 @@ func (r *queue) append(incomingLogs ...types.Log) error {
 
 		// 5b. 部分重叠：需要截断现有日志并追加新日志
 		truncateToIndex := incomingFirstIndex - 1
+		if truncateToIndex < r.committedIndex {
+			return types.ErrCommittedLogConflict
+		}
 		originalQueueSize := len(r.logs)
 
 		r.Warn("resolving log conflict by truncation",
@@ -173,6 +176,16 @@ func (r *queue) nextStoreLogs(maxSize int) []types.Log {
 	}
 	if maxSize != 0 && endIndex > uint64(maxSize) {
 		endIndex = uint64(maxSize)
+	}
+	// Storage accepts one term-start record per append. Historical catch-up
+	// can contain several terms; persist each boundary before acknowledging
+	// the next one, so LastLogTerm cannot describe only the first term while
+	// storedIndex already includes later terms.
+	for i := uint64(1); i < endIndex; i++ {
+		if r.logs[i].Term != r.logs[0].Term {
+			endIndex = i
+			break
+		}
 	}
 	r.appending = true
 	return r.logs[:endIndex]

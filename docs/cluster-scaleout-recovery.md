@@ -15,7 +15,7 @@ slot 迁移任务保存在配置日志中，频道任务保存在已有频道元
 
 slot 和频道均在完成回调时重新检查迁出节点的健康状态。C 在 D 同步期间恢复时，保留 C，经历 `ABC + learner D → ABCD → ABD`；四个正式副本只是迁移中间态，目标副本数仍为三。D 和中间配置多数派确认后才能移出 C。若 D 在中间态故障，原正式副本仍在线并满足原多数派及目标容量时，取消 D 并保留迁出节点。
 
-若中间态发生选举、原迁出节点成为新 leader，保留新 leader，优先将故障旧 leader 选为迁出 follower；正常领导权转移不受此规则影响。旧角色的完成回调不能直接清空任务并留下超额副本。进程重启后，任务由现有提示及最长 30 秒一轮的后台扫描重新发现。
+若中间态发生选举，无论原迁出节点 C、迁入节点 D 或其他正式副本当选，都保留新 leader，优先安排故障旧 leader 退出，并选择一个健康 follower 进行同步确认。迁入节点成为 leader 后不等待它向自己同步；选举及完成回调不能直接清空任务并留下超额副本。已出现超额正式副本但迁移标记丢失时，后台也按配置目标副本数重建收尾任务。规划不直接删除投票成员，原配置多数派、已安装配置和落盘前缀仍必须确认；不足多数派时保持现状。普通领导权转移不受此规则影响。进程重启后，任务由现有提示及最长 30 秒一轮的后台扫描重新发现。
 
 D 先完成加入、C 随后才被心跳判离线时，后台仍会按现有健康容量继续完成成员清理。健康容量不足时保留原投票集合。
 
@@ -23,21 +23,26 @@ D 先完成加入、C 随后才被心跳判离线时，后台仍会按现有健�
 
 ## 旧节点恢复和资源回收
 
-C 仍是成员时按正常重连恢复。C 已退出时，通过内部成员探测复用正常加入入口；成员列表为空时可用原 bootstrap 地址发现当前集群。加入响应中的已提交成员配置让旧进程先被动同步，避免旧任期和旧投票身份阻塞重新接入。已有成员的探测不修改成员、地址或角色，也不能抢在 bootstrap 初始化前创建成员配置。
+C 仍是成员时按正常重连恢复。C 已退出时，通过内部成员探测复用正常加入入口；成员列表为空时可用原 bootstrap 地址发现当前集群。加入响应中的已提交成员配置让旧进程先被动同步，避免旧任期和旧投票身份阻塞重新接入。已有成员的探测不修改成员、地址或角色，也不能抢在 bootstrap 初始化前创建成员配置。 新增 seed 节点若在应用首条配置日志前因超时被清退，探测仍回退原 seed 地址并通过正常加入重试。
 
 已移除节点的 Raft 网络消息在处理任期前被拒绝。只有已提交的成员配置删除对应连接和队列；种子地址或加入响应中的局部节点列表不触发删除。重建 Server 时重新绑定实例自带的 transport，避免复用已停止实例的发送队列。
 
 本地 slot 移除在 Raft 事件循环上完成；以相同编号重新加载前，在循环外等待旧实例已接收的落盘、读日志、截断和 Apply 任务结束，再读取存储状态。所有本地异步完成事件和 slot 配置事件绑定原实例，消费时丢弃已退役实例的事件；旧 Apply 也不能唤醒新实例的等待者。角色配置保存在异步任务前由事件循环快照，SaveConfig 不进入单 slot 的存储等待，以免成员变更回调等待自身。停机先停止接收工作并等待已接收 worker 完成，再关闭存储。
 
-新增两个内部配置日志命令和一个内部探测路由；加入响应扩展可以读取旧响应。执行这些成员变更前应完成所有投票节点的版本升级，不支持用旧二进制应用新增命令。
+旧节点重启或 leader 切换后，先确认日志前缀，再允许心跳推进提交；leader 只将完成前缀确认后的持久化同步位置计入多数派和晋升判断。异步日志读取保留发起时任期，旧任期结果不能作为新 leader 的同步响应。一批历史数据跨多个任期时，按任期边界分批持久化，确保每个任期起点和实际尾部任期一致；slot 日志与对应任期起点在同一批次提交。
+
+截断不能越过已提交前缀，存储拒绝截断时必须返回错误，不能让内存位置继续回退。slot Apply 在锁内核对日志身份、内容及连续性，拒绝读取后已被替换的旧数据；已应用范围不重复覆盖。启动发现 applied 超过日志尾部时返回错误，不能通过降低 applied 标记掩盖已经落盘的状态。该保护防止新分歧，不自动重建旧版本已经产生的错误状态。
+
+已合入的地址变更配置日志命令保留编号 11；本变更的成员移除、条件 slot 更新命令分别使用编号 12、13，避免与已有持久化日志冲突。新增两个内部配置日志命令和一个内部探测路由；加入响应扩展可以读取旧响应。执行这些成员变更前应完成所有投票节点的版本升级，不支持用旧二进制应用新增命令。
 
 ## 本地验证
 
 ```sh
 go test ./pkg/raft/... ./pkg/cluster/node/... ./pkg/cluster/slot ./pkg/cluster/channel ./pkg/cluster/store -count=1
+go test -race ./pkg/raft/raft ./pkg/raft/raftgroup ./pkg/cluster/slot -run '^(TestRestartedReplica.*|TestLeaderDoesNotCountUnmatchedSyncPosition|TestSyncErrorDoesNotValidateLocalPrefix|TestUncheckedSyncCannotPromoteLearner|TestPrefixAlignment.*|TestMixedTermCatchup.*|TestAsyncLogReadRetainsRequestTerm|TestSlotRestartRepairsConflictingChannelMetadata|TestSlotRejects.*)$' -count=3 -timeout=90s
 go test ./pkg/wkdb -run '^TestChannelConfigCloneDoesNotShareMembership$' -count=1
 go test -race ./pkg/raft/raftgroup ./pkg/cluster/slot -run '^(TestRetired.*|TestStorageDrain.*|TestConfigurationCallback.*|TestSlotRecreation.*|TestSlotStop.*)$' -count=5 -timeout=90s
-go test ./pkg/cluster/cluster -run '^(TestChannelRetirement.*|TestChannelRecoveredSource.*|TestChannelFollowerMigration.*|TestExpansionRecovery.*|TestCommittedRemoval.*|TestClusterJoinResponse.*|TestMembershipProbe.*|TestChannelExpansion.*|TestSlotTransition.*|TestChannelReplicationAfterLeaderConfigChange|TestConfigOrphanMigration.*|TestSeededEmptyDiskRejoinCompletesRecoveryOverTCP)$' -count=1 -timeout=10m
+go test ./pkg/cluster/cluster -run '^(TestChannelRetirement.*|TestSlotRetirement.*|TestChannelRecoveredSource.*|TestChannelFollowerMigration.*|TestExpansionRecovery.*|TestCommittedRemoval.*|TestClusterJoinResponse.*|TestMembershipProbe.*|TestChannelExpansion.*|TestSlotTransition.*|TestChannelReplicationAfterLeaderConfigChange|TestConfigOrphanMigration.*|TestSeededEmptyDiskRejoinCompletesRecoveryOverTCP)$' -count=1 -timeout=12m
 ```
 
 集成用例使用真实 TCP 和独立 Pebble 数据库，覆盖普通节点和配置 leader 故障后新增 D、C 在 D 晋升前恢复、C 在数据同步期间恢复、learner/控制节点重启、配置或数据 learner 崩溃后新增另一节点、C 用原磁盘或空磁盘重新接入，以及加入早于故障心跳超时、恢复节点重新当选 leader、正常重连、空目录 seed 重入、旧回调和资源清理。
@@ -45,6 +50,10 @@ go test ./pkg/cluster/cluster -run '^(TestChannelRetirement.*|TestChannelRecover
 频道交错故障回归覆盖 `C 故障 → D 同步 → C 恢复 → B 频道不可达或整机停止 → D 完成`，验证 B 不恢复时仍能提交消息和读取历史；另覆盖四副本中间态的目标节点重启、元数据 owner 重启、消息 leader 故障后原迁出节点当选，以及目标节点故障取消。
 
 slot 生命周期回归暂停真实 Pebble 写入，经过正式配置入口移除再加入相同 slot，确认新实例等待旧任务结束、加载完整历史并继续存储后续日志。另覆盖已入队和延迟到达的旧回调、旧实例销毁、各类存储任务排空、worker 池拒绝、配置回调重入，以及存储和重新加载等待期间停机。
+
+日志分歧回归构造返回节点在同一序号保存不同的未提交频道配置，先送达新 leader 心跳，再放开前缀校验和同步。验证旧配置不会先被应用，分歧尾部能修复，随后写入能提交，停机重新打开物理数据库后 leader、任期和配置版本一致。另覆盖 follower/learner、未确认同步不能晋升、同步错误、跨任期历史分批落盘、异步读取任期和 Apply 读取后的尾部替换。
+
+新增选举回归以真实 TCP 和独立 Pebble 构造只有 A 与指定后继副本持有最新日志的四副本中间态，分别强制 C、D 当选，另覆盖选举后迁移标记丢失。频道与 slot 均验证收敛到三个健康副本，再关闭另一个节点并提交后续写入、核对数据。
 
 另有独立进程 SIGKILL 验证：64 个 slot、64 个已有频道、64 个用户，初始 512 条消息；恢复后继续发送并停机核对每个正式副本的消息 ID、序号、内容、频道元数据和用户设备数据。HTTP `/message/send` 返回表示请求进入异步发送队列，因此第二次故障的注入点以实际持久化完成为准。
 

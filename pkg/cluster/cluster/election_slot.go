@@ -44,8 +44,9 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 			// 如果副本的分布式配置的版本小于当前领导的则也不能参与选举，
 			// 这样做的目的防止旧领导slot的状态没更新到Candidate，导致slot继续在接受日志，
 			// 这时候通过日志选举出来的领导肯定不可信
-			if s.cfgServer.NodeConfigVersionFromLeader(replicaId) < s.cfgServer.GetClusterConfig().Version {
-				s.Warn("replica config version < leader config version,stop election", zap.Uint64("replicaCfgVersion", s.cfgServer.NodeConfigVersionFromLeader(replicaId)), zap.Uint64("leaderCfgVersion", s.cfgServer.GetClusterConfig().Version))
+			configVersion := s.cfgServer.ConfigVersion()
+			if s.cfgServer.NodeConfigVersionFromLeader(replicaId) < configVersion {
+				s.Warn("replica config version < leader config version,stop election", zap.Uint64("replicaCfgVersion", s.cfgServer.NodeConfigVersionFromLeader(replicaId)), zap.Uint64("leaderCfgVersion", configVersion))
 				return nil
 			}
 
@@ -114,7 +115,7 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 				}
 			}
 			if slot.Leader != newLeaderId || slot.Status == types.SlotStatus_SlotStatusCandidate {
-				newSlot, err := slotElectionConfig(slot, newLeaderId, replicaLastLogInfoMap)
+				newSlot, err := slotElectionConfig(slot, newLeaderId, replicaLastLogInfoMap, s.cfgServer.SlotReplicaCount())
 				if err != nil {
 					return err
 				}
@@ -134,7 +135,7 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 	return nil
 }
 
-func slotElectionConfig(slot *types.Slot, leader uint64, infos map[uint64]map[uint32]SlotInfo) (*types.Slot, error) {
+func slotElectionConfig(slot *types.Slot, leader uint64, infos map[uint64]map[uint32]SlotInfo, capacity uint32) (*types.Slot, error) {
 	term := slot.Term
 	for _, id := range slot.Replicas {
 		if info, ok := infos[id][slot.Id]; ok {
@@ -151,7 +152,7 @@ func slotElectionConfig(slot *types.Slot, leader uint64, infos map[uint64]map[ui
 	recovering := slot.Status == types.SlotStatus_SlotStatusCandidate && slot.ExpectLeader == slot.Leader
 	// Recovery supersedes a previous leadership transfer. A real membership
 	// migration still has a learner and must continue through normal catch-up.
-	if next.MigrateTo != 0 && (next.MigrateTo == leader || recovering &&
+	if !types.HasExcessReplicas(next.Replicas, next.Learners, capacity) && next.MigrateTo != 0 && (next.MigrateTo == leader || recovering &&
 		wkutil.ArrayContainsUint64(next.Replicas, next.MigrateTo) && !wkutil.ArrayContainsUint64(next.Learners, next.MigrateTo)) {
 		next.MigrateFrom, next.MigrateTo = 0, 0
 		next.Learners = wkutil.RemoveUint64(next.Learners, leader)

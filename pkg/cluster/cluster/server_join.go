@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+
 	"go.uber.org/zap"
 )
 
@@ -63,21 +65,7 @@ func (s *Server) membershipLoop() {
 				continue
 			}
 			cfg := s.cfgServer.Snapshot()
-			var peers []uint64
-			for _, node := range cfg.Nodes {
-				if node.Id != s.opts.ConfigOptions.NodeId {
-					peers = append(peers, node.Id)
-				}
-			}
-			if len(peers) == 0 {
-				// A retired bootstrap node may have lost its local config too.
-				// Its original peer addresses can still find the current leader.
-				for id := range s.opts.ConfigOptions.InitNodes {
-					if id != s.opts.ConfigOptions.NodeId {
-						peers = append(peers, id)
-					}
-				}
-			}
+			peers := s.membershipProbePeers(cfg)
 			if len(peers) == 0 {
 				continue
 			}
@@ -108,6 +96,30 @@ func (s *Server) membershipLoop() {
 			s.addOrUpdateNodes(nodes)
 		}
 	}
+}
+
+// A seeded learner can be retired before applying its first config log. Keep
+// its original discovery route so releasing a temporary outage can rejoin it.
+func (s *Server) membershipProbePeers(cfg *types.Config) []uint64 {
+	var peers []uint64
+	for _, node := range cfg.Nodes {
+		if node.Id != s.opts.ConfigOptions.NodeId {
+			peers = append(peers, node.Id)
+		}
+	}
+	if len(peers) == 0 {
+		for id := range s.opts.ConfigOptions.InitNodes {
+			if id != s.opts.ConfigOptions.NodeId {
+				peers = append(peers, id)
+			}
+		}
+	}
+	if len(peers) == 0 {
+		if id, _, err := seedNode(s.opts.Seed); err == nil && id != 0 && id != s.opts.ConfigOptions.NodeId {
+			peers = append(peers, id)
+		}
+	}
+	return peers
 }
 
 // 是否需要加入集群

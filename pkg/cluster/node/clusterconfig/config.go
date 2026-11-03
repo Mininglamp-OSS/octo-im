@@ -80,10 +80,11 @@ func (c *Config) version() uint64 {
 	defer c.mu.RUnlock()
 	return c.cfg.Version
 }
-func (c *Config) setVersion(version uint64) {
+func (c *Config) setVersionAndTerm(version uint64, term uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cfg.Version = version
+	c.cfg.Term = term
 }
 
 func (c *Config) versionInc() {
@@ -114,8 +115,8 @@ func (c *Config) nodes() []*types.Node {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	nodes := make([]*types.Node, len(c.cfg.Nodes))
-	for i, n := range c.cfg.Nodes {
-		nodes[i] = n.Clone()
+	for i, node := range c.cfg.Nodes {
+		nodes[i] = node.Clone()
 	}
 	return nodes
 }
@@ -149,18 +150,18 @@ func (c *Config) hasNode(id uint64) bool {
 	return false
 }
 
-func (c *Config) addJoiningNode(node *types.Node) {
+func (c *Config) joinNode(node *types.Node) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	found := false
+	updated := false
 	for i, n := range c.cfg.Nodes {
 		if n.Id == node.Id {
 			c.cfg.Nodes[i] = node
-			found = true
+			updated = true
 			break
 		}
 	}
-	if !found {
+	if !updated {
 		c.cfg.Nodes = append(c.cfg.Nodes, node)
 	}
 	if !wkutil.ArrayContainsUint64(c.cfg.Learners, node.Id) {
@@ -193,6 +194,17 @@ func (c *Config) updateApiServerAddr(nodeId uint64, addr string) {
 	for _, node := range c.cfg.Nodes {
 		if node.Id == nodeId {
 			node.ApiServerAddr = addr
+			return
+		}
+	}
+}
+
+func (c *Config) updateClusterAddr(nodeId uint64, addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, node := range c.cfg.Nodes {
+		if node.Id == nodeId {
+			node.ClusterAddr = addr
 			return
 		}
 	}
@@ -311,6 +323,9 @@ func (c *Config) updateNodeStatus(nodeId uint64, status types.NodeStatus) {
 func (c *Config) config() *types.Config {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.cfg == nil {
+		return nil
+	}
 	return c.cfg.Clone()
 }
 

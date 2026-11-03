@@ -215,6 +215,14 @@ func (n *Node) stepLeader(e types.Event) error {
 		types.FollowerToLeaderResp:
 
 		n.stopPropose = false
+		// Applying the role config may already have cleared replicaSync. Wake
+		// remaining learners before the nil check so suspended peers can resume
+		// SyncReq-driven promotion, even when they are no longer migrateTo.
+		for _, learnerID := range n.cfg.Learners {
+			if learnerID != n.opts.NodeId {
+				n.sendNotifySync(learnerID)
+			}
+		}
 		syncInfo := n.replicaSync[e.From]
 		if syncInfo == nil {
 			if n.queue.lastLogIndex > 0 {
@@ -260,9 +268,6 @@ func (n *Node) stepFollower(e types.Event) error {
 		n.idleTick = 0
 		n.syncRespTimeoutTick = 0
 		n.syncing = false
-		if !n.onlySync {
-			n.onlySync = true
-		}
 
 		switch e.Reason {
 		case types.ReasonOk:
@@ -281,7 +286,11 @@ func (n *Node) stepFollower(e types.Event) error {
 					n.suspend = true
 				}
 			}
-			n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
+			// ReasonOk certifies the pre-existing prefix, unlike a heartbeat
+			// or a response which still requires truncation. Received new logs
+			// remain bounded by storedIndex until their StoreResp.
+			n.onlySync = true
+			n.updateFollowCommittedIndex(e.CommittedIndex)
 
 		case types.ReasonTruncate:
 			// if n.Key() == "clusterconfig" {
@@ -290,6 +299,10 @@ func (n *Node) stepFollower(e types.Event) error {
 			if n.truncating {
 				return nil
 			}
+			if e.Index < n.queue.committedIndex {
+				return types.ErrCommittedLogConflict
+			}
+			n.onlySync = false
 			n.truncating = true
 			n.sendTruncateReq(e.Index)
 			n.advance()
@@ -300,9 +313,13 @@ func (n *Node) stepFollower(e types.Event) error {
 	case types.TruncateResp: // 裁剪返回
 		n.truncating = false
 		if e.Reason == types.ReasonOk {
+			if e.Index < n.queue.committedIndex {
+				return types.ErrCommittedLogConflict
+			}
 			if e.Index < n.queue.lastLogIndex {
 				n.queue.truncateLogTo(e.Index)
 			}
+			n.onlySync = true
 			n.sendSyncReq()
 			n.advance()
 		}
@@ -364,9 +381,6 @@ func (n *Node) stepLearner(e types.Event) error {
 		n.idleTick = 0
 		n.syncRespTimeoutTick = 0
 		n.syncing = false
-		if !n.onlySync {
-			n.onlySync = true
-		}
 
 		if e.Reason == types.ReasonOk {
 			// if n.Key() == "clusterconfig" {
@@ -383,7 +397,8 @@ func (n *Node) stepLearner(e types.Event) error {
 					n.suspend = true
 				}
 			}
-			n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
+			n.onlySync = true
+			n.updateFollowCommittedIndex(e.CommittedIndex)
 
 		} else if e.Reason == types.ReasonTruncate {
 			// if n.Key() == "clusterconfig" {
@@ -392,6 +407,10 @@ func (n *Node) stepLearner(e types.Event) error {
 			if n.truncating {
 				return nil
 			}
+			if e.Index < n.queue.committedIndex {
+				return types.ErrCommittedLogConflict
+			}
+			n.onlySync = false
 			n.truncating = true
 			n.sendTruncateReq(e.Index)
 			n.advance()
@@ -401,9 +420,13 @@ func (n *Node) stepLearner(e types.Event) error {
 	case types.TruncateResp: // 裁剪返回
 		n.truncating = false
 		if e.Reason == types.ReasonOk {
+			if e.Index < n.queue.committedIndex {
+				return types.ErrCommittedLogConflict
+			}
 			if e.Index < n.queue.lastLogIndex {
 				n.queue.truncateLogTo(e.Index)
 			}
+			n.onlySync = true
 			n.sendSyncReq()
 			n.advance()
 		}
@@ -513,7 +536,13 @@ func (n *Node) updateSyncInfo(e types.Event) {
 	}
 	syncInfo.SyncTick = 0
 	syncInfo.LastSyncIndex = e.Index
-	syncInfo.StoredIndex = e.StoredIndex
+	// The first request after a leader/term change can report a divergent
+	// durable tail. Only the request following successful prefix alignment
+	// acknowledges this leader's log (indices on the wire are exclusive).
+	syncInfo.StoredIndex = 0
+	if e.Reason == types.ReasonOnlySync {
+		syncInfo.StoredIndex = e.StoredIndex
+	}
 	syncInfo.ConfigVersion = e.ConfigVersion
 }
 
@@ -593,6 +622,9 @@ func (n *Node) committedIndexForLeader() uint64 {
 
 // 更新跟随者的提交索引
 func (n *Node) updateFollowCommittedIndex(leaderCommittedIndex uint64) {
+	if !n.onlySync || n.truncating {
+		return
+	}
 	if leaderCommittedIndex == 0 || leaderCommittedIndex <= n.queue.committedIndex {
 		return
 	}
@@ -613,6 +645,10 @@ func (n *Node) committedIndexForFollow(leaderCommittedIndex uint64) uint64 {
 }
 
 func (n *Node) roleSwitchIfNeed(e types.Event) {
+	// An unchecked stored position cannot authorize promotion or retirement.
+	if e.Reason != types.ReasonOnlySync {
+		return
+	}
 	if !n.isLearner(e.From) && !n.isVoter(e.From) {
 		return
 	}

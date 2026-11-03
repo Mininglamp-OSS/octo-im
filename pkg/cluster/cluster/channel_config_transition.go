@@ -73,7 +73,7 @@ func (s *Server) saveChannelConfigTransitionLocal(ctx context.Context, id string
 	if next.Version != current.ConfVersion || next.Term < current.Term {
 		return current, raft.ErrConfigVersionStale
 	}
-	if channelAddFirstStage(current) && current.MigrateFrom == current.LeaderId && next.MigrateFrom == 0 && next.MigrateTo == 0 {
+	if channelAddFirstStage(current) && (current.MigrateFrom == current.LeaderId || current.MigrateTo == current.LeaderId) && next.MigrateFrom == 0 && next.MigrateTo == 0 {
 		// An election changed the retiring follower into the leader. Let
 		// maintenance choose another follower before accepting a completion;
 		// a plain leadership transfer would leave four permanent voters.

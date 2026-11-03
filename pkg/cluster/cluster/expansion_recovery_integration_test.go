@@ -26,12 +26,20 @@ type expansionGroupGate struct {
 	base             raftgroup.ITransport
 	pause            atomic.Bool
 	maxConfigVersion atomic.Uint64 // nonzero: hold acknowledgement of a later membership
+	capConfigVersion atomic.Uint64 // retain log sync while delaying installed-config acknowledgement
+	holdLogTo        atomic.Uint64 // bit mask: withhold data responses to selected followers
 }
 
 func (g *expansionGroupGate) Send(key string, e rafttypes.Event) {
+	if e.Type == rafttypes.SyncResp && len(e.Logs) > 0 && g.holdLogTo.Load()&(1<<e.To) != 0 {
+		return
+	}
 	if e.Type == rafttypes.SyncReq {
 		if limit := g.maxConfigVersion.Load(); g.pause.Load() || limit != 0 && e.ConfigVersion > limit {
 			return
+		}
+		if limit := g.capConfigVersion.Load(); limit != 0 && e.ConfigVersion > limit {
+			e.ConfigVersion = limit
 		}
 	}
 	g.base.Send(key, e)

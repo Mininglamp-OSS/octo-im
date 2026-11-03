@@ -307,6 +307,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 				r.stepC <- stepReq{event: types.Event{
 					To:     e.From,
 					Type:   types.GetLogsResp,
+					Term:   e.Term,
 					Index:  e.Index,
 					Reason: treason,
 				}}
@@ -319,6 +320,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 			r.stepC <- stepReq{event: types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  trunctIndex,
 				Reason: types.ReasonTruncate,
 			}}
@@ -332,6 +334,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 			r.stepC <- stepReq{event: types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonError,
 			}}
@@ -340,6 +343,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		r.stepC <- stepReq{event: types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Logs:   logs,
 			Reason: types.ReasonOk,
@@ -350,6 +354,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		r.stepC <- stepReq{event: types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Reason: types.ReasonError,
 		}}
