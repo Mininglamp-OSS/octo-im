@@ -203,12 +203,21 @@ func (s *Server) ProposeJoinWithVersion(node *pb.Node) (uint64, error) {
 				return 0, err
 			}
 		}
-		// Retirement may already have committed before the online update.
-		// Retry normal admission instead of acknowledging an absent member.
-		if s.Node(node.Id) == nil {
-			return 0, ErrMembershipBusy
+		version, err := s.proposeJoiningWithVersion(node.Id)
+		if err != nil {
+			return 0, err
 		}
-		return s.proposeJoiningWithVersion(node.Id)
+		// Retirement can commit between the address/online updates and the
+		// recovery boundary. A no-op on a removed voter is not a successful join.
+		applied := s.Snapshot()
+		for _, member := range applied.Nodes {
+			if member.Id == node.Id && member.Online && member.AllowVote && member.Role == pb.NodeRole_NodeRoleReplica &&
+				!slices.Contains(applied.Learners, node.Id) &&
+				(member.Status == pb.NodeStatus_NodeStatusJoining || member.Status == pb.NodeStatus_NodeStatusJoined) {
+				return version, nil
+			}
+		}
+		return 0, ErrMembershipBusy
 	}
 	// The Raft migration fields describe one change. A concurrent new voter
 	// must retry instead of overwriting its target.

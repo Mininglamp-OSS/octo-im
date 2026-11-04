@@ -97,6 +97,21 @@ func (s *Server) handleNodeJoining() error {
 		if err := s.cfgServer.ProposeSlotsIfCurrent(before, planned); err != nil {
 			return err
 		}
+		// Applying the command can skip a superseded slot. Recompute on the
+		// next tick instead of acknowledging a plan that did not take effect.
+		applied := s.cfgServer.Snapshot()
+		for _, next := range planned {
+			matched := false
+			for _, current := range applied.Slots {
+				if current.Id == next.Id {
+					matched = current.Equal(next)
+					break
+				}
+			}
+			if !matched {
+				return nil
+			}
+		}
 	}
 	if joining != nil && admitted {
 		return s.cfgServer.ProposeJoined(joining.Id, nil)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,10 +16,20 @@ import (
 
 // joiningTestTransport connects actual configuration Raft servers without sockets.
 type joiningTestTransport struct {
-	servers map[uint64]*clusterconfig.Server
+	servers       map[uint64]*clusterconfig.Server
+	mu            sync.RWMutex
+	beforePropose func(rafttypes.Event)
 }
 
 func (t *joiningTestTransport) Send(e rafttypes.Event) {
+	if e.Type == rafttypes.SendPropose {
+		t.mu.RLock()
+		before := t.beforePropose
+		t.mu.RUnlock()
+		if before != nil {
+			before(e)
+		}
+	}
 	if target := t.servers[e.To]; target != nil {
 		target.StepRaftEvent(e)
 	}
