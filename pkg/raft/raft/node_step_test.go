@@ -536,6 +536,7 @@ func TestFollower_SyncResp_Truncate_SendsTruncateReq(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeFollower(n, 3, 2)
 	n.onlySync = true
+	n.queue.lastLogIndex, n.queue.storedIndex = 8, 8
 	n.Step(types.Event{
 		Type: types.SyncResp, Term: 3, From: 2,
 		Reason: types.ReasonTruncate, Index: 5,
@@ -554,10 +555,12 @@ func TestFollower_TruncateResp_Ok_TruncatesAndSyncs(t *testing.T) {
 	n.queue.lastLogIndex = 10
 	n.queue.storedIndex = 10
 	n.truncating = true
+	n.sendTruncateReq(10)
+	clearEvents(n)
 	// When TruncateResp.Index < lastLogIndex, it calls truncateLogTo
 	// Use index >= lastLogIndex to skip that branch
 	n.Step(types.Event{
-		Type: types.TruncateResp, Term: 3,
+		Type: types.TruncateResp, Term: 3, TruncateID: n.truncateID,
 		Reason: types.ReasonOk, Index: 10,
 	})
 	assert.False(t, n.truncating)
@@ -733,6 +736,7 @@ func TestLearner_SyncResp_Ok_WithLogs_Appends(t *testing.T) {
 func TestLearner_SyncResp_Truncate_SendsTruncateReq(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeLearner(n, 3, 2)
+	n.queue.lastLogIndex, n.queue.storedIndex = 8, 8
 	n.Step(types.Event{
 		Type: types.SyncResp, Term: 3, From: 2,
 		Reason: types.ReasonTruncate, Index: 5,
@@ -764,9 +768,11 @@ func TestLearner_TruncateResp_Ok(t *testing.T) {
 	n.queue.lastLogIndex = 10
 	n.queue.storedIndex = 10
 	n.truncating = true
+	n.sendTruncateReq(10)
+	clearEvents(n)
 	// Use index >= lastLogIndex to avoid slice bounds issue in truncateLogTo
 	n.Step(types.Event{
-		Type: types.TruncateResp, Reason: types.ReasonOk, Index: 10,
+		Type: types.TruncateResp, TruncateID: n.truncateID, Reason: types.ReasonOk, Index: 10,
 	})
 	assert.False(t, n.truncating)
 }

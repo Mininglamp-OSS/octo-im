@@ -241,6 +241,7 @@ func (r *queue) truncateLogTo(logIndex uint64) {
 		r.Panic("truncate log index is out of bound", zap.Uint64("logIndex", logIndex), zap.Uint64("lastLogIndex", r.lastLogIndex))
 	}
 	if logIndex < r.storedIndex {
+		r.logs = nil
 		r.storedIndex = logIndex
 	} else {
 		r.logs = r.logs[:logIndex-r.storedIndex]

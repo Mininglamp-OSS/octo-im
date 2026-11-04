@@ -70,12 +70,13 @@ func TestRetiredResponsesCannotReachReplacement(t *testing.T) {
 
 type lifecycleStorage struct {
 	IStorage
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
+	entered     chan struct{}
+	release     chan struct{}
+	once        sync.Once
+	enteredOnce sync.Once
 }
 
-func (s *lifecycleStorage) block()   { close(s.entered); <-s.release }
+func (s *lifecycleStorage) block()   { s.enteredOnce.Do(func() { close(s.entered) }); <-s.release }
 func (s *lifecycleStorage) unblock() { s.once.Do(func() { close(s.release) }) }
 func (s *lifecycleStorage) AppendLogs(string, []types.Log, *types.TermStartIndexInfo) error {
 	s.block()
@@ -83,8 +84,9 @@ func (s *lifecycleStorage) AppendLogs(string, []types.Log, *types.TermStartIndex
 }
 func (s *lifecycleStorage) GetLogs(string, uint64, uint64, uint64) ([]types.Log, error) {
 	s.block()
-	return []types.Log{{Index: 1}}, nil
+	return []types.Log{{Index: 1, Term: 1}}, nil
 }
+func (*lifecycleStorage) GetTermStartIndex(string, uint32) (uint64, error)               { return 1, nil }
 func (s *lifecycleStorage) TruncateLogTo(string, uint64) error                           { s.block(); return nil }
 func (*lifecycleStorage) DeleteLeaderTermStartIndexGreaterThanTerm(string, uint32) error { return nil }
 func (*lifecycleStorage) Apply(string, []types.Log) error                                { return nil }

@@ -7,6 +7,11 @@ import (
 )
 
 func (n *Node) Step(e types.Event) error {
+	// A physical cut must be reconciled even if its originating term ended.
+	// Its local request identity, not the current leader, owns this completion.
+	if e.Type == types.TruncateResp {
+		return n.handleTruncateResp(e)
+	}
 	// Removed peers may return with a stale leader role and a higher term.
 	// Reject their network traffic before it can change terms, sync progress,
 	// or leadership. Re-admission is a committed application membership change.
@@ -123,7 +128,7 @@ func (n *Node) stepLeader(e types.Event) error {
 
 	switch e.Type {
 	case types.Propose: // 提案
-		if n.stopPropose { // 停止提案
+		if n.stopPropose || n.truncating { // 停止提案
 			n.Foucs("stop propose", zap.String("key", n.Key()))
 			return types.ErrProposalDropped
 		}
@@ -137,6 +142,9 @@ func (n *Node) stepLeader(e types.Event) error {
 		// }
 		n.advance()
 	case types.SyncReq: // 同步
+		if n.truncating {
+			return nil
+		}
 		n.idleTick = 0
 		if e.ConfigVersion < n.cfg.Version {
 			n.sendConfigResp(e.From, n.cfg.Clone())
@@ -155,7 +163,7 @@ func (n *Node) stepLeader(e types.Event) error {
 		n.roleSwitchIfNeed(e)
 
 		// 无数据可同步
-		if (e.Reason == types.ReasonOnlySync && e.Index > n.queue.storedIndex) || n.queue.storedIndex == 0 {
+		if (e.Reason == types.ReasonOnlySync && e.Index > n.queue.storedIndex) || (e.Index == 1 && n.queue.storedIndex == 0) {
 
 			var speed types.Speed
 			if n.opts.AutoSuspend {
@@ -264,6 +272,9 @@ func (n *Node) stepFollower(e types.Event) error {
 		n.sendSyncReq()
 		n.advance()
 	case types.SyncResp: // 同步返回
+		if n.truncating {
+			return nil
+		}
 		n.electionElapsed = 0
 		n.idleTick = 0
 		n.syncRespTimeoutTick = 0
@@ -296,32 +307,25 @@ func (n *Node) stepFollower(e types.Event) error {
 			// if n.Key() == "clusterconfig" {
 			// 	n.Info("truncating...", zap.Bool("truncating", n.truncating), zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.Int("len", len(e.Logs)))
 			// }
-			if n.truncating {
-				return nil
+			n.onlySync = false
+			if n.queue.appending {
+				return nil // StoreResp will restart alignment after the pending append.
 			}
 			if e.Index < n.queue.committedIndex {
 				return types.ErrCommittedLogConflict
 			}
-			n.onlySync = false
+			if e.Index >= n.queue.lastLogIndex {
+				// A delayed response can refer to the tail before an earlier cut.
+				// Recheck the current prefix; there is no physical work left here.
+				n.sendSyncReq()
+				return nil
+			}
 			n.truncating = true
 			n.sendTruncateReq(e.Index)
 			n.advance()
 		default:
 			n.Error("sync error", zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.String("reason", e.Reason.String()))
 
-		}
-	case types.TruncateResp: // 裁剪返回
-		n.truncating = false
-		if e.Reason == types.ReasonOk {
-			if e.Index < n.queue.committedIndex {
-				return types.ErrCommittedLogConflict
-			}
-			if e.Index < n.queue.lastLogIndex {
-				n.queue.truncateLogTo(e.Index)
-			}
-			n.onlySync = true
-			n.sendSyncReq()
-			n.advance()
 		}
 	case types.StoreResp: // 异步存储日志返回
 		n.queue.appending = false
@@ -377,6 +381,9 @@ func (n *Node) stepLearner(e types.Event) error {
 		n.sendSyncReq()
 		n.advance()
 	case types.SyncResp: // 同步返回
+		if n.truncating {
+			return nil
+		}
 		n.electionElapsed = 0
 		n.idleTick = 0
 		n.syncRespTimeoutTick = 0
@@ -404,31 +411,24 @@ func (n *Node) stepLearner(e types.Event) error {
 			// if n.Key() == "clusterconfig" {
 			// 	n.Info("truncating...", zap.Bool("truncating", n.truncating), zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.Int("len", len(e.Logs)))
 			// }
-			if n.truncating {
-				return nil
+			n.onlySync = false
+			if n.queue.appending {
+				return nil // StoreResp will restart alignment after the pending append.
 			}
 			if e.Index < n.queue.committedIndex {
 				return types.ErrCommittedLogConflict
 			}
-			n.onlySync = false
+			if e.Index >= n.queue.lastLogIndex {
+				// A delayed response can refer to the tail before an earlier cut.
+				// Recheck the current prefix; there is no physical work left here.
+				n.sendSyncReq()
+				return nil
+			}
 			n.truncating = true
 			n.sendTruncateReq(e.Index)
 			n.advance()
 		} else {
 			n.Error("sync error", zap.Uint64("from", e.From), zap.Uint64("index", e.Index), zap.String("reason", e.Reason.String()))
-		}
-	case types.TruncateResp: // 裁剪返回
-		n.truncating = false
-		if e.Reason == types.ReasonOk {
-			if e.Index < n.queue.committedIndex {
-				return types.ErrCommittedLogConflict
-			}
-			if e.Index < n.queue.lastLogIndex {
-				n.queue.truncateLogTo(e.Index)
-			}
-			n.onlySync = true
-			n.sendSyncReq()
-			n.advance()
 		}
 	case types.StoreResp: // 异步存储日志返回
 		n.queue.appending = false
@@ -735,6 +735,7 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 		// 如果迁移的源节点是领导者，那么学习者必须完全追上领导者的日志
 		if n.cfg.MigrateFrom == n.cfg.Leader { // 学习者转领导者
 			if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
+				n.stopPropose = true          // Freeze this tail until asynchronous handoff finishes.
 				syncInfo.roleSwitching = true // 学习者转让中
 				// 发送学习者转为领导者
 				n.sendLearnerToLeaderReq(e.From)
@@ -759,6 +760,7 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 		}
 	} else if n.cfg.MigrateFrom == n.cfg.Leader && n.cfg.MigrateTo == e.From { // // 追随者转为领导者
 		if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
+			n.stopPropose = true // Freeze this tail until asynchronous handoff finishes.
 			syncInfo.roleSwitching = true
 			// 发送追随者转为领导者
 			n.sendFollowToLeaderReq(e.From)
@@ -766,4 +768,40 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 			n.stopPropose = true // 停止提案
 		}
 	}
+}
+
+// handleTruncateResp releases the storage barrier only for its pending request.
+// Completing old I/O is necessary for liveness but never validates a prefix.
+func (n *Node) handleTruncateResp(e types.Event) error {
+	if (e.From != 0 && e.From != types.LocalNode) || !n.truncating || e.TruncateID == 0 || e.TruncateID != n.truncateID {
+		return nil
+	}
+	if e.Reason != types.ReasonOk {
+		// Some storage operations can fail after the physical cut. Keep all
+		// append/alignment work fenced until a tick retries and reconciles it.
+		n.truncateRetry = &e
+		return nil
+	}
+	if e.Index < n.queue.committedIndex {
+		return types.ErrCommittedLogConflict
+	}
+	if e.Index < n.queue.lastLogIndex {
+		n.queue.truncateLogTo(e.Index)
+	}
+	if e.TermStartIndexInfo != nil {
+		n.lastTermStartIndex = *e.TermStartIndexInfo
+	}
+	n.truncating = false
+	n.truncateRetry = nil
+	n.onlySync = false
+	n.syncing = false
+	if n.cfg.Role == types.RoleFollower || n.cfg.Role == types.RoleLearner {
+		if n.cfg.Leader != None {
+			n.sendSyncReq()
+		}
+	} else if n.IsLeader() {
+		n.ResumeReplication()
+	}
+	n.advance()
+	return nil
 }

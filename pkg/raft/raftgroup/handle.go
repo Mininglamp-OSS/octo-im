@@ -41,37 +41,14 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
-	// Capture mutable Raft state on its owner before launching storage work.
-	lastIndex := r.LastLogIndex()
 	err := rg.submitWork(r, true, func() {
-		// 获取裁断日志下标
-		var (
-			trunctIndex uint64
-		)
 		if e.Reason != types.ReasonOnlySync {
-			var treason types.Reason
-			trunctIndex, treason = rg.getTrunctLogIndex(r.Key(), lastIndex, e)
-			if treason != types.ReasonOk {
-				rg.AddEventFor(r, types.Event{
-					To:     e.From,
-					Type:   types.GetLogsResp,
-					Term:   e.Term,
-					Reason: treason,
-				})
+			index, reason := rg.getTrunctLogIndex(r.Key(), e.StoredIndex, e)
+			if reason != types.ReasonOk {
+				rg.AddEventFor(r, types.Event{To: e.From, Type: types.GetLogsResp,
+					Term: e.Term, Index: index, Reason: reason})
 				return
 			}
-		}
-		// 需要裁剪
-		if trunctIndex > 0 {
-			rg.AddEventFor(r, types.Event{
-				To:     e.From,
-				Type:   types.GetLogsResp,
-				Term:   e.Term,
-				Index:  trunctIndex,
-				Reason: types.ReasonTruncate,
-			})
-			rg.Advance()
-			return
 		}
 		if e.Reason != types.ReasonOnlySync && e.Index > e.StoredIndex {
 			rg.Debug("index is greater than stored index", zap.String("key", r.Key()), zap.Uint64("index", e.Index), zap.Uint64("storedIndex", e.StoredIndex))
@@ -127,32 +104,44 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 		if err != nil {
 			rg.Error("truncate logs failed", zap.Error(err))
 			rg.AddEventFor(r, types.Event{
-				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
+				Type:       types.TruncateResp,
+				Term:       e.Term,
+				TruncateID: e.TruncateID,
+				Index:      e.Index,
+				Reason:     types.ReasonError,
 			})
 			return
 		}
-		// 删除本地的leader term start index
-		err = rg.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(r.Key(), e.LastLogTerm)
+		info, err := types.RetainedTermStart(e.Index,
+			func(start, end, size uint64) ([]types.Log, error) {
+				return rg.opts.Storage.GetLogs(r.Key(), start, end, size)
+			},
+			func(term uint32) (uint64, error) { return rg.opts.Storage.GetTermStartIndex(r.Key(), term) })
+		if err == nil {
+			err = rg.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(r.Key(), info.Term)
+		}
 		if err != nil {
-			rg.Error("delete leader term start index failed", zap.Error(err), zap.Uint32("LastLogTerm", e.LastLogTerm))
-			rg.AddEventFor(r, types.Event{
-				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
-			})
+			rg.Error("restore retained log term failed", zap.Error(err))
+			rg.AddEventFor(r, types.Event{Type: types.TruncateResp, Term: e.Term, TruncateID: e.TruncateID, Index: e.Index, Reason: types.ReasonError})
 			return
 		}
 		rg.AddEventFor(r, types.Event{
-			Type:   types.TruncateResp,
-			Index:  e.Index,
-			Reason: types.ReasonOk,
+			Type:               types.TruncateResp,
+			Term:               e.Term,
+			TruncateID:         e.TruncateID,
+			Index:              e.Index,
+			TermStartIndexInfo: info,
+			Reason:             types.ReasonOk,
 		})
 	})
 	if err != nil {
 		rg.Error("submit truncate req failed", zap.Error(err))
 		rg.AddEventFor(r, types.Event{
-			Type:   types.TruncateResp,
-			Reason: types.ReasonError,
+			Type:       types.TruncateResp,
+			Term:       e.Term,
+			TruncateID: e.TruncateID,
+			Index:      e.Index,
+			Reason:     types.ReasonError,
 		})
 	}
 }
@@ -217,58 +206,17 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 	}
 }
 
-// 根据副本的同步数据，来获取副本的需要裁剪的日志下标，如果不需要裁剪，则返回0
-func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Event) (uint64, types.Reason) {
-	leaderLastLogTerm, err := rg.opts.Storage.LeaderLastLogTerm(key)
+// getTrunctLogIndex returns ReasonTruncate even when the common prefix is empty.
+func (rg *RaftGroup) getTrunctLogIndex(key string, stored uint64, e types.Event) (uint64, types.Reason) {
+	index, reason, err := types.CheckLogPrefix(e.Index, stored, e.LastLogTerm,
+		func(start, end, size uint64) ([]types.Log, error) {
+			return rg.opts.Storage.GetLogs(key, start, end, size)
+		},
+		func(term uint32) (uint64, error) { return rg.opts.Storage.GetTermStartIndex(key, term) })
 	if err != nil {
-		rg.Error("get leader last log term failed", zap.Error(err))
-		return 0, types.ReasonError
+		rg.Error("check log prefix failed", zap.Error(err))
 	}
-	// 副本的最新日志任期为0，说明副本没有日志，不需要裁剪
-	if e.LastLogTerm == 0 {
-		return 0, types.ReasonOk
-	}
-	// 如果副本的最新日志任期等于当前领导的最新日志任期
-	//  如果副本的最新日志下标大于领导者最新日志下标，则需要裁剪至领导者最新日志下标
-	if e.LastLogTerm == leaderLastLogTerm {
-		if e.Index > 0 {
-			replicaLastLogIndex := e.Index - 1 // 副本日志下标等于同步下标-1
-			if replicaLastLogIndex > lastIndex {
-				return lastIndex, types.ReasonOk
-			}
-		}
-		return 0, types.ReasonOk
-	}
-
-	// 如果副本的最新日志任期小于当前领导的最新日志任期，则需要裁剪
-	if e.LastLogTerm < leaderLastLogTerm {
-		term, err := rg.opts.Storage.LeaderTermGreaterEqThan(key, e.LastLogTerm+1)
-		if err != nil {
-			rg.Error("LeaderTermGreaterEqThan: get leader last term failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		// 获取副本的最新日志任期+1的开始日志下标
-		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(key, term)
-		if err != nil {
-			rg.Error("get term start index failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		if termStartIndex > 0 {
-			return termStartIndex - 1, types.ReasonOk
-		}
-		return termStartIndex, types.ReasonOk
-	} else {
-		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(key, leaderLastLogTerm)
-		if err != nil {
-			rg.Error("get term start index failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		rg.Foucs("getTrunctLogIndex: lastLogTerm > leaderLastLogTerm", zap.Uint32("e.LastLogTerm", e.LastLogTerm), zap.Uint32("leaderLastLogTerm", leaderLastLogTerm), zap.Uint64("termStartIndex", termStartIndex))
-		if termStartIndex > 0 {
-			return termStartIndex - 1, types.ReasonOk
-		}
-		return termStartIndex, types.ReasonOk
-	}
+	return index, reason
 }
 
 func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {

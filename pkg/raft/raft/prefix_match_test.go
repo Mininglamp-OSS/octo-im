@@ -25,7 +25,7 @@ func TestRestartedReplicaDoesNotApplyUnmatchedTail(t *testing.T) {
 			clearEvents(n)
 			require.NoError(t, n.Step(types.Event{Type: types.Ping, From: 1, Term: 2, CommittedIndex: 12}))
 			require.Equal(t, uint64(11), n.CommittedIndex(), "truncation has not reached disk yet")
-			require.NoError(t, n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonOk, Index: 11}))
+			require.NoError(t, n.Step(types.Event{Type: types.TruncateResp, TruncateID: n.truncateID, Reason: types.ReasonOk, Index: 11}))
 			clearEvents(n)
 			require.NoError(t, n.Step(types.Event{Type: types.SyncResp, From: 1, Term: 2, Reason: types.ReasonOk, Index: 12,
 				CommittedIndex: 12, Logs: []types.Log{{Index: 12, Term: 2, Data: []byte("canonical")}}}))

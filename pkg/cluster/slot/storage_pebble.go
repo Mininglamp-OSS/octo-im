@@ -235,10 +235,6 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 
 // TruncateLogTo 截断日志
 func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) error {
-	if index == 0 {
-		return errors.New("index must be greater than 0")
-	}
-
 	// 加锁保护，防止与 Apply 并发执行导致 appliedIndex > lastLogIndex
 	lock := p.slotLock(shardNo)
 	lock.Lock()
