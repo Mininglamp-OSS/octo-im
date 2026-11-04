@@ -122,17 +122,13 @@ func (p *PebbleShardLogStorage) SaveConfig(cfg types.Config) error {
 
 // TruncateLogTo 截断日志
 func (p *PebbleShardLogStorage) TruncateLogTo(index uint64) error {
-	if index == 0 {
-		return errors.New("index must be greater than 0")
-	}
 	appliedIdx, err := p.AppliedIndex()
 	if err != nil {
 		p.Error("get max index error", zap.Error(err))
 		return err
 	}
 	if index < appliedIdx {
-		p.Error("index must be less than  applied index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx))
-		return nil
+		return types.ErrCommittedLogConflict
 	}
 
 	keyData := key.NewLogKey(index + 1)

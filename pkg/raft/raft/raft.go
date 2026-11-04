@@ -293,35 +293,18 @@ func (r *Raft) handleStoreReq(e types.Event) {
 
 func (r *Raft) handleGetLogsReq(e types.Event) {
 
-	var leaderLastLogTerm = r.node.lastTermStartIndex.Term
-
 	err := r.pool.Submit(func() {
-		// 获取裁断日志下标
-		var (
-			trunctIndex uint64
-		)
 		if e.Reason != types.ReasonOnlySync {
-			var treason types.Reason
-			trunctIndex, treason = r.getTrunctLogIndex(e, leaderLastLogTerm)
-			if treason != types.ReasonOk {
-				r.stepC <- stepReq{event: types.Event{
-					To:     e.From,
-					Type:   types.GetLogsResp,
-					Index:  e.Index,
-					Reason: treason,
-				}}
+			index, reason := r.getTrunctLogIndex(e)
+			if reason != types.ReasonOk {
+				r.stepC <- stepReq{event: types.Event{To: e.From, Type: types.GetLogsResp,
+					Term: e.Term, Index: index, Reason: reason}}
 				return
 			}
 		}
-
-		// 需要裁剪
-		if trunctIndex > 0 {
-			r.stepC <- stepReq{event: types.Event{
-				To:     e.From,
-				Type:   types.GetLogsResp,
-				Index:  trunctIndex,
-				Reason: types.ReasonTruncate,
-			}}
+		if e.Index > e.StoredIndex {
+			r.stepC <- stepReq{event: types.Event{To: e.From, Type: types.GetLogsResp,
+				Term: e.Term, Index: e.Index, Reason: types.ReasonOk}}
 			return
 		}
 
@@ -332,6 +315,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 			r.stepC <- stepReq{event: types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonError,
 			}}
@@ -340,6 +324,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		r.stepC <- stepReq{event: types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Logs:   logs,
 			Reason: types.ReasonOk,
@@ -350,6 +335,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		r.stepC <- stepReq{event: types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Reason: types.ReasonError,
 		}}
@@ -363,32 +349,40 @@ func (r *Raft) handleTruncateReq(e types.Event) {
 		if err != nil {
 			r.Error("truncate logs failed", zap.Error(err))
 			r.stepC <- stepReq{event: types.Event{
-				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
+				Type:       types.TruncateResp,
+				Term:       e.Term,
+				TruncateID: e.TruncateID,
+				Index:      e.Index,
+				Reason:     types.ReasonError,
 			}}
 			return
 		}
-		// 删除本地的leader term start index
-		err = r.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(e.LastLogTerm)
+		info, err := types.RetainedTermStart(e.Index, r.opts.Storage.GetLogs, r.opts.Storage.GetTermStartIndex)
+		if err == nil {
+			err = r.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(info.Term)
+		}
 		if err != nil {
-			r.Error("delete leader term start index failed", zap.Error(err), zap.Uint32("LastLogTerm", e.LastLogTerm))
-			r.stepC <- stepReq{event: types.Event{
-				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
-			}}
+			r.Error("restore retained log term failed", zap.Error(err))
+			r.stepC <- stepReq{event: types.Event{Type: types.TruncateResp, Term: e.Term, TruncateID: e.TruncateID, Index: e.Index, Reason: types.ReasonError}}
 			return
 		}
 		r.stepC <- stepReq{event: types.Event{
-			Type:   types.TruncateResp,
-			Index:  e.Index,
-			Reason: types.ReasonOk,
+			Type:               types.TruncateResp,
+			Term:               e.Term,
+			TruncateID:         e.TruncateID,
+			Index:              e.Index,
+			TermStartIndexInfo: info,
+			Reason:             types.ReasonOk,
 		}}
 	})
 	if err != nil {
 		r.Error("submit truncate logs failed", zap.Error(err))
 		r.stepC <- stepReq{event: types.Event{
-			Type:   types.TruncateResp,
-			Reason: types.ReasonError,
+			Type:       types.TruncateResp,
+			Term:       e.Term,
+			TruncateID: e.TruncateID,
+			Index:      e.Index,
+			Reason:     types.ReasonError,
 		}}
 	}
 }
@@ -443,64 +437,13 @@ func (r *Raft) handleApplyReq(e types.Event) {
 	}
 }
 
-// 根据副本的同步数据，来获取副本的需要裁剪的日志下标，如果不需要裁剪，则返回0
-func (r *Raft) getTrunctLogIndex(e types.Event, leaderLastLogTerm uint32) (uint64, types.Reason) {
-
-	// 副本的最新日志任期为0，说明副本没有日志，不需要裁剪
-	if e.LastLogTerm == 0 {
-		return 0, types.ReasonOk
+func (r *Raft) getTrunctLogIndex(e types.Event) (uint64, types.Reason) {
+	index, reason, err := types.CheckLogPrefix(e.Index, e.StoredIndex, e.LastLogTerm,
+		r.opts.Storage.GetLogs, r.opts.Storage.GetTermStartIndex)
+	if err != nil {
+		r.Error("check log prefix failed", zap.Error(err))
 	}
-	// 如果副本的最新日志任期等于当前领导的最新日志任期
-	//  如果副本的最新日志下标大于领导者最新日志下标，则需要裁剪至领导者最新日志下标
-	if e.LastLogTerm == leaderLastLogTerm {
-		if e.Index > 0 {
-			replicaLastLogIndex := e.Index - 1 // 副本日志下标等于同步下标-1
-			if replicaLastLogIndex > r.node.LastLogIndex() {
-				return r.node.LastLogIndex(), types.ReasonOk
-			}
-		}
-		return 0, types.ReasonOk
-	}
-
-	// 如果副本的最新日志任期小于当前领导的最新日志任期，则需要裁剪
-	if e.LastLogTerm < leaderLastLogTerm {
-
-		term, err := r.opts.Storage.LeaderTermGreaterEqThan(e.LastLogTerm + 1)
-		if err != nil {
-			r.Error("LeaderTermGreaterEqThan: get leader last term failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-
-		// 获取副本的最新日志任期+1的开始日志下标
-		termStartIndex, err := r.opts.Storage.GetTermStartIndex(term)
-		if err != nil {
-			r.Error("get term start index failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		if termStartIndex > 0 {
-			return termStartIndex - 1, types.ReasonOk
-		}
-		return termStartIndex, types.ReasonOk
-	} else {
-		if e.LastLogTerm <= 1 {
-			return 0, types.ReasonOk
-		}
-		term, err := r.opts.Storage.LeaderLastTerm()
-		if err != nil {
-			r.Error("LeaderLastTerm: get leader last term failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		termStartIndex, err := r.opts.Storage.GetTermStartIndex(term)
-		if err != nil {
-			r.Error("get term start index failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		r.Foucs("getTrunctLogIndex: lastLogTerm > leaderLastLogTerm", zap.Uint64("from", e.From), zap.Uint32("e.LastLogTerm", e.LastLogTerm), zap.Uint32("leaderLastLogTerm", leaderLastLogTerm), zap.Uint64("termStartIndex", termStartIndex))
-		if termStartIndex > 0 {
-			return termStartIndex - 1, types.ReasonOk
-		}
-		return termStartIndex, types.ReasonOk
-	}
+	return index, reason
 }
 
 func (r *Raft) advance() {

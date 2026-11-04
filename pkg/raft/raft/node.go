@@ -45,8 +45,10 @@ type Node struct {
 	onlySync           bool // 是否只同步,不做截断判断
 	// softState softState // 软状态
 	sync.Mutex
-	truncating  bool // 截断中
-	stopPropose bool // 停止提案
+	truncating    bool // 截断中; survives role changes until physical I/O completes
+	truncateID    uint64
+	truncateRetry *types.Event
+	stopPropose   bool // 停止提案
 
 	suspend bool // 挂起
 
@@ -134,7 +136,7 @@ func (n *Node) HasReady() bool {
 	if n.hasUnpersistedHardState() {
 		return true
 	}
-	if n.queue.hasNextStoreLogs() {
+	if !n.truncating && n.queue.hasNextStoreLogs() {
 		return true
 	}
 	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
@@ -162,7 +164,7 @@ func (n *Node) Ready() []types.Event {
 		n.persistedHardState = state
 	}
 
-	if n.queue.hasNextStoreLogs() {
+	if !n.truncating && n.queue.hasNextStoreLogs() {
 		logs := n.queue.nextStoreLogs(0)
 		if len(logs) > 0 {
 			var termStartIndexInfo *types.TermStartIndexInfo
