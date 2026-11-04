@@ -136,6 +136,53 @@ func TestNewNodeWaitsForPendingBalanceBeforeJoined(t *testing.T) {
 	require.Positive(t, assigned, "balancing must resume after the previous task completes")
 }
 
+func TestNewNodeWaitsForBalanceAfterDeadLearnerCleanup(t *testing.T) {
+	cfg := joiningTestConfig(true)
+	for _, node := range cfg.Nodes {
+		node.Status = types.NodeStatus_NodeStatusJoined
+	}
+	cfg.Nodes = append(cfg.Nodes,
+		&types.Node{Id: 1004, Online: true, AllowVote: true, Status: types.NodeStatus_NodeStatusJoining},
+		&types.Node{Id: 1005, Online: false, Status: types.NodeStatus_NodeStatusJoined})
+	cfg.Slots[0].Learners = []uint64{1005}
+	cfg.Slots[0].MigrateFrom, cfg.Slots[0].MigrateTo = 1003, 1005
+	s := newJoiningTestServer(t, cfg)
+	require.NoError(t, s.handleNodeJoining())
+	require.Empty(t, s.cfgServer.Slot(0).Learners)
+	require.Zero(t, s.cfgServer.Slot(0).MigrateTo)
+	require.Equal(t, types.NodeStatus_NodeStatusJoining, s.cfgServer.Node(1004).Status,
+		"cleaning another node's dead learner is not this node's slot allocation")
+	require.NoError(t, s.handleNodeJoining())
+	require.Equal(t, types.NodeStatus_NodeStatusJoined, s.cfgServer.Node(1004).Status)
+	assigned := 0
+	for _, slot := range s.cfgServer.Slots() {
+		if slot.MigrateTo == 1004 {
+			assigned++
+		}
+	}
+	require.Positive(t, assigned, "the next pass must allocate slots to the new node")
+}
+
+func TestReturningReplicaPrecedesNewNodeWaitingForBalance(t *testing.T) {
+	cfg := joiningTestConfig(true)
+	cfg.Nodes[2].Status = types.NodeStatus_NodeStatusJoined
+	cfg.Nodes = append([]*types.Node{{Id: 1004, Online: true, AllowVote: true, Status: types.NodeStatus_NodeStatusJoining}}, cfg.Nodes...)
+	cfg.Nodes = append(cfg.Nodes, &types.Node{Id: 1005, Online: true, Status: types.NodeStatus_NodeStatusJoined})
+	cfg.Slots[0].Leader = 1002
+	cfg.Slots[0].Learners = []uint64{1005}
+	cfg.Slots[0].MigrateFrom, cfg.Slots[0].MigrateTo = 1003, 1005
+	s := newJoiningTestServer(t, cfg)
+	require.NoError(t, s.handleNodeJoining())
+	require.Equal(t, types.NodeStatus_NodeStatusJoined, s.cfgServer.Node(1002).Status)
+	require.Equal(t, types.NodeStatus_NodeStatusJoining, s.cfgServer.Node(1004).Status)
+	got := s.cfgServer.Slot(0)
+	require.Equal(t, types.SlotStatus_SlotStatusCandidate, got.Status)
+	require.Equal(t, uint64(1002), got.ExpectLeader)
+	require.Equal(t, cfg.Slots[0].Learners, got.Learners)
+	require.Equal(t, cfg.Slots[0].MigrateFrom, got.MigrateFrom)
+	require.Equal(t, cfg.Slots[0].MigrateTo, got.MigrateTo)
+}
+
 func joiningTestConfig(full bool) *types.Config {
 	cfg := &types.Config{SlotCount: 64, SlotReplicaCount: 3, ChannelReplicaCount: 3}
 	for _, id := range []uint64{1001, 1002, 1003} {

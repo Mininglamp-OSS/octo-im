@@ -13,9 +13,23 @@ func (s *Server) handleNodeJoining() error {
 		return nil
 	}
 	var joining *types.Node
+	recovering := false
 	for _, node := range cfg.Nodes {
-		if node.Status == types.NodeStatus_NodeStatusJoining {
+		if node.Status != types.NodeStatus_NodeStatusJoining {
+			continue
+		}
+		if joining == nil {
 			joining = node
+		}
+		// Existing slot replicas may be needed by an unfinished migration.
+		// Recover them before a new node waiting for ordinary balancing.
+		for _, slot := range cfg.Slots {
+			if slices.Contains(slot.Replicas, node.Id) {
+				joining, recovering = node, true
+				break
+			}
+		}
+		if recovering {
 			break
 		}
 	}
@@ -27,6 +41,7 @@ func (s *Server) handleNodeJoining() error {
 	// Use the same planner after a restart or an interrupted migration. Its
 	// durable journal is the slot assignment, not an in-memory join callback.
 	planned := planSlotExpansion(cfg)
+	admitted := recovering
 	pending := false
 	if joining != nil && len(planned) == 0 {
 		for _, slot := range cfg.Slots {
@@ -39,9 +54,15 @@ func (s *Server) handleNodeJoining() error {
 		// an existing migration may itself need this joining leader to recover.
 		if !pending {
 			planned = balanceJoiningSlots(cfg, joining.Id)
+			admitted = true
 		}
 	}
 	if joining != nil {
+		for _, next := range planned {
+			if next.MigrateTo == joining.Id && slices.Contains(next.Learners, joining.Id) {
+				admitted = true // this node received a replica repair assignment
+			}
+		}
 		// An explicitly rejoined ID may have lost its slot logs. Preserve the
 		// existing recovery election even when no replica migration is needed.
 		for _, slot := range cfg.Slots {
@@ -63,9 +84,6 @@ func (s *Server) handleNodeJoining() error {
 			updated.ExpectLeader = slot.Leader
 		}
 	}
-	if pending && len(planned) == 0 {
-		return nil // a new node still needs ordinary balancing before Joined
-	}
 	if len(planned) > 0 {
 		before := make([]*types.Slot, 0, len(planned))
 		for _, next := range planned {
@@ -80,7 +98,7 @@ func (s *Server) handleNodeJoining() error {
 			return err
 		}
 	}
-	if joining != nil {
+	if joining != nil && admitted {
 		return s.cfgServer.ProposeJoined(joining.Id, nil)
 	}
 	return nil
