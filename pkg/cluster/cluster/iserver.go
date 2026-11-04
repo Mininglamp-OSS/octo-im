@@ -126,7 +126,7 @@ func (s *Server) SlotLeaderNodeInfo(slotId uint32) *types.Node {
 }
 
 func (s *Server) NodeVersion() uint64 {
-	return s.cfgServer.GetClusterConfig().Version
+	return s.cfgServer.ConfigVersion()
 }
 
 func (s *Server) Nodes() []*types.Node {

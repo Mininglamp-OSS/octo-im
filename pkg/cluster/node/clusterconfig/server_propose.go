@@ -2,6 +2,7 @@ package clusterconfig
 
 import (
 	"encoding/binary"
+	"strings"
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"go.uber.org/zap"
@@ -9,6 +10,11 @@ import (
 
 // 提案配置
 func (s *Server) ProposeConfig(cfg *pb.Config) error {
+	for _, node := range cfg.Nodes {
+		if err := pb.ValidateAdvertiseAddr(node.ClusterAddr); err != nil {
+			return err
+		}
+	}
 	data, err := cfg.Marshal()
 	if err != nil {
 		return err
@@ -40,6 +46,32 @@ func (s *Server) ProposeApiServerAddr(nodeId uint64, apiServerAddr string) error
 	_, err = s.ProposeUntilApplied(s.genConfigId(), cmdBytes)
 	if err != nil {
 		s.Error("ProposeApiServerAddr failed", zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+// ProposeClusterAddr 提案节点cluster通讯地址变更
+func (s *Server) ProposeClusterAddr(nodeId uint64, clusterAddr string) error {
+	clusterAddr = strings.TrimSpace(clusterAddr)
+	if err := pb.ValidateAdvertiseAddr(clusterAddr); err != nil {
+		return err
+	}
+
+	data, err := EncodeClusterAddrChange(nodeId, clusterAddr)
+	if err != nil {
+		return err
+	}
+
+	cmd := NewCMD(CMDTypeConfigClusterAddrChange, data)
+	cmdBytes, err := cmd.Marshal()
+	if err != nil {
+		return err
+	}
+
+	_, err = s.ProposeUntilApplied(s.genConfigId(), cmdBytes)
+	if err != nil {
+		s.Error("ProposeClusterAddr failed", zap.Error(err))
 		return err
 	}
 	return nil
@@ -150,6 +182,9 @@ func (s *Server) ProposeJoinWithVersion(node *pb.Node) (uint64, error) {
 		return 0, err
 	}
 	cmd := NewCMD(CMDTypeNodeJoin, data)
+	if err := pb.ValidateJoinAddr(node.ClusterAddr); err != nil {
+		return 0, err
+	}
 	// Preserve expansion-only replay for historical version-1 commands.
 	// Replacement joins require all configuration voters to run this version.
 	cmd.version = 2
