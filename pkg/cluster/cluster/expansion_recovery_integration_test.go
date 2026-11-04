@@ -61,6 +61,7 @@ type expansionFixture struct {
 	t           *testing.T
 	ctx         context.Context
 	addresses   map[uint64]string
+	serverAddrs map[uint64]string
 	dirs        map[uint64]string
 	servers     map[uint64]*Server
 	slots       map[uint64]*expansionGroupGate
@@ -73,7 +74,7 @@ type expansionFixture struct {
 
 func newExpansionFixture(t *testing.T) *expansionFixture { return newExpansionFixtureWithPong(t, 10) }
 
-func newExpansionFixtureWithPong(t *testing.T, pong int) *expansionFixture {
+func newExpansionFixtureWithPong(t *testing.T, pong int, serverAddrs ...map[uint64]string) *expansionFixture {
 	t.Helper()
 	previous := trace.GlobalTrace
 	trace.SetGlobalTrace(trace.New(context.Background(), trace.NewOptions()))
@@ -82,6 +83,9 @@ func newExpansionFixtureWithPong(t *testing.T, pong int) *expansionFixture {
 	t.Cleanup(cancel)
 	f := &expansionFixture{t: t, ctx: ctx, pongMaxTick: pong, addresses: map[uint64]string{}, dirs: map[uint64]string{}, servers: map[uint64]*Server{},
 		slots: map[uint64]*expansionGroupGate{}, channels: map[uint64]*expansionGroupGate{}, configs: map[uint64]*expansionConfigGate{}}
+	if len(serverAddrs) > 0 {
+		f.serverAddrs = serverAddrs[0]
+	}
 	for id := uint64(1); id <= 5; id++ {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		require.NoError(t, err)
@@ -107,18 +111,22 @@ func newExpansionFixtureWithPong(t *testing.T, pong int) *expansionFixture {
 }
 func (f *expansionFixture) start(id uint64, seed string, pauseConfig, pauseData bool) {
 	f.t.Helper()
+	serverAddr, configured := f.serverAddrs[id]
+	if !configured {
+		serverAddr = f.addresses[id]
+	}
 	init := map[uint64]string{1: f.addresses[1], 2: f.addresses[2], 3: f.addresses[3]}
 	if seed != "" {
 		init = nil
 	}
 	cfg := clusterconfig.NewOptions(clusterconfig.WithNodeId(id), clusterconfig.WithInitNodes(init), clusterconfig.WithSlotCount(8),
 		clusterconfig.WithConfigPath(filepath.Join(f.dirs[id], "cfg", "cluster.json")), clusterconfig.WithSlotMaxReplicaCount(3),
-		clusterconfig.WithServerAddr(f.addresses[id]), clusterconfig.WithSeed(seed), clusterconfig.WithPongMaxTick(f.pongMaxTick))
+		clusterconfig.WithServerAddr(serverAddr), clusterconfig.WithSeed(seed), clusterconfig.WithPongMaxTick(f.pongMaxTick))
 	sg, cg, ng := &expansionGroupGate{}, &expansionGroupGate{}, &expansionConfigGate{}
 	sg.pause.Store(pauseData)
 	cg.pause.Store(pauseData)
 	ng.pause.Store(pauseConfig)
-	s := New(NewOptions(WithAddr("tcp://"+f.addresses[id]), WithServerAddr(f.addresses[id]), WithSeed(seed), WithConfigOptions(cfg),
+	s := New(NewOptions(WithAddr("tcp://"+f.addresses[id]), WithServerAddr(serverAddr), WithSeed(seed), WithConfigOptions(cfg),
 		WithDataDir(f.dirs[id]), WithSlotTransport(sg), WithChannelTransport(cg), WithDBWKDbShardNum(1), WithDBSlotShardNum(1),
 		WithDBWKDbMemTableSize(1<<20), WithDBSlotMemTableSize(1<<20)))
 	sg.base, cg.base, ng.base = newSlotTransport(s), newChannelTransport(s), newNodeTransport(s)
@@ -296,6 +304,35 @@ func TestExpansionRecoveryOverTCP(t *testing.T) {
 			f.start(victim, "", false, false)
 			f.waitStable([]uint64{1, 2, 3, 4}, 4)
 			f.send(victim, 2)
+			f.checkMessages([]uint64{1, 2, 3, 4})
+		})
+	}
+}
+
+func TestExpansionRecoveryBootstrapRejoinAdvertisedAddress(t *testing.T) {
+	for _, tc := range []struct{ name, addr string }{
+		{"init_nodes_only", ""},
+		{"legacy_wildcard", "0.0.0.0:11110"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newExpansionFixtureWithPong(t, 10, map[uint64]string{3: tc.addr})
+			f.stop(3)
+			f.waitOffline(3)
+			seed := f.live()
+			f.start(4, fmt.Sprintf("%d@%s", seed, f.addresses[seed]), false, false)
+			f.waitStable([]uint64{1, 2, 4}, 3)
+			f.checkMessages([]uint64{1, 2, 4})
+			for _, s := range f.servers {
+				require.Nil(t, s.cfgServer.Node(3), "C must be retired before its return")
+			}
+			// Reuse C's original disk and bootstrap-only advertised address.
+			// Its old membership probe must become a valid new join after retirement.
+			f.start(3, "", false, false)
+			f.waitStable([]uint64{1, 2, 3, 4}, 4)
+			for _, s := range f.servers {
+				require.Equal(t, f.addresses[3], s.cfgServer.Node(3).ClusterAddr)
+			}
+			f.send(3, 2)
 			f.checkMessages([]uint64{1, 2, 3, 4})
 		})
 	}

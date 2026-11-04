@@ -15,7 +15,7 @@ func (s *Server) joinLoop() {
 	seedNodeId, _, _ := seedNode(s.opts.Seed)
 	req := &ClusterJoinReq{
 		NodeId:     s.opts.ConfigOptions.NodeId,
-		ServerAddr: s.opts.ServerAddr,
+		ServerAddr: s.joinServerAddr(s.cfgServer.Snapshot()),
 		Role:       s.opts.Role,
 	}
 	for {
@@ -72,7 +72,7 @@ func (s *Server) membershipLoop() {
 			peer := peers[cursor%len(peers)]
 			cursor++
 			resp, err := s.rpcClient.RequestClusterJoin(peer, &ClusterJoinReq{
-				NodeId: s.opts.ConfigOptions.NodeId, ServerAddr: s.opts.ServerAddr, Role: s.opts.Role, Probe: true,
+				NodeId: s.opts.ConfigOptions.NodeId, ServerAddr: s.joinServerAddr(cfg), Role: s.opts.Role, Probe: true,
 			})
 			if err != nil {
 				continue
@@ -96,6 +96,25 @@ func (s *Server) membershipLoop() {
 			s.addOrUpdateNodes(nodes)
 		}
 	}
+}
+
+// Bootstrap deployments may advertise through InitNodes and leave ServerAddr
+// empty or set to an unused legacy bind address. Rejoining must use a dialable
+// self address, with the committed address preferred over the bootstrap fallback.
+func (s *Server) joinServerAddr(cfg *types.Config) string {
+	if types.ValidateJoinAddr(s.opts.ServerAddr) == nil {
+		return s.opts.ServerAddr
+	}
+	for _, node := range cfg.Nodes {
+		if node.Id == s.opts.ConfigOptions.NodeId && types.ValidateJoinAddr(node.ClusterAddr) == nil {
+			return node.ClusterAddr
+		}
+	}
+	if addr := s.opts.ConfigOptions.InitNodes[s.opts.ConfigOptions.NodeId]; types.ValidateJoinAddr(addr) == nil {
+		return addr
+	}
+	// Preserve the original validation error when no advertised source is usable.
+	return s.opts.ServerAddr
 }
 
 // A seeded learner can be retired before applying its first config log. Keep
