@@ -45,6 +45,11 @@ func (n *Node) sendSyncReq() {
 	if n.truncating || n.syncing { // 如果在截断中，则发起同步没用
 		return
 	}
+	// During alignment Index and LastLogTerm must describe the same durable
+	// tail, including while a multi-term batch is being persisted.
+	if !n.onlySync && n.queue.storedIndex != n.queue.lastLogIndex {
+		return
+	}
 	n.syncing = true
 	n.syncElapsed = 0
 	n.KeepAlive()
@@ -192,8 +197,11 @@ func (n *Node) sendSyncResp(to uint64, syncIndex uint64, logs []types.Log, reson
 }
 
 func (n *Node) sendTruncateReq(index uint64) {
+	n.truncateID++
 	n.events = append(n.events, types.Event{
 		Type:        types.TruncateReq,
+		Term:        n.cfg.Term,
+		TruncateID:  n.truncateID,
 		To:          types.LocalNode,
 		LastLogTerm: n.lastTermStartIndex.Term,
 		Index:       index,
