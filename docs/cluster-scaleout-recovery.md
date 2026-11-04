@@ -25,7 +25,11 @@ D 先完成加入、C 随后才被心跳判离线时，后台仍会按现有健�
 
 C 仍是成员时按正常重连恢复。C 已退出时，通过内部成员探测复用正常加入入口；成员列表为空时可用原 bootstrap 地址发现当前集群。加入响应中的已提交成员配置让旧进程先被动同步，避免旧任期和旧投票身份阻塞重新接入。已有成员的探测不修改成员、地址或角色，也不能抢在 bootstrap 初始化前创建成员配置。 新增 seed 节点若在应用首条配置日志前因超时被清退，探测仍回退原 seed 地址并通过正常加入重试。
 
-原 slot leader 在心跳超时前以空目录和 seed 重入时，即使存在未完成的迁移，也要保留该任务并完成恢复选举及 Joined 发布，避免迁移与启动恢复互相等待。没有继承 leader 的普通新节点仍等待旧迁移结束后再分配 slot，避免提前 Joined 而错失均衡。
+原 slot leader 在心跳超时前以空目录和 seed 重入时，即使存在未完成的迁移或另一个新节点正在 Joining，也要保留该任务并完成恢复选举及 Joined 发布，避免迁移与启动恢复互相等待。已经提交的配置 voter 通过现有 NodeJoining 命令获得本次恢复边界，不重新降为配置 learner，也不覆盖另一节点的成员迁移；应用该边界时恢复本地投票集合。若并发退役使恢复命令成为空操作，返回重试。
+
+已有 slot 副本的恢复优先于尚未分配的新节点。普通新节点等待旧迁移后再均衡；清理其他节点的失败任务不能算作自身分配完成。发布 Joined 前检查条件 slot 更新已经落地，被并发更新取代的计划留到下一轮重新计算，恢复选举的 Candidate 计划也适用此检查。
+
+bootstrap 节点重新加入时，地址依次取有效的显式 ServerAddr、已提交的自身 ClusterAddr、InitNodes 中的自身地址。因此原来依靠 InitNodes 启动、ServerAddr 为空或旧 wildcard 的节点可以使用原配置返回；所有候选均无效时仍由原地址校验拒绝，不把监听地址当作广播地址。
 
 已移除节点的 Raft 网络消息在处理任期前被拒绝。只有已提交的成员配置删除对应连接和队列；种子地址或加入响应中的局部节点列表不触发删除。重建 Server 时重新绑定实例自带的 transport，避免复用已停止实例的发送队列。
 
@@ -46,7 +50,7 @@ go test ./pkg/raft/... ./pkg/cluster/node/... ./pkg/cluster/slot ./pkg/cluster/c
 go test -race ./pkg/raft/raft ./pkg/raft/raftgroup ./pkg/cluster/slot -run '^(TestRestartedReplica.*|TestLeaderDoesNotCountUnmatchedSyncPosition|TestSyncErrorDoesNotValidateLocalPrefix|TestUncheckedSyncCannotPromoteLearner|TestPrefixAlignment.*|TestMixedTermCatchup.*|TestAsyncLogReadRetainsRequestTerm|TestSlotRestartRepairsConflictingChannelMetadata|TestSlotRejects.*)$' -count=3 -timeout=90s
 go test ./pkg/wkdb -run '^TestChannelConfigCloneDoesNotShareMembership$' -count=1
 go test -race ./pkg/raft/raft ./pkg/raft/raftgroup ./pkg/raft/types ./pkg/cluster/slot -run '^Test(SlotMultiTermPrefixRecovery|SlotOldTermTruncate.*|OldTruncate.*|Truncate.*|StandaloneTruncate.*|PendingTruncate.*|DelayedTruncate.*|Prefix.*|EmptyLeader.*|LeaderHandoff.*|LogPrefix.*)$' -count=3 -timeout=3m
-go test ./pkg/cluster/cluster -run '^Test(SeededEmptyLeaderRejoinDuringSlotMigrationOverTCP|SingleReplicaExpansionPreservesDataOverTCP)$' -count=1 -timeout=90s
+go test ./pkg/cluster/cluster -run '^Test(SeededEmptyLeaderRejoin(DuringSlotMigrationOverTCP|WhileNextNodeJoiningOverTCP)|JoiningNodeReceivesSlotsAfterDeadLearnerCleanupOverTCP|ExpansionRecoveryBootstrapRejoinAdvertisedAddress|SingleReplicaExpansionPreservesDataOverTCP)$' -count=1 -timeout=180s
 go test -race ./pkg/raft/raftgroup ./pkg/cluster/slot -run '^(TestRetired.*|TestStorageDrain.*|TestConfigurationCallback.*|TestSlotRecreation.*|TestSlotStop.*)$' -count=5 -timeout=90s
 go test ./pkg/cluster/cluster -run '^(TestChannelRetirement.*|TestSlotRetirement.*|TestChannelRecoveredSource.*|TestChannelFollowerMigration.*|TestExpansionRecovery.*|TestCommittedRemoval.*|TestClusterJoinResponse.*|TestMembershipProbe.*|TestChannelExpansion.*|TestSlotTransition.*|TestChannelReplicationAfterLeaderConfigChange|TestConfigOrphanMigration.*|TestSeededEmptyDiskRejoinCompletesRecoveryOverTCP)$' -count=1 -timeout=12m
 ```
@@ -59,7 +63,7 @@ slot 生命周期回归暂停真实 Pebble 写入，经过正式配置入口移�
 
 日志分歧回归构造返回节点在同一序号保存不同的未提交频道配置，先送达新 leader 心跳，再放开前缀校验和同步。验证旧配置不会先被应用，分歧尾部能修复，随后写入能提交，停机重新打开物理数据库后 leader、任期和配置版本一致。另覆盖 follower/learner、未确认同步不能晋升、同步错误、跨任期历史分批落盘、异步读取任期和 Apply 读取后的尾部替换。
 
-多任期回归为每条日志写入不同频道，避免后续正确写入掩盖错误应用；比较完整保留日志与关闭重开后的物理元数据。延迟真实 Pebble 截断直到 leader 换届，验证旧回调不能推进提交且同步可以继续；另覆盖存储错误重试、迟到重复响应、空前缀和空 leader。迁移中空盘重入用例在 learner 仍暂停时验证重入、选举及写入，再释放迁移并接入下一节点；单副本扩容核对迁移前后的持久化数据。
+多任期回归为每条日志写入不同频道，避免后续正确写入掩盖错误应用；比较完整保留日志与关闭重开后的物理元数据。延迟真实 Pebble 截断直到 leader 换届，验证旧回调不能推进提交且同步可以继续；另覆盖存储错误重试、迟到重复响应、空前缀和空 leader。迁移中空盘重入用例在 learner 仍暂停时验证重入、选举及写入，也覆盖下一节点已经 Joining 的组合；learner 崩溃清理后检查新节点真正获得 slot 及历史数据。确定性配置 Raft 交错用例覆盖恢复命令前抢先退役、分配或恢复选举计划被条件更新跳过，验证不会提前确认成功。单副本扩容核对迁移前后的持久化数据。
 
 新增选举回归以真实 TCP 和独立 Pebble 构造只有 A 与指定后继副本持有最新日志的四副本中间态，分别强制 C、D 当选，另覆盖选举后迁移标记丢失。频道与 slot 均验证收敛到三个健康副本，再关闭另一个节点并提交后续写入、核对数据。
 
