@@ -75,6 +75,67 @@ func TestHandleNodeJoiningReelectsInheritedSlotLeaders(t *testing.T) {
 	}
 }
 
+func TestHandleNodeJoiningRecoversDuringPendingMigration(t *testing.T) {
+	for _, pending := range []string{"learner", "leader-transfer", "election"} {
+		t.Run(pending, func(t *testing.T) {
+			cfg := joiningTestConfig(true)
+			cfg.Nodes[2].Status = types.NodeStatus_NodeStatusJoined
+			cfg.Slots[0].Leader = 1002
+			st := cfg.Slots[0]
+			switch pending {
+			case "learner":
+				cfg.Nodes = append(cfg.Nodes, &types.Node{Id: 1004, Online: true, Status: types.NodeStatus_NodeStatusJoined})
+				st.Learners, st.MigrateFrom, st.MigrateTo = []uint64{1004}, 1003, 1004
+			case "leader-transfer":
+				st.MigrateFrom, st.MigrateTo = 1002, 1003
+			case "election":
+				st.Status = types.SlotStatus_SlotStatusCandidate
+			}
+			s := newJoiningTestServer(t, cfg)
+			require.NoError(t, s.handleNodeJoining())
+			require.Equal(t, types.NodeStatus_NodeStatusJoined, s.cfgServer.Node(1002).Status)
+			got := s.cfgServer.Slot(0)
+			require.Equal(t, types.SlotStatus_SlotStatusCandidate, got.Status)
+			require.Equal(t, uint64(1002), got.ExpectLeader)
+			require.Equal(t, st.Learners, got.Learners, "recovery must retain the persisted migration")
+			require.Equal(t, st.MigrateFrom, got.MigrateFrom)
+			require.Equal(t, st.MigrateTo, got.MigrateTo)
+			for _, slot := range s.cfgServer.Slots()[1:] {
+				require.True(t, slot.Equal(cfg.Slots[slot.Id]), "do not schedule ordinary balancing while a task is pending")
+			}
+		})
+	}
+}
+
+func TestNewNodeWaitsForPendingBalanceBeforeJoined(t *testing.T) {
+	cfg := joiningTestConfig(true)
+	for _, node := range cfg.Nodes {
+		node.Status = types.NodeStatus_NodeStatusJoined
+	}
+	cfg.Nodes = append(cfg.Nodes,
+		&types.Node{Id: 1004, Online: true, AllowVote: true, Status: types.NodeStatus_NodeStatusJoining},
+		&types.Node{Id: 1005, Online: true, Status: types.NodeStatus_NodeStatusJoined})
+	cfg.Slots[0].Learners = []uint64{1005}
+	cfg.Slots[0].MigrateFrom, cfg.Slots[0].MigrateTo = 1003, 1005
+	s := newJoiningTestServer(t, cfg)
+	require.NoError(t, s.handleNodeJoining())
+	require.Equal(t, types.NodeStatus_NodeStatusJoining, s.cfgServer.Node(1004).Status,
+		"a new node must retain its pending balance instead of completing with no slots")
+	completed := cfg.Slots[0].Clone()
+	completed.Replicas = []uint64{1001, 1002, 1005}
+	completed.Learners, completed.MigrateFrom, completed.MigrateTo = nil, 0, 0
+	require.NoError(t, s.cfgServer.ProposeSlots([]*types.Slot{completed}))
+	require.NoError(t, s.handleNodeJoining())
+	require.Equal(t, types.NodeStatus_NodeStatusJoined, s.cfgServer.Node(1004).Status)
+	assigned := 0
+	for _, slot := range s.cfgServer.Slots() {
+		if slot.MigrateTo == 1004 {
+			assigned++
+		}
+	}
+	require.Positive(t, assigned, "balancing must resume after the previous task completes")
+}
+
 func joiningTestConfig(full bool) *types.Config {
 	cfg := &types.Config{SlotCount: 64, SlotReplicaCount: 3, ChannelReplicaCount: 3}
 	for _, id := range []uint64{1001, 1002, 1003} {

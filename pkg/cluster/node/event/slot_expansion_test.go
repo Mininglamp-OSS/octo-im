@@ -100,6 +100,28 @@ func TestHealthySlotExpansionBalancesThreeToFour(t *testing.T) {
 	}
 }
 
+func TestHealthySingleReplicaSlotExpansion(t *testing.T) {
+	cfg := expansionTestConfig()
+	cfg.SlotReplicaCount = 1
+	cfg.Nodes = cfg.Nodes[:2]
+	cfg.Nodes[1].Status = types.NodeStatus_NodeStatusJoining
+	for _, slot := range cfg.Slots {
+		slot.Replicas = []uint64{1}
+	}
+	before := cfg.Clone()
+	require.Empty(t, planSlotExpansion(cfg))
+	planned := balanceJoiningSlots(cfg, 2)
+	require.Len(t, planned, 32)
+	for _, slot := range planned {
+		require.Equal(t, uint64(1), slot.Leader, "the sole leader must serve until the learner catches up")
+		require.Equal(t, []uint64{1}, slot.Replicas)
+		require.Equal(t, []uint64{2}, slot.Learners)
+		require.Equal(t, uint64(1), slot.MigrateFrom)
+		require.Equal(t, uint64(2), slot.MigrateTo)
+	}
+	require.True(t, proto.Equal(before, cfg))
+}
+
 func TestSlotExpansionCancelsFailedPromotedDestination(t *testing.T) {
 	cfg := expansionTestConfig()
 	cfg.Nodes[2].Online = true

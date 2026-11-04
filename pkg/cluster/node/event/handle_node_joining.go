@@ -27,13 +27,19 @@ func (s *Server) handleNodeJoining() error {
 	// Use the same planner after a restart or an interrupted migration. Its
 	// durable journal is the slot assignment, not an in-memory join callback.
 	planned := planSlotExpansion(cfg)
+	pending := false
 	if joining != nil && len(planned) == 0 {
 		for _, slot := range cfg.Slots {
 			if len(slot.Learners) != 0 || slot.MigrateFrom != 0 || slot.MigrateTo != 0 || slot.Status != types.SlotStatus_SlotStatusNormal {
-				return nil // finish the existing migration before ordinary balance
+				pending = true
+				break
 			}
 		}
-		planned = balanceJoiningSlots(cfg, joining.Id)
+		// Defer ordinary balancing, but allow recovery elections and admission:
+		// an existing migration may itself need this joining leader to recover.
+		if !pending {
+			planned = balanceJoiningSlots(cfg, joining.Id)
+		}
 	}
 	if joining != nil {
 		// An explicitly rejoined ID may have lost its slot logs. Preserve the
@@ -56,6 +62,9 @@ func (s *Server) handleNodeJoining() error {
 			updated.Status = types.SlotStatus_SlotStatusCandidate
 			updated.ExpectLeader = slot.Leader
 		}
+	}
+	if pending && len(planned) == 0 {
+		return nil // a new node still needs ordinary balancing before Joined
 	}
 	if len(planned) > 0 {
 		before := make([]*types.Slot, 0, len(planned))
@@ -212,6 +221,11 @@ func balanceJoiningSlots(cfg *types.Config, joining uint64) []*types.Slot {
 			if from == 0 || counts[id] > counts[from] {
 				from = id
 			}
+		}
+		// A single-replica slot has no follower to move. Reuse the existing
+		// learner-to-leader handoff, which waits for durable catch-up.
+		if from == 0 && len(slot.Replicas) == 1 && counts[slot.Leader] > target {
+			from = slot.Leader
 		}
 		if from == 0 {
 			continue
