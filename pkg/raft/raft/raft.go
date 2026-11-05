@@ -454,81 +454,49 @@ func (r *Raft) advance() {
 }
 
 func (r *Raft) handleRoleChangeReq(e types.Event) {
-
-	err := r.pool.Submit(func() {
-
-		var (
-			newCfg        types.Config
-			err           error
-			respEventType types.EventType
-		)
-		switch e.Type {
-		case types.LearnerToLeaderReq,
-			types.LearnerToFollowerReq:
-			newCfg, err = r.learnTo(e.From)
-			if err != nil {
-				r.Error("learn switch failed", zap.Error(err), zap.String("type", e.Type.String()), zap.String("cfg", r.node.Config().String()))
-			}
-			if e.Type == types.LearnerToFollowerReq {
-				respEventType = types.LearnerToFollowerResp
-			} else if e.Type == types.LearnerToLeaderReq {
-				respEventType = types.LearnerToLeaderResp
-			}
-		case types.FollowerToLeaderReq:
-			newCfg, err = r.followerToLeader(e.From)
-			if err != nil {
-				r.Error("follower switch to leader failed", zap.Error(err), zap.String("cfg", r.node.Config().String()))
-			}
-			respEventType = types.FollowerToLeaderResp
-		default:
-			err = errors.New("unknown role switch")
+	// Freeze mutable membership on the owner before dispatching storage work.
+	current := r.node.Config()
+	if !r.node.IsLeader() || e.Term != 0 && (e.Term != current.Term || e.ConfigVersion != current.Version) {
+		return
+	}
+	var (
+		newCfg       types.Config
+		err          error
+		responseType types.EventType
+	)
+	switch e.Type {
+	case types.LearnerToLeaderReq, types.LearnerToFollowerReq:
+		newCfg, err = r.learnTo(e.From)
+		responseType = types.LearnerToFollowerResp
+		if e.Type == types.LearnerToLeaderReq {
+			responseType = types.LearnerToLeaderResp
 		}
-
-		if err != nil {
-
-			r.stepC <- stepReq{event: types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
-			}}
-			return
-		}
-
-		err = r.opts.Storage.SaveConfig(newCfg)
-		if err != nil {
+	case types.FollowerToLeaderReq:
+		newCfg, err = r.followerToLeader(e.From)
+		responseType = types.FollowerToLeaderResp
+	default:
+		err = errors.New("unknown role switch")
+	}
+	respond := func(reason types.Reason, cfg types.Config) {
+		r.stepC <- stepReq{event: types.Event{Type: responseType, From: e.From, Term: e.Term,
+			ConfigVersion: e.ConfigVersion, RoleChangeID: e.RoleChangeID, Reason: reason, Config: cfg}}
+	}
+	if err != nil {
+		r.Error("prepare role change failed", zap.Error(err))
+		respond(types.ReasonError, types.Config{})
+		return
+	}
+	err = r.pool.Submit(func() {
+		if err := r.opts.Storage.SaveConfig(newCfg); err != nil {
 			r.Error("change role failed", zap.Error(err))
-			r.stepC <- stepReq{event: types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
-			}}
+			respond(types.ReasonError, types.Config{})
 			return
 		}
-		r.stepC <- stepReq{event: types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonOk,
-			Config: newCfg,
-		}}
+		respond(types.ReasonOk, newCfg)
 	})
 	if err != nil {
 		r.Error("submit role change req failed", zap.Error(err))
-
-		var respEventType types.EventType
-
-		switch e.Type {
-		case types.LearnerToLeaderReq:
-			respEventType = types.LearnerToLeaderResp
-		case types.LearnerToFollowerReq:
-			respEventType = types.LearnerToFollowerResp
-		case types.FollowerToLeaderReq:
-			respEventType = types.FollowerToLeaderResp
-		}
-		r.stepC <- stepReq{event: types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonError,
-		}}
+		respond(types.ReasonError, types.Config{})
 	}
 }
 

@@ -49,6 +49,8 @@ type Node struct {
 	truncateID    uint64
 	truncateRetry *types.Event
 	stopPropose   bool // 停止提案
+	handoff       *leaderHandoff
+	roleChangeID  uint64 // monotonic across role changes and retries
 
 	suspend bool // 挂起
 

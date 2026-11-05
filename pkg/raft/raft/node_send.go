@@ -210,11 +210,7 @@ func (n *Node) sendTruncateReq(index uint64) {
 }
 
 func (n *Node) sendLearnerToLeaderReq(from uint64) {
-
-	n.events = append(n.events, types.Event{
-		Type: types.LearnerToLeaderReq,
-		From: from,
-	})
+	n.sendLeaderHandoffReq(types.LearnerToLeaderReq, from)
 }
 
 func (n *Node) sendLearnerToFollowerReq(from uint64) {
@@ -225,10 +221,7 @@ func (n *Node) sendLearnerToFollowerReq(from uint64) {
 }
 
 func (n *Node) sendFollowToLeaderReq(from uint64) {
-	n.events = append(n.events, types.Event{
-		Type: types.FollowerToLeaderReq,
-		From: from,
-	})
+	n.sendLeaderHandoffReq(types.FollowerToLeaderReq, from)
 }
 
 func (n *Node) sendConfigReq() {

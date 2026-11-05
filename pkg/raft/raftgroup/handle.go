@@ -221,6 +221,10 @@ func (rg *RaftGroup) getTrunctLogIndex(key string, stored uint64, e types.Event)
 
 func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 	// Snapshot mutable membership on the owner, before asynchronous SaveConfig.
+	current := r.Config()
+	if !r.IsLeader() || e.Term != 0 && (e.Term != current.Term || e.ConfigVersion != current.Version) {
+		return
+	}
 	var (
 		newCfg        types.Config
 		err           error
@@ -239,9 +243,13 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 	default:
 		err = errors.New("unknown role switch")
 	}
+	respond := func(reason types.Reason, cfg types.Config) {
+		rg.AddEventFor(r, types.Event{Type: respEventType, From: e.From, Term: e.Term,
+			ConfigVersion: e.ConfigVersion, RoleChangeID: e.RoleChangeID, Reason: reason, Config: cfg})
+	}
 	if err != nil {
 		rg.Error("prepare role change failed", zap.Error(err), zap.String("key", r.Key()))
-		rg.AddEventFor(r, types.Event{Type: respEventType, From: e.From, Reason: types.ReasonError})
+		respond(types.ReasonError, types.Config{})
 		return
 	}
 	err = rg.submitWork(r, false, func() {
@@ -250,14 +258,14 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 			if err != types.ErrNotLeader {
 				rg.Error("change role failed", zap.Error(err), zap.String("key", r.Key()), zap.String("cfg", newCfg.String()))
 			}
-			rg.AddEventFor(r, types.Event{Type: respEventType, From: e.From, Reason: types.ReasonError})
+			respond(types.ReasonError, types.Config{})
 			return
 		}
-		rg.AddEventFor(r, types.Event{Type: respEventType, From: e.From, Reason: types.ReasonOk, Config: newCfg})
+		respond(types.ReasonOk, newCfg)
 	})
 	if err != nil {
 		rg.Error("submit role change req failed", zap.Error(err))
-		rg.AddEventFor(r, types.Event{Type: respEventType, From: e.From, Reason: types.ReasonError})
+		respond(types.ReasonError, types.Config{})
 	}
 }
 

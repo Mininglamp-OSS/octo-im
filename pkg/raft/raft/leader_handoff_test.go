@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestLeaderHandoffFencesWritesUntilFailedSaveReturns(t *testing.T) {
+func TestLeaderHandoffFencesWritesUntilAuthoritativeCancellation(t *testing.T) {
 	for _, learner := range []bool{true, false} {
 		t.Run(map[bool]string{true: "learner", false: "follower"}[learner], func(t *testing.T) {
 			replicas := []uint64{1, 2, 3}
@@ -29,7 +29,7 @@ func TestLeaderHandoffFencesWritesUntilFailedSaveReturns(t *testing.T) {
 			// D has the complete durable tail. Hold the asynchronous SaveConfig
 			// completion while a new proposal arrives at the current leader.
 			require.NoError(t, n.Step(types.Event{Type: types.SyncReq, From: 2, Term: 2, Index: 9, StoredIndex: 9, Reason: types.ReasonOnlySync, ConfigVersion: 1}))
-			_, ok := findEvent(collectEvents(n), requestType)
+			handoff, ok := findEvent(collectEvents(n), requestType)
 			require.True(t, ok)
 			commitStored := func(index uint64) {
 				require.NoError(t, n.Step(types.Event{Type: types.StoreResp, Index: index, Reason: types.ReasonOk}))
@@ -49,9 +49,16 @@ func TestLeaderHandoffFencesWritesUntilFailedSaveReturns(t *testing.T) {
 			require.ErrorIs(t, err, types.ErrProposalDropped)
 			require.Zero(t, countEvents(events, types.StoreReq))
 			require.Equal(t, uint64(8), n.LastLogIndex())
-			// A failed save has not moved leadership; the old leader must become
-			// writable again and commit the retried request normally.
-			require.NoError(t, n.Step(types.Event{Type: responseType, From: 2, Reason: types.ReasonError}))
+			// SaveConfig may have committed before returning an error. Its
+			// callback cannot reopen writes before the owner sees the outcome.
+			handoff.Type, handoff.Reason = responseType, types.ReasonError
+			require.NoError(t, n.Step(handoff))
+			require.ErrorIs(t, n.Step(proposal), types.ErrProposalDropped)
+			require.Zero(t, countEvents(collectEvents(n), types.StoreReq))
+			cancelled := n.Config().Clone()
+			cancelled.Version++
+			cancelled.Learners, cancelled.MigrateFrom, cancelled.MigrateTo = nil, 0, 0
+			require.NoError(t, n.Step(types.Event{Type: types.ConfChange, Config: cancelled}))
 			require.Equal(t, uint64(1), n.LeaderId())
 			require.NoError(t, n.Step(proposal))
 			stored, ok := findEvent(collectEvents(n), types.StoreReq)

@@ -12,6 +12,11 @@ func (n *Node) Step(e types.Event) error {
 	if e.Type == types.TruncateResp {
 		return n.handleTruncateResp(e)
 	}
+	// Instance-bound local completions retain their request identity even
+	// after the peer is removed. Validate it before the network member filter.
+	if (e.RoleChangeID != 0 || n.handoff != nil) && (e.Type == types.LearnerToLeaderResp || e.Type == types.FollowerToLeaderResp) {
+		return n.handleLeaderHandoffResp(e)
+	}
 	// Removed peers may return with a stale leader role and a higher term.
 	// Reject their network traffic before it can change terms, sync progress,
 	// or leadership. Re-admission is a committed application membership change.
@@ -222,7 +227,11 @@ func (n *Node) stepLeader(e types.Event) error {
 		types.LearnerToLeaderResp,
 		types.FollowerToLeaderResp:
 
-		n.stopPropose = false
+		if n.handoff == nil {
+			n.stopPropose = false
+		} else if e.From == n.handoff.to {
+			return nil // an unidentified/old role response cannot finish this handoff
+		}
 		// Applying the role config may already have cleared replicaSync. Wake
 		// remaining learners before the nil check so suspended peers can resume
 		// SyncReq-driven promotion, even when they are no longer migrateTo.
@@ -735,12 +744,12 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 		// 如果迁移的源节点是领导者，那么学习者必须完全追上领导者的日志
 		if n.cfg.MigrateFrom == n.cfg.Leader { // 学习者转领导者
 			if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
-				n.stopPropose = true          // Freeze this tail until asynchronous handoff finishes.
+				n.pauseLeaderHandoff()
 				syncInfo.roleSwitching = true // 学习者转让中
 				// 发送学习者转为领导者
 				n.sendLearnerToLeaderReq(e.From)
 			} else if e.Index+n.opts.LearnerToLeaderMinLogGap > n.queue.lastLogIndex { // 如果日志差距达到预期，则当前领导停止接受任何提案，等待学习者日志完全追赶上
-				n.stopPropose = true // 停止提案
+				n.pauseLeaderHandoff()
 			}
 
 		} else { // 学习者转追随者
@@ -760,12 +769,12 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 		}
 	} else if n.cfg.MigrateFrom == n.cfg.Leader && n.cfg.MigrateTo == e.From { // // 追随者转为领导者
 		if e.Index >= n.queue.lastLogIndex+1 && e.StoredIndex >= n.queue.lastLogIndex+1 {
-			n.stopPropose = true // Freeze this tail until asynchronous handoff finishes.
+			n.pauseLeaderHandoff()
 			syncInfo.roleSwitching = true
 			// 发送追随者转为领导者
 			n.sendFollowToLeaderReq(e.From)
 		} else if e.Index+n.opts.FollowerToLeaderMinLogGap > n.queue.lastLogIndex { // 如果日志差距达到预期，则当前领导停止接受任何提案，等待学习者日志完全追赶上
-			n.stopPropose = true // 停止提案
+			n.pauseLeaderHandoff()
 		}
 	}
 }
