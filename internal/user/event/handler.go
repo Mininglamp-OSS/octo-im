@@ -130,10 +130,9 @@ func (u *userHandler) advanceEvents(events []*eventbus.Event) {
 }
 
 func (u *userHandler) tick() {
-	conns := u.conns.allConns()
 	u.tickCount++
 	if u.tickCount%10 == 0 {
-		u.checkInvalidConn(conns)
+		u.checkInvalidConn(u.conns.allConns())
 	}
 }
 
