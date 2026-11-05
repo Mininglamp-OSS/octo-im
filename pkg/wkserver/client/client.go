@@ -101,6 +101,7 @@ func (c *Client) Start() error {
 func (c *Client) Stop() {
 	c.Foucs("client stop...")
 	c.cancel()
+	c.conn().close(nil)
 	err := c.cli.Stop()
 	if err != nil {
 		c.Error("client stop failed", zap.Error(err))
@@ -259,9 +260,6 @@ func (c *Client) handler(p string) Handler {
 }
 
 func (c *Client) handleData(data []byte, msgType proto.MsgType, remoteAddr string) {
-
-	c.conn().idleTick = 0
-	c.conn().timeoutTick = 0
 
 	if c.opts.LogDetailOn {
 		c.Info("handleData....", zap.Uint8("msgType", msgType.Uint8()), zap.Int("data", len(data)), zap.String("remoteAddr", remoteAddr))

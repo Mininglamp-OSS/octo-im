@@ -1,19 +1,27 @@
 package wkserver_test
 
 import (
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/client"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
-	"net"
-	"sync/atomic"
-	"testing"
-	"time"
 )
+
+var recoveryLoggerOnce sync.Once
+
+func configureRecoveryLogger() {
+	recoveryLoggerOnce.Do(func() { wklog.Configure(wklog.NewOptions()) })
+}
 
 func TestStartupDialRecovery(t *testing.T) {
 	// Initialize the process logger before concurrent networking callbacks.
-	wklog.Configure(wklog.NewOptions())
+	configureRecoveryLogger()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

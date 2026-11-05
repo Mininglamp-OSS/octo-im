@@ -22,8 +22,7 @@ func TestDialHasDeadlineAndRetries(t *testing.T) {
 		return nil, errors.New("unreachable")
 	}
 	for i := 0; i < 2; i++ {
-		c.conn().status.Store(connecting)
-		c.conn().startDial()
+		c.conn().startDial(c.conn().prepareDial())
 		if c.conn().status.Load() != disconnect {
 			t.Fatal("failed dial prevents retry")
 		}
@@ -43,7 +42,8 @@ func TestStopCancelsBlockedDial(t *testing.T) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	go func() { c.conn().startDial(); close(done) }()
+	a := c.conn().prepareDial()
+	go func() { c.conn().startDial(a); close(done) }()
 	<-entered
 	c.cancel()
 	select {
