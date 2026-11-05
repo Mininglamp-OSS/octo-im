@@ -298,6 +298,12 @@ func (c *conversationUpdater) push(channelId string, channelType uint8, tagKey s
 
 	tag := service.TagManager.Get(tagKey)
 	if tag == nil {
+		// 订阅者变更会给频道的tag换新key，变更前开始的投递拿的还是旧key，这里改用频道当前的tag
+		if channelTagKey := service.TagManager.GetChannelTag(channelId, channelType); channelTagKey != "" && channelTagKey != tagKey {
+			tag = service.TagManager.Get(channelTagKey)
+		}
+	}
+	if tag == nil {
 		c.Warn("tag not found, conversation not updated", zap.String("tagKey", tagKey), zap.String("channelId", channelId))
 		return
 	}
