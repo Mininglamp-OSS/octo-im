@@ -208,7 +208,13 @@ func (r *rpcClient) RequestClusterJoin(nodeId uint64, req *ClusterJoinReq) (*Clu
 	if err != nil {
 		return nil, err
 	}
-	body, err := r.request(nodeId, "/rpc/cluster/join", data)
+	path := "/rpc/cluster/join"
+	if req.Probe {
+		// Older peers reject this path instead of interpreting a periodic
+		// membership check as a fresh rejoin during a rolling upgrade.
+		path = "/rpc/cluster/join/probe/v1"
+	}
+	body, err := r.request(nodeId, path, data)
 	if err != nil {
 		return nil, err
 	}

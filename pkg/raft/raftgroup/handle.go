@@ -12,7 +12,7 @@ import (
 // 处理存储请求
 func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 
-	err := rg.goPool.Submit(func() {
+	err := rg.submitWork(r, true, func() {
 		err := rg.opts.Storage.AppendLogs(r.Key(), e.Logs, e.TermStartIndexInfo)
 		if err != nil {
 			rg.Panic("append logs failed", zap.Error(err))
@@ -22,7 +22,7 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 			reason = types.ReasonError
 		}
 
-		rg.AddEvent(r.Key(), types.Event{
+		rg.AddEventFor(r, types.Event{
 			Type:   types.StoreResp,
 			Index:  e.Logs[len(e.Logs)-1].Index,
 			Logs:   e.Logs,
@@ -32,7 +32,7 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 	})
 	if err != nil {
 		rg.Error("submit append logs failed", zap.Error(err))
-		rg.AddEvent(r.Key(), types.Event{
+		rg.AddEventFor(r, types.Event{
 			Type:   types.StoreResp,
 			Reason: types.ReasonError,
 		})
@@ -41,41 +41,21 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
-	// Capture mutable Raft state on its owner before launching storage work.
-	lastIndex := r.LastLogIndex()
-	err := rg.goPool.Submit(func() {
-		// 获取裁断日志下标
-		var (
-			trunctIndex uint64
-		)
+	err := rg.submitWork(r, true, func() {
 		if e.Reason != types.ReasonOnlySync {
-			var treason types.Reason
-			trunctIndex, treason = rg.getTrunctLogIndex(r.Key(), lastIndex, e)
-			if treason != types.ReasonOk {
-				rg.AddEvent(r.Key(), types.Event{
-					To:     e.From,
-					Type:   types.GetLogsResp,
-					Reason: treason,
-				})
+			index, reason := rg.getTrunctLogIndex(r.Key(), e.StoredIndex, e)
+			if reason != types.ReasonOk {
+				rg.AddEventFor(r, types.Event{To: e.From, Type: types.GetLogsResp,
+					Term: e.Term, Index: index, Reason: reason})
 				return
 			}
 		}
-		// 需要裁剪
-		if trunctIndex > 0 {
-			rg.AddEvent(r.Key(), types.Event{
-				To:     e.From,
-				Type:   types.GetLogsResp,
-				Index:  trunctIndex,
-				Reason: types.ReasonTruncate,
-			})
-			rg.Advance()
-			return
-		}
 		if e.Reason != types.ReasonOnlySync && e.Index > e.StoredIndex {
 			rg.Debug("index is greater than stored index", zap.String("key", r.Key()), zap.Uint64("index", e.Index), zap.Uint64("storedIndex", e.StoredIndex))
-			rg.AddEvent(r.Key(), types.Event{
+			rg.AddEventFor(r, types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonOk,
 			})
@@ -86,9 +66,10 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		logs, err := rg.opts.Storage.GetLogs(r.Key(), e.Index, e.StoredIndex+1, rg.opts.MaxLogSizePerBatch)
 		if err != nil {
 			rg.Error("get logs failed", zap.Error(err))
-			rg.AddEvent(r.Key(), types.Event{
+			rg.AddEventFor(r, types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonError,
 			})
@@ -97,9 +78,10 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		if len(logs) == 0 {
 			rg.Warn("logs is empty", zap.String("key", r.Key()), zap.Uint64("index", e.Index), zap.Uint64("storedIndex", e.StoredIndex))
 		}
-		rg.AddEvent(r.Key(), types.Event{
+		rg.AddEventFor(r, types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Logs:   logs,
 			Reason: types.ReasonOk,
@@ -108,58 +90,71 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 	})
 	if err != nil {
 		rg.Error("submit get logs failed", zap.Error(err))
-		rg.AddEvent(r.Key(), types.Event{
+		rg.AddEventFor(r, types.Event{
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Reason: types.ReasonError,
 		})
 	}
 }
 
 func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
-	err := rg.goPool.Submit(func() {
+	err := rg.submitWork(r, true, func() {
 		err := rg.opts.Storage.TruncateLogTo(r.Key(), e.Index)
 		if err != nil {
 			rg.Error("truncate logs failed", zap.Error(err))
-			rg.AddEvent(r.Key(), types.Event{
-				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
+			rg.AddEventFor(r, types.Event{
+				Type:       types.TruncateResp,
+				Term:       e.Term,
+				TruncateID: e.TruncateID,
+				Index:      e.Index,
+				Reason:     types.ReasonError,
 			})
 			return
 		}
-		// 删除本地的leader term start index
-		err = rg.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(r.Key(), e.LastLogTerm)
+		info, err := types.RetainedTermStart(e.Index,
+			func(start, end, size uint64) ([]types.Log, error) {
+				return rg.opts.Storage.GetLogs(r.Key(), start, end, size)
+			},
+			func(term uint32) (uint64, error) { return rg.opts.Storage.GetTermStartIndex(r.Key(), term) })
+		if err == nil {
+			err = rg.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(r.Key(), info.Term)
+		}
 		if err != nil {
-			rg.Error("delete leader term start index failed", zap.Error(err), zap.Uint32("LastLogTerm", e.LastLogTerm))
-			rg.AddEvent(r.Key(), types.Event{
-				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
-			})
+			rg.Error("restore retained log term failed", zap.Error(err))
+			rg.AddEventFor(r, types.Event{Type: types.TruncateResp, Term: e.Term, TruncateID: e.TruncateID, Index: e.Index, Reason: types.ReasonError})
 			return
 		}
-		rg.AddEvent(r.Key(), types.Event{
-			Type:   types.TruncateResp,
-			Index:  e.Index,
-			Reason: types.ReasonOk,
+		rg.AddEventFor(r, types.Event{
+			Type:               types.TruncateResp,
+			Term:               e.Term,
+			TruncateID:         e.TruncateID,
+			Index:              e.Index,
+			TermStartIndexInfo: info,
+			Reason:             types.ReasonOk,
 		})
 	})
 	if err != nil {
 		rg.Error("submit truncate req failed", zap.Error(err))
-		rg.AddEvent(r.Key(), types.Event{
-			Type:   types.TruncateResp,
-			Reason: types.ReasonError,
+		rg.AddEventFor(r, types.Event{
+			Type:       types.TruncateResp,
+			Term:       e.Term,
+			TruncateID: e.TruncateID,
+			Index:      e.Index,
+			Reason:     types.ReasonError,
 		})
 	}
 }
 
 func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
-	err := rg.goPool.Submit(func() {
+	err := rg.submitWork(r, true, func() {
 		// 已提交
 		// rg.wait.didCommit(r.Key(), e.EndIndex-1)
 		var lastLogIndex uint64
 		if storage, ok := rg.opts.Storage.(CommittedRangeApplier); ok && !rg.opts.NotNeedApplied {
 			if err := storage.ApplyCommittedRange(r.Key(), e.StartIndex, e.EndIndex); err != nil {
 				rg.Error("apply committed range failed", zap.Error(err))
-				rg.AddEvent(r.Key(), types.Event{Type: types.ApplyResp, Reason: types.ReasonError})
+				rg.AddEventFor(r, types.Event{Type: types.ApplyResp, Reason: types.ReasonError})
 				return
 			}
 			lastLogIndex = e.EndIndex - 1
@@ -167,7 +162,7 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			logs, err := rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, min(e.EndIndex, e.StartIndex+1000), rg.opts.MaxLogSizePerBatch)
 			if err != nil {
 				rg.Error("get logs failed", zap.Error(err))
-				rg.AddEvent(r.Key(), types.Event{
+				rg.AddEventFor(r, types.Event{
 					Type:   types.ApplyResp,
 					Reason: types.ReasonError,
 				})
@@ -175,7 +170,7 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			}
 			if len(logs) == 0 {
 				rg.Error("logs is empty", zap.String("key", r.Key()), zap.Uint64("startIndex", e.StartIndex), zap.Uint64("endIndex", e.EndIndex))
-				rg.AddEvent(r.Key(), types.Event{
+				rg.AddEventFor(r, types.Event{
 					Type:   types.ApplyResp,
 					Reason: types.ReasonError,
 				})
@@ -184,7 +179,7 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			err = rg.opts.Storage.Apply(r.Key(), logs)
 			if err != nil {
 				rg.Error("apply logs failed", zap.Error(err))
-				rg.AddEvent(r.Key(), types.Event{
+				rg.AddEventFor(r, types.Event{
 					Type:   types.ApplyResp,
 					Reason: types.ReasonError,
 				})
@@ -195,166 +190,93 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			lastLogIndex = e.EndIndex - 1
 		}
 
-		rg.AddEvent(r.Key(), types.Event{
+		rg.AddEventFor(r, types.Event{
 			Type:   types.ApplyResp,
 			Reason: types.ReasonOk,
 			Index:  lastLogIndex,
 		})
-		// 已应用
-		rg.wait.didApply(r.Key(), lastLogIndex)
 		rg.Advance()
 	})
 	if err != nil {
 		rg.Error("submit apply req failed", zap.Error(err))
-		rg.AddEvent(r.Key(), types.Event{
+		rg.AddEventFor(r, types.Event{
 			Type:   types.ApplyResp,
 			Reason: types.ReasonError,
 		})
 	}
 }
 
-// 根据副本的同步数据，来获取副本的需要裁剪的日志下标，如果不需要裁剪，则返回0
-func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Event) (uint64, types.Reason) {
-	leaderLastLogTerm, err := rg.opts.Storage.LeaderLastLogTerm(key)
+// getTrunctLogIndex returns ReasonTruncate even when the common prefix is empty.
+func (rg *RaftGroup) getTrunctLogIndex(key string, stored uint64, e types.Event) (uint64, types.Reason) {
+	index, reason, err := types.CheckLogPrefix(e.Index, stored, e.LastLogTerm,
+		func(start, end, size uint64) ([]types.Log, error) {
+			return rg.opts.Storage.GetLogs(key, start, end, size)
+		},
+		func(term uint32) (uint64, error) { return rg.opts.Storage.GetTermStartIndex(key, term) })
 	if err != nil {
-		rg.Error("get leader last log term failed", zap.Error(err))
-		return 0, types.ReasonError
+		rg.Error("check log prefix failed", zap.Error(err))
 	}
-	// 副本的最新日志任期为0，说明副本没有日志，不需要裁剪
-	if e.LastLogTerm == 0 {
-		return 0, types.ReasonOk
-	}
-	// 如果副本的最新日志任期等于当前领导的最新日志任期
-	//  如果副本的最新日志下标大于领导者最新日志下标，则需要裁剪至领导者最新日志下标
-	if e.LastLogTerm == leaderLastLogTerm {
-		if e.Index > 0 {
-			replicaLastLogIndex := e.Index - 1 // 副本日志下标等于同步下标-1
-			if replicaLastLogIndex > lastIndex {
-				return lastIndex, types.ReasonOk
-			}
-		}
-		return 0, types.ReasonOk
-	}
-
-	// 如果副本的最新日志任期小于当前领导的最新日志任期，则需要裁剪
-	if e.LastLogTerm < leaderLastLogTerm {
-		term, err := rg.opts.Storage.LeaderTermGreaterEqThan(key, e.LastLogTerm+1)
-		if err != nil {
-			rg.Error("LeaderTermGreaterEqThan: get leader last term failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		// 获取副本的最新日志任期+1的开始日志下标
-		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(key, term)
-		if err != nil {
-			rg.Error("get term start index failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		if termStartIndex > 0 {
-			return termStartIndex - 1, types.ReasonOk
-		}
-		return termStartIndex, types.ReasonOk
-	} else {
-		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(key, leaderLastLogTerm)
-		if err != nil {
-			rg.Error("get term start index failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		rg.Foucs("getTrunctLogIndex: lastLogTerm > leaderLastLogTerm", zap.Uint32("e.LastLogTerm", e.LastLogTerm), zap.Uint32("leaderLastLogTerm", leaderLastLogTerm), zap.Uint64("termStartIndex", termStartIndex))
-		if termStartIndex > 0 {
-			return termStartIndex - 1, types.ReasonOk
-		}
-		return termStartIndex, types.ReasonOk
-	}
+	return index, reason
 }
 
 func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
-
-	err := rg.goPool.Submit(func() {
-
-		var (
-			newCfg        types.Config
-			err           error
-			respEventType types.EventType
-		)
-		switch e.Type {
-		case types.LearnerToLeaderReq,
-			types.LearnerToFollowerReq:
-			newCfg, err = rg.learnTo(r, e.From)
-			if err != nil {
-				rg.Error("learn switch failed", zap.Error(err), zap.String("key", r.Key()), zap.String("type", e.Type.String()), zap.String("cfg", r.Config().String()))
-			}
-			if e.Type == types.LearnerToFollowerReq {
-				respEventType = types.LearnerToFollowerResp
-			} else if e.Type == types.LearnerToLeaderReq {
-				respEventType = types.LearnerToLeaderResp
-			}
-		case types.FollowerToLeaderReq:
-			newCfg, err = rg.followerToLeader(r, e.From)
-			if err != nil {
-				rg.Error("follower switch to leader failed", zap.Error(err), zap.String("key", r.Key()), zap.String("cfg", r.Config().String()))
-			}
-			respEventType = types.FollowerToLeaderResp
-		default:
-			err = errors.New("unknown role switch")
+	// Snapshot mutable membership on the owner, before asynchronous SaveConfig.
+	current := r.Config()
+	if !r.IsLeader() || e.Term != 0 && (e.Term != current.Term || e.ConfigVersion != current.Version) {
+		return
+	}
+	var (
+		newCfg        types.Config
+		err           error
+		respEventType types.EventType
+	)
+	switch e.Type {
+	case types.LearnerToLeaderReq, types.LearnerToFollowerReq:
+		newCfg, err = rg.learnTo(r, e.From)
+		respEventType = types.LearnerToFollowerResp
+		if e.Type == types.LearnerToLeaderReq {
+			respEventType = types.LearnerToLeaderResp
 		}
-
-		if err != nil {
-			rg.AddEvent(r.Key(), types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
-			})
-			return
-		}
-
-		err = rg.opts.Storage.SaveConfig(r.Key(), newCfg)
+	case types.FollowerToLeaderReq:
+		newCfg, err = rg.followerToLeader(r, e.From)
+		respEventType = types.FollowerToLeaderResp
+	default:
+		err = errors.New("unknown role switch")
+	}
+	respond := func(reason types.Reason, cfg types.Config) {
+		rg.AddEventFor(r, types.Event{Type: respEventType, From: e.From, Term: e.Term,
+			ConfigVersion: e.ConfigVersion, RoleChangeID: e.RoleChangeID, Reason: reason, Config: cfg})
+	}
+	if err != nil {
+		rg.Error("prepare role change failed", zap.Error(err), zap.String("key", r.Key()))
+		respond(types.ReasonError, types.Config{})
+		return
+	}
+	err = rg.submitWork(r, false, func() {
+		err := rg.opts.Storage.SaveConfig(r.Key(), newCfg)
 		if err != nil {
 			if err != types.ErrNotLeader {
 				rg.Error("change role failed", zap.Error(err), zap.String("key", r.Key()), zap.String("cfg", newCfg.String()))
 			}
-			rg.AddEvent(r.Key(), types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
-			})
+			respond(types.ReasonError, types.Config{})
 			return
 		}
-		rg.AddEvent(r.Key(), types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonOk,
-			Config: newCfg,
-		})
-		rg.Advance()
+		respond(types.ReasonOk, newCfg)
 	})
 	if err != nil {
 		rg.Error("submit role change req failed", zap.Error(err))
-
-		var respEventType types.EventType
-
-		switch e.Type {
-		case types.LearnerToLeaderReq:
-			respEventType = types.LearnerToLeaderResp
-		case types.LearnerToFollowerReq:
-			respEventType = types.LearnerToFollowerResp
-		case types.FollowerToLeaderReq:
-			respEventType = types.FollowerToLeaderResp
-		}
-
-		rg.AddEvent(r.Key(), types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonError,
-		})
+		respond(types.ReasonError, types.Config{})
 	}
 }
 
 // 学习者转换
 func (rg *RaftGroup) learnTo(r IRaft, learnerId uint64) (types.Config, error) {
-	if !wkutil.ArrayContainsUint64(r.Config().Learners, learnerId) {
+	cfg := r.Config().Clone()
+	completing := cfg.MigrateTo == learnerId && cfg.MigrateFrom != learnerId && cfg.MigrateFrom != r.LeaderId() &&
+		wkutil.ArrayContainsUint64(cfg.Replicas, learnerId) && wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateFrom)
+	if !wkutil.ArrayContainsUint64(cfg.Learners, learnerId) && !completing {
 		return types.Config{}, errors.New("promotion target is not a learner")
 	}
-	cfg := r.Config().Clone()
 
 	// orphan learner: 前次迁移已完成（MigrateFrom/MigrateTo 都为 0），
 	// 但 learnerId 仍残留在 cfg.Learners 中。此时既无迁移源也无迁移目标，

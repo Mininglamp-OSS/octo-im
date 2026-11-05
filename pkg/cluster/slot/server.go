@@ -72,6 +72,11 @@ func (s *Server) Start() error {
 
 func (s *Server) Stop() {
 	s.raftGroup.Stop()
+	// A config update may have passed its drain just before Stop began.
+	// Let it finish loading before closing the DB; a waiting drain is woken
+	// by the stopped group and cannot load a replacement afterward.
+	s.slotUpdateLock.Lock()
+	defer s.slotUpdateLock.Unlock()
 
 	err := s.storage.Close()
 	if err != nil {

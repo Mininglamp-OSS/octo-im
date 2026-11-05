@@ -12,6 +12,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
 
 const channelConfigTransitionPath = "/rpc/channel/configTransition/v1"
@@ -72,7 +73,30 @@ func (s *Server) saveChannelConfigTransitionLocal(ctx context.Context, id string
 	if next.Version != current.ConfVersion || next.Term < current.Term {
 		return current, raft.ErrConfigVersionStale
 	}
-	s.updateChannelCfgByConfig(&current, next)
+	if channelAddFirstStage(current) && (current.MigrateFrom == current.LeaderId || current.MigrateTo == current.LeaderId) && next.MigrateFrom == 0 && next.MigrateTo == 0 {
+		// An election changed the retiring follower into the leader. Let
+		// maintenance choose another follower before accepting a completion;
+		// a plain leadership transfer would leave four permanent voters.
+		return current, ErrConversationReadRetry
+	}
+	current = current.Clone()
+	if current.MigrateFrom != 0 && current.MigrateFrom != current.MigrateTo && current.MigrateFrom != current.LeaderId &&
+		wkutil.ArrayContainsUint64(current.Replicas, current.MigrateFrom) && wkutil.ArrayContainsUint64(current.Learners, current.MigrateTo) &&
+		next.MigrateFrom == 0 && next.MigrateTo == 0 && wkutil.ArrayContainsUint64(next.Replicas, current.MigrateTo) {
+		if s.cfgServer.NodeIsOnline(current.MigrateFrom) {
+			// The source may have recovered during catch-up. Keep its vote
+			// until D and an intermediate majority install the add-first set,
+			// just as in the slot follower migration path.
+			if !wkutil.ArrayContainsUint64(current.Replicas, current.MigrateTo) {
+				current.Replicas = append(current.Replicas, current.MigrateTo)
+			}
+			current.Learners = wkutil.RemoveUint64(current.Learners, current.MigrateTo)
+		} else {
+			current.Replicas = wkutil.RemoveUint64(current.Replicas, current.MigrateFrom)
+		}
+	} else {
+		s.updateChannelCfgByConfig(&current, next)
+	}
 	if !validConversationConfig(current, id, typ) {
 		return current, ErrConversationReadRetry
 	}
@@ -82,6 +106,12 @@ func (s *Server) saveChannelConfigTransitionLocal(ctx context.Context, id string
 	}
 	current.ConfVersion = version
 	return current, nil
+}
+
+func channelAddFirstStage(cfg wkdb.ChannelClusterConfig) bool {
+	return cfg.ReplicaMaxCount > 0 && len(cfg.Learners) == 0 && len(cfg.Replicas) > int(cfg.ReplicaMaxCount) &&
+		cfg.MigrateFrom != 0 && cfg.MigrateFrom != cfg.MigrateTo &&
+		wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateFrom) && wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo)
 }
 
 func (r *rpcServer) handleChannelConfigTransition(c *wkserver.Context) {

@@ -124,7 +124,11 @@ func (c *Config) nodes() []*types.Node {
 func (c *Config) slots() []*types.Slot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg.Slots
+	slots := make([]*types.Slot, len(c.cfg.Slots))
+	for i, slot := range c.cfg.Slots {
+		slots[i] = slot.Clone()
+	}
+	return slots
 }
 
 // 判断是否有slot
@@ -344,7 +348,7 @@ func (c *Config) slot(id uint32) *types.Slot {
 	defer c.mu.RUnlock()
 	for _, slot := range c.cfg.Slots {
 		if slot.Id == id {
-			return slot
+			return slot.Clone()
 		}
 	}
 	return nil

@@ -91,9 +91,11 @@ func driveCluster(nodes map[uint64]*Node) bool {
 					})
 				case types.TruncateReq:
 					sourceNode.Step(types.Event{
-						Type:   types.TruncateResp,
-						Index:  e.Index,
-						Reason: types.ReasonOk,
+						Type:       types.TruncateResp,
+						Term:       e.Term,
+						TruncateID: e.TruncateID,
+						Index:      e.Index,
+						Reason:     types.ReasonOk,
 					})
 				}
 			} else {
@@ -280,9 +282,11 @@ func TestFlow_LogConflict_FollowerExtraLogs(t *testing.T) {
 
 	// Simulate TruncateResp
 	follower.Step(types.Event{
-		Type:   types.TruncateResp,
-		Index:  truncateReq.Index,
-		Reason: types.ReasonOk,
+		Type:       types.TruncateResp,
+		Term:       truncateReq.Term,
+		TruncateID: truncateReq.TruncateID,
+		Index:      truncateReq.Index,
+		Reason:     types.ReasonOk,
 	})
 
 	// Now drive the rest of the cluster to completion
@@ -359,9 +363,11 @@ func TestFlow_LogConflict_DifferentTerm(t *testing.T) {
 	assert.True(t, found)
 
 	follower.Step(types.Event{
-		Type:   types.TruncateResp,
-		Index:  truncateReq.Index,
-		Reason: types.ReasonOk,
+		Type:       types.TruncateResp,
+		Term:       truncateReq.Term,
+		TruncateID: truncateReq.TruncateID,
+		Index:      truncateReq.Index,
+		Reason:     types.ReasonOk,
 	})
 
 	// Drive to idle; follower re-syncs and gets correct logs
@@ -589,6 +595,8 @@ func TestFlow_PingUpdatesFollowerCommit(t *testing.T) {
 
 	assert.Equal(t, uint64(0), follower.CommittedIndex(), "follower committedIndex should be 0 initially")
 
+	// The first successful sync has checked the existing prefix.
+	follower.Step(types.Event{Type: types.SyncResp, From: 1, Term: 2, Index: 4, Reason: types.ReasonOk})
 	// Leader sends Ping with committedIndex=2
 	follower.Step(types.Event{
 		Type:           types.Ping,

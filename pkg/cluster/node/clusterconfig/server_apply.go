@@ -40,7 +40,10 @@ func (s *Server) applyLog(log types.Log) error {
 			return err
 		}
 		after := s.configToRaftConfig(s.config)
-		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
+		// ResumeJoin temporarily makes a returning voter a local learner.
+		// Its committed recovery boundary must reinstall the voting set even
+		// when that set did not change in the application configuration.
+		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after) || cmd.CmdType == CMDTypeNodeJoining
 		s.config.setVersionAndTerm(log.Index, log.Term)
 		s.configSavePending = true
 		s.configNotifyPending = true
@@ -91,6 +94,10 @@ func (s *Server) handleCmd(cmd *CMD) error {
 		return s.handleSlotMigrate(cmd)
 	case CMDTypeSlotStatusChange: // 槽状态改变
 		return s.handleSlotStatusChange(cmd)
+	case CMDTypeNodeRemove:
+		return s.handleNodeRemove(cmd)
+	case CMDTypeSlotUpdateIfCurrent:
+		return s.handleSlotUpdateIfCurrent(cmd)
 	}
 	return nil
 }

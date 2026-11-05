@@ -22,7 +22,9 @@ const (
 	CMDTypeSlotUpdate                        // 槽更新
 	CMDTypeNodeStatusChange                  // 节点状态改变
 	CMDTypeSlotStatusChange                  // 槽状态改变
-	CMDTypeConfigClusterAddrChange           // 节点cluster通讯地址变更
+	CMDTypeConfigClusterAddrChange           // preserve the merged address command's ID 11
+	CMDTypeNodeRemove                        // remove one offline voter before learner promotion
+	CMDTypeSlotUpdateIfCurrent               // fence a slot transition against its source assignment
 
 )
 
@@ -54,6 +56,10 @@ func (c CMDType) String() string {
 		return "CMDTypeNodeStatusChange"
 	case CMDTypeSlotStatusChange:
 		return "CMDTypeSlotStatusChange"
+	case CMDTypeNodeRemove:
+		return "CMDTypeNodeRemove"
+	case CMDTypeSlotUpdateIfCurrent:
+		return "CMDTypeSlotUpdateIfCurrent"
 	}
 	return "CMDTypeUnknown"
 }

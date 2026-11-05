@@ -55,7 +55,7 @@ func (s *Server) Step(event types.Event) {
 
 	s.cfgServer.StepRaftEvent(event)
 
-	if s.cfgServer.IsLeader() && event.Type == types.SyncReq {
+	if s.cfgServer.IsLeader() && event.Type == types.SyncReq && s.cfgServer.Node(event.From) != nil {
 		s.pong.Lock()
 		s.pong.tickMap[event.From] = 0
 		s.pong.Unlock()
@@ -105,6 +105,10 @@ func (s *Server) handleEvents() {
 			s.Error("handleJoinNode failed", zap.Error(err))
 			return
 		}
+		if err = s.cfgServer.ReconcileExpansionMembership(); err != nil {
+			s.Error("reconcile expansion membership failed", zap.Error(err))
+			return
+		}
 
 		// 检查和均衡槽领导
 		err = s.handleSlotLeaderAutoBalance()
@@ -120,8 +124,28 @@ func (s *Server) handleEvents() {
 
 func (s *Server) tick() {
 	if s.cfgServer.IsLeader() {
-		for _, node := range s.cfgServer.Nodes() {
+		cfg := s.cfgServer.Snapshot()
+		s.pong.Lock()
+		for id := range s.pong.tickMap {
+			found := false
+			for _, node := range cfg.Nodes {
+				if node.Id == id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				delete(s.pong.tickMap, id)
+			}
+		}
+		s.pong.Unlock()
+		for _, node := range cfg.Nodes {
 			if node.Id == s.cfgOptions.NodeId {
+				// A returning voter can win the election while its committed
+				// health flag is still offline. It receives no self SyncReq.
+				if !node.Online {
+					s.handler.handleOnlineStatus(node.Id, true)
+				}
 				continue
 			}
 
