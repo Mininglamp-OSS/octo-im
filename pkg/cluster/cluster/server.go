@@ -407,6 +407,19 @@ func (s *Server) onSaveChannelConfig(channelId string, channelType uint8, cfg ra
 	defer cancel()
 	channelCfg, err := s.saveChannelConfigTransition(ctx, channelId, channelType, cfg)
 	if err != nil {
+		// A rejected or timed-out transition may leave this runtime behind
+		// durable metadata. Read the authority again; never replay the losing
+		// decision with a newer version. The original failure is still returned.
+		s.hintChannelConfig(channelId, channelType)
+		refreshCtx, refreshCancel := context.WithTimeout(s.cancelCtx, 2*time.Second)
+		latest, refreshErr := s.loadConversationConfig(refreshCtx, channelId, channelType)
+		if refreshErr == nil {
+			refreshErr = s.channelServer.SwitchConfigContext(refreshCtx, channelId, channelType, latest)
+		}
+		refreshCancel()
+		if refreshErr != nil {
+			s.Warn("refresh after rejected channel transition failed", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(refreshErr))
+		}
 		s.Error("onSaveChannelConfig: transition rejected", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(err))
 		return err
 	}

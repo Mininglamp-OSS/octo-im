@@ -89,12 +89,20 @@ func (s *Server) ProposeBatchUntilAppliedTimeoutForLocal(ctx context.Context, ch
 }
 
 func (s *Server) SwitchConfig(channelId string, channelType uint8, cfg wkdb.ChannelClusterConfig) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.SwitchConfigContext(ctx, channelId, channelType, cfg)
+}
+
+// SwitchConfigContext updates an existing runtime without waking dormant
+// channels, and shares the caller's recovery budget with the owner operations.
+func (s *Server) SwitchConfigContext(ctx context.Context, channelId string, channelType uint8, cfg wkdb.ChannelClusterConfig) error {
 	channelKey := wkutil.ChannelToKey(channelId, channelType)
 	rg := s.getRaftGroup(channelKey)
 	raft := rg.GetRaft(channelKey)
 	if raft == nil {
 		return nil
 	}
-	return raft.(*Channel).switchConfig(channelConfigToRaftConfig(s.opts.NodeId, cfg))
+	return raft.(*Channel).applyConfig(ctx, channelConfigToRaftConfig(s.opts.NodeId, cfg))
 
 }

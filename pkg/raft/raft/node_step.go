@@ -204,6 +204,19 @@ func (n *Node) stepLeader(e types.Event) error {
 		types.FollowerToLeaderResp:
 
 		n.stopPropose = false
+		if e.Reason == types.ReasonError {
+			// Failed persistence must not immediately restart NotifySync ->
+			// SyncReq -> promotion with the same configuration. Keep cooldown
+			// outside replicaSync, which configuration application can replace.
+			n.roleRetryFailures = min(n.roleRetryFailures+1, 6)
+			n.roleRetryTicks = 1 << (n.roleRetryFailures - 1)
+			n.roleRetryTarget = e.From
+			if syncInfo := n.replicaSync[e.From]; syncInfo != nil {
+				syncInfo.roleSwitching = false
+			}
+			return nil
+		}
+		n.roleRetryTicks, n.roleRetryFailures, n.roleRetryTarget = 0, 0, 0
 		// Applying the role config may already have cleared replicaSync. Wake
 		// remaining learners before the nil check so suspended peers can resume
 		// SyncReq-driven promotion, even when they are no longer migrateTo.
@@ -609,6 +622,9 @@ func (n *Node) committedIndexForFollow(leaderCommittedIndex uint64) uint64 {
 }
 
 func (n *Node) roleSwitchIfNeed(e types.Event) {
+	if n.roleRetryTicks > 0 {
+		return
+	}
 	if !n.isLearner(e.From) && !n.isVoter(e.From) {
 		return
 	}
