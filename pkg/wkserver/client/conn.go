@@ -102,9 +102,23 @@ func (c *conn) startDial() {
 		_ = old.Close()
 	}
 
-	gc, err := c.c.cli.DialContext(proto, addr, connCtx{
-		no: c.no,
-	})
+	// gnet.DialContext's context is connection metadata, not a cancellation
+	// context; internally it calls net.Dial without a deadline. A blackholed
+	// old Pod IP can otherwise hold status=connecting for minutes.
+	ctx, cancel := context.WithTimeout(c.c.cancelCtx, 2*time.Second)
+	defer cancel()
+	raw, err := c.c.dialContext(ctx, proto, addr)
+	if err != nil {
+		c.status.Store(disconnect)
+		return
+	}
+	if c.c.cancelCtx.Err() != nil {
+		_ = raw.Close()
+		c.status.Store(disconnect)
+		return
+	}
+	// EnrollContext takes ownership and closes raw after duplicating its fd.
+	gc, err := c.c.cli.EnrollContext(raw, connCtx{no: c.no})
 	if err != nil {
 		// c.Foucs("conn failed", zap.Error(err))
 		c.status.Store(disconnect)

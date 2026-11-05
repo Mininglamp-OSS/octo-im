@@ -193,26 +193,8 @@ func (s *Server) Start() error {
 		return err
 	}
 
-	err = s.slotServer.Start()
-	if err != nil {
-		return err
-	}
-
-	err = s.eventServer.Start()
-	if err != nil {
-		return err
-	}
-
-	err = s.cfgServer.Start()
-	if err != nil {
-		return err
-	}
-
-	err = s.channelServer.Start()
-	if err != nil {
-		return err
-	}
-
+	// Install transport peers from persisted configuration before any Raft starts.
+	// Dial/auth is asynchronous; startup must not wait for unavailable peers.
 	// 添加或更新节点
 	cfg := s.cfgServer.GetClusterConfig()
 	if len(cfg.Nodes) == 0 {
@@ -238,6 +220,26 @@ func (s *Server) Start() error {
 			nodeMap[seedNodeId] = addr
 			s.addOrUpdateNodes(nodeMap)
 		}
+	}
+
+	err = s.slotServer.Start()
+	if err != nil {
+		return err
+	}
+
+	err = s.eventServer.Start()
+	if err != nil {
+		return err
+	}
+
+	err = s.cfgServer.Start()
+	if err != nil {
+		return err
+	}
+
+	err = s.channelServer.Start()
+	if err != nil {
+		return err
 	}
 
 	// 如果有新加入的节点 则执行加入逻辑

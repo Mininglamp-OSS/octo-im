@@ -437,9 +437,9 @@ func TestLeader_StoreResp_SingleNode_DirectCommit(t *testing.T) {
 func TestLeader_GetLogsResp_SendsSyncResp(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeLeader(n, 3)
-	n.replicaSync[2] = &SyncInfo{GetingLogs: true}
+	n.replicaSync[2] = &SyncInfo{GetingLogs: true, readID: 123}
 	n.Step(types.Event{
-		Type: types.GetLogsResp, To: 2, Index: 5,
+		Type: types.GetLogsResp, To: 2, Index: 5, LocalReadID: 123,
 		Logs:   []types.Log{{Term: 3, Index: 5, Data: []byte("data")}},
 		Reason: types.ReasonOk,
 	})

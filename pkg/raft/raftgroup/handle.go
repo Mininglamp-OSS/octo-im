@@ -53,9 +53,10 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			trunctIndex, treason = rg.getTrunctLogIndex(r.Key(), lastIndex, e)
 			if treason != types.ReasonOk {
 				rg.AddEvent(r.Key(), types.Event{
-					To:     e.From,
-					Type:   types.GetLogsResp,
-					Reason: treason,
+					To:          e.From,
+					Type:        types.GetLogsResp,
+					LocalReadID: e.LocalReadID,
+					Reason:      treason,
 				})
 				return
 			}
@@ -63,10 +64,11 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		// 需要裁剪
 		if trunctIndex > 0 {
 			rg.AddEvent(r.Key(), types.Event{
-				To:     e.From,
-				Type:   types.GetLogsResp,
-				Index:  trunctIndex,
-				Reason: types.ReasonTruncate,
+				To:          e.From,
+				Type:        types.GetLogsResp,
+				LocalReadID: e.LocalReadID,
+				Index:       trunctIndex,
+				Reason:      types.ReasonTruncate,
 			})
 			rg.Advance()
 			return
@@ -74,10 +76,11 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		if e.Reason != types.ReasonOnlySync && e.Index > e.StoredIndex {
 			rg.Debug("index is greater than stored index", zap.String("key", r.Key()), zap.Uint64("index", e.Index), zap.Uint64("storedIndex", e.StoredIndex))
 			rg.AddEvent(r.Key(), types.Event{
-				To:     e.From,
-				Type:   types.GetLogsResp,
-				Index:  e.Index,
-				Reason: types.ReasonOk,
+				To:          e.From,
+				Type:        types.GetLogsResp,
+				LocalReadID: e.LocalReadID,
+				Index:       e.Index,
+				Reason:      types.ReasonOk,
 			})
 			rg.Advance()
 			return
@@ -87,10 +90,11 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		if err != nil {
 			rg.Error("get logs failed", zap.Error(err))
 			rg.AddEvent(r.Key(), types.Event{
-				To:     e.From,
-				Type:   types.GetLogsResp,
-				Index:  e.Index,
-				Reason: types.ReasonError,
+				To:          e.From,
+				Type:        types.GetLogsResp,
+				LocalReadID: e.LocalReadID,
+				Index:       e.Index,
+				Reason:      types.ReasonError,
 			})
 			return
 		}
@@ -98,19 +102,22 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			rg.Warn("logs is empty", zap.String("key", r.Key()), zap.Uint64("index", e.Index), zap.Uint64("storedIndex", e.StoredIndex))
 		}
 		rg.AddEvent(r.Key(), types.Event{
-			To:     e.From,
-			Type:   types.GetLogsResp,
-			Index:  e.Index,
-			Logs:   logs,
-			Reason: types.ReasonOk,
+			To:          e.From,
+			Type:        types.GetLogsResp,
+			LocalReadID: e.LocalReadID,
+			Index:       e.Index,
+			Logs:        logs,
+			Reason:      types.ReasonOk,
 		})
 		rg.Advance()
 	})
 	if err != nil {
 		rg.Error("submit get logs failed", zap.Error(err))
 		rg.AddEvent(r.Key(), types.Event{
-			Type:   types.GetLogsResp,
-			Reason: types.ReasonError,
+			To:          e.From,
+			Type:        types.GetLogsResp,
+			LocalReadID: e.LocalReadID,
+			Reason:      types.ReasonError,
 		})
 	}
 }

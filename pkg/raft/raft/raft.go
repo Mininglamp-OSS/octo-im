@@ -305,10 +305,11 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 			trunctIndex, treason = r.getTrunctLogIndex(e, leaderLastLogTerm)
 			if treason != types.ReasonOk {
 				r.stepC <- stepReq{event: types.Event{
-					To:     e.From,
-					Type:   types.GetLogsResp,
-					Index:  e.Index,
-					Reason: treason,
+					To:          e.From,
+					Type:        types.GetLogsResp,
+					LocalReadID: e.LocalReadID,
+					Index:       e.Index,
+					Reason:      treason,
 				}}
 				return
 			}
@@ -317,10 +318,11 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		// 需要裁剪
 		if trunctIndex > 0 {
 			r.stepC <- stepReq{event: types.Event{
-				To:     e.From,
-				Type:   types.GetLogsResp,
-				Index:  trunctIndex,
-				Reason: types.ReasonTruncate,
+				To:          e.From,
+				Type:        types.GetLogsResp,
+				LocalReadID: e.LocalReadID,
+				Index:       trunctIndex,
+				Reason:      types.ReasonTruncate,
 			}}
 			return
 		}
@@ -330,28 +332,31 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		if err != nil {
 			r.node.Error("get logs failed", zap.Error(err))
 			r.stepC <- stepReq{event: types.Event{
-				To:     e.From,
-				Type:   types.GetLogsResp,
-				Index:  e.Index,
-				Reason: types.ReasonError,
+				To:          e.From,
+				Type:        types.GetLogsResp,
+				LocalReadID: e.LocalReadID,
+				Index:       e.Index,
+				Reason:      types.ReasonError,
 			}}
 			return
 		}
 		r.stepC <- stepReq{event: types.Event{
-			To:     e.From,
-			Type:   types.GetLogsResp,
-			Index:  e.Index,
-			Logs:   logs,
-			Reason: types.ReasonOk,
+			To:          e.From,
+			Type:        types.GetLogsResp,
+			LocalReadID: e.LocalReadID,
+			Index:       e.Index,
+			Logs:        logs,
+			Reason:      types.ReasonOk,
 		}}
 	})
 	if err != nil {
 		r.Error("submit get logs failed", zap.Error(err))
 		r.stepC <- stepReq{event: types.Event{
-			To:     e.From,
-			Type:   types.GetLogsResp,
-			Index:  e.Index,
-			Reason: types.ReasonError,
+			To:          e.From,
+			Type:        types.GetLogsResp,
+			LocalReadID: e.LocalReadID,
+			Index:       e.Index,
+			Reason:      types.ReasonError,
 		}}
 	}
 }

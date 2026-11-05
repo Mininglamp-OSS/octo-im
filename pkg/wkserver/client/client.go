@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -22,7 +23,8 @@ type clientStats struct {
 }
 type Client struct {
 	clientStats
-	cli *gnet.Client
+	cli         *gnet.Client
+	dialContext func(context.Context, string, string) (net.Conn, error)
 	wklog.Log
 	eng gnet.Engine
 
@@ -55,12 +57,13 @@ func New(addr string, opt ...Option) *Client {
 	}
 
 	c := &Client{
-		Log:       wklog.NewWKLog(fmt.Sprintf("Client[%s]", addr)),
-		opts:      opts,
-		routeMap:  make(map[string]Handler),
-		proto:     proto.New(),
-		w:         wait.New(),
-		batchRead: 1000,
+		Log:         wklog.NewWKLog(fmt.Sprintf("Client[%s]", addr)),
+		opts:        opts,
+		routeMap:    make(map[string]Handler),
+		proto:       proto.New(),
+		w:           wait.New(),
+		batchRead:   1000,
+		dialContext: (&net.Dialer{}).DialContext,
 	}
 
 	c.cancelCtx, c.cancel = context.WithCancel(context.Background())

@@ -52,7 +52,10 @@ func (n *nodeTransport) Send(event types.Event) {
 		trace.GlobalTrace.Metrics.Cluster().MessageOutgoingBytesAdd(trace.ClusterKindConfig, int64(msg.Size()))
 	}
 
-	err = node.SendWithPriority(msg, isHighPriority(event))
+	err = node.sendRaftMessage(msg, isHighPriority(event))
+	if err == errRaftPeerUnavailable {
+		return // Expected during a peer outage; Raft will retry.
+	}
 	if err != nil {
 		n.Error("Send event failed", zap.Error(err), zap.String("event", event.Type.String()))
 	}

@@ -26,6 +26,7 @@ const (
 )
 
 type SyncInfo struct {
+	readID        uint64
 	LastSyncIndex uint64 //最后一次来同步日志的下标（最新日志 + 1）
 	StoredIndex   uint64 // 副本已存储的日志下标
 	SyncTick      int    // 同步计时器
