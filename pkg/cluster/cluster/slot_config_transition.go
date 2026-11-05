@@ -9,6 +9,12 @@ import (
 )
 
 func validSlotConfigTransition(current *types.Slot, next rafttype.Config, capacity uint32) bool {
+	// Version is the controller boundary observed by the originating owner.
+	// Unrelated controller updates are allowed, but an assignment changed after
+	// that boundary must never accept the old asynchronous SaveConfig result.
+	if next.Version < current.Generation {
+		return false
+	}
 	if types.HasExcessReplicas(current.Replicas, current.Learners, capacity) && current.MigrateFrom != 0 &&
 		(current.MigrateFrom == current.Leader || current.MigrateTo == current.Leader) {
 		return false // maintenance must retarget retirement before any completion

@@ -221,8 +221,9 @@ func (s *Server) handleSlotUpdateIfCurrent(cmd *CMD) error {
 	}
 	for i, old := range before {
 		for j, current := range s.config.cfg.Slots {
-			if current.Id == old.Id && current.Equal(old) {
-				s.config.cfg.Slots[j] = after[i]
+			if current.Id == old.Id && current.Equal(old) &&
+				(cmd.version < slotGenerationCommandVersion || current.Generation == old.Generation) {
+				s.config.cfg.Slots[j] = slotAfterMutation(current, after[i], cmd.slotMutation())
 				break
 			}
 		}

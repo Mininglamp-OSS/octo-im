@@ -34,6 +34,7 @@ func (s *Server) applyLog(log types.Log) error {
 		}
 
 		before := s.configToRaftConfig(s.config).Clone()
+		cmd.appliedIndex = log.Index
 		err = s.handleCmd(cmd)
 		if err != nil {
 			s.Error("handle cmd failed", zap.Error(err))
@@ -109,7 +110,7 @@ func (s *Server) handleConfigChange(cmd *CMD) error {
 		s.Error("unmarshal config err", zap.Error(err))
 		return err
 	}
-	s.config.update(cfg)
+	s.config.update(cfg, cmd.slotMutation())
 	return nil
 }
 
@@ -153,7 +154,7 @@ func (s *Server) handleSlotUpdate(cmd *CMD) error {
 		s.Error("unmarshal slotset err", zap.Error(err))
 		return err
 	}
-	s.config.updateSlots(slotset)
+	s.config.updateSlots(slotset, cmd.slotMutation())
 
 	return nil
 }
@@ -185,7 +186,7 @@ func (s *Server) handleNodeJoined(cmd *CMD) error {
 		s.Error("decode node joined err", zap.Error(err))
 		return err
 	}
-	s.config.updateNodeJoined(nodeId, slots)
+	s.config.updateNodeJoined(nodeId, slots, cmd.slotMutation())
 	return nil
 }
 
@@ -195,7 +196,7 @@ func (s *Server) handleSlotMigrate(cmd *CMD) error {
 		s.Error("decode migrate slot err", zap.Error(err))
 		return err
 	}
-	s.config.updateSlotMigrate(slotId, fromNodeId, toNodeId)
+	s.config.updateSlotMigrate(slotId, fromNodeId, toNodeId, cmd.slotMutation())
 	return nil
 }
 
@@ -205,7 +206,7 @@ func (s *Server) handleSlotStatusChange(cmd *CMD) error {
 		s.Error("decode slot status change err", zap.Error(err))
 		return err
 	}
-	s.config.updateSlotStatus(slotId, status)
+	s.config.updateSlotStatus(slotId, status, cmd.slotMutation())
 	return nil
 }
 

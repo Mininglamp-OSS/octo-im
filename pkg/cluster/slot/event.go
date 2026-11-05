@@ -72,7 +72,10 @@ func (s *Server) addOrUpdateSlotRaft(slot *types.Slot, version uint64, force boo
 	}
 	runtimeConfig := func(local *Slot) rafttype.Config {
 		cfg := s.slotRuntimeConfig(slot, local)
-		cfg.Version = version
+		// Startup can load a persisted assignment before a versioned controller
+		// notification. Preserve its generation without replacing the global
+		// notification boundary used by recovery admission.
+		cfg.Version = max(version, slot.Generation)
 		return cfg
 	}
 

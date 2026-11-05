@@ -105,10 +105,56 @@ func (c *Config) data() ([]byte, error) {
 	return c.cfg.Marshal()
 }
 
-func (c *Config) update(cfg *types.Config) {
+// slotMutation is supplied by command Apply. Direct configuration setup can
+// omit it; every production slot mutation supplies the committed log index.
+type slotMutation struct {
+	index     uint64
+	versioned bool
+}
+
+func (c *CMD) slotMutation() slotMutation {
+	return slotMutation{index: c.appliedIndex, versioned: c.version >= slotGenerationCommandVersion}
+}
+
+// slotAfterMutation runs under config.mu with the assignment update. Generation
+// is owner metadata, never imported from a command's proposed after-value.
+func slotAfterMutation(current, next *types.Slot, mutation ...slotMutation) *types.Slot {
+	next = next.Clone()
+	if len(mutation) == 0 {
+		return next // direct fixture/configuration setup, not command Apply
+	}
+	next.Generation = 0
+	if current != nil {
+		next.Generation = current.Generation
+		if current.Equal(next) {
+			return next
+		}
+	}
+	m := mutation[0]
+	// Pure legacy replay must match an old snapshot with no generations. A
+	// legacy command may still change a tracked slot, but cannot erase its fence.
+	if m.index != 0 && (m.versioned || next.Generation != 0) {
+		next.Generation = m.index
+	}
+	return next
+}
+
+func (c *Config) update(cfg *types.Config, mutation ...slotMutation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.cfg = cfg.Clone()
+	next := cfg.Clone()
+	if len(mutation) == 0 {
+		c.cfg = next
+		return
+	}
+	currentSlots := make(map[uint32]*types.Slot, len(c.cfg.Slots))
+	for _, slot := range c.cfg.Slots {
+		currentSlots[slot.Id] = slot
+	}
+	for i, slot := range next.Slots {
+		next.Slots[i] = slotAfterMutation(currentSlots[slot.Id], slot, mutation...)
+	}
+	c.cfg = next
 }
 
 func (c *Config) nodes() []*types.Node {
@@ -241,7 +287,7 @@ func (c *Config) updateNodeJoining(nodeId uint64) {
 	}
 }
 
-func (c *Config) updateNodeJoined(nodeId uint64, slots []*types.Slot) {
+func (c *Config) updateNodeJoined(nodeId uint64, slots []*types.Slot, mutation ...slotMutation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, node := range c.cfg.Nodes {
@@ -255,54 +301,57 @@ func (c *Config) updateNodeJoined(nodeId uint64, slots []*types.Slot) {
 		exist := false
 		for i, s := range c.cfg.Slots {
 			if s.Id == slot.Id {
-				c.cfg.Slots[i] = slot
+				c.cfg.Slots[i] = slotAfterMutation(s, slot, mutation...)
 				exist = true
 				break
 			}
 		}
 		if !exist {
-			c.cfg.Slots = append(c.cfg.Slots, slot)
+			c.cfg.Slots = append(c.cfg.Slots, slotAfterMutation(nil, slot, mutation...))
 		}
 	}
 }
 
-func (c *Config) updateSlotMigrate(slotId uint32, fromNodeId, toNodeId uint64) {
+func (c *Config) updateSlotMigrate(slotId uint32, fromNodeId, toNodeId uint64, mutation ...slotMutation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, slot := range c.cfg.Slots {
+	for i, slot := range c.cfg.Slots {
 		if slot.Id == slotId && slot.MigrateFrom == 0 && slot.MigrateTo == 0 {
-			slot.MigrateFrom = fromNodeId
-			slot.MigrateTo = toNodeId
-			if !wkutil.ArrayContainsUint64(slot.Replicas, toNodeId) { // 如果目标节点不在副本列表里，则要加入学习者列表
-				slot.Learners = append(slot.Learners, toNodeId)
+			next := slot.Clone()
+			next.MigrateFrom = fromNodeId
+			next.MigrateTo = toNodeId
+			if !wkutil.ArrayContainsUint64(next.Replicas, toNodeId) { // 如果目标节点不在副本列表里，则要加入学习者列表
+				next.Learners = append(next.Learners, toNodeId)
 			}
-
+			c.cfg.Slots[i] = slotAfterMutation(slot, next, mutation...)
 			break
 		}
 	}
 }
 
-func (c *Config) updateSlotStatus(slotId uint32, status types.SlotStatus) {
+func (c *Config) updateSlotStatus(slotId uint32, status types.SlotStatus, mutation ...slotMutation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, slot := range c.cfg.Slots {
+	for i, slot := range c.cfg.Slots {
 		if slot.Id == slotId {
-			slot.Status = status
+			next := slot.Clone()
+			next.Status = status
+			c.cfg.Slots[i] = slotAfterMutation(slot, next, mutation...)
 			break
 		}
 	}
 }
 
-func (c *Config) updateSlots(slots []*types.Slot) {
+func (c *Config) updateSlots(slots []*types.Slot, mutation ...slotMutation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for _, slot := range slots {
 		for i, s := range c.cfg.Slots {
 			if s.Id == slot.Id {
-				c.cfg.Slots[i] = slot
+				c.cfg.Slots[i] = slotAfterMutation(s, slot, mutation...)
 				break
 			}
 		}
