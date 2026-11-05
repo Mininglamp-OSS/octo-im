@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -183,6 +184,19 @@ func (n *ImprovedNode) Stop() {
 	n.pendingBatch = nil
 	n.perfMonitor.totalDropped.Add(uint64(n.backpressure.currentCount.Swap(0)))
 	n.backpressure.currentBytes.Store(0)
+}
+
+var errRaftPeerUnavailable = errors.New("raft peer is not authenticated")
+
+// Raft retransmits votes, heartbeats and log synchronization after recovery.
+// Do not retain an outage's obsolete control traffic ahead of fresh elections.
+// This admission rule applies only to Raft transport, not application messages.
+func (n *ImprovedNode) sendRaftMessage(msg *proto.Message, highPriority bool) error {
+	if !n.client.IsAuthed() && !n.isTestMode() {
+		n.perfMonitor.totalDropped.Inc()
+		return errRaftPeerUnavailable
+	}
+	return n.SendWithPriority(msg, highPriority)
 }
 
 // Send 发送消息（改进版本）

@@ -211,6 +211,9 @@ type Event struct {
 	// Speed 同步速度
 	Speed Speed
 
+	// LocalReadID correlates local asynchronous reads only; never serialized.
+	LocalReadID uint64
+
 	// 不参与编码
 	TermStartIndexInfo *TermStartIndexInfo
 	StartIndex         uint64

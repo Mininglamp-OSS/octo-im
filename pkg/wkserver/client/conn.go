@@ -11,7 +11,6 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/panjf2000/gnet/v2"
 	es "github.com/panjf2000/gnet/v2/pkg/errors"
 
@@ -34,12 +33,13 @@ type conn struct {
 	status      atomic.Value // 是否已认证
 	c           *Client
 	addr        string // 服务端地址
-	gcMu        sync.RWMutex
+	mu          sync.Mutex
 	gc          gnet.Conn
 	idleTick    int // 空闲tick数
 	timeoutTick int
 
-	no string // 唯一编号，每次重连都会变
+	generation uint64
+	attempt    *connAttempt // protected with gc, status transitions and heartbeat ticks by mu
 
 	wklog.Log
 }
@@ -57,10 +57,12 @@ func newConn(addr string, c *Client) *conn {
 }
 
 func (c *conn) asyncWrite(b []byte) error {
-	if c.status.Load() != authed {
+	c.mu.Lock()
+	status, gc := c.status.Load(), c.gc
+	c.mu.Unlock()
+	if status != authed {
 		return errors.New("connect is not connected")
 	}
-	gc := c.transport()
 	if gc == nil {
 		return errors.New("conn is nil")
 	}
@@ -68,65 +70,108 @@ func (c *conn) asyncWrite(b []byte) error {
 }
 
 func (c *conn) transport() gnet.Conn {
-	c.gcMu.RLock()
-	defer c.gcMu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.gc
 }
 
-func (c *conn) replaceTransport(gc gnet.Conn) gnet.Conn {
-	c.gcMu.Lock()
-	defer c.gcMu.Unlock()
-	old := c.gc
-	c.gc = gc
-	return old
+// Reserve the generation before scheduling work. CloseConn can invalidate even
+// an attempt whose goroutine has not started yet.
+func (c *conn) prepareDial() *connAttempt {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.status.Load() != disconnect || c.c.cancelCtx.Err() != nil {
+		return nil
+	}
+	c.generation++
+	ctx, cancel := context.WithCancel(c.c.cancelCtx)
+	a := &connAttempt{generation: c.generation, ctx: ctx, cancel: cancel}
+	c.attempt = a
+	c.status.Store(connecting)
+	return a
 }
 
-func (c *conn) startDial() {
-
-	var proto, addr string
+func (c *conn) startDial(a *connAttempt) {
+	if a.ctx.Err() != nil {
+		return
+	}
+	var network, addr string
 	var err error
 	if strings.Contains(c.addr, "://") {
-		proto, addr, err = parseProtoAddr(c.addr)
+		network, addr, err = parseProtoAddr(c.addr)
 		if err != nil {
 			c.Error("parse addr failed", zap.Error(err), zap.String("addr", c.addr))
-			c.status.Store(disconnect)
+			c.disconnectAttempt(a)
 			return
 		}
 	} else {
-		proto = "tcp"
-		addr = c.addr
-	}
-	c.no = wkutil.GenUUID()
-	old := c.replaceTransport(nil)
-	if old != nil {
-		_ = old.Close()
+		network, addr = "tcp", c.addr
 	}
 
-	gc, err := c.c.cli.DialContext(proto, addr, connCtx{
-		no: c.no,
-	})
+	// gnet.DialContext's context is connection metadata, not cancellation.
+	ctx, cancel := context.WithTimeout(a.ctx, 2*time.Second)
+	defer cancel()
+	raw, err := c.c.dialContext(ctx, network, addr)
 	if err != nil {
-		// c.Foucs("conn failed", zap.Error(err))
-		c.status.Store(disconnect)
-	} else {
-		c.replaceTransport(gc)
-		c.status.Store(connected)
-		c.Foucs("conn success")
+		c.disconnectAttempt(a)
+		return
 	}
+	if a.ctx.Err() != nil {
+		_ = raw.Close()
+		c.disconnectAttempt(a)
+		return
+	}
+	// EnrollContext owns raw. Capture the attempt before the blocking call;
+	// an old dial must never inherit a newer connection's identity.
+	gc, err := c.c.cli.EnrollContext(raw, connCtx{attempt: a})
+	if err != nil {
+		c.disconnectAttempt(a)
+		return
+	}
+	c.mu.Lock()
+	if c.attempt != a || a.ctx.Err() != nil || c.status.Load() != connecting {
+		c.mu.Unlock()
+		_ = gc.Close()
+		return
+	}
+	c.gc = gc
+	c.status.Store(connected)
+	c.mu.Unlock()
+	c.Foucs("conn success")
 }
 
-func (c *conn) startAuth() {
-	err := c.sendAuth()
-	if err != nil { // 如果认证失败，断开链接，让其重连
+func (c *conn) prepareAuth() (*connAttempt, gnet.Conn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.status.Load() != connected || c.attempt == nil || c.attempt.ctx.Err() != nil {
+		return nil, nil
+	}
+	c.status.Store(authing)
+	return c.attempt, c.gc
+}
+
+func (c *conn) startAuth(a *connAttempt, gc gnet.Conn) {
+	err := c.sendAuth(a, gc)
+	if err != nil {
 		c.Foucs("auth failed", zap.Error(err))
-		c.status.Store(disconnect)
-	} else {
-		c.status.Store(authed)
-		c.Foucs("auth success")
+		c.disconnectAttempt(a)
+		return
 	}
+	c.mu.Lock()
+	if c.attempt == a && a.ctx.Err() == nil && c.status.Load() == authing {
+		c.idleTick, c.timeoutTick = 0, 0
+		c.status.Store(authed)
+		c.mu.Unlock()
+		c.Foucs("auth success")
+		return
+	}
+	c.mu.Unlock()
 }
 
-func (c *conn) sendAuth() error {
+func (c *conn) sendAuth(a *connAttempt, gc gnet.Conn) error {
+	if err := a.ctx.Err(); err != nil {
+		return err
+	}
 	conn := &proto.Connect{
 		Id:    c.c.reqIDGen.Inc(),
 		Uid:   c.c.opts.Uid,
@@ -144,7 +189,7 @@ func (c *conn) sendAuth() error {
 	}
 
 	waitC := c.c.w.Register(conn.Id)
-	gc := c.transport()
+	defer c.c.w.Trigger(conn.Id, nil)
 	if gc == nil {
 		return errors.New("conn is nil")
 	}
@@ -154,7 +199,7 @@ func (c *conn) sendAuth() error {
 		return err
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(c.c.cancelCtx, time.Second*4)
+	timeoutCtx, cancel := context.WithTimeout(a.ctx, time.Second*4)
 	defer cancel()
 	select {
 	case x := <-waitC:
@@ -172,39 +217,40 @@ func (c *conn) sendAuth() error {
 }
 
 func (c *conn) tick() {
-	c.idleTick++
-
-	// 定时发送心跳
-	if c.idleTick >= c.c.opts.HeartbeatTick {
-		c.idleTick = 0
-		c.sendHeartbeat()
+	c.mu.Lock()
+	if c.status.Load() != authed {
+		c.mu.Unlock()
+		return
 	}
-
+	c.idleTick++
 	c.timeoutTick++
 	if c.timeoutTick >= c.c.opts.HeartbeatTimeoutTick {
-		c.timeoutTick = 0
+		gc := c.disconnectLocked()
+		c.mu.Unlock()
+		if gc != nil {
+			_ = gc.Close()
+		}
 		c.Foucs("node client heartbeat timeout,reconnect")
-		c.reconnect()
+		return
 	}
-
-}
-
-func (c *conn) reconnect() {
-	c.status.Store(disconnect)
-	gc := c.transport()
-	if gc != nil {
-		_ = gc.Close()
+	gc := c.gc
+	heartbeat := c.idleTick >= c.c.opts.HeartbeatTick
+	if heartbeat {
+		c.idleTick = 0
+	}
+	c.mu.Unlock()
+	if heartbeat {
+		c.sendHeartbeat(gc)
 	}
 }
 
 // 发送心跳
-func (c *conn) sendHeartbeat() {
+func (c *conn) sendHeartbeat(gc gnet.Conn) {
 	data, err := c.c.proto.Encode([]byte{proto.MsgTypeHeartbeat.Uint8()}, proto.MsgTypeHeartbeat)
 	if err != nil {
 		c.Warn("encode heartbeat error", zap.Error(err))
 		return
 	}
-	gc := c.transport()
 	if gc == nil {
 		c.Warn("send heartbeat failed, conn is nil")
 		return
@@ -216,12 +262,55 @@ func (c *conn) sendHeartbeat() {
 	}
 }
 
-func (c *conn) close(err error) {
+// Caller holds mu. Invalidate the attempt before closing the transport, so a
+// delayed OnClose, dial or authentication completion cannot affect its successor.
+func (c *conn) disconnectLocked() gnet.Conn {
+	if c.attempt != nil {
+		c.attempt.cancel()
+		c.attempt = nil
+	}
+	gc := c.gc
+	c.gc = nil
+	c.idleTick, c.timeoutTick = 0, 0
 	c.status.Store(disconnect)
+	return gc
+}
+
+func (c *conn) disconnectAttempt(a *connAttempt) {
+	c.mu.Lock()
+	if a != nil && c.attempt != a {
+		c.mu.Unlock()
+		return
+	}
+	gc := c.disconnectLocked()
+	c.mu.Unlock()
+	if gc != nil {
+		_ = gc.Close()
+	}
+}
+
+func (c *conn) close(err error) {
+	c.disconnectAttempt(nil)
 	c.Foucs("client close", zap.String("id", c.c.opts.Uid), zap.String("addr", c.addr), zap.Error(err))
 }
 
-func (c *conn) onTraffic(gc gnet.Conn) gnet.Action {
+func (c *conn) currentAttempt(a *connAttempt) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return a != nil && c.attempt == a && a.ctx.Err() == nil
+}
+
+func (c *conn) receive(a *connAttempt) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if a == nil || c.attempt != a || a.ctx.Err() != nil {
+		return false
+	}
+	c.idleTick, c.timeoutTick = 0, 0
+	return true
+}
+
+func (c *conn) onTraffic(gc gnet.Conn, a *connAttempt) gnet.Action {
 	if gc.InboundBuffered() == 0 {
 		return gnet.None
 	}
@@ -241,9 +330,14 @@ func (c *conn) onTraffic(gc gnet.Conn) gnet.Action {
 		if len(data) == 0 {
 			break
 		}
+		if !c.receive(a) {
+			return gnet.Close
+		}
 		batchCount++
 		remoteAddr := gc.RemoteAddr().String()
 		err = c.c.pool.Submit(func() {
+			// An admitted reply may still complete its original request after
+			// disconnect. Request IDs are unique across connection generations.
 			c.c.handleData(data, msgType, remoteAddr)
 		})
 		if err != nil {
@@ -281,6 +375,13 @@ func parseProtoAddr(protoAddr string) (string, string, error) {
 	return proto, addr, nil
 }
 
+// Immutable identity and cancellation shared by dial, auth and gnet callbacks.
+type connAttempt struct {
+	generation uint64
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
 type connCtx struct {
-	no string
+	attempt *connAttempt
 }

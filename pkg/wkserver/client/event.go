@@ -15,36 +15,30 @@ func (c *clientEvent) OnTick() (delay time.Duration, action gnet.Action) {
 	delay = 100 * time.Millisecond
 	for _, conn := range c.c.conns {
 
-		if conn.status.CompareAndSwap(disconnect, connecting) {
-			go conn.startDial()
+		if a := conn.prepareDial(); a != nil {
+			go conn.startDial(a)
 		}
-
-		if conn.status.Load() != authed && conn.status.CompareAndSwap(connected, authing) {
-			go conn.startAuth()
+		if a, gc := conn.prepareAuth(); a != nil {
+			go conn.startAuth(a, gc)
 		}
-
-		if conn.status.Load() == authed {
-			conn.tick()
-		}
+		conn.tick()
 	}
 	return
 }
 
 func (c *clientEvent) OnClose(gc gnet.Conn, err error) (action gnet.Action) {
-	ctx := gc.Context()
-	if ctx != nil {
-		cn := ctx.(connCtx)
-		if cn.no == c.c.conn().no {
-			c.c.conn().close(err)
-		}
+	if ctx, ok := gc.Context().(connCtx); ok && ctx.attempt != nil {
+		c.c.conn().disconnectAttempt(ctx.attempt)
 	}
-
 	return
 }
 
 func (c *clientEvent) OnTraffic(gc gnet.Conn) (action gnet.Action) {
-	c.c.conn().idleTick = 0
-	return c.c.conn().onTraffic(gc)
+	ctx, ok := gc.Context().(connCtx)
+	if !ok || !c.c.conn().currentAttempt(ctx.attempt) {
+		return gnet.Close
+	}
+	return c.c.conn().onTraffic(gc, ctx.attempt)
 }
 
 func (c *clientEvent) OnShutdown(gnet.Engine) {

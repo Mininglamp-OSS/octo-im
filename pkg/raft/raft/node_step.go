@@ -186,11 +186,13 @@ func (n *Node) stepLeader(e types.Event) error {
 		}
 	case types.GetLogsResp: // 获取日志返回
 		syncInfo := n.replicaSync[e.To]
-		if syncInfo != nil {
-			syncInfo.GetingLogs = false
-		} else {
-			n.Error("sync info not found", zap.Uint64("nodeId", e.To))
+		// Configuration replacement clears replicaSync. A stale completion must
+		// neither send data nor unlock a newer read, even in the same term.
+		if syncInfo == nil || !syncInfo.GetingLogs || e.LocalReadID == 0 || syncInfo.readID != e.LocalReadID {
+			return nil
 		}
+		syncInfo.GetingLogs = false
+
 		for i := range e.Logs {
 			e.Logs[i].Record.Add(track.PositionSyncResp)
 		}

@@ -253,6 +253,13 @@ func (s *Server) requestChannelLastLogInfos(ctx context.Context, replices []uint
 			continue
 		}
 
+		// An unauthenticated transport cannot return log information. Treat
+		// it as a missing response; quorum rules below remain unchanged.
+		// Avoid a failing RPC/log entry for every scanned dormant channel.
+		peer := s.nodeManager.node(nodeId)
+		if peer == nil || !peer.client.IsAuthed() {
+			continue
+		}
 		requestGroup.Go(func() error {
 			resp, err := s.rpcClient.RequestChannelLastLogInfo(timeoutCtx, nodeId, channelId, channelType)
 			if err != nil {

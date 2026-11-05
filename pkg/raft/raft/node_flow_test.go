@@ -82,12 +82,13 @@ func driveCluster(nodes map[uint64]*Node) bool {
 					}
 					logs := getLogsFromNode(leader, e.Index)
 					sourceNode.Step(types.Event{
-						Type:   types.GetLogsResp,
-						From:   e.From,
-						To:     e.From, // GetLogsResp.To = the replica that requested sync
-						Index:  e.Index,
-						Logs:   logs,
-						Reason: types.ReasonOk,
+						Type:        types.GetLogsResp,
+						LocalReadID: e.LocalReadID,
+						From:        e.From,
+						To:          e.From, // GetLogsResp.To = the replica that requested sync
+						Index:       e.Index,
+						Logs:        logs,
+						Reason:      types.ReasonOk,
 					})
 				case types.TruncateReq:
 					sourceNode.Step(types.Event{
@@ -259,11 +260,12 @@ func TestFlow_LogConflict_FollowerExtraLogs(t *testing.T) {
 	// Return ReasonTruncate to tell follower to truncate to index 1.
 	// Index=1 means "truncate to index 1" (keep only log 1).
 	leader.Step(types.Event{
-		Type:   types.GetLogsResp,
-		From:   getLogsReq.From,
-		To:     getLogsReq.From, // route back to follower
-		Index:  1,               // truncate point
-		Reason: types.ReasonTruncate,
+		Type:        types.GetLogsResp,
+		LocalReadID: getLogsReq.LocalReadID,
+		From:        getLogsReq.From,
+		To:          getLogsReq.From, // route back to follower
+		Index:       1,               // truncate point
+		Reason:      types.ReasonTruncate,
 	})
 
 	// Step 5: Drive cluster - leader sends SyncResp(Truncate), follower truncates, re-syncs
@@ -341,11 +343,12 @@ func TestFlow_LogConflict_DifferentTerm(t *testing.T) {
 	// Simulate conflict detection: follower's term at index 2 differs
 	// Tell follower to truncate to index 1
 	leader.Step(types.Event{
-		Type:   types.GetLogsResp,
-		From:   getLogsReq.From,
-		To:     getLogsReq.From,
-		Index:  1, // truncate to index 1
-		Reason: types.ReasonTruncate,
+		Type:        types.GetLogsResp,
+		LocalReadID: getLogsReq.LocalReadID,
+		From:        getLogsReq.From,
+		To:          getLogsReq.From,
+		Index:       1, // truncate to index 1
+		Reason:      types.ReasonTruncate,
 	})
 
 	lEvents = collectEvents(leader)

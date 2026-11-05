@@ -31,6 +31,8 @@ type channelConfigReconciler struct {
 	wg                           sync.WaitGroup
 	mu                           sync.Mutex
 	pending                      map[channelConfigKey]*configTask
+	cooling                      map[channelConfigKey]*configTask
+	overflowDue                  time.Time
 	capacity                     int
 	notify                       chan struct{}
 	scanNow                      chan struct{}
@@ -45,7 +47,7 @@ type channelConfigReconciler struct {
 func newChannelConfigReconciler(parent context.Context) *channelConfigReconciler {
 	ctx, cancel := context.WithCancel(parent)
 	return &channelConfigReconciler{ctx: ctx, cancel: cancel, pending: make(map[channelConfigKey]*configTask),
-		capacity: 4096, notify: make(chan struct{}, 1), scanNow: make(chan struct{}, 1)}
+		cooling: make(map[channelConfigKey]*configTask), capacity: 4096, notify: make(chan struct{}, 1), scanNow: make(chan struct{}, 1)}
 }
 
 func (r *channelConfigReconciler) add(key channelConfigKey, changed bool) bool {
@@ -60,13 +62,31 @@ func (r *channelConfigReconciler) add(key channelConfigKey, changed bool) bool {
 		}
 		return true
 	}
+	// Cooling tasks do not occupy the runnable queue, so scans can reach
+	// healthy channels without forgetting failed channels' retry deadline.
+	if task := r.cooling[key]; task != nil {
+		if time.Now().Before(task.due) {
+			return true
+		}
+	} else if time.Now().Before(r.overflowDue) {
+		// Bounded-history overflow conservatively preserves the evicted deadline.
+		return true
+	}
 	if len(r.pending) >= r.capacity {
 		r.overflow++
 		r.rescan()
 		return false
 	}
 	now := time.Now()
-	r.pending[key] = &configTask{revision: 1, due: now, since: now}
+	if task := r.cooling[key]; task != nil {
+		r.pending[key] = task
+		delete(r.cooling, key)
+		if changed {
+			task.revision++
+		}
+	} else {
+		r.pending[key] = &configTask{revision: 1, due: now, since: now}
+	}
 	select {
 	case r.notify <- struct{}{}:
 	default:
@@ -82,6 +102,16 @@ func (r *channelConfigReconciler) take() (channelConfigKey, uint64, bool) {
 		if !task.busy && !now.Before(task.due) {
 			task.busy = true
 			return key, task.revision, true
+		}
+	}
+	if len(r.pending) < r.capacity {
+		for key, task := range r.cooling {
+			if !now.Before(task.due) {
+				delete(r.cooling, key)
+				r.pending[key] = task
+				task.busy = true
+				return key, task.revision, true
+			}
 		}
 	}
 	return channelConfigKey{}, 0, false
@@ -105,6 +135,18 @@ func (r *channelConfigReconciler) finish(key channelConfigKey, revision uint64, 
 			// reaching healthy channels further on. Yield this slot under pressure;
 			// the durable metadata will rediscover it on the next complete pass.
 			if len(r.pending) >= r.capacity {
+				if len(r.cooling) >= max(1, r.capacity*4) {
+					r.overflowDue = time.Now().Add(2500 * time.Millisecond)
+					// Bound memory even during a long outage. Retain a conservative
+					// deadline for every discarded entry; never retry it immediately.
+					for k, previous := range r.cooling {
+						if previous.due.After(r.overflowDue) {
+							r.overflowDue = previous.due
+						}
+						delete(r.cooling, k)
+					}
+				}
+				r.cooling[key] = task
 				delete(r.pending, key)
 			}
 		}
@@ -139,6 +181,18 @@ func (r *channelConfigReconciler) start() {
 				err := r.process(ctx, key)
 				cancel()
 				r.finish(key, revision, err)
+				// Per-key deadlines alone do not bound a startup wave across
+				// thousands of different channels. Pace failed attempts across
+				// the four workers (at most 80/s); successful work remains unpaced.
+				if err != nil {
+					timer := time.NewTimer(50 * time.Millisecond)
+					select {
+					case <-r.ctx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+				}
 			}
 		}()
 	}
@@ -192,7 +246,10 @@ func (r *channelConfigReconciler) scanLoop() {
 			for _, t := range r.pending {
 				oldest = max(oldest, time.Since(t.since))
 			}
-			pending, completed, retries, overflow := len(r.pending), r.completed, r.retries, r.overflow
+			for _, t := range r.cooling {
+				oldest = max(oldest, time.Since(t.since))
+			}
+			pending, completed, retries, overflow := len(r.pending)+len(r.cooling), r.completed, r.retries, r.overflow
 			r.mu.Unlock()
 			if r.report != nil {
 				r.report(pending, oldest, completed, retries, overflow)

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	"sync/atomic"
 )
 
 func (n *Node) sendNotifySync(to uint64) {
@@ -164,9 +165,15 @@ func (n *Node) sendApplyReq(start, end uint64) {
 	})
 }
 
+// Process-unique identity also prevents reads from a retired instance matching a replacement.
+var localReadSequence atomic.Uint64
+
 func (n *Node) sendGetLogsReq(syncEvent types.Event) {
+	id := localReadSequence.Add(1)
+	n.replicaSync[syncEvent.From].readID = id
 	n.events = append(n.events, types.Event{
 		Type:        types.GetLogsReq,
+		LocalReadID: id,
 		From:        syncEvent.From,
 		To:          types.LocalNode,
 		Term:        syncEvent.Term,
