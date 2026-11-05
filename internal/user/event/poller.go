@@ -7,7 +7,6 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
-	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/lni/goutils/syncutil"
@@ -110,9 +109,6 @@ func (p *poller) tick() {
 		for _, h := range p.loopHandlers {
 			if h.isTimeout() {
 				p.waitlist.remove(h.Uid)
-				if options.G.IsLocalNode(h.leaderId()) {
-					trace.GlobalTrace.Metrics.App().OnlineUserCountAdd(-1)
-				}
 			}
 		}
 	}

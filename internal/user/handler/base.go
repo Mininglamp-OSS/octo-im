@@ -88,10 +88,17 @@ func (h *Handler) OnMessage(m *proto.Message) {
 
 // 收到事件
 func (h *Handler) OnEvent(ctx *eventbus.UserContext) {
-	slotLeaderId := h.userLeaderNodeId(ctx.Uid)
-
 	// 统计
 	h.totalIn(ctx)
+
+	if ctx.EventType == eventbus.EventOnSend {
+		h.handleLocalPings(ctx)
+		if len(ctx.Events) == 0 {
+			return
+		}
+	}
+
+	slotLeaderId := h.userLeaderNodeId(ctx.Uid)
 
 	// 如果本节点的事件则执行，非本节点事件转发到leader节点
 	if options.G.IsLocalNode(slotLeaderId) ||

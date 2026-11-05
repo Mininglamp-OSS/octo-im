@@ -43,7 +43,8 @@ func newAppMetrics(opts *Options) *appMetrics {
 	}
 
 	connCount := NewInt64ObservableCounter("app_conn_count")
-	onlineUserCount := NewInt64ObservableCounter("app_online_user_count")
+	// Keep the existing Prometheus series name while using current-value semantics.
+	onlineUserCount := NewInt64ObservableGauge("app_online_user_count_total")
 	onlineDeviceCount := NewInt64ObservableCounter("app_online_device_count")
 	pingBytes := NewInt64ObservableCounter("app_ping_bytes")
 	pingCount := NewInt64ObservableCounter("app_ping_count")
@@ -64,7 +65,11 @@ func newAppMetrics(opts *Options) *appMetrics {
 
 	RegisterCallback(func(ctx context.Context, obs metric.Observer) error {
 		obs.ObserveInt64(connCount, a.connCount.Load())
-		obs.ObserveInt64(onlineUserCount, a.onlineUserCount.Load())
+		users := a.onlineUserCount.Load()
+		if a.opts.onlineUserCount != nil {
+			users = a.opts.onlineUserCount()
+		}
+		obs.ObserveInt64(onlineUserCount, users)
 		obs.ObserveInt64(onlineDeviceCount, a.onlineDeviceCount.Load())
 		obs.ObserveInt64(pingBytes, a.pingBytes.Load())
 		obs.ObserveInt64(pingCount, a.pingCount.Load())
