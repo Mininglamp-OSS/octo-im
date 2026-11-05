@@ -150,6 +150,8 @@ func (s *Server) ProposeJoining(nodeId uint64) error {
 	binary.BigEndian.PutUint64(nodeIdBytes, nodeId)
 
 	cmd := NewCMD(CMDTypeNodeJoining, nodeIdBytes)
+	// Version 2 explicitly records replacement-aware promotion semantics.
+	cmd.version = 2
 	cmdBytes, err := cmd.Marshal()
 	if err != nil {
 		s.Error("ProposeJoining cmd marshal failed", zap.Error(err))
@@ -183,6 +185,9 @@ func (s *Server) ProposeJoinWithVersion(node *pb.Node) (uint64, error) {
 	if err := pb.ValidateJoinAddr(node.ClusterAddr); err != nil {
 		return 0, err
 	}
+	// Preserve expansion-only replay for historical version-1 commands.
+	// Replacement joins require all configuration voters to run this version.
+	cmd.version = 2
 	cmdBytes, err := cmd.Marshal()
 	if err != nil {
 		return 0, err

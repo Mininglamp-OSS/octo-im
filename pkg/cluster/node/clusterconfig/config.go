@@ -146,7 +146,7 @@ func (c *Config) hasNode(id uint64) bool {
 	return false
 }
 
-func (c *Config) joinNode(node *types.Node) {
+func (c *Config) joinNode(node *types.Node, replace bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	updated := false
@@ -157,12 +157,25 @@ func (c *Config) joinNode(node *types.Node) {
 			break
 		}
 	}
+	from := node.Id
+	// Select the replacement and publish all join state under the same lock.
+	// Version-1 replay passes replace=false; rejoining an existing identity
+	// must never select another voter for retirement.
 	if !updated {
+		if replace && node.AllowVote && node.Role == types.NodeRole_NodeRoleReplica {
+			for _, current := range c.cfg.Nodes {
+				if current.AllowVote && current.Role == types.NodeRole_NodeRoleReplica &&
+					current.Status == types.NodeStatus_NodeStatusJoined && !current.Online && current.OfflineCount > 0 {
+					from = current.Id
+					break
+				}
+			}
+		}
 		c.cfg.Nodes = append(c.cfg.Nodes, node)
 	}
 	if !wkutil.ArrayContainsUint64(c.cfg.Learners, node.Id) {
 		c.cfg.Learners = append(c.cfg.Learners, node.Id)
-		c.cfg.MigrateFrom, c.cfg.MigrateTo = node.Id, node.Id
+		c.cfg.MigrateFrom, c.cfg.MigrateTo = from, node.Id
 	}
 }
 
@@ -221,7 +234,7 @@ func (c *Config) updateNodeOnlineStatus(nodeId uint64, online bool) {
 	}
 }
 
-func (c *Config) updateNodeJoining(nodeId uint64) {
+func (c *Config) updateNodeJoining(nodeId uint64, replace bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, node := range c.cfg.Nodes {
@@ -232,6 +245,16 @@ func (c *Config) updateNodeJoining(nodeId uint64) {
 	}
 	c.cfg.Learners = wkutil.RemoveUint64(c.cfg.Learners, nodeId)
 	if c.cfg.MigrateTo == nodeId {
+		// The learner has caught up and its promotion is committed by the old
+		// quorum. Retain the replaced node's metadata, but not its voting seat.
+		if replace && c.cfg.MigrateFrom != 0 && c.cfg.MigrateFrom != nodeId {
+			for _, node := range c.cfg.Nodes {
+				if node.Id == c.cfg.MigrateFrom {
+					node.AllowVote = false
+					break
+				}
+			}
+		}
 		c.cfg.MigrateTo = 0
 		c.cfg.MigrateFrom = 0
 	}

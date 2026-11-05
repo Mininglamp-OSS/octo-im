@@ -3,6 +3,7 @@ package raftgroup
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
@@ -269,66 +270,78 @@ func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Eve
 
 func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 
-	err := rg.goPool.Submit(func() {
+	// Compute the transition on the owner, before asynchronous storage work.
+	key := r.Key()
+	if !r.IsLeader() || e.Term != 0 && (e.Term != r.Config().Term || e.ConfigVersion != r.Config().Version) {
+		return // the owner has already superseded this transfer request
+	}
 
-		var (
-			newCfg        types.Config
-			err           error
-			respEventType types.EventType
-		)
-		switch e.Type {
-		case types.LearnerToLeaderReq,
-			types.LearnerToFollowerReq:
-			newCfg, err = rg.learnTo(r, e.From)
-			if err != nil {
-				rg.Error("learn switch failed", zap.Error(err), zap.String("key", r.Key()), zap.String("type", e.Type.String()), zap.String("cfg", r.Config().String()))
-			}
-			if e.Type == types.LearnerToFollowerReq {
-				respEventType = types.LearnerToFollowerResp
-			} else if e.Type == types.LearnerToLeaderReq {
-				respEventType = types.LearnerToLeaderResp
-			}
-		case types.FollowerToLeaderReq:
-			newCfg, err = rg.followerToLeader(r, e.From)
-			if err != nil {
-				rg.Error("follower switch to leader failed", zap.Error(err), zap.String("key", r.Key()), zap.String("cfg", r.Config().String()))
-			}
-			respEventType = types.FollowerToLeaderResp
-		default:
-			err = errors.New("unknown role switch")
+	var (
+		newCfg        types.Config
+		err           error
+		respEventType types.EventType
+	)
+	switch e.Type {
+	case types.LearnerToLeaderReq,
+		types.LearnerToFollowerReq:
+		newCfg, err = rg.learnTo(r, e.From)
+		if err != nil {
+			rg.Error("learn switch failed", zap.Error(err), zap.String("key", key), zap.String("type", e.Type.String()), zap.String("cfg", r.Config().String()))
 		}
+		if e.Type == types.LearnerToFollowerReq {
+			respEventType = types.LearnerToFollowerResp
+		} else if e.Type == types.LearnerToLeaderReq {
+			respEventType = types.LearnerToLeaderResp
+		}
+	case types.FollowerToLeaderReq:
+		newCfg, err = rg.followerToLeader(r, e.From)
+		if err != nil {
+			rg.Error("follower switch to leader failed", zap.Error(err), zap.String("key", key), zap.String("cfg", r.Config().String()))
+		}
+		respEventType = types.FollowerToLeaderResp
+	default:
+		err = errors.New("unknown role switch")
+	}
+
+	submitErr := rg.goPool.Submit(func() {
 
 		if err != nil {
-			rg.AddEvent(r.Key(), types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
+			rg.AddEvent(key, types.Event{
+				Type:          respEventType,
+				From:          e.From,
+				Term:          e.Term,
+				ConfigVersion: e.ConfigVersion,
+				Reason:        types.ReasonError,
 			})
 			return
 		}
 
-		err = rg.opts.Storage.SaveConfig(r.Key(), newCfg)
+		err = rg.opts.Storage.SaveConfig(key, newCfg)
 		if err != nil {
 			if err != types.ErrNotLeader {
-				rg.Error("change role failed", zap.Error(err), zap.String("key", r.Key()), zap.String("cfg", newCfg.String()))
+				rg.Error("change role failed", zap.Error(err), zap.String("key", key), zap.String("cfg", newCfg.String()))
 			}
-			rg.AddEvent(r.Key(), types.Event{
-				Type:   respEventType,
-				From:   e.From,
-				Reason: types.ReasonError,
+			rg.AddEvent(key, types.Event{
+				Type:          respEventType,
+				From:          e.From,
+				Term:          e.Term,
+				ConfigVersion: e.ConfigVersion,
+				Reason:        types.ReasonError,
 			})
 			return
 		}
-		rg.AddEvent(r.Key(), types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonOk,
-			Config: newCfg,
+		rg.AddEvent(key, types.Event{
+			Type:          respEventType,
+			From:          e.From,
+			Term:          e.Term,
+			ConfigVersion: e.ConfigVersion,
+			Reason:        types.ReasonOk,
+			Config:        newCfg,
 		})
 		rg.Advance()
 	})
-	if err != nil {
-		rg.Error("submit role change req failed", zap.Error(err))
+	if submitErr != nil {
+		rg.Error("submit role change req failed", zap.Error(submitErr))
 
 		var respEventType types.EventType
 
@@ -341,10 +354,12 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 			respEventType = types.FollowerToLeaderResp
 		}
 
-		rg.AddEvent(r.Key(), types.Event{
-			Type:   respEventType,
-			From:   e.From,
-			Reason: types.ReasonError,
+		rg.AddEvent(key, types.Event{
+			Type:          respEventType,
+			From:          e.From,
+			Term:          e.Term,
+			ConfigVersion: e.ConfigVersion,
+			Reason:        types.ReasonError,
 		})
 	}
 }
@@ -385,6 +400,10 @@ func (rg *RaftGroup) learnTo(r IRaft, learnerId uint64) (types.Config, error) {
 		}
 
 		if cfg.MigrateFrom == r.LeaderId() { // 学习者转领导
+			if cfg.Term == math.MaxUint32 {
+				return types.Config{}, errors.New("leader term exhausted")
+			}
+			cfg.Term++
 			cfg.Leader = cfg.MigrateTo
 		}
 	}
@@ -403,6 +422,9 @@ func (rg *RaftGroup) followerToLeader(r IRaft, followerId uint64) (types.Config,
 		return types.Config{}, fmt.Errorf("follower not in replicas")
 	}
 
+	if cfg.Term == math.MaxUint32 {
+		return types.Config{}, errors.New("leader term exhausted")
+	}
 	cfg.Leader = followerId
 	cfg.Term = cfg.Term + 1
 	cfg.MigrateFrom = 0

@@ -28,7 +28,10 @@ func (s *Server) handleNodeJoining() error {
 
 	voteNodes := s.cfgServer.AllowVoteNodes()
 
-	if uint32(len(firstSlot.Replicas)) < s.cfgServer.SlotReplicaCount() { // 如果当前槽的副本数量小于配置的副本数量，则可以将新节点直接加入到学习节点中
+	if replacements := planOfflineSlotReplacements(s.cfgServer.GetClusterConfig(), joiningNode.Id); len(replacements) > 0 {
+		// Restore redundancy before balancing healthy replicas onto the joiner.
+		migrateSlots = replacements
+	} else if uint32(len(firstSlot.Replicas)) < s.cfgServer.SlotReplicaCount() { // 如果当前槽的副本数量小于配置的副本数量，则可以将新节点直接加入到学习节点中
 		for _, slot := range slots {
 			newSlot := slot.Clone()
 			newSlot.MigrateFrom = joiningNode.Id

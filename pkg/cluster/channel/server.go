@@ -3,6 +3,7 @@ package channel
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/fasthash"
@@ -34,6 +35,7 @@ type Server struct {
 	}
 
 	wakeLeaderLock *ringlock.RingLock
+	admissionBytes atomic.Int64
 }
 
 func NewServer(opts *Options) *Server {

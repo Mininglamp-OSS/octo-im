@@ -1,6 +1,7 @@
 package eventbus
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/WuKongIM/WuKongIM/internal/track"
@@ -42,6 +43,8 @@ const (
 	EventPushOnline
 	// EventPushOffline push离线消息
 	EventPushOffline
+	// Local-only work admitted by the channel leader's migration barrier.
+	EventChannelPersistAdmitted
 )
 
 func (e EventType) String() string {
@@ -77,6 +80,8 @@ func (e EventType) Uint8() uint8 {
 }
 
 type Event struct {
+	// Local lifetime only: never serialize or clone a completion callback.
+	CompleteAdmission func()
 	// Forwarding metadata is carried by the versioned RPC envelope, not legacy events.
 	ForwardDeadline int64
 	ForwardHops     uint8
@@ -179,6 +184,18 @@ func (e Event) encodeWithEcoder(enc *wkproto.Encoder) error {
 		if err != nil {
 			return err
 		}
+		// GoProto v1.2.3 counts StreamNo in the v5 SEND length even though
+		// its v5 encoder omits that field. Correct the length before forwarding
+		// post-persistence stream events from the channel leader to the slot.
+		if p, ok := e.Frame.(*wkproto.SendPacket); ok && p.Setting.IsSet(wkproto.SettingStream) && wkproto.LatestVersion >= 5 {
+			_, n := binary.Uvarint(data[1:])
+			if n <= 0 {
+				return fmt.Errorf("invalid encoded SEND length")
+			}
+			body := data[1+n:]
+			fixed := binary.AppendUvarint([]byte{data[0]}, uint64(len(body)))
+			data = append(fixed, body...)
+		}
 		enc.WriteUint32(uint32(len(data)))
 		enc.WriteBytes(data)
 	}
@@ -248,6 +265,9 @@ func (e *Event) decodeWithDecoder(dec *wkproto.Decoder) error {
 		frame, _, err := Proto.DecodeFrame(frameData, wkproto.LatestVersion)
 		if err != nil {
 			return err
+		}
+		if frame == nil {
+			return fmt.Errorf("incomplete event frame")
 		}
 		e.Frame = frame
 

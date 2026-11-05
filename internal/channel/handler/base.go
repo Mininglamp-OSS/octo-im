@@ -20,6 +20,7 @@ type Handler struct {
 	commonService       *common.Service
 	forwardCapabilities forward.CapabilityCache
 	forwardGate         *forward.Gate
+	admissionWaiters    httpAdmissionWaiters
 }
 
 func NewHandler() *Handler {
@@ -34,6 +35,7 @@ func NewHandler() *Handler {
 		forwardGate:   forward.NewGate(workerCount),
 	}
 	h.routes()
+	service.AdmitHTTPMessage = h.admitHTTPMessage
 	return h
 }
 
@@ -41,6 +43,7 @@ func (h *Handler) routes() {
 
 	// 发送消息
 	eventbus.RegisterChannelHandlers(eventbus.EventChannelOnSend, h.onSend)
+	eventbus.RegisterChannelHandlers(eventbus.EventChannelPersistAdmitted, h.onPersistAdmitted)
 	// webhook
 	eventbus.RegisterChannelHandlers(eventbus.EventChannelWebhook, h.webhook)
 	// 分发消息
@@ -70,7 +73,8 @@ func (h *Handler) OnEvent(ctx *eventbus.ChannelContext) {
 func (h *Handler) notForwardToLeader(eventType eventbus.EventType) bool {
 	switch eventType {
 	case eventbus.EventChannelWebhook,
-		eventbus.EventChannelDistribute:
+		eventbus.EventChannelDistribute,
+		eventbus.EventChannelPersistAdmitted:
 		return true
 	}
 	return false
