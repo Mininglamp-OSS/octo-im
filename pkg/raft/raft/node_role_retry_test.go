@@ -14,7 +14,7 @@ func TestFailedPromotionWaitsForTickAndRetriesWithoutWrites(t *testing.T) {
 	n.queue.lastLogIndex, n.queue.storedIndex = 10, 10
 	n.queue.committedIndex, n.queue.appliedIndex = 10, 10
 	clearEvents(n)
-	request := types.Event{Type: types.SyncReq, From: 2, To: 1, Term: 1, Index: 11, StoredIndex: 11}
+	request := types.Event{Type: types.SyncReq, From: 2, To: 1, Term: 1, Index: 11, StoredIndex: 11, Reason: types.ReasonOnlySync}
 	require.NoError(t, n.Step(request))
 	require.Len(t, findEventsOfType(collectEvents(n), types.LearnerToFollowerReq), 1)
 	for failure := 0; failure < 8; failure++ {
