@@ -117,6 +117,11 @@ func TestSingleReplicaSlotCancellationAfterHeldHandoff(t *testing.T) {
 						}
 						return errors.New("slot membership transition superseded")
 					})))
+				// One worker orders the held completion before the next append/apply
+				// results, so the successful write also proves owner consumption.
+				s.raftGroup.Stop() // replace only the not-yet-started default group
+				s.raftGroup = raftgroup.New(raftgroup.NewOptions(raftgroup.WithLogPrefix("slot"),
+					raftgroup.WithStorage(s.storage), raftgroup.WithTransport(st), raftgroup.WithGoPoolSize(1)))
 				st.peers[id] = s
 				cfg.AddEventListener(s)
 			}
@@ -138,6 +143,10 @@ func TestSingleReplicaSlotCancellationAfterHeldHandoff(t *testing.T) {
 				return false
 			}, 5*time.Second, 10*time.Millisecond)
 			for _, slot := range leader.Slots() {
+				require.Eventually(t, func() bool {
+					state, err := st.peers[slot.Leader].ReadLeaderState(ctx, slot.Id)
+					return err == nil && state.Exists && state.Ready && state.LeaderID == slot.Leader && state.Term == slot.Term
+				}, 3*time.Second, 10*time.Millisecond)
 				_, err := st.peers[slot.Leader].ProposeUntilApplied(slot.Id, []byte("before-handoff"))
 				require.NoError(t, err)
 			}
@@ -172,8 +181,19 @@ func TestSingleReplicaSlotCancellationAfterHeldHandoff(t *testing.T) {
 				if slot == nil || len(slot.Learners) != 0 || slot.MigrateFrom != 0 || slot.MigrateTo != 0 || slot.Leader != held.leader {
 					return false
 				}
-				state, err := s.ReadLeaderState(ctx, held.slot)
-				return err == nil && state.ConfigVersion >= cfg.Version && state.Term == before.Term
+				// Later controller logs can remove D without changing this slot.
+				// Check the installed cancellation itself, not that global version.
+				installed := false
+				err := s.raftGroup.Do(ctx, SlotIdToKey(held.slot), func(r raftgroup.IRaft) error {
+					if r != nil {
+						current := r.Config()
+						installed = current.Version > before.ConfigVersion && current.Term == before.Term && current.Leader == held.leader &&
+							len(current.Replicas) == 1 && current.Replicas[0] == held.leader && len(current.Learners) == 0 &&
+							current.MigrateFrom == 0 && current.MigrateTo == 0
+					}
+					return nil
+				})
+				return err == nil && installed
 			}, 10*time.Second, 10*time.Millisecond, "heartbeat failure must commit and install the actual planner cancellation")
 			unblock()
 			select {
