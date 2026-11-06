@@ -175,42 +175,51 @@ func (i *Ingress) handleUpdateTag(c *wkserver.Context) {
 		return
 	}
 
-	// realFakeChannelId := req.ChannelId
-	// if options.G.IsCmdChannel(req.ChannelId) {
-	// 	realFakeChannelId = options.G.CmdChannelConvertOrginalChannel(req.ChannelId)
-	// }
-
-	tagKey := req.TagKey
-	if tagKey == "" {
-		if req.ChannelId != "" {
-			tagKey = service.TagManager.GetChannelTag(req.ChannelId, req.ChannelType)
-		}
-	}
-	if tagKey != "" {
-		if service.TagManager.Exist(tagKey) {
-			if req.Remove {
-				err = service.TagManager.RemoveUsers(tagKey, req.Uids)
-				if err != nil {
-					i.Warn("handleUpdateTag: remove users failed", zap.Error(err))
-				}
-			} else {
-				err = service.TagManager.AddUsers(tagKey, req.Uids)
-				if err != nil {
-					i.Warn("handleUpdateTag: add users failed", zap.Error(err))
-				}
-			}
-			if req.ChannelTag {
-				newTagKey := wkutil.GenUUID()
-				err = service.TagManager.RenameTag(tagKey, newTagKey)
-				if err != nil {
-					i.Warn("handleUpdateTag: rename tag failed", zap.Error(err))
-				}
-				service.TagManager.SetChannelTag(req.ChannelId, req.ChannelType, newTagKey)
-			}
-		}
+	if err := i.updateTag(req); err != nil {
+		i.Warn("handleUpdateTag: update failed", zap.Error(err))
+		c.WriteErr(err)
+		return
 	}
 	c.WriteOk()
+}
 
+func (i *Ingress) updateTag(req *TagUpdateReq) error {
+	// A caller can have an old slot route during a handoff. Never acknowledge an
+	// update to a non-authoritative cache (or a cache absent on the wrong node).
+	if req.ChannelTag {
+		slotLeaderId, err := service.Cluster.SlotLeaderIdOfChannel(req.ChannelId, req.ChannelType)
+		if err != nil {
+			return err
+		}
+		if slotLeaderId == 0 || !options.G.IsLocalNode(slotLeaderId) {
+			return errors.New("channel Tag update must reach its slot leader")
+		}
+	}
+	tagKey := req.TagKey
+	if tagKey == "" && req.ChannelId != "" {
+		tagKey = service.TagManager.GetChannelTag(req.ChannelId, req.ChannelType)
+	}
+	if tagKey == "" || !service.TagManager.Exist(tagKey) {
+		// The authoritative node builds a cold Tag from persisted membership.
+		return nil
+	}
+	var err error
+	if req.Remove {
+		err = service.TagManager.RemoveUsers(tagKey, req.Uids)
+	} else {
+		err = service.TagManager.AddUsers(tagKey, req.Uids)
+	}
+	if err != nil {
+		return err
+	}
+	if req.ChannelTag {
+		newTagKey := wkutil.GenUUID()
+		if err := service.TagManager.RenameTag(tagKey, newTagKey); err != nil {
+			return err
+		}
+		service.TagManager.SetChannelTag(req.ChannelId, req.ChannelType, newTagKey)
+	}
+	return nil
 }
 
 func (i *Ingress) handleAddTag(c *wkserver.Context) {
@@ -280,4 +289,3 @@ func (i *Ingress) handleGetSubscribers(c *wkserver.Context) {
 	}
 	c.Write(data)
 }
-
