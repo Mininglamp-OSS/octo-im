@@ -298,92 +298,56 @@ func (ch *channel) addSubscribers(channelId string, channelType uint8, members [
 	return nil
 }
 
-// // cmd和普通频道
+// updateTagBySubscribers updates the owners used by distribution, not the
+// independent message Raft leaders. The cmd channel can hash to another slot.
 func (ch *channel) updateTagBySubscribers(channelId string, channelType uint8, subscribers []string, remove bool) error {
-
-	updateTag := func(chId string, chType uint8) {
-		tagKey := service.TagManager.GetChannelTag(chId, chType)
-		if tagKey != "" {
-			if service.TagManager.Exist(tagKey) {
-				newTagKey := wkutil.GenUUID()
-				if remove {
-					err := service.TagManager.RemoveUsers(tagKey, subscribers)
-					if err != nil {
-						ch.Error("updateTagByAddSubscribers: removeUsers failed", zap.Error(err))
-						return
-					}
-				} else {
-					err := service.TagManager.AddUsers(tagKey, subscribers)
-					if err != nil {
-						ch.Error("updateTagByAddSubscribers: addUsers failed", zap.Error(err))
-						return
-					}
-				}
-
-				err := service.TagManager.RenameTag(tagKey, newTagKey)
-				if err != nil {
-					ch.Error("updateTagByAddSubscribers: renameTag failed", zap.Error(err))
-					return
-				}
-				service.TagManager.SetChannelTag(chId, chType, newTagKey)
-			}
-		}
-	}
-
-	// 获取频道的领导节点
-	leaderId, err := service.Cluster.LeaderIdOfChannel(channelId, channelType)
-	if err != nil {
-		ch.Error("updateTagByAddSubscribers: get leader id failed", zap.Error(err))
+	if err := ch.updateSubscriberTag(channelId, channelType, subscribers, remove); err != nil {
 		return err
 	}
-	if leaderId == 0 {
-		ch.Error("updateTagByAddSubscribers: leader id is 0")
+	cmdChannelId := options.G.OrginalConvertCmdChannel(channelId)
+	if cmdChannelId == channelId {
 		return nil
 	}
+	return ch.updateSubscriberTag(cmdChannelId, channelType, subscribers, remove)
+}
 
-	if options.G.IsLocalNode(leaderId) {
-		updateTag(channelId, channelType)
-	} else {
-		err = ch.s.client.UpdateTag(leaderId, &ingress.TagUpdateReq{
+func (ch *channel) updateSubscriberTag(channelId string, channelType uint8, subscribers []string, remove bool) error {
+	slotLeaderId, err := service.Cluster.SlotLeaderIdOfChannel(channelId, channelType)
+	if err != nil {
+		return errors.Wrap(err, "resolve subscriber Tag slot leader")
+	}
+	if slotLeaderId == 0 {
+		return fmt.Errorf("subscriber Tag slot leader is zero: %s/%d", channelId, channelType)
+	}
+	if !options.G.IsLocalNode(slotLeaderId) {
+		return ch.s.client.UpdateTag(slotLeaderId, &ingress.TagUpdateReq{
 			ChannelId:   channelId,
 			ChannelType: channelType,
 			Uids:        subscribers,
 			Remove:      remove,
 			ChannelTag:  true,
 		})
-		if err != nil {
-			ch.Error("updateTagByAddSubscribers: updateOrMakeTag failed", zap.Error(err))
-			return err
-		}
 	}
 
-	// 更新cmd频道的tag
-	cmdChannelId := options.G.OrginalConvertCmdChannel(channelId)
-	// 获取或请求cmd频道的分布式配置
-	cfg, err := service.Cluster.LoadOnlyChannelClusterConfig(cmdChannelId, channelType)
-	if err != nil && err != wkdb.ErrNotFound {
-		ch.Info("updateTagByAddSubscribers: loadOnlyChannelClusterConfig failed", zap.Error(err))
+	// A cold Tag will be built from persisted subscribers on first distribution.
+	// Do not create or require a message Raft configuration just to update it.
+	tagKey := service.TagManager.GetChannelTag(channelId, channelType)
+	if tagKey == "" || !service.TagManager.Exist(tagKey) {
 		return nil
 	}
-	if cfg.LeaderId == 0 { // 说明频道还没选举过，不存在被激活，这里无需去创建tag了
-		return nil
-	}
-	if options.G.IsLocalNode(cfg.LeaderId) {
-		updateTag(cmdChannelId, channelType)
+	if remove {
+		err = service.TagManager.RemoveUsers(tagKey, subscribers)
 	} else {
-		err = ch.s.client.UpdateTag(cfg.LeaderId, &ingress.TagUpdateReq{
-			ChannelId:   cmdChannelId,
-			ChannelType: channelType,
-			Uids:        subscribers,
-			Remove:      remove,
-			ChannelTag:  true,
-		})
-		if err != nil {
-			ch.Error("updateTagByAddSubscribers: updateOrMakeTag failed", zap.Error(err))
-			return err
-		}
+		err = service.TagManager.AddUsers(tagKey, subscribers)
 	}
-
+	if err != nil {
+		return err
+	}
+	newTagKey := wkutil.GenUUID()
+	if err = service.TagManager.RenameTag(tagKey, newTagKey); err != nil {
+		return err
+	}
+	service.TagManager.SetChannelTag(channelId, channelType, newTagKey)
 	return nil
 }
 
