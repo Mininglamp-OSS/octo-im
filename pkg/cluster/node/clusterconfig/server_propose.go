@@ -156,6 +156,8 @@ func (s *Server) proposeJoiningWithVersion(nodeId uint64) (uint64, error) {
 	binary.BigEndian.PutUint64(nodeIdBytes, nodeId)
 
 	cmd := NewCMD(CMDTypeNodeJoining, nodeIdBytes)
+	// New admissions retire voters through the explicit, revalidated removal
+	// command. Version-2 replacement remains available only for replay.
 	cmdBytes, err := cmd.Marshal()
 	if err != nil {
 		s.Error("ProposeJoining cmd marshal failed", zap.Error(err))

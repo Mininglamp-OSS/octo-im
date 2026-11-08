@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -538,6 +539,10 @@ func (r *Raft) learnTo(learnerId uint64) (types.Config, error) {
 		}
 
 		if cfg.MigrateFrom == r.LeaderId() { // 学习者转领导
+			if cfg.Term == math.MaxUint32 {
+				return types.Config{}, errors.New("leader term exhausted")
+			}
+			cfg.Term++
 			cfg.Leader = cfg.MigrateTo
 		}
 	}
@@ -556,6 +561,9 @@ func (r *Raft) followerToLeader(followerId uint64) (types.Config, error) {
 		return types.Config{}, fmt.Errorf("follower not in replicas")
 	}
 
+	if cfg.Term == math.MaxUint32 {
+		return types.Config{}, errors.New("leader term exhausted")
+	}
 	cfg.Leader = followerId
 	cfg.Term = cfg.Term + 1
 	cfg.MigrateFrom = 0

@@ -449,23 +449,37 @@ func (s *Server) onSaveChannelConfig(channelId string, channelType uint8, cfg ra
 	ctx, cancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
 	defer cancel()
 	channelCfg, err := s.saveChannelConfigTransition(ctx, channelId, channelType, cfg)
+	transitionErr := err
 	if err != nil {
-		s.Error("onSaveChannelConfig: transition rejected", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(err))
-		return err
+		// The authority may have committed before its response was lost. Read
+		// it again instead of reopening the old leader on a transport error.
+		reconcileCtx, reconcileCancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
+		defer reconcileCancel()
+		current, readErr := s.loadConversationConfig(reconcileCtx, channelId, channelType)
+		if readErr != nil || current.ConfVersion <= cfg.Version {
+			return err
+		}
+		channelCfg = current
 	}
+
 	retiring := cfg.MigrateTo == 0 && channelCfg.MigrateTo != 0
 
-	// 切换配置
-	if channelCfg.LeaderId == s.opts.ConfigOptions.NodeId {
-		err = s.channelServer.SwitchConfig(channelCfg.ChannelId, channelCfg.ChannelType, channelCfg)
-		if err != nil {
-			s.Error("onSaveChannelConfig: switch config failed", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(err))
+	// The callback runs on the old leader, which may no longer be a member
+	// and will therefore never receive the new leader's replication traffic.
+	// Demote it before notifying the new leader, even if notification fails.
+	if err = s.channelServer.SwitchConfig(channelId, channelType, channelCfg); err != nil {
+		return err
+	}
+	if channelCfg.LeaderId != s.opts.ConfigOptions.NodeId {
+		if err = s.rpcClient.RequestChannelSwitchConfig(channelCfg.LeaderId, channelCfg); err != nil {
+			// The slot owner's persisted-config reconciler retries this hint.
+			s.hintChannelConfig(channelId, channelType)
 			return err
 		}
-	} else {
-		if err := s.rpcClient.RequestChannelSwitchConfig(channelCfg.LeaderId, channelCfg); err != nil {
-			return err
-		}
+	}
+
+	if transitionErr != nil {
+		return transitionErr
 	}
 	if retiring {
 		return clusterconfig.ErrMembershipBusy

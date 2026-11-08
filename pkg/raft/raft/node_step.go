@@ -133,7 +133,7 @@ func (n *Node) stepLeader(e types.Event) error {
 
 	switch e.Type {
 	case types.Propose: // 提案
-		if n.stopPropose || n.truncating { // 停止提案
+		if n.stopPropose || n.truncating || !n.admittedProposals(e.Logs) { // 停止提案
 			n.Foucs("stop propose", zap.String("key", n.Key()))
 			return types.ErrProposalDropped
 		}
@@ -729,6 +729,26 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 	syncInfo := n.replicaSync[e.From]
 	if syncInfo.roleSwitching {
 		return
+	}
+
+	if n.cfg.MigrateFrom == n.cfg.Leader {
+		if n.admissionDrainCooldown > 0 {
+			return
+		}
+		gap := n.opts.FollowerToLeaderMinLogGap
+		if n.isLearner(e.From) {
+			gap = n.opts.LearnerToLeaderMinLogGap
+		}
+		if e.Index >= n.queue.lastLogIndex+1 || e.Index+gap > n.queue.lastLogIndex {
+			n.beginLeaderHandoff()
+			n.drainingAdmissions = true
+		}
+		if n.drainingAdmissions {
+			if len(n.messageAdmissions) > 0 {
+				return
+			}
+			n.pauseLeaderHandoff()
+		}
 	}
 
 	isLearner := n.isLearner(e.From) // 当前同步节点是否是学习者

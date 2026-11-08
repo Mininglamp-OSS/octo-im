@@ -45,12 +45,16 @@ type Node struct {
 	onlySync           bool // 是否只同步,不做截断判断
 	// softState softState // 软状态
 	sync.Mutex
-	truncating    bool // 截断中; survives role changes until physical I/O completes
-	truncateID    uint64
-	truncateRetry *types.Event
-	stopPropose   bool // 停止提案
-	handoff       *leaderHandoff
-	roleChangeID  uint64 // monotonic across role changes and retries
+	truncating             bool // 截断中; survives role changes until physical I/O completes
+	truncateID             uint64
+	truncateRetry          *types.Event
+	stopPropose            bool // 停止提案
+	handoff                *leaderHandoff
+	roleChangeID           uint64 // monotonic across role changes and retries
+	drainingAdmissions     bool
+	messageAdmissions      map[uint64]struct{}
+	admissionDrainTicks    int
+	admissionDrainCooldown int
 
 	suspend bool // 挂起
 

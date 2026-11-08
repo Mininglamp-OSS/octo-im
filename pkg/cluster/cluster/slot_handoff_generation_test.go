@@ -133,18 +133,21 @@ func TestSlotHandoffSaveConfigRejectsRestartedGeneration(t *testing.T) {
 	state, err := a.ReadLeaderState(ctx, 0)
 	require.NoError(t, err)
 	require.False(t, state.Ready)
+	originalTerm := state.Term
+	require.Equal(t, originalTerm+1, old.Term, "the prepared new-leader configuration advances the original term")
 
 	// D's data path fails. Commit the same cancellation the maintenance
 	// planner uses, retaining the original slot leader and term.
 	dt.paused.Store(true)
 	current := configLeader.Slot(0)
+	require.Equal(t, originalTerm, current.Term)
 	cancelled := current.Clone()
 	cancelled.Learners, cancelled.MigrateFrom, cancelled.MigrateTo = nil, 0, 0
 	require.NoError(t, configLeader.ProposeSlotsIfCurrent([]*nodetypes.Slot{current}, []*nodetypes.Slot{cancelled}))
 	require.Eventually(t, func() bool {
 		state, err := a.ReadLeaderState(ctx, 0)
 		dState, dErr := d.ReadLeaderState(ctx, 0)
-		return err == nil && state.Ready && state.LeaderID == 1 && state.Term == old.Term && state.ConfigVersion > old.Version &&
+		return err == nil && state.Ready && state.LeaderID == 1 && state.Term == originalTerm && state.ConfigVersion > old.Version &&
 			dErr == nil && !dState.Exists
 	}, time.Second, 5*time.Millisecond)
 	_, err = a.ProposeUntilApplied(0, []byte("X-committed-after-cancellation"))
@@ -164,7 +167,7 @@ func TestSlotHandoffSaveConfigRejectsRestartedGeneration(t *testing.T) {
 		cfg := ct.peers[1].Slot(0)
 		state, err := a.ReadLeaderState(ctx, 0)
 		dState, dErr := d.ReadLeaderState(ctx, 0)
-		return cfg != nil && cfg.MigrateFrom == 1 && cfg.MigrateTo == 4 && cfg.Term == old.Term &&
+		return cfg != nil && cfg.MigrateFrom == 1 && cfg.MigrateTo == 4 && cfg.Term == originalTerm &&
 			err == nil && state.ConfigVersion > old.Version && dErr == nil && dState.Exists
 	}, time.Second, 5*time.Millisecond)
 	tail, err = d.LastIndex(0)
@@ -209,7 +212,7 @@ func TestSlotHandoffSaveConfigRejectsRestartedGeneration(t *testing.T) {
 		cfg := configLeader.Slot(0)
 		state, err := d.ReadLeaderState(ctx, 0)
 		return cfg != nil && cfg.Leader == 4 && len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 &&
-			err == nil && state.Ready && state.LeaderID == 4
+			cfg.Term == originalTerm+1 && err == nil && state.Ready && state.LeaderID == 4 && state.Term == cfg.Term
 	}, 5*time.Second, 10*time.Millisecond)
 	xOnD, err := d.LastLog(0)
 	require.NoError(t, err)

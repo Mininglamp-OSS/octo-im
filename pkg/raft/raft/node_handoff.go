@@ -11,13 +11,25 @@ type leaderHandoff struct {
 	requestID    uint64
 	responseType types.EventType
 	attempted    bool // SaveConfig may have committed despite a failed response
+	paused       bool // accepted work has drained and the final tail is fixed
 }
 
-func (n *Node) pauseLeaderHandoff() {
+func (n *Node) beginLeaderHandoff() {
 	if n.handoff == nil {
 		n.handoff = &leaderHandoff{term: n.cfg.Term, version: n.cfg.Version, from: n.cfg.MigrateFrom, to: n.cfg.MigrateTo}
 	}
+}
+
+func (n *Node) pauseLeaderHandoff() {
+	n.beginLeaderHandoff()
+	n.handoff.paused = true
 	n.stopPropose = true
+}
+
+func (n *Node) clearLeaderHandoff() {
+	n.handoff = nil
+	n.stopPropose, n.drainingAdmissions = false, false
+	n.admissionDrainTicks, n.admissionDrainCooldown = 0, 0
 }
 
 func (n *Node) sendLeaderHandoffReq(kind types.EventType, target uint64) {
@@ -35,17 +47,20 @@ func (n *Node) sendLeaderHandoffReq(kind types.EventType, target uint64) {
 
 func (n *Node) reconcileLeaderHandoff(h *leaderHandoff) {
 	if h == nil {
+		if n.cfg.MigrateTo == 0 || n.cfg.MigrateFrom != n.cfg.Leader {
+			n.clearLeaderHandoff()
+		}
 		return
 	}
 	if !n.IsLeader() || n.cfg.Term != h.term || n.cfg.MigrateFrom != h.from || n.cfg.MigrateTo != h.to ||
 		(!n.isVoter(h.to) && !n.isLearner(h.to)) {
-		n.handoff = nil
-		n.stopPropose = false
+		n.clearLeaderHandoff()
 		return
 	}
 	// RoleUnknown can re-enter BecomeLeader while retaining the same leader
 	// and term. Preserve this task's uncertainty across that local reset too.
-	n.handoff, n.stopPropose = h, true
+	n.handoff, n.stopPropose = h, h.paused
+	n.drainingAdmissions = true
 	if n.cfg.Version != h.version {
 		// A version refresh is not cancellation. Retain the unknown outcome
 		// fence, but let the next SyncReq retry against the current config.

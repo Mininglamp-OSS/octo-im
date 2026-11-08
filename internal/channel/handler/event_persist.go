@@ -59,6 +59,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	}
 
 	// ========== webhook ==========
+	var afterPersist []*eventbus.Event
 	if options.G.WebhookOn(types.EventMsgNotify) {
 		for _, e := range events {
 			sendPacket := e.Frame.(*wkproto.SendPacket)
@@ -66,7 +67,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 				cloneEvent := e.Clone()
 				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 				cloneEvent.Type = eventbus.EventChannelWebhook
-				eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+				afterPersist = append(afterPersist, cloneEvent)
 			}
 		}
 	}
@@ -79,9 +80,18 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		cloneEvent := e.Clone()
 		cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 		cloneEvent.Type = eventbus.EventChannelDistribute
-		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+		afterPersist = append(afterPersist, cloneEvent)
 	}
 
+	if ctx.EventType == eventbus.EventChannelPersistAdmitted && !options.G.IsLocalNode(ctx.SlotLeaderId) {
+		// Distribution/tag creation and webhook execution stay on the slot
+		// owner. Persisting on the message leader must not skip remote users.
+		if len(afterPersist) > 0 {
+			h.forwardsToNode(ctx.SlotLeaderId, ctx.ChannelId, ctx.ChannelType, afterPersist)
+		}
+		return
+	}
+	eventbus.Channel.AddEvents(ctx.ChannelId, ctx.ChannelType, afterPersist)
 	eventbus.Channel.Advance(ctx.ChannelId, ctx.ChannelType)
 
 }

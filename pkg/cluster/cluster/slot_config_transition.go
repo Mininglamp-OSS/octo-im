@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"math"
 	"slices"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -30,13 +31,17 @@ func validSlotConfigTransition(current *types.Slot, next rafttype.Config, capaci
 				expected.Replicas = wkutil.RemoveUint64(expected.Replicas, expected.MigrateFrom)
 			}
 		} else if expected.MigrateFrom == expected.Leader && wkutil.ArrayContainsUint64(expected.Replicas, expected.MigrateTo) {
-			expected.Term++
+			// The leadership term advances below for both voter and learner targets.
 		} else if wkutil.ArrayContainsUint64(expected.Replicas, expected.MigrateFrom) && wkutil.ArrayContainsUint64(expected.Replicas, expected.MigrateTo) {
 			expected.Replicas = wkutil.RemoveUint64(expected.Replicas, expected.MigrateFrom)
 		} else {
 			return false
 		}
 		if expected.MigrateFrom == expected.Leader {
+			if expected.Term == math.MaxUint32 {
+				return false
+			}
+			expected.Term++
 			expected.Leader = expected.MigrateTo
 		}
 		expected.MigrateFrom, expected.MigrateTo = 0, 0

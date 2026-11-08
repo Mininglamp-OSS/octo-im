@@ -63,6 +63,9 @@ type IClusterSlot interface {
 }
 
 type IClusterChannel interface {
+	// AdmitLocalChannelMessage queues work on the current channel leader and
+	// keeps its migration barrier until the local worker calls done.
+	AdmitLocalChannelMessage(ctx context.Context, channelID string, channelType uint8, messageID uint64, size int64, enqueue func(done func())) error
 	// LoadChannelReadConfig resolves metadata from the current slot leader without creating a channel.
 	LoadChannelReadConfig(ctx context.Context, channelID string, channelType uint8) (wkdb.ChannelClusterConfig, error)
 	// ValidateLocalChannelRead rejects a stale route or a fenced local channel leader.

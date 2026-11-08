@@ -3,6 +3,7 @@ package raftgroup
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
@@ -307,6 +308,10 @@ func (rg *RaftGroup) learnTo(r IRaft, learnerId uint64) (types.Config, error) {
 		}
 
 		if cfg.MigrateFrom == r.LeaderId() { // 学习者转领导
+			if cfg.Term == math.MaxUint32 {
+				return types.Config{}, errors.New("leader term exhausted")
+			}
+			cfg.Term++
 			cfg.Leader = cfg.MigrateTo
 		}
 	}
@@ -325,6 +330,9 @@ func (rg *RaftGroup) followerToLeader(r IRaft, followerId uint64) (types.Config,
 		return types.Config{}, fmt.Errorf("follower not in replicas")
 	}
 
+	if cfg.Term == math.MaxUint32 {
+		return types.Config{}, errors.New("leader term exhausted")
+	}
 	cfg.Leader = followerId
 	cfg.Term = cfg.Term + 1
 	cfg.MigrateFrom = 0

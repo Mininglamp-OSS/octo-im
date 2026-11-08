@@ -2,6 +2,7 @@ package clusterconfig_test
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ func TestJoinVersionIdentifiesExactAppliedCommand(t *testing.T) {
 	logs, err := s.GetLogsByLimit(version, version+1, 1)
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
+	require.Equal(t, uint16(1), binary.BigEndian.Uint16(logs[0].Data), "new joins use explicit removal, not historical implicit replacement")
 	var cmd clusterconfig.CMD
 	require.NoError(t, cmd.Unmarshal(logs[0].Data))
 	require.Equal(t, clusterconfig.CMDTypeNodeJoin, cmd.CmdType)
@@ -68,6 +70,7 @@ func TestExistingVoterRejoinPreservesConcurrentAdmission(t *testing.T) {
 	logs, err := s.GetLogsByLimit(version, version+1, 1)
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
+	require.Equal(t, uint16(1), binary.BigEndian.Uint16(logs[0].Data), "an existing voter recovery must not implicitly retire another voter")
 	var cmd clusterconfig.CMD
 	require.NoError(t, cmd.Unmarshal(logs[0].Data))
 	require.Equal(t, clusterconfig.CMDTypeNodeJoining, cmd.CmdType, "reuse the existing committed recovery boundary")

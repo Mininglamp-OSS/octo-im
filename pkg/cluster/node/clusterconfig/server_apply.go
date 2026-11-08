@@ -167,7 +167,7 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 		s.Error("unmarshal node err", zap.Error(err))
 		return err
 	}
-	s.config.joinNode(newNode)
+	s.config.joinNode(newNode, cmd.version == 2)
 	return nil
 }
 
@@ -176,7 +176,7 @@ func (s *Server) handleNodeJoining(cmd *CMD) error {
 		return fmt.Errorf("invalid node joining payload length: %d", len(cmd.Data))
 	}
 	nodeId := binary.BigEndian.Uint64(cmd.Data)
-	s.config.updateNodeJoining(nodeId)
+	s.config.updateNodeJoining(nodeId, cmd.version == 2)
 	return nil
 }
 
