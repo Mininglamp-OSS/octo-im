@@ -166,7 +166,27 @@ func TestJoiningNodeReceivesSlotsAfterDeadLearnerCleanupOverTCP(t *testing.T) {
 			return err == nil && got.Token == device.Token
 		}, 5*time.Second, 10*time.Millisecond, "new slot replicas must contain the existing data")
 		device.Token = "after-cleanup"
-		require.NoError(t, f.servers[5].store.UpdateDevice(device))
+		// waitStable is a snapshot; leader balancing can start immediately
+		// afterwards. Retry this idempotent update only when the same slot has
+		// an observed transition, and retain the data checks on every replica.
+		for deadline := time.Now().Add(5 * time.Second); ; {
+			err := f.servers[5].store.UpdateDevice(device)
+			if err == nil {
+				break
+			}
+			changing := false
+			for _, peer := range f.servers {
+				current := peer.cfgServer.Slot(slot.Id)
+				if current != nil && (current.MigrateFrom != 0 || current.MigrateTo != 0 ||
+					current.Generation != slot.Generation || current.Leader != slot.Leader || current.Term != slot.Term) {
+					changing = true
+					break
+				}
+			}
+			require.True(t, changing, "device update failed without an observed slot transition: %v", err)
+			require.True(t, time.Now().Before(deadline), "device update did not recover after slot transition: %v", err)
+			time.Sleep(25 * time.Millisecond)
+		}
 		for _, id := range slot.Replicas {
 			require.Eventually(t, func() bool {
 				got, err := f.servers[id].db.GetDevice(device.Uid, 1)
