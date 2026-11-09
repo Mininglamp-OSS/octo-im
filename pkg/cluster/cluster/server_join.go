@@ -26,21 +26,9 @@ func (s *Server) joinLoop() {
 				s.Error("requestClusterJoin failed", zap.Error(err), zap.Uint64("seedNodeId", seedNodeId))
 				continue
 			}
-			if resp.Config != nil {
-				if err := s.cfgServer.ResumeJoin(resp.Config, resp.LeaderID, resp.JoinVersion); err != nil {
-					continue
-				}
+			if err := s.resumeClusterJoin(resp); err != nil {
+				continue
 			}
-			if len(resp.Nodes) > 0 && s.cfgServer.Snapshot().Version < resp.JoinVersion {
-				nodeMap := make(map[uint64]string)
-				for _, n := range resp.Nodes {
-					nodeMap[n.NodeId] = n.ServerAddr
-				}
-				s.addOrUpdateNodes(nodeMap)
-			}
-			// The response may race ahead of or behind configuration replay. The
-			// slot server waits for Joined after this exact fresh command in either case.
-			s.slotServer.SetRecoveryJoinVersion(resp.JoinVersion)
 			s.joinReady.Store(true)
 			return
 		case <-s.stopper.ShouldStop():
@@ -49,9 +37,8 @@ func (s *Server) joinLoop() {
 	}
 }
 
-// A persisted bootstrap node can have been removed while it was down. Probe
-// through the existing join RPC so it can reconnect without a new seed/config
-// or an operator choosing a replacement ID. Existing membership is a no-op.
+// A persisted bootstrap node can have been removed while it was down. Discover
+// that absence first, then explicitly join without a new seed or node ID.
 func (s *Server) membershipLoop() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -71,31 +58,109 @@ func (s *Server) membershipLoop() {
 			}
 			peer := peers[cursor%len(peers)]
 			cursor++
-			resp, err := s.rpcClient.RequestClusterJoin(peer, &ClusterJoinReq{
-				NodeId: s.opts.ConfigOptions.NodeId, ServerAddr: s.joinServerAddr(cfg), Role: s.opts.Role, Probe: true,
-			})
-			if err != nil {
-				continue
-			}
-			boundary := resp.JoinVersion
-			if boundary == 0 && resp.Config != nil {
-				boundary = resp.Config.Version
-			}
-			if boundary == 0 || s.cfgServer.Snapshot().Version >= boundary {
-				continue
-			}
-			if resp.Config != nil {
-				if err := s.cfgServer.ResumeJoin(resp.Config, resp.LeaderID, boundary); err != nil {
-					continue
-				}
-			}
-			nodes := make(map[uint64]string, len(resp.Nodes))
-			for _, node := range resp.Nodes {
-				nodes[node.NodeId] = node.ServerAddr
-			}
-			s.addOrUpdateNodes(nodes)
+			_ = s.probeMembership(peer)
 		}
 	}
+}
+
+func (s *Server) probeMembership(peer uint64) error {
+	req := &ClusterJoinReq{NodeId: s.opts.ConfigOptions.NodeId,
+		ServerAddr: s.joinServerAddr(s.cfgServer.Snapshot()), Role: s.opts.Role, Probe: true}
+	resp, err := s.rpcClient.RequestClusterJoin(peer, req)
+	if err != nil {
+		return err // Transport/route errors never establish absence.
+	}
+	if resp.JoinVersion != 0 {
+		return errors.New("membership probe returned a mutating join response")
+	}
+	if resp.Config == nil {
+		return nil // An existing formal member needs no recovery action.
+	}
+	if resp.Config.Version == 0 || resp.LeaderID == 0 {
+		return errors.New("membership probe returned an incomplete configuration")
+	}
+	var existing *types.Node
+	leaderKnown := false
+	for _, node := range resp.Config.Nodes {
+		if node.Id == resp.LeaderID {
+			leaderKnown = true
+		}
+		if node.Id == req.NodeId {
+			existing = node
+		}
+	}
+	if !leaderKnown {
+		return errors.New("membership probe leader is absent from its configuration")
+	}
+	if existing == nil {
+		// A delayed absence response must not rejoin a member whose newer
+		// configuration has already arrived. A newer local deletion still joins.
+		current := s.cfgServer.Snapshot()
+		if current.Version >= resp.Config.Version {
+			for _, node := range current.Nodes {
+				if node.Id == req.NodeId {
+					return nil
+				}
+			}
+		}
+		select {
+		case <-s.stopper.ShouldStop():
+			return nil
+		default:
+		}
+		req.Probe = false
+		joined, err := s.rpcClient.RequestClusterJoin(peer, req)
+		if err != nil {
+			return err
+		}
+		return s.resumeClusterJoin(joined)
+	}
+	// A WillJoin node is already admitted. Resume its passive catch-up without
+	// creating another membership command or changing a formal member's role.
+	if existing.Status != types.NodeStatus_NodeStatusWillJoin || s.cfgServer.Snapshot().Version >= resp.Config.Version {
+		return nil
+	}
+	if err := s.cfgServer.ResumeJoin(resp.Config, resp.LeaderID, resp.Config.Version); err != nil {
+		return err
+	}
+	s.addJoinPeers(resp.Nodes)
+	return nil
+}
+
+func (s *Server) resumeClusterJoin(resp *ClusterJoinResp) error {
+	if resp == nil || resp.Config == nil || resp.JoinVersion == 0 || resp.LeaderID == 0 || resp.Config.Version < resp.JoinVersion {
+		return errors.New("join response does not establish a committed recovery boundary")
+	}
+	found, leaderKnown := false, false
+	for _, node := range resp.Config.Nodes {
+		if node.Id == resp.LeaderID {
+			leaderKnown = true
+		}
+		if node.Id == s.opts.ConfigOptions.NodeId {
+			found = true
+		}
+	}
+	if !found || !leaderKnown {
+		return errors.New("join response no longer contains this member and its leader")
+	}
+	if err := s.cfgServer.ResumeJoin(resp.Config, resp.LeaderID, resp.JoinVersion); err != nil {
+		return err
+	}
+	if s.cfgServer.Snapshot().Version < resp.JoinVersion {
+		s.addJoinPeers(resp.Nodes)
+	}
+	// Only the actual join command, never a discovery snapshot, can release
+	// the startup recovery fence after its subsequent Joined configuration.
+	s.slotServer.SetRecoveryJoinVersion(resp.JoinVersion)
+	return nil
+}
+
+func (s *Server) addJoinPeers(nodes []*NodeInfo) {
+	peers := make(map[uint64]string, len(nodes))
+	for _, node := range nodes {
+		peers[node.NodeId] = node.ServerAddr
+	}
+	s.addOrUpdateNodes(peers)
 }
 
 // Bootstrap deployments may advertise through InitNodes and leave ServerAddr

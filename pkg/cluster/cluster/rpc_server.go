@@ -68,6 +68,7 @@ func (r *rpcServer) setRoutes() {
 	// 节点加入
 	r.s.netServer.Route("/rpc/cluster/join", r.handleClusterJoin)
 	r.s.netServer.Route("/rpc/cluster/join/probe/v1", r.handleClusterJoinProbe)
+	r.s.netServer.Route("/rpc/cluster/join/probe/v2", r.handleClusterJoinProbe)
 
 	// 获取分布式日志
 	r.s.netServer.Route("/rpc/cluster/logs", r.handleClusterLogs)
@@ -416,26 +417,26 @@ func (r *rpcServer) handleClusterJoinRequest(c *wkserver.Context, probe bool) {
 		return
 	}
 
-	allowVote := false
-	if req.Role == types.NodeRole_NodeRoleReplica {
-		allowVote = true
-	}
-
 	resp := ClusterJoinResp{}
-
-	nodeInfos := make([]*NodeInfo, 0, len(r.s.cfgServer.Nodes()))
-	for _, node := range r.s.cfgServer.Nodes() {
+	snapshot := r.s.cfgServer.Snapshot()
+	nodeInfos := make([]*NodeInfo, 0, len(snapshot.Nodes))
+	var existing *types.Node
+	for _, node := range snapshot.Nodes {
 		nodeInfos = append(nodeInfos, &NodeInfo{
 			NodeId:     node.Id,
 			ServerAddr: node.ClusterAddr,
 		})
+		if node.Id == req.NodeId {
+			existing = node
+		}
 	}
 	resp.Nodes = nodeInfos
-	existing := r.s.cfgServer.Node(req.NodeId)
-	if req.Probe && existing != nil {
-		if existing.Status == types.NodeStatus_NodeStatusWillJoin {
+	if req.Probe {
+		// Discovery never proposes membership, including for an unknown ID.
+		// The snapshot distinguishes absence from an already accepted learner.
+		if existing == nil || existing.Status == types.NodeStatus_NodeStatusWillJoin {
 			resp.LeaderID = r.s.cfgServer.LeaderId()
-			resp.Config = r.s.cfgServer.Snapshot()
+			resp.Config = snapshot
 		}
 		data, err := resp.Marshal()
 		if err != nil {
@@ -446,6 +447,7 @@ func (r *rpcServer) handleClusterJoinRequest(c *wkserver.Context, probe bool) {
 		return
 	}
 
+	allowVote := req.Role == types.NodeRole_NodeRoleReplica
 	joinVersion, err := r.s.cfgServer.ProposeJoinWithVersion(&types.Node{
 		Id:          req.NodeId,
 		ClusterAddr: req.ServerAddr,

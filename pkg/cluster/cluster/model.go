@@ -591,7 +591,7 @@ type ClusterJoinReq struct {
 	NodeId     uint64
 	ServerAddr string
 	Role       types.NodeRole
-	// Probe leaves an existing member unchanged; an absent member rejoins.
+	// Probe only discovers membership. An absent node must explicitly join.
 	Probe bool
 }
 
