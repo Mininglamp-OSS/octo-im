@@ -68,6 +68,12 @@ func TestNotifySyncAllStillExcludesLearners(t *testing.T) {
 }
 
 func TestRoleChangeResponseResumesSecondLearnerPromotion(t *testing.T) {
+	for _, legacySuspended := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy-suspended-%t", legacySuspended), func(t *testing.T) { roleChangeResumesSecondLearner(t, legacySuspended) })
+	}
+}
+
+func roleChangeResumesSecondLearner(t *testing.T, legacySuspended bool) {
 	leader := newTestNode(1, []uint64{1})
 	initial := types.Config{Replicas: []uint64{1}, Learners: []uint64{2, 3},
 		Leader: 1, Role: types.RoleLeader, Term: 1, Version: 1, MigrateFrom: 2, MigrateTo: 2}
@@ -94,7 +100,7 @@ func TestRoleChangeResponseResumesSecondLearnerPromotion(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, types.SpeedSuspend, response.Speed)
 	require.NoError(t, learner.Step(response))
-	require.True(t, learner.suspend)
+	require.False(t, learner.suspend, "active membership work must keep the current learner synchronizing")
 
 	// The first promotion is applied before its asynchronous response. The
 	// remaining peer keeps its learner role and can still be suspended.
@@ -106,8 +112,15 @@ func TestRoleChangeResponseResumesSecondLearnerPromotion(t *testing.T) {
 	require.Empty(t, leader.replicaSync)
 	local = updated.Clone()
 	local.Role = types.RoleLearner
-	require.NoError(t, learner.Step(types.Event{Type: types.ConfChange, Config: local}))
-	require.True(t, learner.suspend)
+	if legacySuspended {
+		// Model a suspended peer that has not installed the first promotion.
+		// The role response must wake it before it can request that config.
+		learner.suspend = true
+		require.Equal(t, uint64(1), learner.cfg.Version)
+	} else {
+		require.NoError(t, learner.Step(types.Event{Type: types.ConfChange, Config: local}))
+		require.False(t, learner.suspend)
+	}
 
 	require.NoError(t, leader.Step(types.Event{Type: types.LearnerToFollowerResp, From: 2, Reason: types.ReasonOk}))
 	notifications := findEventsOfType(collectEvents(leader), types.NotifySync)

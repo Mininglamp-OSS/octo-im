@@ -12,13 +12,12 @@ func (n *Node) tickAdmissionDrain() {
 	if n.admissionDrainCooldown > 0 {
 		n.admissionDrainCooldown--
 	}
-	if !n.drainingAdmissions || n.leaderTransferAttempted {
+	if !n.drainingAdmissions || n.handoff != nil && n.handoff.attempted {
 		return
 	}
 	n.admissionDrainTicks++
 	if n.admissionDrainTicks >= maxAdmissionDrainTicks {
-		n.drainingAdmissions, n.stopPropose = false, false
-		n.admissionDrainTicks = 0
+		n.clearLeaderHandoff()
 		n.admissionDrainCooldown = maxAdmissionDrainTicks
 	}
 }

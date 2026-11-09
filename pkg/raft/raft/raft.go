@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -293,35 +294,18 @@ func (r *Raft) handleStoreReq(e types.Event) {
 
 func (r *Raft) handleGetLogsReq(e types.Event) {
 
-	var leaderLastLogTerm = r.node.lastTermStartIndex.Term
-
 	err := r.pool.Submit(func() {
-		// 获取裁断日志下标
-		var (
-			trunctIndex uint64
-		)
 		if e.Reason != types.ReasonOnlySync {
-			var treason types.Reason
-			trunctIndex, treason = r.getTrunctLogIndex(e, leaderLastLogTerm)
-			if treason != types.ReasonOk {
-				r.stepC <- stepReq{event: types.Event{
-					To:     e.From,
-					Type:   types.GetLogsResp,
-					Index:  e.Index,
-					Reason: treason,
-				}}
+			index, reason := r.getTrunctLogIndex(e)
+			if reason != types.ReasonOk {
+				r.stepC <- stepReq{event: types.Event{To: e.From, Type: types.GetLogsResp,
+					Term: e.Term, Index: index, Reason: reason}}
 				return
 			}
 		}
-
-		// 需要裁剪
-		if trunctIndex > 0 {
-			r.stepC <- stepReq{event: types.Event{
-				To:     e.From,
-				Type:   types.GetLogsResp,
-				Index:  trunctIndex,
-				Reason: types.ReasonTruncate,
-			}}
+		if e.Index > e.StoredIndex {
+			r.stepC <- stepReq{event: types.Event{To: e.From, Type: types.GetLogsResp,
+				Term: e.Term, Index: e.Index, Reason: types.ReasonOk}}
 			return
 		}
 
@@ -332,6 +316,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 			r.stepC <- stepReq{event: types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
+				Term:   e.Term,
 				Index:  e.Index,
 				Reason: types.ReasonError,
 			}}
@@ -340,6 +325,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		r.stepC <- stepReq{event: types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Logs:   logs,
 			Reason: types.ReasonOk,
@@ -350,6 +336,7 @@ func (r *Raft) handleGetLogsReq(e types.Event) {
 		r.stepC <- stepReq{event: types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
+			Term:   e.Term,
 			Index:  e.Index,
 			Reason: types.ReasonError,
 		}}
@@ -363,32 +350,40 @@ func (r *Raft) handleTruncateReq(e types.Event) {
 		if err != nil {
 			r.Error("truncate logs failed", zap.Error(err))
 			r.stepC <- stepReq{event: types.Event{
-				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
+				Type:       types.TruncateResp,
+				Term:       e.Term,
+				TruncateID: e.TruncateID,
+				Index:      e.Index,
+				Reason:     types.ReasonError,
 			}}
 			return
 		}
-		// 删除本地的leader term start index
-		err = r.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(e.LastLogTerm)
+		info, err := types.RetainedTermStart(e.Index, r.opts.Storage.GetLogs, r.opts.Storage.GetTermStartIndex)
+		if err == nil {
+			err = r.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(info.Term)
+		}
 		if err != nil {
-			r.Error("delete leader term start index failed", zap.Error(err), zap.Uint32("LastLogTerm", e.LastLogTerm))
-			r.stepC <- stepReq{event: types.Event{
-				Type:   types.TruncateResp,
-				Reason: types.ReasonError,
-			}}
+			r.Error("restore retained log term failed", zap.Error(err))
+			r.stepC <- stepReq{event: types.Event{Type: types.TruncateResp, Term: e.Term, TruncateID: e.TruncateID, Index: e.Index, Reason: types.ReasonError}}
 			return
 		}
 		r.stepC <- stepReq{event: types.Event{
-			Type:   types.TruncateResp,
-			Index:  e.Index,
-			Reason: types.ReasonOk,
+			Type:               types.TruncateResp,
+			Term:               e.Term,
+			TruncateID:         e.TruncateID,
+			Index:              e.Index,
+			TermStartIndexInfo: info,
+			Reason:             types.ReasonOk,
 		}}
 	})
 	if err != nil {
 		r.Error("submit truncate logs failed", zap.Error(err))
 		r.stepC <- stepReq{event: types.Event{
-			Type:   types.TruncateResp,
-			Reason: types.ReasonError,
+			Type:       types.TruncateResp,
+			Term:       e.Term,
+			TruncateID: e.TruncateID,
+			Index:      e.Index,
+			Reason:     types.ReasonError,
 		}}
 	}
 }
@@ -443,64 +438,13 @@ func (r *Raft) handleApplyReq(e types.Event) {
 	}
 }
 
-// 根据副本的同步数据，来获取副本的需要裁剪的日志下标，如果不需要裁剪，则返回0
-func (r *Raft) getTrunctLogIndex(e types.Event, leaderLastLogTerm uint32) (uint64, types.Reason) {
-
-	// 副本的最新日志任期为0，说明副本没有日志，不需要裁剪
-	if e.LastLogTerm == 0 {
-		return 0, types.ReasonOk
+func (r *Raft) getTrunctLogIndex(e types.Event) (uint64, types.Reason) {
+	index, reason, err := types.CheckLogPrefix(e.Index, e.StoredIndex, e.LastLogTerm,
+		r.opts.Storage.GetLogs, r.opts.Storage.GetTermStartIndex)
+	if err != nil {
+		r.Error("check log prefix failed", zap.Error(err))
 	}
-	// 如果副本的最新日志任期等于当前领导的最新日志任期
-	//  如果副本的最新日志下标大于领导者最新日志下标，则需要裁剪至领导者最新日志下标
-	if e.LastLogTerm == leaderLastLogTerm {
-		if e.Index > 0 {
-			replicaLastLogIndex := e.Index - 1 // 副本日志下标等于同步下标-1
-			if replicaLastLogIndex > r.node.LastLogIndex() {
-				return r.node.LastLogIndex(), types.ReasonOk
-			}
-		}
-		return 0, types.ReasonOk
-	}
-
-	// 如果副本的最新日志任期小于当前领导的最新日志任期，则需要裁剪
-	if e.LastLogTerm < leaderLastLogTerm {
-
-		term, err := r.opts.Storage.LeaderTermGreaterEqThan(e.LastLogTerm + 1)
-		if err != nil {
-			r.Error("LeaderTermGreaterEqThan: get leader last term failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-
-		// 获取副本的最新日志任期+1的开始日志下标
-		termStartIndex, err := r.opts.Storage.GetTermStartIndex(term)
-		if err != nil {
-			r.Error("get term start index failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		if termStartIndex > 0 {
-			return termStartIndex - 1, types.ReasonOk
-		}
-		return termStartIndex, types.ReasonOk
-	} else {
-		if e.LastLogTerm <= 1 {
-			return 0, types.ReasonOk
-		}
-		term, err := r.opts.Storage.LeaderLastTerm()
-		if err != nil {
-			r.Error("LeaderLastTerm: get leader last term failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		termStartIndex, err := r.opts.Storage.GetTermStartIndex(term)
-		if err != nil {
-			r.Error("get term start index failed", zap.Error(err))
-			return 0, types.ReasonError
-		}
-		r.Foucs("getTrunctLogIndex: lastLogTerm > leaderLastLogTerm", zap.Uint64("from", e.From), zap.Uint32("e.LastLogTerm", e.LastLogTerm), zap.Uint32("leaderLastLogTerm", leaderLastLogTerm), zap.Uint64("termStartIndex", termStartIndex))
-		if termStartIndex > 0 {
-			return termStartIndex - 1, types.ReasonOk
-		}
-		return termStartIndex, types.ReasonOk
-	}
+	return index, reason
 }
 
 func (r *Raft) advance() {
@@ -511,98 +455,60 @@ func (r *Raft) advance() {
 }
 
 func (r *Raft) handleRoleChangeReq(e types.Event) {
-
-	err := r.pool.Submit(func() {
-
-		var (
-			newCfg        types.Config
-			err           error
-			respEventType types.EventType
-		)
-		switch e.Type {
-		case types.LearnerToLeaderReq,
-			types.LearnerToFollowerReq:
-			newCfg, err = r.learnTo(e.From)
-			if err != nil {
-				r.Error("learn switch failed", zap.Error(err), zap.String("type", e.Type.String()), zap.String("cfg", r.node.Config().String()))
-			}
-			if e.Type == types.LearnerToFollowerReq {
-				respEventType = types.LearnerToFollowerResp
-			} else if e.Type == types.LearnerToLeaderReq {
-				respEventType = types.LearnerToLeaderResp
-			}
-		case types.FollowerToLeaderReq:
-			newCfg, err = r.followerToLeader(e.From)
-			if err != nil {
-				r.Error("follower switch to leader failed", zap.Error(err), zap.String("cfg", r.node.Config().String()))
-			}
-			respEventType = types.FollowerToLeaderResp
-		default:
-			err = errors.New("unknown role switch")
+	// Freeze mutable membership on the owner before dispatching storage work.
+	current := r.node.Config()
+	if !r.node.IsLeader() || e.Term != 0 && (e.Term != current.Term || e.ConfigVersion != current.Version) {
+		return
+	}
+	var (
+		newCfg       types.Config
+		err          error
+		responseType types.EventType
+	)
+	switch e.Type {
+	case types.LearnerToLeaderReq, types.LearnerToFollowerReq:
+		newCfg, err = r.learnTo(e.From)
+		responseType = types.LearnerToFollowerResp
+		if e.Type == types.LearnerToLeaderReq {
+			responseType = types.LearnerToLeaderResp
 		}
-
-		if err != nil {
-
-			r.stepC <- stepReq{event: types.Event{
-				Type:          respEventType,
-				From:          e.From,
-				Term:          e.Term,
-				ConfigVersion: e.ConfigVersion,
-				Reason:        types.ReasonError,
-			}}
-			return
-		}
-
-		err = r.opts.Storage.SaveConfig(newCfg)
-		if err != nil {
+	case types.FollowerToLeaderReq:
+		newCfg, err = r.followerToLeader(e.From)
+		responseType = types.FollowerToLeaderResp
+	default:
+		err = errors.New("unknown role switch")
+	}
+	respond := func(reason types.Reason, cfg types.Config) {
+		r.stepC <- stepReq{event: types.Event{Type: responseType, From: e.From, Term: e.Term,
+			ConfigVersion: e.ConfigVersion, RoleChangeID: e.RoleChangeID, Reason: reason, Config: cfg}}
+	}
+	if err != nil {
+		r.Error("prepare role change failed", zap.Error(err))
+		respond(types.ReasonError, types.Config{})
+		return
+	}
+	err = r.pool.Submit(func() {
+		if err := r.opts.Storage.SaveConfig(newCfg); err != nil {
 			r.Error("change role failed", zap.Error(err))
-			r.stepC <- stepReq{event: types.Event{
-				Type:          respEventType,
-				From:          e.From,
-				Term:          e.Term,
-				ConfigVersion: e.ConfigVersion,
-				Reason:        types.ReasonError,
-			}}
+			respond(types.ReasonError, types.Config{})
 			return
 		}
-		r.stepC <- stepReq{event: types.Event{
-			Type:          respEventType,
-			From:          e.From,
-			Term:          e.Term,
-			ConfigVersion: e.ConfigVersion,
-			Reason:        types.ReasonOk,
-			Config:        newCfg,
-		}}
+		respond(types.ReasonOk, newCfg)
 	})
 	if err != nil {
 		r.Error("submit role change req failed", zap.Error(err))
-
-		var respEventType types.EventType
-
-		switch e.Type {
-		case types.LearnerToLeaderReq:
-			respEventType = types.LearnerToLeaderResp
-		case types.LearnerToFollowerReq:
-			respEventType = types.LearnerToFollowerResp
-		case types.FollowerToLeaderReq:
-			respEventType = types.FollowerToLeaderResp
-		}
-		r.stepC <- stepReq{event: types.Event{
-			Type:          respEventType,
-			From:          e.From,
-			Term:          e.Term,
-			ConfigVersion: e.ConfigVersion,
-			Reason:        types.ReasonError,
-		}}
+		respond(types.ReasonError, types.Config{})
 	}
 }
 
 // 学习者转换
 func (r *Raft) learnTo(learnerId uint64) (types.Config, error) {
-	if !wkutil.ArrayContainsUint64(r.node.Config().Learners, learnerId) {
+	cfg := r.node.Config().Clone()
+	completing := cfg.MigrateTo == learnerId && cfg.MigrateFrom != learnerId && cfg.MigrateFrom != r.LeaderId() &&
+		wkutil.ArrayContainsUint64(cfg.Replicas, learnerId) && wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateFrom)
+	if !wkutil.ArrayContainsUint64(cfg.Learners, learnerId) && !completing {
 		return types.Config{}, errors.New("promotion target is not a learner")
 	}
-	cfg := r.node.Config().Clone()
 
 	// orphan learner: 前次迁移已完成（MigrateFrom/MigrateTo 都为 0），
 	// 但 learnerId 仍残留在 cfg.Learners 中。此时既无迁移源也无迁移目标，
@@ -633,6 +539,10 @@ func (r *Raft) learnTo(learnerId uint64) (types.Config, error) {
 		}
 
 		if cfg.MigrateFrom == r.LeaderId() { // 学习者转领导
+			if cfg.Term == math.MaxUint32 {
+				return types.Config{}, errors.New("leader term exhausted")
+			}
+			cfg.Term++
 			cfg.Leader = cfg.MigrateTo
 		}
 	}
@@ -651,6 +561,9 @@ func (r *Raft) followerToLeader(followerId uint64) (types.Config, error) {
 		return types.Config{}, fmt.Errorf("follower not in replicas")
 	}
 
+	if cfg.Term == math.MaxUint32 {
+		return types.Config{}, errors.New("leader term exhausted")
+	}
 	cfg.Leader = followerId
 	cfg.Term = cfg.Term + 1
 	cfg.MigrateFrom = 0

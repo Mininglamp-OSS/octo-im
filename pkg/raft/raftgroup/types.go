@@ -5,5 +5,6 @@ import "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 type Event struct {
 	RaftKey string
 	types.Event
-	WaitC chan error
+	WaitC    chan error
+	instance IRaft
 }

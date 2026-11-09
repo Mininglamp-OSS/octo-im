@@ -102,88 +102,91 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 
 // 视情况是否需要加入新的副本
 func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, error) {
-	// A completed single-replica configuration cannot finish an abandoned
-	// expansion with no learner. Clear only that historical orphan state;
-	// multi-replica repair below must still choose eligible replacement learners.
-	if cfg.ReplicaMaxCount == 1 && len(cfg.Replicas) == 1 && len(cfg.Learners) == 0 &&
-		cfg.MigrateFrom != 0 && cfg.MigrateFrom == cfg.MigrateTo &&
+	// The single-voter orphan decision is local metadata work; it must not
+	// require a running cluster or inspect health for an already full group.
+	if cfg.ReplicaMaxCount == 1 && len(cfg.Replicas) == 1 {
+		return clearSingleReplicaOrphan(cfg), nil
+	}
+	return planChannelExpansion(cfg, &types.Config{Nodes: s.cfgServer.Nodes()}), nil
+}
+
+func clearSingleReplicaOrphan(cfg *wkdb.ChannelClusterConfig) bool {
+	if len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 && cfg.MigrateFrom == cfg.MigrateTo &&
 		!wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo) {
 		cfg.MigrateFrom, cfg.MigrateTo = 0, 0
-		return true, nil
+		return true
 	}
-	if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 && s.cfgServer != nil {
-		// Membership cardinality alone does not describe live redundancy. Use
-		// the existing learner migration to replace one failed replica while
-		// preserving the current voters, leader and requested replica count.
-		var failed uint64
-		online := 0
-		for _, id := range cfg.Replicas {
-			node := s.cfgServer.Node(id)
-			if node == nil {
-				continue
-			}
-			if node.Online {
-				online++
-			}
-			if id != cfg.LeaderId && (!node.AllowVote || !node.Online && node.OfflineCount > 0) {
-				failed = id
-			}
-		}
-		if failed != 0 && online >= len(cfg.Replicas)/2+1 {
-			for _, node := range s.cfgServer.AllowVoteAndJoinedOnlineNodes() {
-				if !wkutil.ArrayContainsUint64(cfg.Replicas, node.Id) {
-					cfg.MigrateFrom, cfg.MigrateTo = failed, node.Id
-					cfg.Learners = []uint64{node.Id}
-					return true, nil
-				}
-			}
+	return false
+}
+
+func planChannelExpansion(cfg *wkdb.ChannelClusterConfig, cluster *types.Config) bool {
+	if cfg.ReplicaMaxCount == 1 && len(cfg.Replicas) == 1 {
+		return clearSingleReplicaOrphan(cfg)
+	}
+	online := make(map[uint64]bool, len(cluster.Nodes))
+	var eligible []uint64
+	for _, n := range cluster.Nodes {
+		online[n.Id] = n.Online
+		if n.Online && n.AllowVote && n.Role == types.NodeRole_NodeRoleReplica && n.Status == types.NodeStatus_NodeStatusJoined {
+			eligible = append(eligible, n.Id)
 		}
 	}
-	if len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
-		return false, nil
+	live := 0
+	var offline uint64
+	for _, id := range cfg.Replicas {
+		if online[id] {
+			live++
+		} else if offline == 0 {
+			offline = id
+		}
 	}
-	// An interrupted expansion can leave equal, nonzero migration endpoints
-	// after its learner disappeared. If the target is not a replica either,
-	// no member can complete that migration. Select eligible learners below and
-	// replace the stale markers in the same version-fenced metadata write.
-	// Preserve real learners, transfers, partial markers and existing replicas.
 	orphanedExpansion := len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 &&
 		cfg.MigrateFrom == cfg.MigrateTo && !wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo)
 	if len(cfg.Learners) > 0 || (cfg.MigrateFrom != 0 || cfg.MigrateTo != 0) && !orphanedExpansion {
-		return false, nil
-	}
-	allowVoteNodes := s.cfgServer.AllowVoteAndJoinedOnlineNodes()
-	if len(allowVoteNodes) == 0 {
-		return false, errors.New("no allow vote nodes")
-	}
-
-	if len(cfg.Replicas) >= len(allowVoteNodes) { // 如果当前已集群的副本数大于等于允许投票的节点数，则不需要加入新的副本
-		return false, nil
-	}
-
-	newReplicaIds := make([]uint64, 0, len(allowVoteNodes)-len(cfg.Replicas))
-	for _, node := range allowVoteNodes {
-		if !wkutil.ArrayContainsUint64(cfg.Replicas, node.Id) {
-			newReplicaIds = append(newReplicaIds, node.Id)
+		if cfg.MigrateTo != 0 && !online[cfg.MigrateTo] && wkutil.ArrayContainsUint64(cfg.Learners, cfg.MigrateTo) {
+			cfg.Learners = wkutil.RemoveUint64(cfg.Learners, cfg.MigrateTo)
+			cfg.MigrateFrom, cfg.MigrateTo = 0, 0
+			return true
 		}
+		addFirst := channelAddFirstStage(*cfg) && cfg.MigrateTo != cfg.LeaderId
+		if addFirst && !online[cfg.MigrateTo] && online[cfg.MigrateFrom] &&
+			live >= len(cfg.Replicas)/2+1 && live >= int(cfg.ReplicaMaxCount) {
+			cfg.Replicas = wkutil.RemoveUint64(cfg.Replicas, cfg.MigrateTo)
+			cfg.MigrateFrom, cfg.MigrateTo = 0, 0
+			return true
+		}
+		if from, to, ok := types.PlanReplicaRetirement(cfg.Replicas, cfg.Learners, uint32(cfg.ReplicaMaxCount), cfg.LeaderId, cfg.MigrateFrom, cfg.MigrateTo, online); ok {
+			cfg.MigrateFrom, cfg.MigrateTo = from, to
+			return true
+		}
+		return false
 	}
-	// 打乱顺序，防止每次都是相同的节点加入
-	rand.Shuffle(len(newReplicaIds), func(i, j int) {
-		newReplicaIds[i], newReplicaIds[j] = newReplicaIds[j], newReplicaIds[i]
-	})
+	if from, to, ok := types.PlanReplicaRetirement(cfg.Replicas, cfg.Learners, uint32(cfg.ReplicaMaxCount), cfg.LeaderId, cfg.MigrateFrom, cfg.MigrateTo, online); ok {
+		cfg.MigrateFrom, cfg.MigrateTo = from, to
+		return true
+	}
 
-	// 将新节点加入到学习者列表
-	for _, newReplicaId := range newReplicaIds {
-		cfg.MigrateFrom = newReplicaId
-		cfg.MigrateTo = newReplicaId
-		cfg.Learners = append(cfg.Learners, newReplicaId)
-		if len(cfg.Learners)+len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
+	if live >= int(cfg.ReplicaMaxCount) || live < len(cfg.Replicas)/2+1 || !online[cfg.LeaderId] {
+		return false
+	}
+	rand.Shuffle(len(eligible), func(i, j int) { eligible[i], eligible[j] = eligible[j], eligible[i] })
+	for _, id := range eligible {
+		if wkutil.ArrayContainsUint64(cfg.Replicas, id) {
+			continue
+		}
+		cfg.MigrateFrom, cfg.MigrateTo = id, id
+		cfg.Learners = append(cfg.Learners, id)
+		if offline != 0 {
+			// Replace the unavailable follower after catch-up. The healthy
+			// leader chosen above keeps leading throughout this expansion.
+			cfg.MigrateFrom = offline
+			break
+		}
+		if len(cfg.Replicas)+len(cfg.Learners) >= int(cfg.ReplicaMaxCount) {
 			break
 		}
 	}
-
-	return true, nil
-
+	return len(cfg.Learners) > 0
 }
 
 // 视情况是否需要变更领导节点

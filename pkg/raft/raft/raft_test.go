@@ -353,6 +353,7 @@ func (t *testTransport) Send(event types.Event) {
 }
 
 type testStorage struct {
+	appliedIndex    uint64
 	hardState       types.HardState
 	nodeId          uint64
 	logs            []types.Log
@@ -390,7 +391,7 @@ func (s *testStorage) GetState() (types.RaftState, error) {
 		HardState:    s.hardState,
 		LastLogIndex: lastLog.Index,
 		LastTerm:     lastLog.Term,
-		AppliedIndex: lastLog.Index,
+		AppliedIndex: s.appliedIndex,
 	}, nil
 }
 
@@ -440,7 +441,9 @@ func (s *testStorage) LeaderLastTerm() (uint32, error) {
 }
 
 func (s *testStorage) Apply(logs []types.Log) error {
-
+	if len(logs) > 0 {
+		s.appliedIndex = logs[len(logs)-1].Index
+	}
 	return nil
 }
 

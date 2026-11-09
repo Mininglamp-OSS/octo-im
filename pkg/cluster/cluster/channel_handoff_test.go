@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/clusterconfig"
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
@@ -63,4 +64,44 @@ func TestHandoffNotificationFailureCannotReopenOldLeader(t *testing.T) {
 	var done func()
 	require.NoError(t, next.channelServer.AdmitMessage(ctx, id, 2, 43, 1, func(f func()) { done = f }))
 	done()
+}
+
+func TestChannelCallbackKeepsRetirementPendingAfterLocalInstall(t *testing.T) {
+	servers, ctx := newConfigRPCServers(t, 3)
+	owner := servers[0]
+	var id string
+	for i := 0; i < 1000; i++ {
+		candidate := fmt.Sprintf("callback-retirement-%d", i)
+		if owner.cfgServer.SlotLeaderId(owner.getSlotId(candidate)) == 1 {
+			id = candidate
+			break
+		}
+	}
+	require.NotEmpty(t, id)
+	cfg := wkdb.ChannelClusterConfig{ChannelId: id, ChannelType: 2, LeaderId: 1, Term: 1,
+		ReplicaMaxCount: 2, Replicas: []uint64{1, 2}, Learners: []uint64{3}, MigrateFrom: 2, MigrateTo: 3}
+	version, err := owner.saveChannelConfig(ctx, cfg)
+	require.NoError(t, err)
+	cfg.ConfVersion = version
+	require.NoError(t, owner.channelServer.WakeLeaderIfNeed(cfg))
+	completion := rafttype.Config{Version: version, Term: 1, Leader: 1, Replicas: []uint64{1, 3}}
+	require.ErrorIs(t, owner.onSaveChannelConfig(id, 2, completion), clusterconfig.ErrMembershipBusy)
+	stage, err := owner.loadConversationConfig(ctx, id, 2)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []uint64{1, 2, 3}, stage.Replicas, "healthy source remains until the intermediate voting set is confirmed")
+	require.Empty(t, stage.Learners)
+	require.Equal(t, uint64(2), stage.MigrateFrom)
+	require.Equal(t, uint64(3), stage.MigrateTo)
+	state, err := owner.channelServer.ReadLeaderState(ctx, id, 2)
+	require.NoError(t, err)
+	require.Equal(t, stage.ConfVersion, state.ConfigVersion, "the intermediate authority is installed locally even while retirement remains pending")
+	require.Equal(t, uint64(1), state.LeaderID)
+	// A delayed callback must neither finish the intermediate task nor rewrite
+	// its version, even when the callback reconciles the already saved authority.
+	require.Error(t, owner.onSaveChannelConfig(id, 2, completion))
+	current, err := owner.loadConversationConfig(ctx, id, 2)
+	require.NoError(t, err)
+	require.Equal(t, stage.ConfVersion, current.ConfVersion)
+	require.Equal(t, stage.Replicas, current.Replicas)
+	require.Equal(t, stage.MigrateTo, current.MigrateTo)
 }

@@ -48,7 +48,7 @@ func TestLeadershipTransferFenceSurvivesVersionPublication(t *testing.T) {
 	cfg.Version++
 	require.NoError(t, n.Step(types.Event{Type: types.ConfChange, Config: cfg}))
 	require.NoError(t, n.Step(types.Event{Type: types.FollowerToLeaderResp, From: 3,
-		Term: request.Term, ConfigVersion: request.ConfigVersion, Reason: types.ReasonOk}))
+		Term: request.Term, ConfigVersion: request.ConfigVersion, RoleChangeID: request.RoleChangeID, Reason: types.ReasonOk}))
 	require.ErrorIs(t, n.Step(n.NewPropose([]byte("same leader, newer config"))), types.ErrProposalDropped)
 }
 
@@ -69,7 +69,7 @@ func TestLeadershipTransferSuccessWaitsForOwnerConfiguration(t *testing.T) {
 	n := transferTestLeader(t, false)
 	request := beginTestTransfer(t, n)
 	require.NoError(t, n.Step(types.Event{Type: types.FollowerToLeaderResp, From: 3,
-		Term: request.Term, ConfigVersion: request.ConfigVersion, Reason: types.ReasonOk}))
+		Term: request.Term, ConfigVersion: request.ConfigVersion, RoleChangeID: request.RoleChangeID, Reason: types.ReasonOk}))
 	require.ErrorIs(t, n.Step(n.NewPropose([]byte("owner configuration still pending"))), types.ErrProposalDropped)
 	cfg := n.Config().Clone()
 	cfg.Leader, cfg.Term, cfg.Version, cfg.Role = 3, 2, 8, types.RoleFollower
@@ -82,7 +82,7 @@ func TestLeadershipTransferFailureKeepsFenceAndAllowsReconciliation(t *testing.T
 	n := transferTestLeader(t, false)
 	request := beginTestTransfer(t, n)
 	require.NoError(t, n.Step(types.Event{Type: types.FollowerToLeaderResp, From: 3,
-		Term: request.Term, ConfigVersion: request.ConfigVersion, Reason: types.ReasonError}))
+		Term: request.Term, ConfigVersion: request.ConfigVersion, RoleChangeID: request.RoleChangeID, Reason: types.ReasonError}))
 	require.ErrorIs(t, n.Step(n.NewPropose([]byte("save may have committed"))), types.ErrProposalDropped)
 	require.ErrorIs(t, n.AdmitMessage(123), types.ErrProposalDropped)
 	// The next sync can retry the same version-checked transition, not writes.
@@ -94,7 +94,7 @@ func TestLeadershipTransferIgnoresUnrelatedCompletion(t *testing.T) {
 	request := beginTestTransfer(t, n)
 	for _, completion := range []types.Event{
 		{Type: types.LearnerToFollowerResp, From: 2, Reason: types.ReasonOk},
-		{Type: types.FollowerToLeaderResp, From: 2, Term: request.Term, ConfigVersion: request.ConfigVersion, Reason: types.ReasonError},
+		{Type: types.FollowerToLeaderResp, From: 2, Term: request.Term, ConfigVersion: request.ConfigVersion, RoleChangeID: request.RoleChangeID, Reason: types.ReasonError},
 		{Type: types.FollowerToLeaderResp, From: 3, Term: request.Term, ConfigVersion: request.ConfigVersion + 1, Reason: types.ReasonError},
 	} {
 		require.NoError(t, n.Step(completion))

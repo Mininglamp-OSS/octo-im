@@ -14,15 +14,17 @@ func TestTransferDrainsAdmittedWorkBeforeFixingTail(t *testing.T) {
 			require.NoError(t, n.AdmitMessage(100))
 			require.NoError(t, n.Step(types.Event{Type: types.SyncReq, Term: 1, From: 3, Index: 13, StoredIndex: 13, LastLogTerm: 1, Reason: types.ReasonOnlySync}))
 			require.True(t, n.drainingAdmissions)
-			require.Zero(t, n.leaderTransferTo, "queued accepted work must prevent transfer")
+			require.NotNil(t, n.handoff)
+			require.Zero(t, n.handoff.requestID, "queued accepted work must prevent transfer")
 			require.ErrorIs(t, n.AdmitMessage(101), types.ErrProposalDropped)
 			require.ErrorIs(t, n.Step(types.Event{Type: types.Propose, Logs: []types.Log{{Id: 101, Term: 1, Index: 13}}}), types.ErrProposalDropped)
 			require.NoError(t, n.Step(types.Event{Type: types.Propose, Logs: []types.Log{{Id: 100, Term: 1, Index: 13}}}))
 			n.CompleteMessage(100)
 			require.NoError(t, n.Step(types.Event{Type: types.SyncReq, Term: 1, From: 3, Index: 14, StoredIndex: 13, LastLogTerm: 1, Reason: types.ReasonOnlySync}))
-			require.Zero(t, n.leaderTransferTo, "received tail is not a stored tail")
+			require.Zero(t, n.handoff.requestID, "received tail is not a stored tail")
 			require.NoError(t, n.Step(types.Event{Type: types.SyncReq, Term: 1, From: 3, Index: 14, StoredIndex: 14, LastLogTerm: 1, Reason: types.ReasonOnlySync}))
-			require.Equal(t, uint64(3), n.leaderTransferTo)
+			require.Equal(t, uint64(3), n.handoff.to)
+			require.True(t, n.handoff.attempted)
 		})
 	}
 }
@@ -56,14 +58,14 @@ func TestPrePublicationDrainTimeoutResumesOldLeader(t *testing.T) {
 		n.tickAdmissionDrain()
 	}
 	require.NoError(t, n.AdmitMessage(101))
-	require.Zero(t, n.leaderTransferTo)
+	require.Nil(t, n.handoff)
 	require.Positive(t, n.admissionDrainCooldown)
 }
 
 func TestUnknownPublishedTransferNeverTimesOutIntoTwoWriters(t *testing.T) {
 	n := transferTestLeader(t, true)
 	e := beginTestTransfer(t, n)
-	require.NoError(t, n.Step(types.Event{Type: types.LearnerToLeaderResp, From: 3, Term: e.Term, ConfigVersion: e.ConfigVersion, Reason: types.ReasonError}))
+	require.NoError(t, n.Step(types.Event{Type: types.LearnerToLeaderResp, From: 3, Term: e.Term, ConfigVersion: e.ConfigVersion, RoleChangeID: e.RoleChangeID, Reason: types.ReasonError}))
 	for i := 0; i < maxAdmissionDrainTicks*3; i++ {
 		n.tickAdmissionDrain()
 	}

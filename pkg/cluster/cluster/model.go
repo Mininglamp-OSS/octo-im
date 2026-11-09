@@ -591,6 +591,8 @@ type ClusterJoinReq struct {
 	NodeId     uint64
 	ServerAddr string
 	Role       types.NodeRole
+	// Probe only discovers membership. An absent node must explicitly join.
+	Probe bool
 }
 
 func (c *ClusterJoinReq) Marshal() ([]byte, error) {
@@ -599,11 +601,13 @@ func (c *ClusterJoinReq) Marshal() ([]byte, error) {
 	enc.WriteUint64(c.NodeId)
 	enc.WriteString(c.ServerAddr)
 	enc.WriteUint32(uint32(c.Role))
+	enc.WriteUint8(wkutil.BoolToUint8(c.Probe))
 	return enc.Bytes(), nil
 
 }
 
 func (c *ClusterJoinReq) Unmarshal(data []byte) error {
+	c.Probe = false
 	dec := wkproto.NewDecoder(data)
 	var err error
 	if c.NodeId, err = dec.Uint64(); err != nil {
@@ -617,6 +621,13 @@ func (c *ClusterJoinReq) Unmarshal(data []byte) error {
 		return err
 	}
 	c.Role = types.NodeRole(role)
+	if dec.Len() > 0 {
+		probe, err := dec.Uint8()
+		if err != nil {
+			return err
+		}
+		c.Probe = probe != 0
+	}
 	return nil
 }
 
@@ -625,6 +636,8 @@ type ClusterJoinResp struct {
 	// JoinVersion is the committed configuration-log index of this RPC's join.
 	// Zero from an older seed cannot authorize release of the startup fence.
 	JoinVersion uint64
+	LeaderID    uint64
+	Config      *types.Config
 }
 
 func (c *ClusterJoinResp) Marshal() ([]byte, error) {
@@ -636,10 +649,19 @@ func (c *ClusterJoinResp) Marshal() ([]byte, error) {
 		enc.WriteString(node.ServerAddr)
 	}
 	enc.WriteUint64(c.JoinVersion)
+	if c.Config != nil {
+		data, err := c.Config.Marshal()
+		if err != nil {
+			return nil, err
+		}
+		enc.WriteUint64(c.LeaderID)
+		enc.WriteBinary(data)
+	}
 	return enc.Bytes(), nil
 }
 
 func (c *ClusterJoinResp) Unmarshal(data []byte) error {
+	c.Nodes = nil
 	dec := wkproto.NewDecoder(data)
 	var err error
 	var nodesLen uint16
@@ -660,8 +682,22 @@ func (c *ClusterJoinResp) Unmarshal(data []byte) error {
 		}
 	}
 	c.JoinVersion = 0
+	c.LeaderID, c.Config = 0, nil
 	if dec.Len() > 0 {
 		if c.JoinVersion, err = dec.Uint64(); err != nil {
+			return err
+		}
+	}
+	if dec.Len() > 0 {
+		if c.LeaderID, err = dec.Uint64(); err != nil {
+			return err
+		}
+		data, err := dec.Binary()
+		if err != nil {
+			return err
+		}
+		c.Config = &types.Config{}
+		if err := c.Config.Unmarshal(data); err != nil {
 			return err
 		}
 	}

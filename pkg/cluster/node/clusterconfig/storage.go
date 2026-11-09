@@ -110,6 +110,15 @@ func (p *PebbleShardLogStorage) SaveConfig(cfg types.Config) error {
 
 	for _, willNode := range willNodes {
 		if wkutil.ArrayContainsUint64(cfg.Replicas, willNode.Id) {
+			// Removing and adding voters in separate committed entries keeps an
+			// intersecting quorum. D has caught up as a learner; do not first
+			// turn ABC into ABCD when C is unavailable.
+			if id := offlineVoterForJoin(p.s.Snapshot(), willNode.Id); id != 0 {
+				if err := p.s.proposeNodeRemove(id, willNode.Id); err != nil {
+					return err
+				}
+				return ErrMembershipBusy // retry after D stores the removal too
+			}
 			err := p.s.ProposeJoining(willNode.Id)
 			if err != nil {
 				return err
@@ -122,17 +131,13 @@ func (p *PebbleShardLogStorage) SaveConfig(cfg types.Config) error {
 
 // TruncateLogTo 截断日志
 func (p *PebbleShardLogStorage) TruncateLogTo(index uint64) error {
-	if index == 0 {
-		return errors.New("index must be greater than 0")
-	}
 	appliedIdx, err := p.AppliedIndex()
 	if err != nil {
 		p.Error("get max index error", zap.Error(err))
 		return err
 	}
 	if index < appliedIdx {
-		p.Error("index must be less than  applied index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx))
-		return nil
+		return types.ErrCommittedLogConflict
 	}
 
 	keyData := key.NewLogKey(index + 1)

@@ -77,6 +77,7 @@ message Slot {
     uint64 migrateTo = 8; // 迁移的目标节点
     uint64 expectLeader = 9; // 期望选举到的领导节点
     SlotStatus status = 10; // 槽位状态
+    uint64 generation = 11; // Last committed configuration index that changed this slot assignment.
 }
 
 

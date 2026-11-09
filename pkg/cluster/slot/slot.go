@@ -79,7 +79,7 @@ func (s *Slot) LeaderReadReady() bool {
 // needUpdate 判断是否需要更新
 func (s *Slot) needUpdate(newSlot *types.Slot) bool {
 
-	return !s.slot.Equal(newSlot)
+	return s.slot.Generation != newSlot.Generation || !s.slot.Equal(newSlot)
 }
 
 func (s *Slot) LastLogIndexAndTerm() (uint64, uint32) {

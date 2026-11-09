@@ -16,11 +16,6 @@ func (s *Server) handleSlotLeaderAutoBalance() error {
 			return nil
 		}
 	}
-	// Retry deferred replacements in the existing control loop. A slot busy
-	// during join must still regain redundancy after its migration completes.
-	if replacements := planOfflineSlotReplacements(cfg, 0); len(replacements) > 0 {
-		return s.cfgServer.ProposeSlots(replacements)
-	}
 	for _, slot := range cfg.Slots {
 		if slot.MigrateFrom != 0 || slot.MigrateTo != 0 {
 			return nil

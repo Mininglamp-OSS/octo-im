@@ -119,7 +119,7 @@ func TestApplySerializesSameSlot(t *testing.T) {
 	waitForApply(t, entered, "first apply")
 
 	go func() {
-		errCh <- storage.Apply("1", []types.Log{{Index: 2}})
+		errCh <- storage.Apply("1", []types.Log{{Index: 1}})
 	}()
 
 	select {
@@ -162,6 +162,11 @@ func newBlockingApplyStorage(t *testing.T) (*PebbleShardLogStorage, <-chan uint3
 		}
 	})
 
+	for _, key := range []string{"1", "2"} {
+		if err := storage.AppendLogs(key, []types.Log{{Index: 1}}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return storage, entered, release
 }
 

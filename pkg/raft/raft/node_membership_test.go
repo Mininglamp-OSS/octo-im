@@ -152,10 +152,10 @@ func TestLearnerPromotionWaitsForDurableCommittedPrefix(t *testing.T) {
 		n.queue.committedIndex = 10
 		n.queue.appliedIndex = 10
 		n.replicaSync[4] = &SyncInfo{}
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: 10})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 11, StoredIndex: 10})
 		require.False(t, n.replicaSync[4].roleSwitching)
 		require.Empty(t, n.Ready())
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: 11})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 11, StoredIndex: 11})
 		require.True(t, n.replicaSync[4].roleSwitching)
 		require.Len(t, n.Ready(), 1)
 	}
@@ -182,10 +182,10 @@ func TestSingleVoterPromotionRequiresStoredTail(t *testing.T) {
 		n.queue.lastLogIndex = 10
 		n.replicaSync[4] = &SyncInfo{}
 		for _, stored := range []uint64{5, 10} {
-			n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: stored})
+			n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 11, StoredIndex: stored})
 			require.False(t, n.replicaSync[4].roleSwitching)
 		}
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: 11})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 11, StoredIndex: 11})
 		require.True(t, n.replicaSync[4].roleSwitching)
 	}
 }
@@ -258,9 +258,9 @@ func TestLearnerPromotionGapRequiresDurableCommittedPrefix(t *testing.T) {
 		n.queue.lastLogIndex, n.queue.storedIndex, n.queue.committedIndex = 100, 100, 90
 		n.opts.LearnerToFollowerMinLogGap = 20
 		n.replicaSync[4] = &SyncInfo{}
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 95, StoredIndex: 90})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 95, StoredIndex: 90})
 		require.False(t, n.replicaSync[4].roleSwitching)
-		n.roleSwitchIfNeed(types.Event{From: 4, Index: 95, StoredIndex: 91})
+		n.roleSwitchIfNeed(types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 95, StoredIndex: 91})
 		require.True(t, n.replicaSync[4].roleSwitching)
 	}
 }
@@ -277,6 +277,7 @@ func TestMembershipBroadcastCommitClampedToDurableLogs(t *testing.T) {
 		follower := newTestNode(ping.To, []uint64{1, 2, 3})
 		makeFollower(follower, 2, 1)
 		follower.queue.lastLogIndex, follower.queue.storedIndex = 10, 8
+		require.NoError(t, follower.Step(types.Event{Type: types.SyncResp, From: 1, Term: 2, Index: 11, Reason: types.ReasonOk}))
 		require.NoError(t, follower.Step(ping))
 		require.Equal(t, uint64(8), follower.queue.committedIndex)
 	}
@@ -296,4 +297,77 @@ func TestElectionMembershipHigherTermConfigEndsCampaign(t *testing.T) {
 	require.Empty(t, n.votes)
 	require.NoError(t, n.Step(types.Event{Type: types.VoteResp, From: 2, Term: term, Reason: types.ReasonOk}))
 	require.False(t, n.IsLeader())
+}
+
+func TestRetiredPeerCannotChangeTermOrReplicationState(t *testing.T) {
+	for _, typ := range []types.EventType{types.Ping, types.SyncReq, types.SyncResp, types.NotifySync, types.ConfigReq, types.ConfigResp, types.VoteReq, types.VoteResp} {
+		t.Run(typ.String(), func(t *testing.T) {
+			n := newTestNode(1, []uint64{1, 2, 4})
+			n.cfg.Version = 10
+			makeLeader(n, 3)
+			clearEvents(n)
+			require.NoError(t, n.Step(types.Event{Type: typ, From: 3, To: 1, Term: 100, Index: 999, StoredIndex: 999, Config: types.Config{Version: 100, Replicas: []uint64{1, 2, 3}, Leader: 3}}))
+			require.Equal(t, uint32(3), n.LastTerm())
+			require.True(t, n.IsLeader())
+			require.NotContains(t, n.replicaSync, uint64(3))
+			require.Empty(t, n.Ready())
+		})
+	}
+}
+
+func TestRetiredReplicaPromotionWaitsForIntermediateMajority(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2})
+	makeLeader(n, 3)
+	n.cfg.Version = 10
+	n.cfg.Learners = []uint64{4}
+	n.cfg.MigrateFrom, n.cfg.MigrateTo = 3, 4
+	n.queue.lastLogIndex, n.queue.storedIndex, n.queue.committedIndex, n.queue.appliedIndex = 7, 7, 7, 7
+	n.replicaSync[4] = &SyncInfo{}
+	n.replicaSync[2] = &SyncInfo{ConfigVersion: 9, StoredIndex: 8}
+	promote := types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 8, StoredIndex: 8, ConfigVersion: 10}
+	n.roleSwitchIfNeed(promote)
+	require.Empty(t, n.Ready(), "D cannot promote while B still holds the old voting set")
+	n.replicaSync[2].ConfigVersion = 10
+	promote.ConfigVersion = 9
+	n.roleSwitchIfNeed(promote)
+	require.Empty(t, n.Ready(), "D must also install the intermediate membership")
+	promote.ConfigVersion = 10
+	n.roleSwitchIfNeed(promote)
+	require.Len(t, findEventsOfType(n.Ready(), types.LearnerToFollowerReq), 1)
+}
+
+func TestMembershipMaintenanceWakesQuietFollower(t *testing.T) {
+	n := newTestNode(2, []uint64{1, 2, 3})
+	n.BecomeFollower(2, 1)
+	n.suspend = true
+	cfg := n.Config().Clone()
+	cfg.Version = 2
+	cfg.Learners = []uint64{4}
+	cfg.MigrateFrom, cfg.MigrateTo = 3, 4
+	require.NoError(t, n.Step(types.Event{Type: types.ConfChange, Config: cfg}))
+	require.False(t, n.suspend)
+	require.NoError(t, n.Step(types.Event{Type: types.SyncResp, From: 1, Term: 2, Reason: types.ReasonOk, Speed: types.SpeedSuspend}))
+	require.False(t, n.suspend, "unfinished maintenance must keep synchronization active")
+}
+
+func TestHealthyFollowerMigrationRetiresAfterInstalledQuorum(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3, 4})
+	makeLeader(n, 3)
+	n.cfg.Version = 10
+	n.cfg.MigrateFrom, n.cfg.MigrateTo = 2, 4
+	n.queue.lastLogIndex, n.queue.storedIndex, n.queue.committedIndex, n.queue.appliedIndex = 7, 7, 7, 7
+	n.replicaSync[4] = &SyncInfo{ConfigVersion: 10, StoredIndex: 8}
+	n.replicaSync[2] = &SyncInfo{ConfigVersion: 9, StoredIndex: 8}
+	e := types.Event{Reason: types.ReasonOnlySync, From: 4, Index: 8, StoredIndex: 8, ConfigVersion: 10}
+	n.roleSwitchIfNeed(e)
+	require.Empty(t, findEventsOfType(n.Ready(), types.LearnerToFollowerReq), "install the four-voter stage before retiring B")
+	n.replicaSync[2].ConfigVersion = 10
+	n.roleSwitchIfNeed(e)
+	require.Len(t, findEventsOfType(n.Ready(), types.LearnerToFollowerReq), 1)
+	next, err := newTestRaftWithNode(n).learnTo(4)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []uint64{1, 3, 4}, next.Replicas)
+	require.Equal(t, uint64(1), next.Leader)
+	require.Zero(t, next.MigrateFrom)
+	require.Equal(t, []uint64{1, 2, 3, 4}, n.Config().Replicas)
 }

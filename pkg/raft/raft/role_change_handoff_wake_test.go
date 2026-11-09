@@ -23,7 +23,7 @@ func TestRoleChangeWakePreservesLeadershipTransferFence(t *testing.T) {
 				}
 				n.replicaSync[4] = &SyncInfo{suspend: true, emptySyncTick: 20}
 				require.NoError(t, n.Step(types.Event{Type: types.LearnerToLeaderResp,
-					From: request.From, Term: request.Term, ConfigVersion: request.ConfigVersion, Reason: reason}))
+					From: request.From, Term: request.Term, ConfigVersion: request.ConfigVersion, RoleChangeID: request.RoleChangeID, Reason: reason}))
 				var wokeRemaining bool
 				for _, event := range n.Ready() {
 					wokeRemaining = wokeRemaining || event.Type == types.NotifySync && event.To == 4
@@ -53,9 +53,10 @@ func TestStaleRoleChangeCannotReopenTransferWithRemainingLearners(t *testing.T) 
 	n.Ready()
 	request := beginTestTransfer(t, n)
 	require.NoError(t, n.Step(types.Event{Type: types.LearnerToLeaderResp,
-		From: request.From, Term: request.Term, ConfigVersion: request.ConfigVersion - 1, Reason: types.ReasonError}))
-	require.Equal(t, request.From, n.leaderTransferTo)
-	require.Equal(t, request.ConfigVersion, n.leaderTransferVersion)
+		From: request.From, Term: request.Term, ConfigVersion: request.ConfigVersion - 1, RoleChangeID: request.RoleChangeID, Reason: types.ReasonError}))
+	require.NotNil(t, n.handoff)
+	require.Equal(t, request.From, n.handoff.to)
+	require.Equal(t, request.ConfigVersion, n.handoff.version)
 	require.True(t, n.stopPropose)
 	require.ErrorIs(t, n.AdmitMessage(99), types.ErrProposalDropped)
 }

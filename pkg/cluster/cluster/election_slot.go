@@ -115,7 +115,7 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 				}
 			}
 			if slot.Leader != newLeaderId || slot.Status == types.SlotStatus_SlotStatusCandidate {
-				newSlot, err := slotElectionConfig(slot, newLeaderId, replicaLastLogInfoMap)
+				newSlot, err := slotElectionConfig(slot, newLeaderId, replicaLastLogInfoMap, s.cfgServer.SlotReplicaCount())
 				if err != nil {
 					return err
 				}
@@ -135,7 +135,7 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 	return nil
 }
 
-func slotElectionConfig(slot *types.Slot, leader uint64, infos map[uint64]map[uint32]SlotInfo) (*types.Slot, error) {
+func slotElectionConfig(slot *types.Slot, leader uint64, infos map[uint64]map[uint32]SlotInfo, capacity uint32) (*types.Slot, error) {
 	term := slot.Term
 	for _, id := range slot.Replicas {
 		if info, ok := infos[id][slot.Id]; ok {
@@ -152,7 +152,7 @@ func slotElectionConfig(slot *types.Slot, leader uint64, infos map[uint64]map[ui
 	recovering := slot.Status == types.SlotStatus_SlotStatusCandidate && slot.ExpectLeader == slot.Leader
 	// Recovery supersedes a previous leadership transfer. A real membership
 	// migration still has a learner and must continue through normal catch-up.
-	if next.MigrateTo != 0 && (next.MigrateTo == leader || recovering &&
+	if !types.HasExcessReplicas(next.Replicas, next.Learners, capacity) && next.MigrateTo != 0 && (next.MigrateTo == leader || recovering &&
 		wkutil.ArrayContainsUint64(next.Replicas, next.MigrateTo) && !wkutil.ArrayContainsUint64(next.Learners, next.MigrateTo)) {
 		next.MigrateFrom, next.MigrateTo = 0, 0
 		next.Learners = wkutil.RemoveUint64(next.Learners, leader)

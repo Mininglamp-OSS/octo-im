@@ -84,11 +84,7 @@ func (n *Node) reset() {
 	n.electionState = electionState{
 		votes: make(map[uint64]bool),
 	}
-	n.stopPropose = false
-	n.drainingAdmissions = false
-	n.leaderTransferAttempted = false
-	n.admissionDrainTicks, n.admissionDrainCooldown = 0, 0
-	n.leaderTransferTo, n.leaderTransferVersion = 0, 0
+	n.clearLeaderHandoff()
 	n.syncState.replicaSync = make(map[uint64]*SyncInfo)
 	n.onlySync = false
 	n.suspend = false
