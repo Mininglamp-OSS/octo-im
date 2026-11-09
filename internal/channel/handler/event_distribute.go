@@ -300,6 +300,11 @@ func (h *Handler) requestTag(leaderId uint64, tagKey string) (*types.Tag, error)
 }
 
 func (h *Handler) getOrMakeTagForLeader(fakeChannelId string, channelType uint8) (*types.Tag, error) {
+	// Person/agent identities and explicitly supplied temporary recipients do
+	// not derive their membership from the subscriber database.
+	if channelType != wkproto.ChannelTypePerson && channelType != wkproto.ChannelTypeAgent && channelType != wkproto.ChannelTypeTemp {
+		return h.commonService.GetOrMakeSubscriberTag(fakeChannelId, channelType)
+	}
 	var (
 		tag *types.Tag
 		err error

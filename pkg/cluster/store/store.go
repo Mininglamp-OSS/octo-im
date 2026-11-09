@@ -4,6 +4,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/lni/goutils/syncutil"
+	"sync"
 )
 
 type Store struct {
@@ -12,8 +13,9 @@ type Store struct {
 
 	wdb wkdb.DB
 
-	channelCfgCh chan *channelCfgReq
-	stopper      *syncutil.Stopper
+	channelCfgCh     chan *channelCfgReq
+	stopper          *syncutil.Stopper
+	subscriberStates sync.Map // channel key -> *subscriberState
 }
 
 func New(opts *Options) *Store {

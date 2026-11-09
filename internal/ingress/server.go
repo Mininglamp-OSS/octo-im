@@ -39,6 +39,7 @@ func (i *Ingress) SetRoutes() {
 	service.Cluster.Route("/wk/ingress/addTag", i.handleAddTag)
 	// 获取订阅者
 	service.Cluster.Route("/wk/ingress/getSubscribers", i.handleGetSubscribers)
+	service.Cluster.Route("/wk/ingress/subscriberSnapshot", i.handleSubscriberSnapshot)
 	// 处理转发的PersistAfter插件调用请求
 	service.Cluster.Route("/wk/ingress/persistAfter", i.handlePersistAfter)
 }
@@ -188,6 +189,11 @@ func (i *Ingress) updateTag(req *TagUpdateReq) error {
 	// A caller can have an old slot route during a handoff. Never acknowledge an
 	// update to a non-authoritative cache (or a cache absent on the wrong node).
 	if req.ChannelTag {
+		// Channel updates are addressed only by channel identity. A caller must
+		// not select an unrelated cache entry with a direct Tag key.
+		if req.ChannelId == "" || req.ChannelType == 0 || req.TagKey != "" {
+			return errors.New("channel Tag updates require channel id/type and no Tag key")
+		}
 		slotLeaderId, err := service.Cluster.SlotLeaderIdOfChannel(req.ChannelId, req.ChannelType)
 		if err != nil {
 			return err

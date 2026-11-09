@@ -180,6 +180,7 @@ type testCluster struct {
 	nodes  []testNode
 	owners map[uint32]int
 	http   *http.Client
+	faults *tagRPCFaults
 }
 
 func (c *testCluster) owner(id string) int { return c.owners[crc32.ChecksumIEEE([]byte(id))%64] }
@@ -290,6 +291,7 @@ func startCluster(t *testing.T) *testCluster {
 		require.NoError(t, err, "build server: %s", out)
 	}
 	c := &testCluster{owners: make(map[uint32]int), http: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}}
+	c.faults = &tagRPCFaults{}
 	// Reserve every port together to avoid accidental duplicates and preserve
 	// per-process isolation when go test runs other packages concurrently.
 	var listeners []net.Listener
@@ -307,8 +309,10 @@ func startCluster(t *testing.T) *testCluster {
 		c.http.CloseIdleConnections()
 	})
 	initNodes := make([]string, 3)
+	proxyAddrs := make([]string, 3)
 	for i := 0; i < 3; i++ {
-		initNodes[i] = fmt.Sprintf("%d@%s", 1001+i, ports[i*5+3])
+		proxyAddrs[i] = c.faults.startProxy(t, ports[i*5+3])
+		initNodes[i] = fmt.Sprintf("%d@%s", 1001+i, proxyAddrs[i])
 	}
 	for i := 0; i < 3; i++ {
 		dir := filepath.Join(root, fmt.Sprintf("node%d", 1001+i))
@@ -319,7 +323,7 @@ func startCluster(t *testing.T) *testCluster {
 			"logger":  map[string]any{"level": 2, "traceOn": false, "dir": filepath.Join(dir, "logs")},
 			"manager": map[string]any{"on": false, "addr": ports[i*5+4]}, "demo": map[string]any{"on": false}, "auth": map[string]any{"kind": "none"},
 			"conversation": map[string]any{"on": false}, "db": map[string]any{"shardNum": 2, "slotShardNum": 2},
-			"cluster": map[string]any{"nodeId": 1001 + i, "addr": "tcp://" + ports[i*5+3], "serverAddr": ports[i*5+3], "apiUrl": "http://" + ports[i*5], "slotCount": 64, "slotReplicaCount": 3, "channelReplicaCount": 3, "initNodes": initNodes},
+			"cluster": map[string]any{"nodeId": 1001 + i, "addr": "tcp://" + ports[i*5+3], "serverAddr": proxyAddrs[i], "apiUrl": "http://" + ports[i*5], "slotCount": 64, "slotReplicaCount": 3, "channelReplicaCount": 3, "initNodes": initNodes},
 			"plugin":  map[string]any{"socketPath": fmt.Sprintf("/tmp/tagreset-%d-%s.sock", os.Getpid(), ports[i*5][10:])},
 		}
 		data, err := yaml.Marshal(config)

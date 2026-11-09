@@ -56,6 +56,17 @@ func (t *TagManager) MakeTag(uids []string) (*types.Tag, error) {
 	return t.MakeTagWithTagKey(tagKey, uids)
 }
 
+// Set the revision before publishing the Tag to concurrent readers.
+func (t *TagManager) MakeSubscriberTag(uids []string, revision string) (*types.Tag, error) {
+	tag, err := t.MakeTagNotCacheWithTagKey(wkutil.GenUUID(), uids)
+	if err != nil {
+		return nil, err
+	}
+	tag.SubscriberRevision.Store(revision)
+	t.getBlucketByTagKey(tag.Key).setTag(tag)
+	return tag, nil
+}
+
 func (t *TagManager) MakeTagWithTagKey(tagKey string, uids []string) (*types.Tag, error) {
 
 	tag, err := t.MakeTagNotCacheWithTagKey(tagKey, uids)
@@ -93,7 +104,18 @@ func (t *TagManager) AddUsers(tagKey string, uids []string) error {
 	if tag == nil {
 		return errors.TagNotExist(tagKey)
 	}
+	// A certified snapshot can already be held by a distribution. Leave that
+	// snapshot immutable and publish the incremental result as uncertified;
+	// the next distribution validates/rebuilds it from durable membership.
+	if tag.SubscriberRevision.Load() != "" {
+		var err error
+		tag, err = t.copySubscriberTagForMutation(tag)
+		if err != nil {
+			return err
+		}
+	}
 	// 去除已经存在的用户
+	tag.SubscriberRevision.Store("")
 	t.removeExistUidsInTag(tag, uids)
 
 	// 计算用户所在的节点
@@ -103,6 +125,7 @@ func (t *TagManager) AddUsers(tagKey string, uids []string) error {
 	}
 	// 合并节点
 	t.mergeNodes(tag, nodes)
+	t.setTag(tag)
 
 	return nil
 }
@@ -129,6 +152,14 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 	if tag == nil {
 		return errors.TagNotExist(tagKey)
 	}
+	if tag.SubscriberRevision.Load() != "" {
+		var err error
+		tag, err = t.copySubscriberTagForMutation(tag)
+		if err != nil {
+			return err
+		}
+	}
+	tag.SubscriberRevision.Store("")
 
 	for _, uid := range uids {
 		slotId := service.Cluster.GetSlotId(uid)
@@ -148,7 +179,17 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 			}
 		}
 	}
+	t.setTag(tag)
 	return nil
+}
+
+func (t *TagManager) copySubscriberTagForMutation(old *types.Tag) (*types.Tag, error) {
+	next, err := t.MakeTagNotCacheWithTagKey(old.Key, old.GetUsers())
+	if err != nil {
+		return nil, err
+	}
+	next.ChannelId, next.ChannelType = old.ChannelId, old.ChannelType
+	return next, nil
 }
 
 func (t *TagManager) RemoveTag(tagKey string) {
