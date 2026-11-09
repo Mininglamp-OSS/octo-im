@@ -19,6 +19,9 @@ type Tag struct {
 	LastGetTime time.Time     `json:"last_get_time"`
 	NodeVersion uint64        `json:"node_version"` // 生成tag时的当前节点版本号，如果当前节点版本号大于生成tag时的节点版本号，则tag失效
 	GetCount    atomic.Uint64 `json:"get_count"`    // 获取次数
+	// Only authoritative subscriber-derived Tags use this token. Direct cache
+	// mutations clear it; it is checked against the membership owner's Store.
+	SubscriberRevision atomic.String `json:"-"`
 }
 
 func (t *Tag) String() string {

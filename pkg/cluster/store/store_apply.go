@@ -292,7 +292,9 @@ func (s *Store) handleAddSubscribers(cmd *CMD) error {
 		s.Error("decode subscribers err", zap.Error(err), zap.String("channelID", channelId), zap.Uint8("channelType", channelType), zap.ByteString("data", cmd.Data))
 		return err
 	}
-	return s.wdb.AddSubscribers(channelId, channelType, members)
+	return s.changeSubscribers(channelId, channelType, func() error {
+		return s.wdb.AddSubscribers(channelId, channelType, members)
+	})
 }
 
 func (s *Store) handleRemoveSubscribers(cmd *CMD) error {
@@ -300,7 +302,9 @@ func (s *Store) handleRemoveSubscribers(cmd *CMD) error {
 	if err != nil {
 		return err
 	}
-	return s.wdb.RemoveSubscribers(channelId, channelType, subscribers)
+	return s.changeSubscribers(channelId, channelType, func() error {
+		return s.wdb.RemoveSubscribers(channelId, channelType, subscribers)
+	})
 }
 
 func (s *Store) handleAddUser(cmd *CMD) error {
@@ -358,7 +362,9 @@ func (s *Store) handleRemoveAllSubscriber(cmd *CMD) error {
 	if err != nil {
 		return err
 	}
-	return s.wdb.RemoveAllSubscriber(channelId, channelType)
+	return s.changeSubscribers(channelId, channelType, func() error {
+		return s.wdb.RemoveAllSubscriber(channelId, channelType)
+	})
 }
 
 func (s *Store) handleDeleteChannel(cmd *CMD) error {
@@ -366,7 +372,9 @@ func (s *Store) handleDeleteChannel(cmd *CMD) error {
 	if err != nil {
 		return err
 	}
-	return s.wdb.DeleteChannel(channelId, channelType)
+	return s.changeSubscribers(channelId, channelType, func() error {
+		return s.wdb.DeleteChannel(channelId, channelType)
+	})
 }
 
 func (s *Store) handleAddDenylist(cmd *CMD) error {

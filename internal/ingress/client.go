@@ -62,6 +62,19 @@ func (c *Client) UpdateTag(nodeId uint64, req *TagUpdateReq) error {
 	return nil
 }
 
+// InvalidateChannelTag discards a warm recipient set on its authoritative owner.
+func (c *Client) InvalidateChannelTag(nodeId uint64, req *ChannelReq) error {
+	data, err := req.Encode()
+	if err != nil {
+		return err
+	}
+	resp, err := c.request(nodeId, "/wk/ingress/invalidateChannelTag", data)
+	if err != nil {
+		return err
+	}
+	return c.handleRespError(resp)
+}
+
 func (c *Client) AddTag(nodeId uint64, req *TagAddReq) error {
 	data, err := req.Encode()
 	if err != nil {
