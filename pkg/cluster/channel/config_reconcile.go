@@ -40,17 +40,36 @@ func (s *Server) ReconcileConfig(ctx context.Context, cfg wkdb.ChannelClusterCon
 	return false, r.(*Channel).applyConfig(ctx, channelConfigToRaftConfig(s.opts.NodeId, cfg))
 }
 
-// Load storage outside the owner, then configure and publish atomically with
-// respect to owner operations. A cancelled/failed initialization publishes
-// nothing; an existing instance is reused, never replaced or blindly removed.
+// Callers hold wakeLeaderLock to serialize creation. Reuse an active instance
+// on the owner; otherwise drain retired local I/O before reading its durable
+// state outside the owner and publishing a replacement atomically.
 func (s *Server) createAndApplyConfig(ctx context.Context, cfg wkdb.ChannelClusterConfig) error {
 	key := wkutil.ChannelToKey(cfg.ChannelId, cfg.ChannelType)
 	rg := s.getRaftGroup(key)
-	ch, err := createChannel(cfg, s, rg)
+	raftCfg := channelConfigToRaftConfig(s.opts.NodeId, cfg).Clone()
+	var ch *Channel
+	err := rg.Do(ctx, key, func(existing raftgroup.IRaft) error {
+		if existing == nil {
+			return nil
+		}
+		ch = existing.(*Channel)
+		return ch.applyConfigOnOwner(raftCfg)
+	})
 	if err != nil {
 		return err
 	}
-	raftCfg := channelConfigToRaftConfig(s.opts.NodeId, cfg).Clone()
+	if ch != nil {
+		return ch.resumeConfig(ctx)
+	}
+	// The retired instance cannot submit more local I/O, and the wake lock
+	// keeps another creator from publishing while this drain is in progress.
+	if err := rg.WaitStorage(ctx, key); err != nil {
+		return err
+	}
+	ch, err = createChannel(cfg, s, rg)
+	if err != nil {
+		return err
+	}
 	err = rg.Do(ctx, key, func(existing raftgroup.IRaft) error {
 		if existing != nil {
 			ch = existing.(*Channel)
