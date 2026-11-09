@@ -52,7 +52,9 @@ func (n *Node) sendSyncReq() {
 	}
 	n.syncing = true
 	n.syncElapsed = 0
-	n.KeepAlive()
+	// A locally generated retry is not activity from the leader. Incoming
+	// Ping/NotifySync/SyncResp already reset idleTick; unanswered requests must
+	// not prevent an AutoDestory channel from retiring its in-memory runtime.
 	var reason types.Reason
 	if n.onlySync {
 		reason = types.ReasonOnlySync
