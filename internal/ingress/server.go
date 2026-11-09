@@ -34,6 +34,7 @@ func (i *Ingress) SetRoutes() {
 	service.Cluster.Route("/wk/ingress/allowSend", i.handleAllowSend)
 	// 更新tag
 	service.Cluster.Route("/wk/ingress/updateTag", i.handleUpdateTag)
+	service.Cluster.Route("/wk/ingress/invalidateChannelTag", i.handleInvalidateChannelTag)
 	// 添加tag
 	service.Cluster.Route("/wk/ingress/addTag", i.handleAddTag)
 	// 获取订阅者
@@ -218,6 +219,38 @@ func (i *Ingress) updateTag(req *TagUpdateReq) error {
 			return err
 		}
 		service.TagManager.SetChannelTag(req.ChannelId, req.ChannelType, newTagKey)
+	}
+	return nil
+}
+
+func (i *Ingress) handleInvalidateChannelTag(c *wkserver.Context) {
+	req := &ChannelReq{}
+	if err := req.Decode(c.Body()); err != nil {
+		c.WriteErr(err)
+		return
+	}
+	if err := i.invalidateChannelTag(req); err != nil {
+		c.WriteErr(err)
+		return
+	}
+	c.WriteOk()
+}
+
+func (i *Ingress) invalidateChannelTag(req *ChannelReq) error {
+	if req.ChannelId == "" || req.ChannelType == 0 {
+		return errors.New("channel id and type are required")
+	}
+	slotLeaderId, err := service.Cluster.SlotLeaderIdOfChannel(req.ChannelId, req.ChannelType)
+	if err != nil {
+		return err
+	}
+	if slotLeaderId == 0 || !options.G.IsLocalNode(slotLeaderId) {
+		return errors.New("channel Tag invalidation must reach its slot leader")
+	}
+	tagKey := service.TagManager.GetChannelTag(req.ChannelId, req.ChannelType)
+	service.TagManager.RemoveChannelTag(req.ChannelId, req.ChannelType)
+	if tagKey != "" {
+		service.TagManager.RemoveTag(tagKey)
 	}
 	return nil
 }

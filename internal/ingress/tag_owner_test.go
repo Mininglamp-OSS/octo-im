@@ -140,3 +140,52 @@ func TestTagKeyRPCPreservesLocalNonChannelUpdate(t *testing.T) {
 	require.NoError(t, ingress.UpdateTagForTest(i, &ingress.TagUpdateReq{TagKey: tag.Key, Uids: []string{"new"}}))
 	require.ElementsMatch(t, []string{"old", "new"}, tags.GetUsers(tag.Key))
 }
+
+func TestChannelTagRPCInvalidation(t *testing.T) {
+	for _, typ := range []uint8{2, 5} {
+		for _, cmd := range []bool{false, true} {
+			t.Run(fmt.Sprintf("type%d/cmd%v", typ, cmd), func(t *testing.T) {
+				i, _, tags := setupTagOwner(t)
+				id := "room"
+				if cmd {
+					id = options.G.OrginalConvertCmdChannel(id)
+				}
+				tag, err := tags.MakeTag([]string{"old"})
+				require.NoError(t, err)
+				tags.SetChannelTag(id, typ, tag.Key)
+				req := &ingress.ChannelReq{ChannelId: id, ChannelType: typ}
+				require.NoError(t, ingress.InvalidateChannelTagForTest(i, req))
+				require.Empty(t, tags.GetChannelTag(id, typ))
+				require.False(t, tags.Exist(tag.Key))
+				require.NoError(t, ingress.InvalidateChannelTagForTest(i, req))
+			})
+		}
+	}
+}
+
+func TestChannelTagRPCInvalidationRejectsWrongOwner(t *testing.T) {
+	for _, kind := range []string{"remote", "missing", "lookup", "empty-id", "empty-type"} {
+		t.Run(kind, func(t *testing.T) {
+			i, cluster, tags := setupTagOwner(t)
+			tag, err := tags.MakeTag([]string{"old"})
+			require.NoError(t, err)
+			tags.SetChannelTag("room", 2, tag.Key)
+			req := &ingress.ChannelReq{ChannelId: "room", ChannelType: 2}
+			switch kind {
+			case "remote":
+				cluster.owner = 1002
+			case "missing":
+				cluster.owner = 0
+			case "lookup":
+				cluster.err = errors.New("lookup failed")
+			case "empty-id":
+				req.ChannelId = ""
+			case "empty-type":
+				req.ChannelType = 0
+			}
+			require.Error(t, ingress.InvalidateChannelTagForTest(i, req))
+			require.Equal(t, tag.Key, tags.GetChannelTag("room", 2))
+			require.Equal(t, []string{"old"}, tags.GetUsers(tag.Key))
+		})
+	}
+}

@@ -23,11 +23,15 @@ type tagOwnerRequest struct {
 
 type tagOwnerCluster struct {
 	icluster.ICluster
-	owners       map[string]uint64
-	resolveErr   error
-	requestErr   error
-	status       proto.Status
-	requests     []tagOwnerRequest
+	owners        map[string]uint64
+	resolveErr    error
+	requestErr    error
+	status        proto.Status
+	requests      []tagOwnerRequest
+	invalidations []struct {
+		node uint64
+		req  ingress.ChannelReq
+	}
 	messageReads int
 	messageOwner uint64
 }
@@ -46,6 +50,17 @@ func (c *tagOwnerCluster) LoadOnlyChannelClusterConfig(string, uint8) (wkdb.Chan
 func (c *tagOwnerCluster) GetSlotId(string) uint32    { return 1 }
 func (c *tagOwnerCluster) SlotLeaderId(uint32) uint64 { return 1001 }
 func (c *tagOwnerCluster) RequestWithContext(_ context.Context, node uint64, path string, body []byte) (*proto.Response, error) {
+	if path == "/wk/ingress/invalidateChannelTag" {
+		var req ingress.ChannelReq
+		if err := req.Decode(body); err != nil {
+			return nil, err
+		}
+		c.invalidations = append(c.invalidations, struct {
+			node uint64
+			req  ingress.ChannelReq
+		}{node, req})
+		return &proto.Response{Status: c.status}, c.requestErr
+	}
 	if path != "/wk/ingress/updateTag" {
 		return nil, fmt.Errorf("unexpected RPC %s", path)
 	}
@@ -206,6 +221,67 @@ func TestSubscriberTagLocalMutationErrorsAreReturned(t *testing.T) {
 			want := errors.New("tag mutation failed")
 			service.TagManager = &failingOwnerTags{tags, operation, want}
 			require.ErrorIs(t, ch.updateTagBySubscribers(id, 2, []string{"old-recipient"}, operation == "remove"), want)
+		})
+	}
+}
+
+func TestSubscriberTagInvalidationDropsBothWarmRecipientSets(t *testing.T) {
+	for _, typ := range []uint8{2, 5} {
+		t.Run(fmt.Sprint(typ), func(t *testing.T) {
+			ch, cluster, tags := setupTagOwner(t)
+			id, cmd := "room", options.G.OrginalConvertCmdChannel("room")
+			cluster.owners[id], cluster.owners[cmd] = 1001, 1001
+			keys := []string{warmOwnerTag(t, tags, id, typ), warmOwnerTag(t, tags, cmd, typ)}
+			require.NoError(t, ch.invalidateSubscriberTags(id, typ))
+			for _, key := range keys {
+				require.False(t, tags.Exist(key))
+			}
+			require.Empty(t, tags.GetChannelTag(id, typ))
+			require.Empty(t, tags.GetChannelTag(cmd, typ))
+			// A retry with cold Tags succeeds without activating message Raft.
+			require.NoError(t, ch.invalidateSubscriberTags(id, typ))
+			require.Zero(t, cluster.messageReads)
+		})
+	}
+}
+
+func TestSubscriberTagInvalidationRoutesEachOwner(t *testing.T) {
+	for _, typ := range []uint8{2, 5} {
+		t.Run(fmt.Sprint(typ), func(t *testing.T) {
+			ch, cluster, _ := setupTagOwner(t)
+			id, cmd := "room", options.G.OrginalConvertCmdChannel("room")
+			cluster.owners[id], cluster.owners[cmd] = 1003, 1002
+			require.NoError(t, ch.invalidateSubscriberTags(id, typ))
+			require.Len(t, cluster.invalidations, 2)
+			for index, channel := range []string{id, cmd} {
+				got := cluster.invalidations[index]
+				require.Equal(t, cluster.owners[channel], got.node)
+				require.Equal(t, ingress.ChannelReq{ChannelId: channel, ChannelType: typ}, got.req)
+			}
+			require.Zero(t, cluster.messageReads)
+		})
+	}
+}
+
+func TestSubscriberTagInvalidationDoesNotHideFailures(t *testing.T) {
+	for _, kind := range []string{"lookup", "no-owner", "cmd-no-owner", "transport", "status"} {
+		t.Run(kind, func(t *testing.T) {
+			ch, cluster, _ := setupTagOwner(t)
+			id, cmd := "room", options.G.OrginalConvertCmdChannel("room")
+			cluster.owners[id], cluster.owners[cmd] = 1001, 1002
+			switch kind {
+			case "lookup":
+				cluster.resolveErr = errors.New("lookup failed")
+			case "no-owner":
+				cluster.owners[id] = 0
+			case "cmd-no-owner":
+				cluster.owners[cmd] = 0
+			case "transport":
+				cluster.requestErr = errors.New("rpc failed")
+			case "status":
+				cluster.status = proto.StatusError
+			}
+			require.Error(t, ch.invalidateSubscriberTags(id, 2))
 		})
 	}
 }
