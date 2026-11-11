@@ -825,6 +825,10 @@ func (m *message) getMessageByClientMsgNo(c *wkhttp.Context) {
 
 	if !leaderIsSelf {
 		m.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
+		if committed {
+			forwardCommittedReceipt(c, leaderInfo.ApiServerAddr+c.Request.URL.Path)
+			return
+		}
 		c.Forward(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path))
 		return
 	}
