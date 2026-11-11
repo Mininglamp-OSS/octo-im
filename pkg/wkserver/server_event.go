@@ -360,7 +360,8 @@ func (s *Server) OnClose(conn gnet.Conn, err error) (action gnet.Action) {
 	}
 	connCtx := ctx.(*connContext)
 
-	s.connManager.RemoveConn(connCtx.uid.Load())
+	// A replacement may have registered the same UID before this close arrived.
+	s.connManager.removeConnIfCurrent(connCtx.uid.Load(), conn)
 	s.routeMapLock.RLock()
 	h, ok := s.routeMap[s.opts.ClosePath]
 	s.routeMapLock.RUnlock()

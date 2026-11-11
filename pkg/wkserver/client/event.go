@@ -16,10 +16,7 @@ func (c *clientEvent) OnTick() (delay time.Duration, action gnet.Action) {
 	for _, conn := range c.c.conns {
 
 		if a := conn.prepareDial(); a != nil {
-			go conn.startDial(a)
-		}
-		if a, gc := conn.prepareAuth(); a != nil {
-			go conn.startAuth(a, gc)
+			go conn.connect(a)
 		}
 		conn.tick()
 	}

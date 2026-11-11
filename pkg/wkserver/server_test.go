@@ -1,6 +1,8 @@
 package wkserver_test
 
 import (
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"github.com/panjf2000/gnet/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/raft/v3/raftpb"
 )
 
@@ -94,26 +97,33 @@ func TestServerOnMessage(t *testing.T) {
 }
 
 func TestReconnect(t *testing.T) {
-	addr := "tcp://127.0.0.1:10000"
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := "tcp://" + l.Addr().String()
+	require.NoError(t, l.Close())
+
 	s := wkserver.New(addr)
-	err := s.Start()
-	assert.NoError(t, err)
+	var handshakes atomic.Int64
+	s.Route(s.Options().ConnPath, func(ctx *wkserver.Context) {
+		handshakes.Add(1)
+		ctx.WriteConnack(&proto.Connack{Id: ctx.ConnReq().Id, Status: proto.StatusOK})
+	})
+	require.NoError(t, s.Start())
 	defer s.Stop()
 
 	cli := client.New(addr, client.WithUid("uid"))
-	err = cli.Start()
-	assert.NoError(t, err)
+	require.NoError(t, cli.Start())
 	defer cli.Stop()
 
-	time.Sleep(time.Millisecond * 200)
-
-	assert.Equal(t, true, cli.IsAuthed())
+	require.Eventually(t, func() bool {
+		return handshakes.Load() == 1 && cli.IsAuthed()
+	}, 200*time.Millisecond, time.Millisecond)
 
 	cli.CloseConn()
 
-	assert.Equal(t, false, cli.IsAuthed())
-
-	time.Sleep(time.Millisecond * 200)
-
-	assert.Equal(t, true, cli.IsAuthed())
+	// The replacement may authenticate before the caller can observe
+	// the disconnected state. Require a second server handshake instead.
+	require.Eventually(t, func() bool {
+		return handshakes.Load() == 2 && cli.IsAuthed()
+	}, 200*time.Millisecond, time.Millisecond)
 }

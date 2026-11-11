@@ -3,6 +3,7 @@ package wkserver_test
 import (
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,4 +79,57 @@ func TestReconnectPreservesRequestsAndBatchDelivery(t *testing.T) {
 		}
 	}
 	require.Empty(t, received)
+}
+
+func TestDelayedPeerClosePreservesReplacement(t *testing.T) {
+	configureRecoveryLogger()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := "tcp://" + l.Addr().String()
+	require.NoError(t, l.Close())
+
+	const uid = "overlapping-peer"
+	s := wkserver.New(addr, wkserver.WithRequestTimeout(time.Second))
+	closed := make(chan string, 2)
+	s.Route(s.Options().ClosePath, func(ctx *wkserver.Context) { closed <- ctx.PeerUID() })
+	require.NoError(t, s.Start())
+	t.Cleanup(s.Stop)
+
+	openPeer := func(reply string) func() {
+		c := client.New(addr, client.WithUid(uid))
+		c.Route("/which-peer", func(ctx *client.Context) { ctx.Write([]byte(reply)) })
+		require.NoError(t, c.Start())
+		stop := sync.OnceFunc(c.Stop)
+		t.Cleanup(stop)
+		require.Eventually(t, c.IsAuthed, 3*time.Second, 5*time.Millisecond)
+		return stop
+	}
+	requirePeer := func(reply string) {
+		resp, err := s.Request(uid, "/which-peer", nil)
+		require.NoError(t, err)
+		require.Equal(t, reply, string(resp.Body))
+	}
+	waitForClose := func() {
+		select {
+		case peer := <-closed:
+			require.Equal(t, uid, peer)
+		case <-time.After(3 * time.Second):
+			t.Fatal("server did not handle the closed connection")
+		}
+	}
+
+	stopOld := openPeer("old")
+	requirePeer("old")
+
+	// Keep the old socket open until the replacement has authenticated.
+	stopReplacement := openPeer("replacement")
+	requirePeer("replacement")
+	stopOld()
+	waitForClose()
+	requirePeer("replacement")
+
+	stopReplacement()
+	waitForClose()
+	_, err = s.Request(uid, "/which-peer", nil)
+	require.EqualError(t, err, "conn is nil")
 }

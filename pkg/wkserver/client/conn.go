@@ -23,7 +23,6 @@ type connStatus uint8
 const (
 	disconnect connStatus = iota // 断开
 	connecting                   // 连接中
-	connected                    // 已连接
 	authing                      // 认证中
 	authed                       //已认证
 
@@ -91,9 +90,15 @@ func (c *conn) prepareDial() *connAttempt {
 	return a
 }
 
-func (c *conn) startDial(a *connAttempt) {
+func (c *conn) connect(a *connAttempt) {
+	if gc := c.dial(a); gc != nil {
+		c.startAuth(a, gc)
+	}
+}
+
+func (c *conn) dial(a *connAttempt) gnet.Conn {
 	if a.ctx.Err() != nil {
-		return
+		return nil
 	}
 	var network, addr string
 	var err error
@@ -102,7 +107,7 @@ func (c *conn) startDial(a *connAttempt) {
 		if err != nil {
 			c.Error("parse addr failed", zap.Error(err), zap.String("addr", c.addr))
 			c.disconnectAttempt(a)
-			return
+			return nil
 		}
 	} else {
 		network, addr = "tcp", c.addr
@@ -110,44 +115,36 @@ func (c *conn) startDial(a *connAttempt) {
 
 	// gnet.DialContext's context is connection metadata, not cancellation.
 	ctx, cancel := context.WithTimeout(a.ctx, 2*time.Second)
-	defer cancel()
 	raw, err := c.c.dialContext(ctx, network, addr)
+	cancel()
 	if err != nil {
 		c.disconnectAttempt(a)
-		return
+		return nil
 	}
 	if a.ctx.Err() != nil {
 		_ = raw.Close()
 		c.disconnectAttempt(a)
-		return
+		return nil
 	}
 	// EnrollContext owns raw. Capture the attempt before the blocking call;
 	// an old dial must never inherit a newer connection's identity.
 	gc, err := c.c.cli.EnrollContext(raw, connCtx{attempt: a})
 	if err != nil {
 		c.disconnectAttempt(a)
-		return
+		return nil
 	}
 	c.mu.Lock()
 	if c.attempt != a || a.ctx.Err() != nil || c.status.Load() != connecting {
 		c.mu.Unlock()
 		_ = gc.Close()
-		return
+		return nil
 	}
 	c.gc = gc
-	c.status.Store(connected)
+	// Reserve authentication for this transport before releasing the lock.
+	c.status.Store(authing)
 	c.mu.Unlock()
 	c.Foucs("conn success")
-}
-
-func (c *conn) prepareAuth() (*connAttempt, gnet.Conn) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.status.Load() != connected || c.attempt == nil || c.attempt.ctx.Err() != nil {
-		return nil, nil
-	}
-	c.status.Store(authing)
-	return c.attempt, c.gc
+	return gc
 }
 
 func (c *conn) startAuth(a *connAttempt, gc gnet.Conn) {

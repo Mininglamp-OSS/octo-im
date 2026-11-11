@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -66,6 +67,49 @@ func requirePeerClosed(t *testing.T, peer net.Conn) {
 	require.ErrorIs(t, err, io.EOF, "superseded connection must be closed")
 }
 
+func TestReconnectAuthenticatesWithoutAnotherTick(t *testing.T) {
+	c, l := newGenerationClient(t, nil)
+	allowDial := make(chan struct{}, 1)
+	c.dialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		select {
+		case <-allowDial:
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	for range 2 {
+		// Release the dial only after the sole tick has returned.
+		c.event.OnTick()
+		allowDial <- struct{}{}
+		peer := acceptGenerationConn(t, l)
+		require.NoError(t, peer.SetDeadline(time.Now().Add(time.Second)))
+
+		header := make([]byte, proto.MagicNumberStartLength+proto.MsgTypeLength+proto.MsgContentLength)
+		_, err := io.ReadFull(peer, header)
+		require.NoError(t, err, "client did not authenticate on the new connection")
+		require.Equal(t, proto.MsgTypeConnect.Uint8(), header[proto.MagicNumberStartLength])
+		size := binary.BigEndian.Uint32(header[proto.MagicNumberStartLength+proto.MsgTypeLength:])
+		require.LessOrEqual(t, size, uint32(4096))
+		body := make([]byte, size)
+		_, err = io.ReadFull(peer, body)
+		require.NoError(t, err)
+		req := &proto.Connect{}
+		require.NoError(t, req.Unmarshal(body))
+		require.False(t, c.IsAuthed(), "authentication still requires a server ACK")
+
+		ack, err := (&proto.Connack{Id: req.Id, Status: proto.StatusOK}).Marshal()
+		require.NoError(t, err)
+		packet, err := c.proto.Encode(ack, proto.MsgTypeConnack)
+		require.NoError(t, err)
+		_, err = peer.Write(packet)
+		require.NoError(t, err)
+		require.Eventually(t, c.IsAuthed, time.Second, time.Millisecond)
+		c.CloseConn()
+		require.False(t, c.IsAuthed())
+	}
+}
+
 func TestStaleDialCannotReplaceNewerConnection(t *testing.T) {
 	for _, success := range []bool{false, true} {
 		name := "late_failure"
@@ -94,22 +138,22 @@ func TestStaleDialCannotReplaceNewerConnection(t *testing.T) {
 			}
 			cn := c.conn()
 			old := cn.prepareDial()
-			go func() { cn.startDial(old); close(done) }()
+			go func() { cn.dial(old); close(done) }()
 			waitAttempt(t, entered)
 			oldPeer := acceptGenerationConn(t, l)
 			c.CloseConn()
 			require.ErrorIs(t, old.ctx.Err(), context.Canceled)
 			current := cn.prepareDial()
 			require.Greater(t, current.generation, old.generation)
-			cn.startDial(current)
+			cn.dial(current)
 			_ = acceptGenerationConn(t, l)
 			newer := cn.transport()
 			require.NotNil(t, newer)
-			require.Equal(t, connected, cn.status.Load())
+			require.Equal(t, authing, cn.status.Load())
 			unblock()
 			waitAttempt(t, done)
 			require.Same(t, newer, cn.transport())
-			require.Equal(t, connected, cn.status.Load())
+			require.Equal(t, authing, cn.status.Load())
 			identity := make(chan *connAttempt, 1)
 			require.NoError(t, newer.Wake(func(gc gnet.Conn, err error) error {
 				identity <- gc.Context().(connCtx).attempt
@@ -146,7 +190,7 @@ func TestCloseDuringEnrollmentDiscardsOldTransport(t *testing.T) {
 	t.Cleanup(unblock)
 	a := c.conn().prepareDial()
 	done := make(chan struct{})
-	go func() { c.conn().startDial(a); close(done) }()
+	go func() { c.conn().dial(a); close(done) }()
 	select {
 	case <-e.opened:
 	case <-time.After(3 * time.Second):
@@ -160,13 +204,13 @@ func TestCloseDuringEnrollmentDiscardsOldTransport(t *testing.T) {
 	require.Equal(t, disconnect, c.conn().status.Load())
 	requirePeerClosed(t, oldPeer)
 	b := c.conn().prepareDial()
-	c.conn().startDial(b)
+	c.conn().dial(b)
 	newer := c.conn().transport()
 	require.NotNil(t, newer)
-	// Even a close callback delayed until after B is connected belongs to A.
+	// Even a close callback delayed until after B is enrolled belongs to A.
 	c.event.OnClose(&generationConn{attempt: a}, nil)
 	require.Same(t, newer, c.conn().transport())
-	require.Equal(t, connected, c.conn().status.Load())
+	require.Equal(t, authing, c.conn().status.Load())
 }
 
 func TestCancelledScheduledDialDoesNotStart(t *testing.T) {
@@ -182,10 +226,10 @@ func TestCancelledScheduledDialDoesNotStart(t *testing.T) {
 	require.Nil(t, c.conn().prepareDial(), "only one current attempt may be reserved")
 	c.CloseConn()
 	b := c.conn().prepareDial()
-	c.conn().startDial(a)
+	c.conn().dial(a)
 	require.Zero(t, calls)
 	require.Equal(t, connecting, c.conn().status.Load())
-	c.conn().startDial(b)
+	c.conn().dial(b)
 	require.Equal(t, 1, calls)
 	require.Equal(t, disconnect, c.conn().status.Load())
 }
@@ -212,7 +256,7 @@ func installGeneration(t *testing.T, c *Client, write func([]byte) error) (*conn
 	gc := &generationConn{attempt: a, write: write}
 	cn.mu.Lock()
 	cn.gc = gc
-	cn.status.Store(connected)
+	cn.status.Store(authing)
 	cn.mu.Unlock()
 	return a, gc
 }
@@ -240,7 +284,7 @@ func TestStaleAuthCannotChangeNewerConnection(t *testing.T) {
 			unblock := func() { once.Do(func() { close(release) }) }
 			defer unblock()
 			var oldID uint64
-			_, oldGC := installGeneration(t, c, func(data []byte) error {
+			a, oldGC := installGeneration(t, c, func(data []byte) error {
 				oldID = authID(t, data)
 				// A successful reply is already queued before the connection is
 				// invalidated, but the auth goroutine has not published it yet.
@@ -254,23 +298,21 @@ func TestStaleAuthCannotChangeNewerConnection(t *testing.T) {
 				}
 				return nil
 			})
-			a, gc := c.conn().prepareAuth()
-			go func() { c.conn().startAuth(a, gc); close(done) }()
+			go func() { c.conn().startAuth(a, oldGC); close(done) }()
 			waitAttempt(t, entered)
 			c.CloseConn()
-			_, newGC := installGeneration(t, c, func(data []byte) error {
+			b, newGC := installGeneration(t, c, func(data []byte) error {
 				id := authID(t, data)
 				c.w.Trigger(id, &proto.Connack{Id: id, Status: proto.StatusOK})
 				return nil
 			})
-			b, bgc := c.conn().prepareAuth()
 			unblock()
 			waitAttempt(t, done)
 			require.Same(t, newGC, c.conn().transport())
 			require.Equal(t, authing, c.conn().status.Load(), "A must not authenticate or disconnect B")
 			require.EqualValues(t, 1, oldGC.closed.Load())
 			require.False(t, c.w.IsRegistered(oldID), "old auth wait entry must be released")
-			c.conn().startAuth(b, bgc)
+			c.conn().startAuth(b, newGC)
 			require.True(t, c.IsAuthed(), "B must still authenticate normally")
 		})
 	}
@@ -304,10 +346,9 @@ func TestCloseCancelsAuthAndReleasesWaiter(t *testing.T) {
 	defer c.cancel()
 	defer c.pool.Release()
 	written := make(chan uint64, 1)
-	_, gc := installGeneration(t, c, func(data []byte) error { written <- authID(t, data); return nil })
-	a, gcAuth := c.conn().prepareAuth()
+	a, gc := installGeneration(t, c, func(data []byte) error { written <- authID(t, data); return nil })
 	done := make(chan struct{})
-	go func() { c.conn().startAuth(a, gcAuth); close(done) }()
+	go func() { c.conn().startAuth(a, gc); close(done) }()
 	var id uint64
 	select {
 	case id = <-written:
@@ -324,7 +365,7 @@ func TestCloseCancelsAuthAndReleasesWaiter(t *testing.T) {
 func TestStopInvalidatesConnectionAndPreventsNewDial(t *testing.T) {
 	c, l := newGenerationClient(t, nil)
 	a := c.conn().prepareDial()
-	c.conn().startDial(a)
+	c.conn().dial(a)
 	peer := acceptGenerationConn(t, l)
 	c.Stop()
 	require.Equal(t, disconnect, c.conn().status.Load())
@@ -344,7 +385,7 @@ func TestCloseCancelsBlockedDialImmediately(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	a := c.conn().prepareDial()
-	go func() { c.conn().startDial(a); close(done) }()
+	go func() { c.conn().dial(a); close(done) }()
 	waitAttempt(t, entered)
 	c.CloseConn()
 	select {
@@ -360,15 +401,14 @@ func TestCancelledScheduledAuthDoesNotWriteToSuccessor(t *testing.T) {
 	defer c.cancel()
 	defer c.pool.Release()
 	var writes int
-	_, oldGC := installGeneration(t, c, func([]byte) error { writes++; return nil })
-	a, gc := c.conn().prepareAuth()
+	a, oldGC := installGeneration(t, c, func([]byte) error { writes++; return nil })
 	c.CloseConn()
 	_, newGC := installGeneration(t, c, func([]byte) error { writes++; return nil })
-	c.conn().startAuth(a, gc)
+	c.conn().startAuth(a, oldGC)
 	require.Zero(t, writes)
 	require.Same(t, newGC, c.conn().transport())
 	require.EqualValues(t, 1, oldGC.closed.Load())
-	require.Equal(t, connected, c.conn().status.Load())
+	require.Equal(t, authing, c.conn().status.Load())
 }
 
 func TestHeartbeatTimeoutClosesOnlyCurrentGeneration(t *testing.T) {
@@ -439,7 +479,7 @@ func TestAdmittedReplyCompletesOriginalWaitWithoutTouchingSuccessor(t *testing.T
 		t.Fatal("an already received response was discarded")
 	}
 	require.Same(t, newGC, cn.transport())
-	require.Equal(t, connected, cn.status.Load())
+	require.Equal(t, authing, cn.status.Load())
 	require.Equal(t, 5, cn.idleTick)
 	require.Equal(t, 7, cn.timeoutTick)
 }

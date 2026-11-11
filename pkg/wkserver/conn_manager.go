@@ -34,3 +34,11 @@ func (c *ConnManager) RemoveConn(uid string) {
 	defer c.connMapLock.Unlock()
 	delete(c.connMap, uid)
 }
+
+func (c *ConnManager) removeConnIfCurrent(uid string, conn gnet.Conn) {
+	c.connMapLock.Lock()
+	defer c.connMapLock.Unlock()
+	if c.connMap[uid] == conn {
+		delete(c.connMap, uid)
+	}
+}
