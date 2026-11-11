@@ -38,8 +38,11 @@ type Node struct {
 	membershipRequests map[uint64]uint64 // peer -> newer applied config version requested
 	applyFailures      int
 	applyRetryTicks    int // only Tick advances retries; role changes do not reset it
-	electionState          // 选举状态
-	syncState              // 同步状态
+	roleRetryTicks     int
+	roleRetryFailures  int
+	roleRetryTarget    uint64
+	electionState      // 选举状态
+	syncState          // 同步状态
 	// 最新的任期对应的开始日志下标
 	lastTermStartIndex types.TermStartIndexInfo
 	onlySync           bool // 是否只同步,不做截断判断

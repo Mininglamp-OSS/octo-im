@@ -23,12 +23,20 @@ func TestRoleChangeResponseNotifiesCurrentLearners(t *testing.T) {
 					}
 					require.NoError(t, n.Step(types.Event{Type: eventType, From: 2, Reason: reason,
 						Config: types.Config{Learners: []uint64{2, 99}}}))
+					if reason == types.ReasonError {
+						require.Empty(t, findEventsOfType(collectEvents(n), types.NotifySync))
+						n.Tick()
+					}
 					notifications := findEventsOfType(collectEvents(n), types.NotifySync)
 					var recipients []uint64
 					for _, e := range notifications {
 						recipients = append(recipients, e.To)
 					}
-					require.ElementsMatch(t, []uint64{3, 4}, recipients, "notify current membership, not stale response membership")
+					expected := []uint64{3, 4}
+					if reason == types.ReasonError {
+						expected = append(expected, 2) // failed follower-to-leader retry
+					}
+					require.ElementsMatch(t, expected, recipients, "notify current membership, not stale response membership")
 					require.False(t, n.stopPropose)
 					if !cleared {
 						require.False(t, n.replicaSync[2].roleSwitching)

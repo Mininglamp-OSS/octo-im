@@ -453,23 +453,26 @@ func (s *Server) onSaveChannelConfig(channelId string, channelType uint8, cfg ra
 	if err != nil {
 		// The authority may have committed before its response was lost. Read
 		// it again instead of reopening the old leader on a transport error.
-		reconcileCtx, reconcileCancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
-		defer reconcileCancel()
-		current, readErr := s.loadConversationConfig(reconcileCtx, channelId, channelType)
+		s.hintChannelConfig(channelId, channelType)
+		refreshCtx, refreshCancel := context.WithTimeout(s.cancelCtx, 2*time.Second)
+		defer refreshCancel()
+		current, readErr := s.loadConversationConfig(refreshCtx, channelId, channelType)
 		if readErr != nil || current.ConfVersion <= cfg.Version {
 			return err
 		}
 		channelCfg = current
+		if applyErr := s.channelServer.SwitchConfigContext(refreshCtx, channelId, channelType, channelCfg); applyErr != nil {
+			s.Warn("refresh after rejected channel transition failed", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(applyErr))
+			return transitionErr
+		}
+	} else if err = s.channelServer.SwitchConfig(channelId, channelType, channelCfg); err != nil {
+		return err
 	}
 
 	retiring := cfg.MigrateTo == 0 && channelCfg.MigrateTo != 0
 
-	// The callback runs on the old leader, which may no longer be a member
-	// and will therefore never receive the new leader's replication traffic.
-	// Demote it before notifying the new leader, even if notification fails.
-	if err = s.channelServer.SwitchConfig(channelId, channelType, channelCfg); err != nil {
-		return err
-	}
+	// The callback runs on the old leader, which may no longer be a member.
+	// The local runtime must be fenced before notifying the new leader.
 	if channelCfg.LeaderId != s.opts.ConfigOptions.NodeId {
 		if err = s.rpcClient.RequestChannelSwitchConfig(channelCfg.LeaderId, channelCfg); err != nil {
 			// The slot owner's persisted-config reconciler retries this hint.

@@ -11,6 +11,21 @@ func (n *Node) Tick() {
 		n.truncateRetry = nil
 		n.sendTruncateReq(index)
 	}
+	if n.roleRetryTicks > 0 {
+		n.roleRetryTicks--
+		if n.roleRetryTicks == 0 && n.IsLeader() {
+			// Suspended learners need a wakeup even when no new business
+			// writes arrive. Use current membership, never the failed snapshot.
+			for _, id := range n.cfg.Learners {
+				if id != n.opts.NodeId {
+					n.sendNotifySync(id)
+				}
+			}
+			if n.roleRetryTarget != n.opts.NodeId && n.isVoter(n.roleRetryTarget) {
+				n.sendNotifySync(n.roleRetryTarget)
+			}
+		}
+	}
 	if n.applyRetryTicks > 0 {
 		n.applyRetryTicks--
 	}
