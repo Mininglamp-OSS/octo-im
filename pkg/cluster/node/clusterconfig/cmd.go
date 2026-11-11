@@ -22,7 +22,9 @@ const (
 	CMDTypeSlotUpdate                        // 槽更新
 	CMDTypeNodeStatusChange                  // 节点状态改变
 	CMDTypeSlotStatusChange                  // 槽状态改变
-	CMDTypeConfigClusterAddrChange           // 节点cluster通讯地址变更
+	CMDTypeConfigClusterAddrChange           // preserve the merged address command's ID 11
+	CMDTypeNodeRemove                        // remove one offline voter before learner promotion
+	CMDTypeSlotUpdateIfCurrent               // fence a slot transition against its source assignment
 
 )
 
@@ -54,26 +56,41 @@ func (c CMDType) String() string {
 		return "CMDTypeNodeStatusChange"
 	case CMDTypeSlotStatusChange:
 		return "CMDTypeSlotStatusChange"
+	case CMDTypeNodeRemove:
+		return "CMDTypeNodeRemove"
+	case CMDTypeSlotUpdateIfCurrent:
+		return "CMDTypeSlotUpdateIfCurrent"
 	}
 	return "CMDTypeUnknown"
 }
 
 type CMD struct {
-	CmdType CMDType
-	Data    []byte
-	version uint16 // 数据协议版本
-
+	CmdType      CMDType
+	Data         []byte
+	version      uint16 // 数据协议版本
+	appliedIndex uint64 // local apply metadata; not encoded in the command
 }
 
+const slotGenerationCommandVersion uint16 = 3
+
 func NewCMD(cmdType CMDType, data []byte) *CMD {
+	version := uint16(1)
+	switch cmdType {
+	case CMDTypeConfigChange, CMDTypeSlotUpdate, CMDTypeNodeJoined,
+		CMDTypeSlotMigrate, CMDTypeSlotStatusChange, CMDTypeSlotUpdateIfCurrent:
+		version = slotGenerationCommandVersion
+	}
 	return &CMD{
 		CmdType: cmdType,
 		Data:    data,
+		version: version,
 	}
 }
 
 func (c *CMD) Marshal() ([]byte, error) {
-	c.version = 1
+	if c.version == 0 {
+		c.version = 1
+	}
 	enc := wkproto.NewEncoder()
 	defer enc.End()
 	enc.WriteUint16(c.version)

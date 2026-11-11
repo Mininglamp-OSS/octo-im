@@ -6,6 +6,11 @@ import (
 )
 
 func (n *Node) Tick() {
+	if n.truncateRetry != nil {
+		index := n.truncateRetry.Index
+		n.truncateRetry = nil
+		n.sendTruncateReq(index)
+	}
 	if n.roleRetryTicks > 0 {
 		n.roleRetryTicks--
 		if n.roleRetryTicks == 0 && n.IsLeader() {
@@ -25,7 +30,7 @@ func (n *Node) Tick() {
 		n.applyRetryTicks--
 	}
 	n.idleTick++
-	if n.opts.AutoDestory {
+	if n.opts.AutoDestory && len(n.messageAdmissions) == 0 {
 		if n.idleTick > n.opts.DestoryAfterIdleTick {
 			n.idleTick = 0
 			n.Debug("auto destory")
@@ -39,6 +44,7 @@ func (n *Node) Tick() {
 }
 
 func (n *Node) tickLeader() {
+	n.tickAdmissionDrain()
 	n.tickHeartbeat()
 }
 
@@ -160,6 +166,9 @@ func (n *Node) resetRandomizedElectionTimeout() {
 
 // 开始选举
 func (n *Node) campaign() {
+	if n.truncating {
+		return // Do not campaign using a tail already scheduled for deletion.
+	}
 	if !n.isVoter(n.opts.NodeId) || n.cfg.Role == types.RoleLearner {
 		return
 	}

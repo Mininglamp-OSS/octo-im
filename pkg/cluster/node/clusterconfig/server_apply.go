@@ -34,13 +34,17 @@ func (s *Server) applyLog(log types.Log) error {
 		}
 
 		before := s.configToRaftConfig(s.config).Clone()
+		cmd.appliedIndex = log.Index
 		err = s.handleCmd(cmd)
 		if err != nil {
 			s.Error("handle cmd failed", zap.Error(err))
 			return err
 		}
 		after := s.configToRaftConfig(s.config)
-		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
+		// ResumeJoin temporarily makes a returning voter a local learner.
+		// Its committed recovery boundary must reinstall the voting set even
+		// when that set did not change in the application configuration.
+		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after) || cmd.CmdType == CMDTypeNodeJoining
 		s.config.setVersionAndTerm(log.Index, log.Term)
 		s.configSavePending = true
 		s.configNotifyPending = true
@@ -91,6 +95,10 @@ func (s *Server) handleCmd(cmd *CMD) error {
 		return s.handleSlotMigrate(cmd)
 	case CMDTypeSlotStatusChange: // 槽状态改变
 		return s.handleSlotStatusChange(cmd)
+	case CMDTypeNodeRemove:
+		return s.handleNodeRemove(cmd)
+	case CMDTypeSlotUpdateIfCurrent:
+		return s.handleSlotUpdateIfCurrent(cmd)
 	}
 	return nil
 }
@@ -102,7 +110,7 @@ func (s *Server) handleConfigChange(cmd *CMD) error {
 		s.Error("unmarshal config err", zap.Error(err))
 		return err
 	}
-	s.config.update(cfg)
+	s.config.update(cfg, cmd.slotMutation())
 	return nil
 }
 
@@ -146,7 +154,7 @@ func (s *Server) handleSlotUpdate(cmd *CMD) error {
 		s.Error("unmarshal slotset err", zap.Error(err))
 		return err
 	}
-	s.config.updateSlots(slotset)
+	s.config.updateSlots(slotset, cmd.slotMutation())
 
 	return nil
 }
@@ -159,7 +167,7 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 		s.Error("unmarshal node err", zap.Error(err))
 		return err
 	}
-	s.config.joinNode(newNode)
+	s.config.joinNode(newNode, cmd.version == 2)
 	return nil
 }
 
@@ -168,7 +176,7 @@ func (s *Server) handleNodeJoining(cmd *CMD) error {
 		return fmt.Errorf("invalid node joining payload length: %d", len(cmd.Data))
 	}
 	nodeId := binary.BigEndian.Uint64(cmd.Data)
-	s.config.updateNodeJoining(nodeId)
+	s.config.updateNodeJoining(nodeId, cmd.version == 2)
 	return nil
 }
 
@@ -178,7 +186,7 @@ func (s *Server) handleNodeJoined(cmd *CMD) error {
 		s.Error("decode node joined err", zap.Error(err))
 		return err
 	}
-	s.config.updateNodeJoined(nodeId, slots)
+	s.config.updateNodeJoined(nodeId, slots, cmd.slotMutation())
 	return nil
 }
 
@@ -188,7 +196,7 @@ func (s *Server) handleSlotMigrate(cmd *CMD) error {
 		s.Error("decode migrate slot err", zap.Error(err))
 		return err
 	}
-	s.config.updateSlotMigrate(slotId, fromNodeId, toNodeId)
+	s.config.updateSlotMigrate(slotId, fromNodeId, toNodeId, cmd.slotMutation())
 	return nil
 }
 
@@ -198,7 +206,7 @@ func (s *Server) handleSlotStatusChange(cmd *CMD) error {
 		s.Error("decode slot status change err", zap.Error(err))
 		return err
 	}
-	s.config.updateSlotStatus(slotId, status)
+	s.config.updateSlotStatus(slotId, status, cmd.slotMutation())
 	return nil
 }
 

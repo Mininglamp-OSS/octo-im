@@ -1,9 +1,13 @@
 package slot
 
 import (
+	"context"
+
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
+	"go.uber.org/zap"
 )
 
 // 配置发送改变
@@ -68,7 +72,10 @@ func (s *Server) addOrUpdateSlotRaft(slot *types.Slot, version uint64, force boo
 	}
 	runtimeConfig := func(local *Slot) rafttype.Config {
 		cfg := s.slotRuntimeConfig(slot, local)
-		cfg.Version = version
+		// Startup can load a persisted assignment before a versioned controller
+		// notification. Preserve its generation without replacing the global
+		// notification boundary used by recovery admission.
+		cfg.Version = max(version, slot.Generation)
 		return cfg
 	}
 
@@ -78,26 +85,47 @@ func (s *Server) addOrUpdateSlotRaft(slot *types.Slot, version uint64, force boo
 	// 如果当前节点不是slot的replica或者learner则不处理
 	if !wkutil.ArrayContainsUint64(slot.Replicas, s.opts.NodeId) && !wkutil.ArrayContainsUint64(slot.Learners, s.opts.NodeId) {
 		if rft != nil {
-			s.raftGroup.RemoveRaft(rft)
+			// Retire on the owner, so no old Step/Ready/Tick can launch work
+			// or persist hard state after the replacement starts loading.
+			err := s.raftGroup.Do(context.Background(), shardNo, func(current raftgroup.IRaft) error {
+				if current != nil {
+					s.raftGroup.RemoveRaft(current)
+				}
+				return nil
+			})
+			if err != nil {
+				s.Error("retire slot failed", zap.String("slot", shardNo), zap.Error(err))
+			}
 		}
 		return
 	}
 
 	if rft == nil { // 添加slot的raft
+		// The update lock keeps configuration changes serialized while I/O
+		// drains outside the owner. Snapshot storage only after old writes,
+		// truncations and Apply have completed, including queued workers.
+		if err := s.raftGroup.WaitStorage(context.Background(), shardNo); err != nil {
+			s.Error("drain retired slot failed", zap.String("slot", shardNo), zap.Error(err))
+			return
+		}
 		slotNode := newSlot(slot, s)
 		s.raftGroup.AddRaft(slotNode)
 
-		s.raftGroup.AddEvent(shardNo, rafttype.Event{
+		s.raftGroup.AddEventFor(slotNode, rafttype.Event{
 			Type:   rafttype.ConfChange,
 			Config: runtimeConfig(slotNode),
 		})
 	} else { // 更新slot的分布式配置
 		raftSlot := rft.(*Slot)
 		if force || raftSlot.needUpdate(slot) {
-			s.raftGroup.AddEvent(shardNo, rafttype.Event{
+			s.raftGroup.AddEventFor(raftSlot, rafttype.Event{
 				Type:   rafttype.ConfChange,
 				Config: runtimeConfig(raftSlot),
 			})
+			// Compare the last controller assignment scheduled for this raft,
+			// not its creation-time assignment. Unrelated config log entries
+			// must not keep resetting a migration's synchronization progress.
+			raftSlot.slot = slot.Clone()
 		}
 	}
 }

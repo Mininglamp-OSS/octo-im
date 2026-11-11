@@ -213,6 +213,8 @@ type Event struct {
 
 	// 不参与编码
 	TermStartIndexInfo *TermStartIndexInfo
+	TruncateID         uint64 // local storage request identity; never sent on the wire
+	RoleChangeID       uint64 // local leader-handoff request identity; never sent on the wire
 	StartIndex         uint64
 	EndIndex           uint64
 }

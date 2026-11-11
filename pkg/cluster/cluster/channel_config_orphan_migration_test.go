@@ -164,8 +164,13 @@ func TestConfigOrphanMigrationPreservesOtherTransitions(t *testing.T) {
 			cfg := wkdb.ChannelClusterConfig{ReplicaMaxCount: 3, Replicas: tc.replicas,
 				Learners: tc.learners, MigrateFrom: tc.from, MigrateTo: tc.to}
 			before := cfg.Clone()
-			changed, err := (&Server{}).joinNewRepliceIfNeed(&cfg)
-			require.NoError(t, err)
+			cluster := &clustertype.Config{}
+			for _, id := range []uint64{1, 2, 3} {
+				cluster.Nodes = append(cluster.Nodes, &clustertype.Node{Id: id, Online: true, AllowVote: true, Status: clustertype.NodeStatus_NodeStatusJoined})
+			}
+			cfg.LeaderId = 1
+			before.LeaderId = 1
+			changed := planChannelExpansion(&cfg, cluster)
 			require.False(t, changed)
 			require.Equal(t, before, cfg)
 		})

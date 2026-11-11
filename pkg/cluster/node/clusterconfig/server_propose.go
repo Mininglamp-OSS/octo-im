@@ -2,6 +2,7 @@ package clusterconfig
 
 import (
 	"encoding/binary"
+	"slices"
 	"strings"
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -145,24 +146,31 @@ func (s *Server) ProposeJoined(nodeId uint64, slots []*pb.Slot) error {
 }
 
 func (s *Server) ProposeJoining(nodeId uint64) error {
+	_, err := s.proposeJoiningWithVersion(nodeId)
+	return err
+}
+
+func (s *Server) proposeJoiningWithVersion(nodeId uint64) (uint64, error) {
 
 	nodeIdBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(nodeIdBytes, nodeId)
 
 	cmd := NewCMD(CMDTypeNodeJoining, nodeIdBytes)
+	// New admissions retire voters through the explicit, revalidated removal
+	// command. Version-2 replacement remains available only for replay.
 	cmdBytes, err := cmd.Marshal()
 	if err != nil {
 		s.Error("ProposeJoining cmd marshal failed", zap.Error(err))
-		return err
+		return 0, err
 	}
 
 	logId := s.genConfigId()
-	_, err = s.ProposeUntilApplied(logId, cmdBytes)
+	resp, err := s.ProposeUntilApplied(logId, cmdBytes)
 	if err != nil {
 		s.Error("ProposeJoining failed", zap.Error(err))
-		return err
+		return 0, err
 	}
-	return nil
+	return resp.Index, nil
 
 }
 
@@ -175,14 +183,56 @@ func (s *Server) ProposeJoin(node *pb.Node) error {
 // ProposeJoinWithVersion returns the applied join command's exact log index.
 // A recovering process uses it to distinguish its own rejoin from replay.
 func (s *Server) ProposeJoinWithVersion(node *pb.Node) (uint64, error) {
+	if err := pb.ValidateJoinAddr(node.ClusterAddr); err != nil {
+		return 0, err
+	}
+	s.joinMu.Lock()
+	defer s.joinMu.Unlock()
+	current := s.Snapshot()
+	for _, existing := range current.Nodes {
+		if existing.Id != node.Id || !existing.AllowVote || existing.Role != pb.NodeRole_NodeRoleReplica || slices.Contains(current.Learners, node.Id) {
+			continue
+		}
+		// A committed voter only needs a fresh recovery boundary. Reusing
+		// NodeJoin would demote it and overwrite another admission's migration.
+		if !existing.Online {
+			if err := s.ProposeNodeOnlineStatus(node.Id, true); err != nil {
+				return 0, err
+			}
+		}
+		if existing.ClusterAddr != node.ClusterAddr {
+			if err := s.ProposeClusterAddr(node.Id, node.ClusterAddr); err != nil {
+				return 0, err
+			}
+		}
+		version, err := s.proposeJoiningWithVersion(node.Id)
+		if err != nil {
+			return 0, err
+		}
+		// Retirement can commit between the address/online updates and the
+		// recovery boundary. A no-op on a removed voter is not a successful join.
+		applied := s.Snapshot()
+		for _, member := range applied.Nodes {
+			if member.Id == node.Id && member.Online && member.AllowVote && member.Role == pb.NodeRole_NodeRoleReplica &&
+				!slices.Contains(applied.Learners, node.Id) &&
+				(member.Status == pb.NodeStatus_NodeStatusJoining || member.Status == pb.NodeStatus_NodeStatusJoined) {
+				return version, nil
+			}
+		}
+		return 0, ErrMembershipBusy
+	}
+	// The Raft migration fields describe one change. A concurrent new voter
+	// must retry instead of overwriting its target.
+	for _, pending := range current.Nodes {
+		if pending.Id != node.Id && (pending.Status == pb.NodeStatus_NodeStatusWillJoin || pending.Status == pb.NodeStatus_NodeStatusJoining) {
+			return 0, ErrMembershipBusy
+		}
+	}
 	data, err := node.Marshal()
 	if err != nil {
 		return 0, err
 	}
 	cmd := NewCMD(CMDTypeNodeJoin, data)
-	if err := pb.ValidateJoinAddr(node.ClusterAddr); err != nil {
-		return 0, err
-	}
 	cmdBytes, err := cmd.Marshal()
 	if err != nil {
 		return 0, err

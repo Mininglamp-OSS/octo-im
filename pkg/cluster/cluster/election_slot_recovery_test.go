@@ -32,27 +32,27 @@ func TestSlotRecoveryChoosesDurableLogAndFencesAllTerms(t *testing.T) {
 	for range 100 {
 		leader := s.electionSlotLeaderBySlot(infos, slot.Id)
 		require.Equal(t, uint64(1001), leader, "runtime term cannot outrank a surviving log")
-		next, err := slotElectionConfig(slot, leader, infos)
+		next, err := slotElectionConfig(slot, leader, infos, 3)
 		require.NoError(t, err)
 		require.Equal(t, uint32(21), next.Term)
 		require.Equal(t, types.SlotStatus_SlotStatusNormal, next.Status)
 		require.Zero(t, next.ExpectLeader)
 	}
 	infos[1002][7] = SlotInfo{Term: math.MaxUint32}
-	_, err := slotElectionConfig(slot, 1001, infos)
+	_, err := slotElectionConfig(slot, 1001, infos, 3)
 	require.Error(t, err, "term overflow cannot publish term zero")
 }
 
 func TestSlotRecoveryCancelsSupersededLeadershipTransfer(t *testing.T) {
 	slot := &types.Slot{Id: 7, Leader: 1002, Term: 3, ExpectLeader: 1002, Status: types.SlotStatus_SlotStatusCandidate,
 		Replicas: []uint64{1001, 1002, 1003}, MigrateFrom: 1002, MigrateTo: 1003}
-	next, err := slotElectionConfig(slot, 1001, nil)
+	next, err := slotElectionConfig(slot, 1001, nil, 3)
 	require.NoError(t, err)
 	require.Zero(t, next.MigrateFrom)
 	require.Zero(t, next.MigrateTo)
 	require.Equal(t, uint64(1002), slot.MigrateFrom, "the previous configuration must remain immutable")
 	slot.Replicas, slot.Learners = []uint64{1001, 1002}, []uint64{1003}
-	next, err = slotElectionConfig(slot, 1001, nil)
+	next, err = slotElectionConfig(slot, 1001, nil, 3)
 	require.NoError(t, err)
 	require.Equal(t, slot.MigrateFrom, next.MigrateFrom, "actual learner catch-up must continue")
 	require.Equal(t, slot.MigrateTo, next.MigrateTo)

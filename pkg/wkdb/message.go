@@ -488,11 +488,6 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 
 	wk.metrics.TruncateLogToAdd(1)
 
-	if messageSeq == 0 {
-		return fmt.Errorf("messageSeq[%d] must be greater than 0", messageSeq)
-
-	}
-
 	applied, err := wk.GetChannelAppliedIndex(channelId, channelType)
 	if err != nil {
 		return err

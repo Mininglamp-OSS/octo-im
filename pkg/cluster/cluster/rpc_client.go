@@ -208,7 +208,13 @@ func (r *rpcClient) RequestClusterJoin(nodeId uint64, req *ClusterJoinReq) (*Clu
 	if err != nil {
 		return nil, err
 	}
-	body, err := r.request(nodeId, "/rpc/cluster/join", data)
+	path := "/rpc/cluster/join"
+	if req.Probe {
+		// Version 2 guarantees read-only discovery for unknown IDs too. Older
+		// peers must fail instead of admitting a node through their v1 probe.
+		path = "/rpc/cluster/join/probe/v2"
+	}
+	body, err := r.request(nodeId, path, data)
 	if err != nil {
 		return nil, err
 	}

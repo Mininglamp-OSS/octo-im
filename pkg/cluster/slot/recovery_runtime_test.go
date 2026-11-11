@@ -9,6 +9,7 @@ import (
 	nodetypes "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/stretchr/testify/require"
 )
 
@@ -81,6 +82,35 @@ func TestRecoveryRuntimeHistoricalFollowerCannotCommitNewHistory(t *testing.T) {
 		require.NoError(t, err)
 		require.Zero(t, applied)
 	}
+}
+
+func TestRecoveryRuntimeJoiningFollowerCanAcknowledgeAndApply(t *testing.T) {
+	wklog.Debug("initialize logging before starting concurrent recovery owners")
+	servers := recoveryRuntimeServers(t, true)
+	for _, server := range servers {
+		server.OnConfigChange(runtimeSlotConfig(2, 1, nodetypes.SlotStatus_SlotStatusNormal))
+	}
+	cfg := runtimeSlotConfig(1, 2, nodetypes.SlotStatus_SlotStatusNormal)
+	cfg.Version = 2
+	cfg.Nodes = []*nodetypes.Node{
+		{Id: 1, Status: nodetypes.NodeStatus_NodeStatusJoined},
+		{Id: 3, Status: nodetypes.NodeStatus_NodeStatusJoining},
+	}
+	servers[0].SetRecoveryJoinVersion(1)
+	for _, server := range servers {
+		server.OnConfigChange(cfg)
+	}
+	waitRuntimeSlot(t, servers[0], 2, true)
+	waitRuntimeSlot(t, servers[1], 2, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := servers[0].ProposeUntilAppliedTimeoutForLocal(ctx, 1, types.ProposeReqSet{{Id: 1, Data: []byte("joining-follower")}})
+	require.NoError(t, err, "the Joining follower is the only available vote besides the leader")
+	require.Eventually(t, func() bool {
+		applied, err := servers[1].AppliedIndex(1)
+		return err == nil && applied == 1
+	}, time.Second, 5*time.Millisecond)
+	require.Zero(t, servers[1].recoveryBoundary.Load(), "replication must not depend on releasing the admission fence")
 }
 
 func TestRecoveryRuntimeCandidateDemotesExistingLeader(t *testing.T) {
