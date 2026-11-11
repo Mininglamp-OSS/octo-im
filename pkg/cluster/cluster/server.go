@@ -463,7 +463,7 @@ func (s *Server) onSaveChannelConfig(channelId string, channelType uint8, cfg ra
 		channelCfg = current
 		if applyErr := s.channelServer.SwitchConfigContext(refreshCtx, channelId, channelType, channelCfg); applyErr != nil {
 			s.Warn("refresh after rejected channel transition failed", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(applyErr))
-			return applyErr
+			return transitionErr
 		}
 	} else if err = s.channelServer.SwitchConfig(channelId, channelType, channelCfg); err != nil {
 		return err
