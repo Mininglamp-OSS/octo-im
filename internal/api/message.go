@@ -781,6 +781,12 @@ func (m *message) getMessageByClientMsgNo(c *wkhttp.Context) {
 	channelId := c.Query("channel_id")
 	channelType := wkutil.StringToUint8(c.Query("channel_type"))
 	clientMsgNo := c.Query("client_msg_no")
+	committed := c.Query("committed") == "1"
+	fromUID := c.Query("from_uid")
+	if committed && strings.TrimSpace(fromUID) == "" {
+		c.ResponseError(errors.New("from_uid不能为空"))
+		return
+	}
 
 	if strings.TrimSpace(channelId) == "" {
 		c.ResponseError(errors.New("channel_id不能为空"))
@@ -800,7 +806,16 @@ func (m *message) getMessageByClientMsgNo(c *wkhttp.Context) {
 	fakeChannelId := channelId
 	// 注意：如果是个人频道，需要传入完整的 fakeChannelId（如 uid1@uid2）
 
-	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(fakeChannelId, channelType)
+	leaderOfChannel := service.Cluster.SlotLeaderOfChannel
+	if committed {
+		leaderOfChannel = service.Cluster.LeaderOfChannelForRead
+	}
+	leaderInfo, err := leaderOfChannel(fakeChannelId, channelType)
+	if committed && errors.Is(err, cluster.ErrChannelClusterConfigNotFound) {
+		c.Header("X-WK-Receipt-Version", "1")
+		c.ResponseStatus(http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		m.Error("获取频道所在节点失败！", zap.Error(err), zap.String("channelID", fakeChannelId), zap.Uint8("channelType", channelType))
 		c.ResponseError(errors.New("获取频道所在节点失败！"))
@@ -810,11 +825,21 @@ func (m *message) getMessageByClientMsgNo(c *wkhttp.Context) {
 
 	if !leaderIsSelf {
 		m.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
+		if committed {
+			forwardCommittedReceipt(c, leaderInfo.ApiServerAddr+c.Request.URL.Path)
+			return
+		}
 		c.Forward(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path))
 		return
 	}
 
-	msg, err := service.Store.LoadMsgByClientMsgNo(fakeChannelId, channelType, clientMsgNo)
+	var msg wkdb.Message
+	if committed {
+		c.Header("X-WK-Receipt-Version", "1")
+		msg, err = committedMessageReceipt(c.Request.Context(), service.Store.DB(), fakeChannelId, channelType, fromUID, clientMsgNo)
+	} else {
+		msg, err = service.Store.LoadMsgByClientMsgNo(fakeChannelId, channelType, clientMsgNo)
+	}
 	if err != nil {
 		if err == wkdb.ErrNotFound {
 			m.Info("消息不存在！", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.String("clientMsgNo", clientMsgNo))
