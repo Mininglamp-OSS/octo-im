@@ -54,6 +54,7 @@ func createChannel(cfg wkdb.ChannelClusterConfig, s *Server, rg *raftgroup.RaftG
 		raft.NewOptions(
 			raft.WithKey(channelKey),
 			raft.WithSaveHardState(func(state types.HardState) error { return s.storage.db.SaveRaftHardState(channelKey, state) }),
+			raft.WithHandoffFence(func(fence raft.HandoffFence) { s.handoffFences.Store(channelKey, fence) }),
 			raft.WithAutoSuspend(true),
 			raft.WithAutoDestory(true),
 			raft.WithNodeId(s.opts.NodeId),
@@ -104,16 +105,37 @@ func (ch *Channel) applyConfigOnOwner(cfg rafttype.Config) error {
 			cfg.Leader = 0
 		}
 	}
-	if sameChannelConfig(current, cfg) {
-		return nil
+	fenceValue, _ := ch.s.handoffFences.Load(ch.channelKey)
+	fence, fenced := fenceValue.(raft.HandoffFence)
+	matchesHandoff := fenced && cfg.Role == types.RoleLeader && cfg.Leader == fence.From &&
+		cfg.MigrateFrom == fence.From && cfg.MigrateTo == fence.To &&
+		(slices.Contains(cfg.Replicas, fence.To) || slices.Contains(cfg.Learners, fence.To))
+	if fenced && cfg.Version < fence.Version {
+		return fmt.Errorf("%w: incoming=%d handoff=%d", raft.ErrConfigVersionStale, cfg.Version, fence.Version)
 	}
-	if cfg.Version != 0 && cfg.Version == current.Version {
-		return fmt.Errorf("%w: incoming=%+v runtime=%+v", ErrConfigConflict, cfg, current)
+	if fenced && cfg.Version == fence.Version && !matchesHandoff {
+		return fmt.Errorf("%w: incoming config contradicts handoff version %d", ErrConfigConflict, fence.Version)
 	}
-	if err := ch.Step(rafttype.Event{Type: rafttype.ConfChange, Config: cfg}); err != nil {
-		return err
+	if !sameChannelConfig(current, cfg) {
+		if cfg.Version != 0 && cfg.Version == current.Version {
+			return fmt.Errorf("%w: incoming=%+v runtime=%+v", ErrConfigConflict, cfg, current)
+		}
+		if err := ch.Step(rafttype.Event{Type: rafttype.ConfChange, Config: cfg}); err != nil {
+			return err
+		}
+		ch.needsConfigResume = true
 	}
-	ch.needsConfigResume = true
+	if matchesHandoff {
+		ch.RestoreHandoffFence()
+		if cfg.Version > fence.Version {
+			fence.Version = cfg.Version
+			ch.s.handoffFences.Store(ch.channelKey, fence)
+		}
+	} else if fenced {
+		// Only a newer applied config which replaces this migration can
+		// release the record. An equal config cannot clear uncertainty.
+		ch.s.handoffFences.Delete(ch.channelKey)
+	}
 	return nil
 }
 
@@ -131,6 +153,11 @@ func (ch *Channel) resumeConfig(ctx context.Context) error {
 				return raftgroup.ErrRaftNotExist
 			}
 			if ch.needsConfigResume && ch.IsLeader() && len(ch.Config().Replicas) == 1 {
+				if _, fenced := ch.s.handoffFences.Load(ch.channelKey); fenced {
+					// The fence intentionally prevents ResumeReplication. A
+					// newer config can resume this work if it keeps us leader.
+					return nil
+				}
 				if !ch.LeaderReadReady() {
 					return ErrConfigNotReady
 				}

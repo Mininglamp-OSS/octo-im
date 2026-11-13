@@ -77,9 +77,10 @@ func retryDB(t *testing.T) wkdb.DB {
 	t.Cleanup(func() { require.NoError(t, d.Close()) })
 	return d
 }
-func retryServer(t *testing.T, id uint64, db wkdb.DB, replicas []uint64, tr *retryTransport) *Server {
+func retryServer(t *testing.T, id uint64, db wkdb.DB, replicas []uint64, tr *retryTransport, opts ...Option) *Server {
 	t.Helper()
-	s := NewServer(NewOptions(WithNodeId(id), WithDB(db), WithGroupCount(1), WithTransport(tr)))
+	defaults := []Option{WithNodeId(id), WithDB(db), WithGroupCount(1), WithTransport(tr)}
+	s := NewServer(NewOptions(append(defaults, opts...)...))
 	require.NoError(t, s.Start())
 	t.Cleanup(s.Stop)
 	tr.mu.Lock()

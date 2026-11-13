@@ -85,6 +85,7 @@ func (n *Node) reset() {
 		votes: make(map[uint64]bool),
 	}
 	n.clearLeaderHandoff()
+	n.messageConfirmations = nil
 	n.syncState.replicaSync = make(map[uint64]*SyncInfo)
 	n.onlySync = false
 	n.suspend = false

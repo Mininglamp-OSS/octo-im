@@ -8,6 +8,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -46,7 +47,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 	var term uint32
 	var version uint64
 	var maxIndex uint64
-	var proposed bool
+	var confirmation *raft.MessageConfirmation
 	resps := make(types.ProposeRespSet, len(reqs))
 	admit := func() error {
 		var revision uint64
@@ -155,7 +156,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				if err := ch.Step(types.Event{Type: types.Propose, Logs: logs}); err != nil {
 					return err
 				}
-				proposed = true
+				confirmation = ch.BeginMessageConfirmation()
 			}
 			ch.ResumeReplication()
 			return nil
@@ -176,6 +177,15 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 	if err != nil {
 		return nil, err
 	}
+	if confirmation != nil {
+		// LoadMsg is synchronous and may outlive the request. Abandoning
+		// confirmation on cancellation also unblocks a planned handoff.
+		defer confirmation.Abandon()
+		if ctx.Done() != nil {
+			stopAbandon := context.AfterFunc(ctx, confirmation.Abandon)
+			defer stopAbandon()
+		}
+	}
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -183,6 +193,12 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 		err = rg.Do(ctx, key, func(r raftgroup.IRaft) error {
 			ch, ok := r.(*Channel)
 			if !ok || ch != owner || !ch.IsLeader() || ch.Config().Term != term {
+				return errMessageLeaderChanged
+			}
+			if confirmation != nil && !ch.MessageConfirmationActive(confirmation) {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				return errMessageLeaderChanged
 			}
 			ch.KeepAlive()
@@ -204,7 +220,7 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 			return nil
 		})
 		if err != nil {
-			return nil, classifyPostProposalError(proposed, err)
+			return nil, classifyPostProposalError(confirmation != nil, err)
 		}
 		if done {
 			// The committed/applied prefix is immutable. Verify the canonical
@@ -212,11 +228,11 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 			// still serving that prefix. A new append does not invalidate it.
 			for i, resp := range resps {
 				if err := ctx.Err(); err != nil {
-					return nil, classifyPostProposalError(proposed, err)
+					return nil, classifyPostProposalError(confirmation != nil, err)
 				}
 				stored, err := s.opts.DB.LoadMsg(id, typ, resp.Index)
 				if err != nil {
-					return nil, classifyPostProposalError(proposed, err)
+					return nil, classifyPostProposalError(confirmation != nil, err)
 				}
 				if uint64(stored.MessageID) != resp.CanonicalID || !sameMessageContent(stored, messages[i]) {
 					return nil, fmt.Errorf("canonical message changed at index %d", resp.Index)
@@ -227,8 +243,17 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				if !ok || ch != owner || !ch.IsLeader() || ch.Config().Term != term {
 					return errMessageLeaderChanged
 				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if !ch.LeaderReadReady() || ch.Config().Version != version || ch.CommittedIndex() < maxIndex || ch.AppliedIndex() < maxIndex {
 					return errMessageNotReady
+				}
+				if confirmation != nil && !ch.CompleteMessageConfirmation(confirmation) {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					return errMessageLeaderChanged
 				}
 				return nil
 			})
@@ -236,12 +261,12 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				return resps, nil
 			}
 			if !errors.Is(err, errMessageNotReady) {
-				return nil, classifyPostProposalError(proposed, err)
+				return nil, classifyPostProposalError(confirmation != nil, err)
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return nil, classifyPostProposalError(proposed, ctx.Err())
+			return nil, classifyPostProposalError(confirmation != nil, ctx.Err())
 		case <-ticker.C:
 		}
 	}

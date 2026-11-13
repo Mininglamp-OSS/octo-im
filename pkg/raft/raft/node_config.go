@@ -71,6 +71,7 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	if !sameVoters(oldCfg, newCfg) || oldCfg.Term != newCfg.Term {
 		n.votes = make(map[uint64]bool)
 	}
+	oldTarget := n.replicaSync[newCfg.MigrateTo]
 	n.replicaSync = make(map[uint64]*SyncInfo)
 	n.resetRandomizedElectionTimeout()
 
@@ -91,6 +92,12 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 		newCfg.Leader = n.cfg.Leader
 	}
 	n.cfg = newCfg
+	// A configuration refresh clears log and membership progress. Evidence
+	// that this peer knows the same leader remains valid in the same term.
+	if n.IsLeader() && oldCfg.Leader == newCfg.Leader && oldCfg.Term == newCfg.Term &&
+		n.isLeaderTransferTarget(newCfg.MigrateTo) && oldTarget != nil && oldTarget.leaderKnown {
+		n.replicaSync[newCfg.MigrateTo] = &SyncInfo{leaderKnown: true}
+	}
 	n.reconcileLeaderHandoff(handoff)
 	// Membership maintenance must progress without a new business write.
 	// A same-leader config update otherwise leaves quiet followers suspended

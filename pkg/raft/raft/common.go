@@ -32,6 +32,7 @@ type SyncInfo struct {
 	SyncTick      int    // 同步计时器
 	GetingLogs    bool   // 领导是否正在查询此副本的日志中
 	roleSwitching bool   // 角色切换中
+	leaderKnown   bool   // this peer addressed the current leader in this term
 	emptySyncTick int    // 空同步计时器(连续多少次tick没有同步到数据)
 	suspend       bool   // 是否挂起
 }

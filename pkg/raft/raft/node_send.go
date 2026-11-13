@@ -42,7 +42,7 @@ func (n *Node) sendNotifySync(to uint64) {
 
 func (n *Node) sendSyncReq() {
 
-	if n.truncating || n.syncing { // 如果在截断中，则发起同步没用
+	if n.cfg.Leader == None || n.truncating || n.syncing {
 		return
 	}
 	// During alignment Index and LastLogTerm must describe the same durable
@@ -103,15 +103,7 @@ func (n *Node) sendPing(to uint64) {
 		return
 	}
 	if to != All {
-		n.events = append(n.events, types.Event{
-			Type:           types.Ping,
-			From:           n.opts.NodeId,
-			To:             to,
-			Term:           n.cfg.Term,
-			Index:          n.queue.lastLogIndex,
-			CommittedIndex: n.queue.committedIndex,
-			ConfigVersion:  n.cfg.Version,
-		})
+		n.sendPingTo(to, types.ReasonUnknown)
 		return
 	}
 	for _, replicaId := range n.cfg.Replicas {
@@ -144,6 +136,19 @@ func (n *Node) sendPing(to uint64) {
 			})
 		}
 	}
+}
+
+func (n *Node) sendPingTo(to uint64, reason types.Reason) {
+	n.events = append(n.events, types.Event{
+		Type:           types.Ping,
+		From:           n.opts.NodeId,
+		To:             to,
+		Term:           n.cfg.Term,
+		Index:          n.queue.lastLogIndex,
+		CommittedIndex: n.queue.committedIndex,
+		ConfigVersion:  n.cfg.Version,
+		Reason:         reason,
+	})
 }
 
 func (n *Node) sendStoreReq(logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) {
@@ -183,7 +188,7 @@ func (n *Node) sendGetLogsReq(syncEvent types.Event) {
 	})
 }
 
-func (n *Node) sendSyncResp(to uint64, syncIndex uint64, logs []types.Log, reson types.Reason, speed types.Speed) {
+func (n *Node) sendSyncResp(to uint64, syncIndex uint64, logs []types.Log, reason types.Reason, speed types.Speed, suspendVersion uint64) {
 	n.events = append(n.events, types.Event{
 		Type:           types.SyncResp,
 		From:           n.opts.NodeId,
@@ -192,8 +197,9 @@ func (n *Node) sendSyncResp(to uint64, syncIndex uint64, logs []types.Log, reson
 		Index:          syncIndex,
 		Logs:           logs,
 		CommittedIndex: n.queue.committedIndex,
-		Reason:         reson,
+		Reason:         reason,
 		Speed:          speed,
+		ConfigVersion:  suspendVersion,
 	})
 }
 
