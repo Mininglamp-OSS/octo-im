@@ -15,11 +15,12 @@ func (n *Node) Tick() {
 		n.applyRetryTicks--
 	}
 	n.idleTick++
-	if n.opts.AutoDestory && len(n.messageAdmissions) == 0 {
-		if n.idleTick > n.opts.DestoryAfterIdleTick {
+	if n.opts.AutoDestory && !n.hasPendingHandoffWork() {
+		if n.idleTicks() > n.opts.DestoryAfterIdleTick {
 			n.idleTick = 0
 			n.Debug("auto destory")
 			n.sendDestory()
+			return
 		}
 	}
 
@@ -28,8 +29,32 @@ func (n *Node) Tick() {
 	}
 }
 
+func (n *Node) idleTicks() int {
+	// Recovery probes and their replies must not keep an exhausted source
+	// resident forever. Only apply this separate idle limit to a quiet tail
+	// with no pending publication or local storage work.
+	h := n.handoff
+	if h != nil && h.retryExhausted() && h.requestID == 0 && !h.published &&
+		!n.truncating && !n.queue.appending && !n.queue.applying &&
+		n.queue.storedIndex == n.queue.lastLogIndex && n.queue.appliedIndex == n.queue.committedIndex {
+		return max(n.idleTick, h.quietTicks)
+	}
+	return n.idleTick
+}
+
 func (n *Node) tickLeader() {
 	n.tickAdmissionDrain()
+	if h := n.handoff; h != nil {
+		if h.retryTicks > 0 {
+			h.retryTicks--
+		}
+		if h.probeTicks > 0 {
+			h.probeTicks--
+		}
+		if h.retryExhausted() {
+			h.quietTicks++
+		}
+	}
 	n.tickHeartbeat()
 }
 
@@ -114,15 +139,22 @@ func (n *Node) tickHeartbeat() {
 }
 
 func (n *Node) sendPingIfNeed(replicaId uint64) {
-	syncInfo := n.syncState.replicaSync[replicaId]
-	if syncInfo == nil {
-		syncInfo = &SyncInfo{}
-		n.syncState.replicaSync[replicaId] = syncInfo
-	}
-
+	syncInfo := n.replicaSyncInfo(replicaId)
 	syncInfo.SyncTick++
 
-	if syncInfo.SyncTick > n.opts.SyncIntervalTick && !syncInfo.suspend {
+	if syncInfo.SyncTick <= n.opts.SyncIntervalTick {
+		return
+	}
+	if n.canWakeLeaderTransferTarget(replicaId) {
+		n.wakeLeaderTransferTarget(replicaId)
+		syncInfo.SyncTick = 0
+		return
+	}
+	if n.probeExhaustedLeaderTransfer(replicaId) {
+		syncInfo.SyncTick = 0
+		return
+	}
+	if !syncInfo.suspend {
 		n.sendPing(replicaId)
 	}
 }

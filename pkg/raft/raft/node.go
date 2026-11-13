@@ -56,6 +56,8 @@ type Node struct {
 	admissionDrainTicks    int
 	admissionDrainCooldown int
 
+	messageConfirmations *messageConfirmationGeneration
+
 	suspend bool // 挂起
 
 	idleTick int // 服务空闲计数

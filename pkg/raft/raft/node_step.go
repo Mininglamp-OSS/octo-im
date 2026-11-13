@@ -171,14 +171,18 @@ func (n *Node) stepLeader(e types.Event) error {
 		if (e.Reason == types.ReasonOnlySync && e.Index > n.queue.storedIndex) || (e.Index == 1 && n.queue.storedIndex == 0) {
 
 			var speed types.Speed
-			if n.opts.AutoSuspend {
+			var suspendVersion uint64
+			if n.grantHandoffIdle(e) {
+				speed, suspendVersion = types.SpeedSuspend, n.cfg.Version
+				syncInfo.suspend = true
+			} else if n.opts.AutoSuspend && !n.canWakeLeaderTransferTarget(e.From) {
 				syncInfo.emptySyncTick++
 				// 超过空同步阈值，挂起
 				if syncInfo.emptySyncTick > n.opts.SuspendAfterEmptySyncTick {
 					speed = types.SpeedSuspend
 				}
 			}
-			n.sendSyncResp(e.From, e.Index, nil, types.ReasonOk, speed)
+			n.sendSyncResp(e.From, e.Index, nil, types.ReasonOk, speed, suspendVersion)
 			return nil
 		}
 
@@ -219,7 +223,7 @@ func (n *Node) stepLeader(e types.Event) error {
 			e.Logs[i].Record.Add(track.PositionSyncResp)
 		}
 
-		n.sendSyncResp(e.To, e.Index, e.Logs, e.Reason, types.SpeedFast)
+		n.sendSyncResp(e.To, e.Index, e.Logs, e.Reason, types.SpeedFast, 0)
 		n.advance()
 
 		// 角色转换
@@ -235,11 +239,7 @@ func (n *Node) stepLeader(e types.Event) error {
 		// Applying the role config may already have cleared replicaSync. Wake
 		// remaining learners before the nil check so suspended peers can resume
 		// SyncReq-driven promotion, even when they are no longer migrateTo.
-		for _, learnerID := range n.cfg.Learners {
-			if learnerID != n.opts.NodeId {
-				n.sendNotifySync(learnerID)
-			}
-		}
+		n.wakeLearnersAfterRoleChange()
 		syncInfo := n.replicaSync[e.From]
 		if syncInfo == nil {
 			if n.queue.lastLogIndex > 0 {
@@ -250,6 +250,9 @@ func (n *Node) stepLeader(e types.Event) error {
 		n.replicaSync[e.From].roleSwitching = false
 
 	case types.ConfigReq: // 配置请求
+		if n.opts.AutoSuspend && n.isLeaderTransferTarget(e.From) && e.Term == n.cfg.Term && e.Term != 0 {
+			n.replicaSyncInfo(e.From).leaderKnown = true
+		}
 		n.sendConfigResp(e.From, n.cfg.Clone())
 	}
 
@@ -268,6 +271,7 @@ func (n *Node) stepFollower(e types.Event) error {
 		}
 		n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
 		n.idleTick = 0
+		n.resumeSyncOnPing(e)
 		// 如果领导的配置版本大于本地配置版本，那么请求配置
 		if e.ConfigVersion > n.cfg.Version {
 			n.sendConfigReq()
@@ -302,7 +306,7 @@ func (n *Node) stepFollower(e types.Event) error {
 				// 推进去存储
 				n.advance()
 			} else {
-				if e.Speed == types.SpeedSuspend && len(n.cfg.Learners) == 0 && n.cfg.MigrateFrom == 0 && n.cfg.MigrateTo == 0 {
+				if n.canSuspendFromSyncResponse(e) {
 					n.suspend = true
 				}
 			}
@@ -380,6 +384,7 @@ func (n *Node) stepLearner(e types.Event) error {
 		}
 		n.updateFollowCommittedIndex(e.CommittedIndex) // 更新提交索引
 		n.idleTick = 0
+		n.resumeSyncOnPing(e)
 		// 如果领导的配置版本大于本地配置版本，那么请求配置
 		if e.ConfigVersion > n.cfg.Version {
 			n.sendConfigReq()
@@ -409,7 +414,7 @@ func (n *Node) stepLearner(e types.Event) error {
 				}
 				n.advance()
 			} else {
-				if e.Speed == types.SpeedSuspend && len(n.cfg.Learners) == 0 && n.cfg.MigrateFrom == 0 && n.cfg.MigrateTo == 0 {
+				if n.canSuspendFromSyncResponse(e) {
 					n.suspend = true
 				}
 			}
@@ -538,11 +543,17 @@ func (n *Node) canVote(e types.Event) bool {
 
 // 更新同步信息
 func (n *Node) updateSyncInfo(e types.Event) {
-	syncInfo := n.replicaSync[e.From]
-	if syncInfo == nil {
-		syncInfo = &SyncInfo{}
-		n.replicaSync[e.From] = syncInfo
+	syncInfo := n.replicaSyncInfo(e.From)
+	// Count real durable catch-up, not repeated reports of the frozen tail.
+	// A recreated target may have to align the same tail after each probe.
+	if h := n.handoff; h != nil && h.retryExhausted() && e.Reason == types.ReasonOnlySync &&
+		syncInfo.StoredIndex != 0 && e.StoredIndex > syncInfo.StoredIndex && e.StoredIndex <= n.queue.lastLogIndex {
+		h.quietTicks = 0
 	}
+	if n.opts.AutoSuspend && e.Term == n.cfg.Term && e.Term != 0 {
+		syncInfo.leaderKnown = true
+	}
+	syncInfo.suspend = false
 	syncInfo.SyncTick = 0
 	syncInfo.LastSyncIndex = e.Index
 	// The first request after a leader/term change can report a divergent
@@ -553,6 +564,15 @@ func (n *Node) updateSyncInfo(e types.Event) {
 		syncInfo.StoredIndex = e.StoredIndex
 	}
 	syncInfo.ConfigVersion = e.ConfigVersion
+}
+
+func (n *Node) replicaSyncInfo(id uint64) *SyncInfo {
+	info := n.replicaSync[id]
+	if info == nil {
+		info = &SyncInfo{}
+		n.replicaSync[id] = info
+	}
+	return info
 }
 
 // 更新领导的提交索引
@@ -732,7 +752,7 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 	}
 
 	if n.cfg.MigrateFrom == n.cfg.Leader {
-		if n.admissionDrainCooldown > 0 {
+		if n.admissionDrainCooldown > 0 || n.handoff != nil && !n.handoff.canPublish() {
 			return
 		}
 		gap := n.opts.FollowerToLeaderMinLogGap
@@ -744,7 +764,7 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 			n.drainingAdmissions = true
 		}
 		if n.drainingAdmissions {
-			if len(n.messageAdmissions) > 0 {
+			if n.hasPendingHandoffWork() {
 				return
 			}
 			n.pauseLeaderHandoff()

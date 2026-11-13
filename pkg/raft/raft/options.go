@@ -34,6 +34,9 @@ type Options struct {
 	// SaveHardState synchronously persists term/vote. Required for durable Node embedders.
 	// Raft.New supplies this from Storage; nil is for in-memory state-machine users.
 	SaveHardState func(types.HardState) error
+	// SaveHandoffFence records a channel's unresolved publication before it
+	// leaves the owner. Slot and standalone Rafts can leave it unset.
+	SaveHandoffFence func(HandoffFence)
 	// Advance 用于推进状态机
 	Advance func()
 	// MaxLogCountPerBatch 每次同步的最大日志数量
@@ -94,6 +97,12 @@ func NewOptions(opt ...Option) *Options {
 }
 
 type Option func(opts *Options)
+
+func WithHandoffFence(save func(HandoffFence)) Option {
+	return func(opts *Options) {
+		opts.SaveHandoffFence = save
+	}
+}
 
 func WithNodeId(nodeId uint64) Option {
 	return func(opts *Options) {

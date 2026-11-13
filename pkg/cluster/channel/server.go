@@ -36,6 +36,7 @@ type Server struct {
 
 	wakeLeaderLock *ringlock.RingLock
 	admissionBytes atomic.Int64
+	handoffFences  sync.Map // channel key -> raft.HandoffFence; survives Raft retirement
 }
 
 func NewServer(opts *Options) *Server {
