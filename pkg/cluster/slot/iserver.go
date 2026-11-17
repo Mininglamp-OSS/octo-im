@@ -11,7 +11,11 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 )
 
-var ErrEmptySlotProposeResponse = errors.New("empty slot propose response")
+var (
+	ErrEmptySlotProposeResponse = errors.New("empty slot propose response")
+	ErrSlotLegacyRPCBusy        = errors.New("slot legacy RPC worker pool saturated")
+	legacySlotRPCSem            = make(chan struct{}, 32)
+)
 
 type slotProposeBatchWithContextRPC interface {
 	RequestSlotProposeBatchUntilAppliedWithContext(ctx context.Context, nodeId uint64, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error)
@@ -38,12 +42,20 @@ func (s *Server) requestSlotProposeBatchWithContext(ctx context.Context, leaderI
 	if ctxRPC, ok := s.opts.RPC.(slotProposeBatchWithContextRPC); ok {
 		return ctxRPC.RequestSlotProposeBatchUntilAppliedWithContext(ctx, leaderId, slotId, reqs)
 	}
+	select {
+	case legacySlotRPCSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		return nil, ErrSlotLegacyRPCBusy
+	}
 	type rpcResult struct {
 		resps types.ProposeRespSet
 		err   error
 	}
 	ch := make(chan rpcResult, 1)
 	go func() {
+		defer func() { <-legacySlotRPCSem }()
 		resps, err := s.opts.RPC.RequestSlotProposeBatchUntilApplied(leaderId, slotId, reqs)
 		ch <- rpcResult{resps: resps, err: err}
 	}()
@@ -105,12 +117,14 @@ func (s *Server) ProposeUntilApplied(slotId uint32, data []byte) (*types.Propose
 		)
 		if s.opts != nil && s.opts.Node != nil {
 			if slotConfig := s.opts.Node.Slot(slotId); slotConfig != nil && slotConfig.Leader != 0 && slotConfig.Leader != s.opts.NodeId && s.opts.RPC != nil {
-				resps, rpcErr := s.requestSlotProposeBatchWithContext(context.Background(), slotConfig.Leader, slotId, types.ProposeReqSet{
+				rpcCtx, cancel := context.WithDeadline(context.Background(), deadline)
+				resps, rpcErr := s.requestSlotProposeBatchWithContext(rpcCtx, slotConfig.Leader, slotId, types.ProposeReqSet{
 					{
 						Id:   logId,
 						Data: data,
 					},
 				})
+				cancel()
 				err = rpcErr
 				if err == nil && len(resps) > 0 {
 					resp = resps[0]

@@ -75,24 +75,24 @@ type Options struct {
 
 func NewOptions(opt ...Option) *Options {
 	opts := &Options{
-		SyncIntervalTick:           2,
-		SyncRespTimeoutTick:        10,
-		ElectionOn:                 false,
-		HeartbeatInterval:          1,
-		ElectionInterval:           10,
-		TickInterval:               time.Millisecond * 150,
-		MaxLogCountPerBatch:        1000,
-		GoPoolSize:                 1000,
-		ProposeTimeout:             time.Second * 5,
+		SyncIntervalTick:             2,
+		SyncRespTimeoutTick:          10,
+		ElectionOn:                   false,
+		HeartbeatInterval:            1,
+		ElectionInterval:             10,
+		TickInterval:                 time.Millisecond * 150,
+		MaxLogCountPerBatch:          1000,
+		GoPoolSize:                   1000,
+		ProposeTimeout:               time.Second * 5,
 		LearnerToFollowerMinLogGap:   100,
 		LearnerToLeaderMinLogGap:     100,
 		FollowerToLeaderMinLogGap:    100,
 		LearnerToFollowerMaxApplyLag: 8,
 		MaxAdmissionDrainTicks:       100,
 		SuspendAfterEmptySyncTick:    10,
-		AutoSuspend:                false,
-		AutoDestory:                false,
-		DestoryAfterIdleTick:       10 * 60 * 30, // 如果TickInterval是100ms, 那么10 * 60 * 30这个值是30分钟，具体时间根据TickInterval来定
+		AutoSuspend:                  false,
+		AutoDestory:                  false,
+		DestoryAfterIdleTick:         10 * 60 * 30, // 如果TickInterval是100ms, 那么10 * 60 * 30这个值是30分钟，具体时间根据TickInterval来定
 	}
 
 	for _, o := range opt {

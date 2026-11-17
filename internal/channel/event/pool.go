@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -15,10 +16,29 @@ import (
 )
 
 type EventPool struct {
-	pollers      []*poller
+	pollers []*poller
 	wklog.Log
-	handler      eventbus.ChannelEventHandler
-	boundCluster icluster.ICluster
+	handler          eventbus.ChannelEventHandler
+	boundCluster     icluster.ICluster
+	leaderWakeupHook atomic.Value // func()
+}
+
+func (e *EventPool) SetLeaderWakeupHook(fn func()) {
+	if e == nil || fn == nil {
+		return
+	}
+	e.leaderWakeupHook.Store(fn)
+}
+
+func (e *EventPool) notifyLeaderWakeup() {
+	if e == nil {
+		return
+	}
+	if v := e.leaderWakeupHook.Load(); v != nil {
+		if fn, ok := v.(func()); ok && fn != nil {
+			fn()
+		}
+	}
 }
 
 func (e *EventPool) BindCluster(c icluster.ICluster) {
@@ -99,6 +119,22 @@ func (e *EventPool) Stop() {
 func (e *EventPool) AddEvent(channelId string, channelType uint8, event *eventbus.Event) {
 	p := e.pollerByChannel(channelId, channelType)
 	p.addEvent(channelId, channelType, event)
+}
+
+func (e *EventPool) TryAddEvent(channelId string, channelType uint8, event *eventbus.Event) bool {
+	if e == nil || len(e.pollers) == 0 {
+		return false
+	}
+	p := e.pollerByChannel(channelId, channelType)
+	return p.tryAddEvent(channelId, channelType, event)
+}
+
+func (e *EventPool) TryAddBatch(channelId string, channelType uint8, events []*eventbus.Event) bool {
+	if e == nil || len(e.pollers) == 0 {
+		return false
+	}
+	p := e.pollerByChannel(channelId, channelType)
+	return p.tryAddBatch(channelId, channelType, events)
 }
 
 // Advance 推进事件

@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -15,14 +14,46 @@ import (
 	"go.uber.org/zap"
 )
 
-func (s *conversation) getChannelLastMsgSeq(ctx context.Context, channelID string, channelType uint8) (uint64, error) {
-	timeout := options.G.Cluster.ReqTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Second
+const maxRecentMsgCount = 500
+
+func clampRecentMsgCount(n int) int {
+	if n <= 0 {
+		return 15
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	if n > maxRecentMsgCount {
+		return maxRecentMsgCount
+	}
+	return n
+}
+
+func userSlotRetryBudget() time.Duration {
+	if options.G != nil && options.G.Cluster.ReqTimeout > 0 {
+		return options.G.Cluster.ReqTimeout
+	}
+	return 10 * time.Second
+}
+
+func (s *conversation) getChannelLastMsgSeq(ctx context.Context, channelID string, channelType uint8) (uint64, error) {
+	timeout := userSlotRetryBudget()
+	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return service.Cluster.GetChannelLastMessageSeq(ctx, channelID, channelType)
+
+	delay := 40 * time.Millisecond
+	for {
+		seq, err := service.Cluster.GetChannelLastMessageSeq(deadlineCtx, channelID, channelType)
+		if err == nil {
+			return seq, nil
+		}
+		if ctx.Err() != nil || deadlineCtx.Err() != nil || !isTransientConversationSlotHandoffError(err) {
+			return 0, err
+		}
+		select {
+		case <-deadlineCtx.Done():
+			return 0, err
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, 200*time.Millisecond)
+	}
 }
 
 func respondConversationReadRetry(c *wkhttp.Context) {
@@ -33,31 +64,37 @@ func isTransientConversationSlotHandoffError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "proposal dropped") || strings.Contains(msg, "not leader") || strings.Contains(msg, "leadership changed")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "proposal dropped") ||
+		strings.Contains(msg, "not leader") ||
+		strings.Contains(msg, "leadership changed") ||
+		strings.Contains(msg, "leader is 0") ||
+		strings.Contains(msg, "leader not found") ||
+		strings.Contains(msg, "slot leader") ||
+		strings.Contains(msg, "propose timeout") ||
+		strings.Contains(msg, "apply wait timeout")
 }
 
 // forwardToUserSlotLeader routes a user-scoped conversation request to the
-// current slot leader. If the target node is mid-restart (transport dial/EOF
-// error), it re-resolves SlotLeaderOfChannel briefly so rolling upgrades can
-// ride through slot failover or local takeover without returning connection refused.
+// current user-slot leader within options.G.Cluster.ReqTimeout (default 10s),
+// returning HTTP 503 {"msg":"retry required","status":503} on election timeout
+// instead of false HTTP 400 errors (closing V11-5).
 func (s *conversation) forwardToUserSlotLeader(c *wkhttp.Context, uid string, channelType uint8, bodyBytes []byte) (handleLocal bool) {
+	if service.Cluster == nil {
+		return true
+	}
 	reqCtx := context.Background()
 	if c.Request != nil && c.Request.Context() != nil {
 		reqCtx = c.Request.Context()
 	}
-	budget := 2500 * time.Millisecond
-	if options.G != nil && options.G.Cluster.ReqTimeout > 0 && options.G.Cluster.ReqTimeout < budget {
-		budget = options.G.Cluster.ReqTimeout
-	}
+	budget := userSlotRetryBudget()
 	deadlineCtx, cancel := context.WithTimeout(reqCtx, budget)
 	defer cancel()
 
 	delay := 50 * time.Millisecond
-	var lastErr error
-	for attempt := 0; attempt < 16; attempt++ {
+	for {
 		leaderInfo, err := service.Cluster.SlotLeaderOfChannel(uid, channelType)
-		if err == nil && leaderInfo != nil {
+		if err == nil && leaderInfo != nil && leaderInfo.Id != 0 {
 			if leaderInfo.Id == options.G.Cluster.NodeId {
 				return true
 			}
@@ -83,8 +120,11 @@ func (s *conversation) forwardToUserSlotLeader(c *wkhttp.Context, uid string, ch
 					baseHeaders = c.CopyRequestHeader(c.Request)
 				}
 				targetURL := fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, path)
-				s.Debug("转发请求：", zap.String("url", targetURL))
-				attemptCtx, attemptCancel := context.WithTimeout(deadlineCtx, 1200*time.Millisecond)
+				if s != nil && s.Log != nil {
+					s.Debug("转发请求：", zap.String("url", targetURL))
+				}
+				attemptTimeout := min(1500*time.Millisecond, budget)
+				attemptCtx, attemptCancel := context.WithTimeout(deadlineCtx, attemptTimeout)
 				resp, sendErr := service.SendPeerRequestWithContext(attemptCtx, rest.Request{
 					Method:      rest.Method(method),
 					BaseURL:     targetURL,
@@ -93,35 +133,24 @@ func (s *conversation) forwardToUserSlotLeader(c *wkhttp.Context, uid string, ch
 					QueryParams: queryMap,
 				})
 				attemptCancel()
-				if sendErr == nil && resp != nil {
+				if sendErr == nil && resp != nil && resp.StatusCode != http.StatusServiceUnavailable {
 					c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 					c.Writer.WriteHeader(resp.StatusCode)
 					_, _ = c.Writer.Write([]byte(resp.Body))
 					return false
 				}
-				lastErr = sendErr
-			} else {
-				lastErr = errors.New("slot leader API unavailable")
 			}
-		} else {
-			lastErr = err
+		} else if err != nil && !isTransientConversationSlotHandoffError(err) && !options.G.ClusterOn() {
+			c.ResponseError(err)
+			return false
 		}
 
 		select {
 		case <-deadlineCtx.Done():
-			if lastErr == nil {
-				lastErr = errors.New("获取频道所在节点失败！")
-			}
-			c.ResponseError(lastErr)
+			respondConversationReadRetry(c)
 			return false
 		case <-time.After(delay):
 		}
-		delay = min(delay*2, 200*time.Millisecond)
+		delay = min(delay*2, 250*time.Millisecond)
 	}
-	if lastErr == nil {
-		lastErr = errors.New("获取频道所在节点失败！")
-	}
-	c.ResponseError(lastErr)
-	return false
 }
-

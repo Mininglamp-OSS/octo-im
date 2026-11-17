@@ -260,6 +260,7 @@ func (s *request) processBatchChannels(ctx context.Context, uid string, msgCount
 
 // loadMessagesBatch 批量加载频道消息（使用批量查询接口）
 func (s *request) loadMessagesBatch(ctx context.Context, channels []*channelRecentMessageReq, msgCount int, orderByLast bool) (map[string]types.MessageRespSlice, error) {
+	msgCount = clampRecentMsgCount(msgCount)
 	// 构建批量查询请求
 	batchRequests := make([]wkdb.BatchMsgRequest, 0, len(channels))
 	for _, channel := range channels {

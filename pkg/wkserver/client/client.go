@@ -257,8 +257,8 @@ func (c *Client) handler(p string) Handler {
 
 func (c *Client) handleData(data []byte, msgType proto.MsgType, remoteAddr string) {
 
-	c.conn().idleTick = 0
-	c.conn().timeoutTick = 0
+	c.conn().idleTick.Store(0)
+	c.conn().timeoutTick.Store(0)
 
 	if c.opts.LogDetailOn {
 		c.Info("handleData....", zap.Uint8("msgType", msgType.Uint8()), zap.Int("data", len(data)), zap.String("remoteAddr", remoteAddr))

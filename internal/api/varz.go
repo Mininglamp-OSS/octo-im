@@ -102,6 +102,8 @@ func CreateVarz(s *Server) *Varz {
 	inBytes := app.SendPacketBytes() + app.SendackPacketBytes() + app.RecvackPacketBytes() + app.PingBytes() + app.ConnPacketBytes()
 	outBytes := app.RecvPacketBytes() + app.RecvackPacketBytes() + app.PongBytes() + app.ConnackPacketBytes()
 
+	partA := eventbus.SnapshotPartATelemetry()
+
 	return &Varz{
 		ServerID:             fmt.Sprintf("%d", opts.Cluster.NodeId),
 		ServerName:           "WuKongIM",
@@ -131,6 +133,23 @@ func CreateVarz(s *Server) *Varz {
 		TreeState:      version.TreeState,
 		ManagerUID:     opts.ManagerUID,
 		ManagerTokenOn: wkutil.BoolToInt(opts.ManagerTokenOn),
+
+		WkPostCommitInflightItems:       partA.PostCommitInflightItems,
+		WkPostCommitInflightBytes:       partA.PostCommitInflightBytes,
+		WkLegacyInboundInflightItems:    partA.LegacyInboundInflightItems,
+		WkLegacyInboundInflightBytes:    partA.LegacyInboundInflightBytes,
+		WkTransientInflightItems:        partA.TransientInflightItems,
+		WkTransientInflightBytes:        partA.TransientInflightBytes,
+		WkPostCommitBackpressureRejects: partA.PostCommitBackpressureRejects,
+		WkLegacyForwardDroppedTotal:     partA.LegacyForwardDroppedTotal,
+		WkRecoveryChannelsActive:        partA.RecoveryChannelsActive,
+		WkRecoveryItemsActive:           partA.RecoveryItemsActive,
+		WkRecoveryCooldownProbesTotal:   partA.RecoveryCooldownProbesTotal,
+		WkSeqTrackerActiveOOOWindows:    partA.SeqTrackerActiveOOOWindows,
+		WkSeqTrackerActiveSlotExts:      partA.SeqTrackerActiveSlotExts,
+		WkSeqTrackerExtraSlotBytes:      partA.SeqTrackerExtraSlotBytes,
+		WkSeqTrackerShardSaturatedTotal: partA.SeqTrackerShardSaturatedTotal,
+		WkSeqTrackerEvictedChannels:     partA.SeqTrackerEvictedChannels,
 	}
 }
 
@@ -167,6 +186,23 @@ type Varz struct {
 	ManagerTokenOn         int         `json:"manager_token_on"`         // 管理员token是否开启
 	Conns                  []*ConnInfo `json:"conns,omitempty"`          // 连接信息
 	ConversationCacheCount int         `json:"conversation_cache_count"` // 最近会话缓存数量
+
+	WkPostCommitInflightItems       int64  `json:"wk_post_commit_inflight_items"`
+	WkPostCommitInflightBytes       int64  `json:"wk_post_commit_inflight_bytes"`
+	WkLegacyInboundInflightItems    int64  `json:"wk_legacy_inbound_inflight_items"`
+	WkLegacyInboundInflightBytes    int64  `json:"wk_legacy_inbound_inflight_bytes"`
+	WkTransientInflightItems        int64  `json:"wk_transient_inflight_items"`
+	WkTransientInflightBytes        int64  `json:"wk_transient_inflight_bytes"`
+	WkPostCommitBackpressureRejects uint64 `json:"wk_post_commit_backpressure_rejects_total"`
+	WkLegacyForwardDroppedTotal     uint64 `json:"wk_legacy_forward_dropped_total"`
+	WkRecoveryChannelsActive        int    `json:"wk_recovery_channels_active"`
+	WkRecoveryItemsActive           int    `json:"wk_recovery_items_active"`
+	WkRecoveryCooldownProbesTotal   uint64 `json:"wk_recovery_cooldown_probes_total"`
+	WkSeqTrackerActiveOOOWindows    int32  `json:"wk_seq_tracker_active_ooo_windows"`
+	WkSeqTrackerActiveSlotExts      int32  `json:"wk_seq_tracker_active_slot_exts"`
+	WkSeqTrackerExtraSlotBytes      int64  `json:"wk_seq_tracker_extra_slot_bytes"`
+	WkSeqTrackerShardSaturatedTotal uint64 `json:"wk_seq_tracker_shard_saturated_total"`
+	WkSeqTrackerEvictedChannels     uint64 `json:"wk_seq_tracker_evicted_channels_total"`
 }
 
 type SystemSetting struct {

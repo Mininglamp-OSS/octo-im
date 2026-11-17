@@ -49,6 +49,19 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 		fakeChannelId = options.GetAgentChannelIDWith(conn.Uid, channelId)
 	}
 
+	if len(channelId) > eventbus.MaxWireStringBytes || len(fakeChannelId) > eventbus.MaxWireStringBytes ||
+		len(conn.Uid) > eventbus.MaxWireStringBytes || len(sendPacket.ClientMsgNo) > eventbus.MaxWireStringBytes {
+		sendack := &wkproto.SendackPacket{
+			Framer:      sendPacket.Framer,
+			MessageID:   event.MessageId,
+			ClientSeq:   sendPacket.ClientSeq,
+			ClientMsgNo: sendPacket.ClientMsgNo,
+			ReasonCode:  wkproto.ReasonPayloadDecodeError,
+		}
+		eventbus.User.ConnWrite(event.ReqId, conn, sendack)
+		return
+	}
+
 	if options.G.Logger.TraceOn {
 		h.Trace("用户发送消息...",
 			"onSend",
@@ -128,8 +141,8 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 
 	trace.GlobalTrace.Metrics.App().SendPacketCountAdd(1)
 	trace.GlobalTrace.Metrics.App().SendPacketBytesAdd(sendPacket.GetFrameSize())
-	// 添加消息到频道
-	eventbus.Channel.SendMessage(fakeChannelId, channelType, &eventbus.Event{
+	// 添加消息到频道（满队时快速返回可重试 ReasonNodeNotMatch，杜绝静默丢包）
+	chEv := &eventbus.Event{
 		Type:            eventbus.EventChannelOnSend,
 		ForwardDeadline: event.ForwardDeadline,
 		ForwardHops:     event.ForwardHops,
@@ -138,7 +151,18 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 		MessageId:       event.MessageId,
 		Track:           event.Track,
 		ReqId:           event.ReqId,
-	})
+	}
+	if !eventbus.Channel.TrySendMessage(fakeChannelId, channelType, chEv) {
+		sendack := &wkproto.SendackPacket{
+			Framer:      sendPacket.Framer,
+			MessageID:   event.MessageId,
+			ClientSeq:   sendPacket.ClientSeq,
+			ClientMsgNo: sendPacket.ClientMsgNo,
+			ReasonCode:  wkproto.ReasonNodeNotMatch,
+		}
+		eventbus.User.ConnWrite(event.ReqId, conn, sendack)
+		return
+	}
 	// 推进
 	eventbus.Channel.Advance(fakeChannelId, channelType)
 

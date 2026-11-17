@@ -99,7 +99,9 @@ func (s *conversation) clearConversationUnread(c *wkhttp.Context) {
 		return
 	}
 
-	for attempt := 0; attempt < 3; attempt++ {
+	writeDeadline := time.Now().Add(userSlotRetryBudget())
+	writeDelay := 25 * time.Millisecond
+	for {
 		if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
 			return
 		}
@@ -155,12 +157,13 @@ func (s *conversation) clearConversationUnread(c *wkhttp.Context) {
 			c.ResponseError(err)
 			return
 		}
-		if attempt == 2 {
+		if time.Now().After(writeDeadline) || c.Request.Context().Err() != nil {
 			s.Error("Failed to add conversation during slot handoff", zap.Error(err))
 			respondConversationReadRetry(c)
 			return
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(writeDelay)
+		writeDelay = min(writeDelay*2, 200*time.Millisecond)
 	}
 }
 
@@ -191,7 +194,9 @@ func (s *conversation) setConversationUnread(c *wkhttp.Context) {
 		return
 	}
 
-	for attempt := 0; attempt < 3; attempt++ {
+	writeDeadline := time.Now().Add(userSlotRetryBudget())
+	writeDelay := 25 * time.Millisecond
+	for {
 		if options.G.ClusterOn() {
 			if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
 				return
@@ -261,12 +266,13 @@ func (s *conversation) setConversationUnread(c *wkhttp.Context) {
 			c.ResponseError(err)
 			return
 		}
-		if attempt == 2 {
+		if time.Now().After(writeDeadline) || c.Request.Context().Err() != nil {
 			s.Error("Failed to add conversation during slot handoff", zap.Error(err))
 			respondConversationReadRetry(c)
 			return
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(writeDelay)
+		writeDelay = min(writeDelay*2, 200*time.Millisecond)
 	}
 }
 
@@ -283,7 +289,9 @@ func (s *conversation) deleteConversation(c *wkhttp.Context) {
 		return
 	}
 
-	for attempt := 0; attempt < 3; attempt++ {
+	writeDeadline := time.Now().Add(userSlotRetryBudget())
+	writeDelay := 25 * time.Millisecond
+	for {
 		if options.G.ClusterOn() {
 			if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
 				return
@@ -312,12 +320,13 @@ func (s *conversation) deleteConversation(c *wkhttp.Context) {
 			c.ResponseError(err)
 			return
 		}
-		if attempt == 2 {
+		if time.Now().After(writeDeadline) || c.Request.Context().Err() != nil {
 			s.Error("更新最近会话的已删除的消息序号位置失败（槽切主中）！", zap.Error(err))
 			respondConversationReadRetry(c)
 			return
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(writeDelay)
+		writeDelay = min(writeDelay*2, 200*time.Millisecond)
 	}
 }
 
@@ -494,9 +503,10 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 	// ==================== 获取最近会话的最近的消息列表 ====================
 	if req.MsgCount > 0 {
 		var channelRecentMessages []*channelRecentMessage
+		clampedMsgCount := clampRecentMsgCount(int(min(req.MsgCount, int64(maxRecentMsgCount))))
 
 		// 获取用户最近会话的最近消息
-		channelRecentMessages, err = s.s.requset.getRecentMessagesForCluster(c.Request.Context(), req.UID, int(req.MsgCount), channelRecentMessageReqs, true)
+		channelRecentMessages, err = s.s.requset.getRecentMessagesForCluster(c.Request.Context(), req.UID, clampedMsgCount, channelRecentMessageReqs, true)
 		if err != nil {
 			s.Error("获取最近消息失败！", zap.Error(err), zap.String("uid", req.UID))
 			respondRecentReadError(c, err)
@@ -710,10 +720,7 @@ func (s *conversation) syncConversationByChannels(c *wkhttp.Context) {
 		return
 	}
 
-	msgCount := req.MsgCount
-	if msgCount <= 0 {
-		msgCount = 15
-	}
+	msgCount := clampRecentMsgCount(req.MsgCount)
 
 	// 获取真实的频道ID（用于响应）
 	getRealChannelId := func(fakeChannelId string, channelType uint8) string {

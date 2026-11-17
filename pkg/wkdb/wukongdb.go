@@ -300,6 +300,12 @@ func (wk *wukongDB) Open() error {
 			for _, openDB := range wk.dbs {
 				_ = openDB.Close()
 			}
+			wk.wkdbs = nil
+			wk.dbs = nil
+			if wk.dblock != nil {
+				wk.dblock.stop()
+				wk.dblock = newDBLock()
+			}
 			if wk.ownsBlockCache && wk.blockCache != nil {
 				wk.blockCache.Unref()
 				wk.blockCache = nil

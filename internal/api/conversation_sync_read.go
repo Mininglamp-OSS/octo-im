@@ -412,9 +412,7 @@ func (s *conversation) serveRecentMessages(c *wkhttp.Context, versioned bool) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), budget)
 	defer cancel()
-	if req.MsgCount <= 0 {
-		req.MsgCount = 15
-	}
+	req.MsgCount = clampRecentMsgCount(req.MsgCount)
 	var result []*channelRecentMessage
 	if versioned || req.PeerRead {
 		result, err = s.s.requset.localRecentMessages(ctx, req.UID, req.MsgCount, req.Channels, wkutil.IntToBool(req.OrderByLast))

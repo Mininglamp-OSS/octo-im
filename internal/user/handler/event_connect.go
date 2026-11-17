@@ -238,6 +238,9 @@ func (u *Handler) getClientAesKeyAndIV(clientKey string, dhServerPrivKey [32]byt
 	if err != nil {
 		return nil, nil, err
 	}
+	if len(clientKeyBytes) < 32 {
+		return nil, nil, errors.New("client key length is less than 32 bytes")
+	}
 
 	var dhClientPubKeyArray [32]byte
 	copy(dhClientPubKeyArray[:], clientKeyBytes[:32])

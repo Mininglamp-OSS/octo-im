@@ -113,13 +113,31 @@ func (c *Config) update(cfg *types.Config) {
 func (c *Config) nodes() []*types.Node {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg.Nodes
+	if len(c.cfg.Nodes) == 0 {
+		return nil
+	}
+	out := make([]*types.Node, 0, len(c.cfg.Nodes))
+	for _, n := range c.cfg.Nodes {
+		if n != nil {
+			out = append(out, n.Clone())
+		}
+	}
+	return out
 }
 
 func (c *Config) slots() []*types.Slot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg.Slots
+	if len(c.cfg.Slots) == 0 {
+		return nil
+	}
+	out := make([]*types.Slot, 0, len(c.cfg.Slots))
+	for _, s := range c.cfg.Slots {
+		if s != nil {
+			out = append(out, s.Clone())
+		}
+	}
+	return out
 }
 
 // 判断是否有slot
@@ -326,7 +344,7 @@ func (c *Config) slot(id uint32) *types.Slot {
 	defer c.mu.RUnlock()
 	for _, slot := range c.cfg.Slots {
 		if slot.Id == id {
-			return slot
+			return slot.Clone()
 		}
 	}
 	return nil
@@ -351,7 +369,7 @@ func (c *Config) allowVoteNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, node := range c.cfg.Nodes {
 		if node.AllowVote {
-			nodes = append(nodes, node)
+			nodes = append(nodes, node.Clone())
 		}
 	}
 	return nodes
@@ -364,7 +382,7 @@ func (c *Config) allowVoteAndJoinedNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, node := range c.cfg.Nodes {
 		if node.AllowVote && node.Status == types.NodeStatus_NodeStatusJoined {
-			nodes = append(nodes, node)
+			nodes = append(nodes, node.Clone())
 		}
 	}
 	return nodes
@@ -403,7 +421,7 @@ func (c *Config) allowVoteAndJoinedOnlineNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, node := range c.cfg.Nodes {
 		if node.AllowVote && node.Status == types.NodeStatus_NodeStatusJoined && node.Online {
-			nodes = append(nodes, node)
+			nodes = append(nodes, node.Clone())
 		}
 	}
 	return nodes
@@ -416,7 +434,7 @@ func (c *Config) onlineNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, node := range c.cfg.Nodes {
 		if node.Online {
-			nodes = append(nodes, node)
+			nodes = append(nodes, node.Clone())
 		}
 	}
 	return nodes
@@ -462,7 +480,7 @@ func (c *Config) willJoinNodes() []*types.Node {
 	var nodes []*types.Node
 	for _, n := range c.cfg.Nodes {
 		if n.Status == types.NodeStatus_NodeStatusWillJoin {
-			nodes = append(nodes, n)
+			nodes = append(nodes, n.Clone())
 		}
 	}
 	return nodes

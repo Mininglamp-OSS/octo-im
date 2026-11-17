@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"fmt"
+
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
@@ -18,9 +20,18 @@ type forwardChannelEventReq struct {
 	channelId   string
 	channelType uint8
 	events      eventbus.EventBatch
+	hasSlotMask bool
+	slotMask    eventbus.SlotBitset
 }
 
 func (f *forwardChannelEventReq) encode() ([]byte, error) {
+	return f.encodeWithTrailer(false)
+}
+
+func (f *forwardChannelEventReq) encodeWithTrailer(includeTrailer bool) ([]byte, error) {
+	if len(f.channelId) > eventbus.MaxWireStringBytes {
+		return nil, fmt.Errorf("%w: len=%d", eventbus.ErrWireChannelIDTooLong, len(f.channelId))
+	}
 	enc := wkproto.NewEncoder()
 	enc.WriteString(f.channelId)
 	enc.WriteUint8(f.channelType)
@@ -32,7 +43,15 @@ func (f *forwardChannelEventReq) encode() ([]byte, error) {
 		}
 		enc.WriteBytes(data)
 	}
-	return enc.Bytes(), nil
+	out := enc.Bytes()
+	if includeTrailer && f.hasSlotMask {
+		var err error
+		out, err = eventbus.EncodeSlotMaskTrailer(out, true, true, f.slotMask)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (f *forwardChannelEventReq) decode(data []byte) error {
@@ -53,9 +72,25 @@ func (f *forwardChannelEventReq) decode(data []byte) error {
 		return err
 	}
 	if len(eventData) > 0 {
-		err = f.events.Decode(eventData)
+		rem, err := f.events.DecodeWithRemainder(eventData)
 		if err != nil {
 			return err
+		}
+		if len(rem) > 0 {
+			hasMask, mask, err := eventbus.DecodeSlotMaskTrailer(rem)
+			if err != nil {
+				return err
+			}
+			if hasMask {
+				f.hasSlotMask = true
+				f.slotMask = mask
+				for _, ev := range f.events {
+					if ev != nil {
+						ev.HasTargetSlotMask = true
+						ev.TargetSlotMask = mask.Clone()
+					}
+				}
+			}
 		}
 	}
 	return nil

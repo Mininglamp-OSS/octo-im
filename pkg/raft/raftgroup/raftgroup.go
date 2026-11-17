@@ -45,13 +45,13 @@ type RaftGroup struct {
 
 func New(opts *Options) *RaftGroup {
 	rg := &RaftGroup{
-		raftList:          newLinkedList(),
-		stopper:           syncutil.NewStopper(),
-		opts:              opts,
-		advanceC:          make(chan struct{}, 1),
-		readStateC:        make(chan readStateRequest),
-		ownerC:            make(chan ownerRequest),
-		Log:               wklog.NewWKLog(fmt.Sprintf("RaftGroup[%s]", opts.LogPrefix)),
+		raftList:            newLinkedList(),
+		stopper:             syncutil.NewStopper(),
+		opts:                opts,
+		advanceC:            make(chan struct{}, 1),
+		readStateC:          make(chan readStateRequest),
+		ownerC:              make(chan ownerRequest),
+		Log:                 wklog.NewWKLog(fmt.Sprintf("RaftGroup[%s]", opts.LogPrefix)),
 		mq:                  NewEventQueue(opts.ReceiveQueueLength, false, 0, 0),
 		wait:                newWait(),
 		storageWork:         make(map[string]*storageWork),

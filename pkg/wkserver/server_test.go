@@ -113,7 +113,7 @@ func TestReconnect(t *testing.T) {
 
 	assert.Equal(t, false, cli.IsAuthed())
 
-	time.Sleep(time.Millisecond * 200)
-
-	assert.Equal(t, true, cli.IsAuthed())
+	assert.Eventually(t, func() bool {
+		return cli.IsAuthed()
+	}, time.Second, 10*time.Millisecond)
 }

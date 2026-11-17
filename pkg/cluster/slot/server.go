@@ -2,6 +2,8 @@ package slot
 
 import (
 	"context"
+	"errors"
+	"math"
 	"path"
 	"strconv"
 	"sync"
@@ -172,30 +174,89 @@ func (s *Server) GetLogsInReverseOrder(slotId uint32, startLogIndex uint64, endL
 	return s.storage.GetLogsInReverseOrder(shardNo, startLogIndex, endLogIndex, limit)
 }
 
-func (s *Server) GetLogsRange(slotId uint32, fromLogIndex uint64, toLogIndex uint64) ([]types.Log, error) {
+const (
+	MaxSlotLogsRangeCount = 10000
+	MaxSlotLogsRangeBytes = 32 * 1024 * 1024
+)
+
+var ErrSlotLogsRangeTooLarge = errors.New("requested slot log range exceeds maximum limit")
+
+func (s *Server) WalkLogsRange(slotId uint32, fromLogIndex uint64, toLogIndex uint64, maxEntries int, fn func(types.Log) error) (int, error) {
 	if fromLogIndex == 0 {
 		fromLogIndex = 1
 	}
 	if toLogIndex < fromLogIndex {
-		return nil, nil
+		return 0, nil
 	}
-	shardNo := SlotIdToKey(slotId)
-	var all []types.Log
-	cur := fromLogIndex
-	for cur <= toLogIndex {
-		logs, err := s.storage.GetLogs(shardNo, cur, toLogIndex+1, 0)
+	if maxEntries <= 0 || maxEntries > MaxSlotLogsRangeCount {
+		maxEntries = MaxSlotLogsRangeCount
+	}
+	if toLogIndex == math.MaxUint64 {
+		lastIdx, err := s.LastIndex(slotId)
 		if err != nil {
-			return nil, err
+			return 0, err
+		}
+		if lastIdx < fromLogIndex {
+			return 0, nil
+		}
+		toLogIndex = lastIdx
+		if toLogIndex == math.MaxUint64 {
+			toLogIndex = math.MaxUint64 - 1
+		}
+	}
+	if toLogIndex-fromLogIndex >= uint64(maxEntries) {
+		return 0, ErrSlotLogsRangeTooLarge
+	}
+
+	batchBytes := uint64(2 * 1024 * 1024)
+	if s.opts != nil && s.opts.MaxLogSizePerBatch > 0 {
+		batchBytes = s.opts.MaxLogSizePerBatch
+	}
+
+	shardNo := SlotIdToKey(slotId)
+	cur := fromLogIndex
+	totalCount := 0
+	var totalBytes uint64
+	for cur <= toLogIndex {
+		logs, err := s.storage.GetLogs(shardNo, cur, toLogIndex+1, batchBytes)
+		if err != nil {
+			return totalCount, err
 		}
 		if len(logs) == 0 {
 			break
 		}
-		all = append(all, logs...)
+		for _, lg := range logs {
+			if lg.Index > toLogIndex {
+				return totalCount, nil
+			}
+			totalCount++
+			totalBytes += uint64(lg.LogSize())
+			if totalCount > maxEntries || totalBytes > MaxSlotLogsRangeBytes {
+				return totalCount, ErrSlotLogsRangeTooLarge
+			}
+			if fn != nil {
+				if err := fn(lg); err != nil {
+					return totalCount, err
+				}
+			}
+		}
 		last := logs[len(logs)-1].Index
-		if last < cur {
+		if last < cur || last >= toLogIndex || last == math.MaxUint64 {
 			break
 		}
 		cur = last + 1
+	}
+	return totalCount, nil
+}
+
+func (s *Server) GetLogsRange(slotId uint32, fromLogIndex uint64, toLogIndex uint64) ([]types.Log, error) {
+	var all []types.Log
+	_, err := s.WalkLogsRange(slotId, fromLogIndex, toLogIndex, MaxSlotLogsRangeCount, func(lg types.Log) error {
+		all = append(all, lg)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return all, nil
 }

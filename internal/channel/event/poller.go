@@ -71,13 +71,35 @@ func (p *poller) stop() {
 
 func (p *poller) addEvent(channelId string, channelType uint8, event *eventbus.Event) {
 	p.Lock()
-	defer p.Unlock()
 	h := p.handler(channelId, channelType)
 	if h == nil {
 		h = newChannelHandler(channelId, channelType, p)
 		p.waitlist.push(h)
 	}
+	p.Unlock()
 	h.addEvent(event)
+}
+
+func (p *poller) tryAddEvent(channelId string, channelType uint8, event *eventbus.Event) bool {
+	p.Lock()
+	h := p.handler(channelId, channelType)
+	if h == nil {
+		h = newChannelHandler(channelId, channelType, p)
+		p.waitlist.push(h)
+	}
+	p.Unlock()
+	return h.tryAddEvent(event)
+}
+
+func (p *poller) tryAddBatch(channelId string, channelType uint8, events []*eventbus.Event) bool {
+	p.Lock()
+	h := p.handler(channelId, channelType)
+	if h == nil {
+		h = newChannelHandler(channelId, channelType, p)
+		p.waitlist.push(h)
+	}
+	p.Unlock()
+	return h.tryAddBatch(events)
 }
 
 func (p *poller) loopEvent() {

@@ -1,17 +1,16 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
-	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
-	"github.com/WuKongIM/WuKongIM/internal/options"
-	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
+	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
@@ -19,132 +18,284 @@ import (
 
 // 消息持久化
 func (h *Handler) persist(ctx *eventbus.ChannelContext) {
-	// 记录消息轨迹
 	events := ctx.Events
 	for _, e := range events {
-		e.Track.Record(track.PositionChannelPersist)
+		if e != nil {
+			e.Track.Record(track.PositionChannelPersist)
+		}
 	}
 
-	// ========== 存储消息 ==========
+	wmKey, hasWMKey := MakeChannelWatermarkKey(ctx.ChannelId, ctx.ChannelType)
+
+	// Separate pre-persisted events from unpersisted events, reserving PostCommitTickets
+	// BEFORE Raft AppendMessages for any unpersisted persistent SEND that lacks a pre-attached ticket.
 	unpersistedEvents := make([]*eventbus.Event, 0, len(events))
-	alreadyPersisted := false
-	skipDistribute := make(map[*eventbus.Event]bool)
 	for _, e := range events {
-		if e != nil && e.MessageSeq > 0 && e.ReasonCode == wkproto.ReasonSuccess {
-			alreadyPersisted = true
-			if h.recordPluginWebhookSideEffect(ctx.ChannelId, ctx.ChannelType, e.MessageSeq) {
-				e.PersistedDuplicate = true
-			}
-			if h.recordDistributeSideEffect(ctx.ChannelId, ctx.ChannelType, e.MessageSeq) {
-				skipDistribute[e] = true
+		if e == nil {
+			continue
+		}
+		if e.MessageSeq > 0 && e.ReasonCode == wkproto.ReasonSuccess {
+			continue
+		}
+		sp, ok := e.Frame.(*wkproto.SendPacket)
+		if !ok || sp == nil {
+			if e.Ticket != nil {
+				e.Ticket.Release()
+				e.Ticket = nil
 			}
 			continue
 		}
+		if e.ReasonCode != wkproto.ReasonSuccess {
+			if e.Ticket != nil {
+				e.Ticket.Release()
+				e.Ticket = nil
+			}
+			continue
+		}
+		if !sp.NoPersist && e.Ticket == nil {
+			tks, okReserve := h.postCommitBudget().TryReserve(ctx.ChannelId, []*eventbus.Event{e})
+			if !okReserve {
+				e.ReasonCode = wkproto.ReasonNodeNotMatch
+				continue
+			}
+			e.Ticket = tks[0]
+		}
 		unpersistedEvents = append(unpersistedEvents, e)
 	}
+
 	persists := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, unpersistedEvents)
 	if len(persists) > 0 {
-
 		timeoutCtx, cancel := h.WithTimeout()
 		defer cancel()
 		results, err := h.store().AppendMessages(timeoutCtx, ctx.ChannelId, ctx.ChannelType, persists)
 		if err != nil {
 			h.Error("store message failed", zap.Error(err), zap.Int("events", len(persists)), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
 			markPersistFailure(unpersistedEvents, err)
-		}
-
-		if err == nil {
-			err = applyPersistResults(unpersistedEvents, persists, results)
-			if err != nil {
+		} else {
+			if err = applyPersistResults(unpersistedEvents, persists, results); err != nil {
 				h.Error("invalid persistence response", zap.Error(err))
 				markPersistFailure(unpersistedEvents, err)
-			} else {
-				for _, e := range unpersistedEvents {
-					if e != nil && e.MessageSeq > 0 && e.ReasonCode == wkproto.ReasonSuccess && !e.PersistedDuplicate {
-						_ = h.recordPluginWebhookSideEffect(ctx.ChannelId, ctx.ChannelType, e.MessageSeq)
-						_ = h.recordDistributeSideEffect(ctx.ChannelId, ctx.ChannelType, e.MessageSeq)
-					}
+			}
+		}
+	}
+
+	// Release tickets on any unpersisted event that failed AppendMessages.
+	for _, e := range unpersistedEvents {
+		if e == nil {
+			continue
+		}
+		if sp, ok := e.Frame.(*wkproto.SendPacket); ok && sp != nil && !sp.NoPersist {
+			if e.MessageSeq == 0 || e.ReasonCode != wkproto.ReasonSuccess {
+				if e.Ticket != nil {
+					e.Ticket.Release()
+					e.Ticket = nil
 				}
 			}
 		}
 	}
-	if len(persists) > 0 || alreadyPersisted {
-		allPersisted := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, events)
-		h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, newlyPersistedMessages(events, allPersisted))
-	}
 
-	if options.G.Logger.TraceOn {
+	// Stage 0: PluginPersistAfter (commit watermark ONLY on err == nil; retain ticket in RecoveryManager on error).
+	h.runStage0PluginPersistAfter(ctx.ChannelId, ctx.ChannelType, wmKey, hasWMKey, events)
+
+	opts := h.opts()
+	if opts != nil && opts.Logger.TraceOn {
 		for _, e := range events {
-			h.Trace("message persistence result", "persist", zap.Int64("messageId", e.MessageId),
-				zap.Uint64("messageSeq", e.MessageSeq), zap.String("channelId", ctx.ChannelId),
-				zap.Uint8("channelType", ctx.ChannelType), zap.String("reason", e.ReasonCode.String()))
+			if e != nil {
+				h.Trace("message persistence result", "persist", zap.Int64("messageId", e.MessageId),
+					zap.Uint64("messageSeq", e.MessageSeq), zap.String("channelId", ctx.ChannelId),
+					zap.Uint8("channelType", ctx.ChannelType), zap.String("reason", e.ReasonCode.String()))
+			}
 		}
 	}
 
 	chBus := h.channelBus()
-	// ========== webhook ==========
-	if options.G.WebhookOn(types.EventMsgNotify) && chBus != nil {
-		for _, e := range events {
-			sendPacket := e.Frame.(*wkproto.SendPacket)
-			if shouldRunPersistSideEffects(e) && !sendPacket.NoPersist {
-				cloneEvent := e.Clone()
-				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
-				cloneEvent.Type = eventbus.EventChannelWebhook
-				chBus.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+	webhookEnabled := opts != nil && opts.WebhookOn(types.EventMsgNotify)
+	queuedToBus := false
+
+	// Stage 1: WebhookNotify & Stage 2/3: Distribute (each gets an explicit Retained reference on e.Ticket).
+	for _, e := range events {
+		if e == nil {
+			continue
+		}
+		sp, ok := e.Frame.(*wkproto.SendPacket)
+		if !ok || sp == nil || e.ReasonCode != wkproto.ReasonSuccess {
+			if e.Ticket != nil {
+				e.Ticket.Release()
+				e.Ticket = nil
 			}
+			continue
+		}
+
+		// Stage 1: EventChannelWebhook
+		if webhookEnabled && shouldRunPersistSideEffects(e) && !sp.NoPersist && !e.WebhookDone {
+			alreadyWebhook := hasWMKey && h.seqTracker.HasCommitted(wmKey, StageWebhookNotify, e.MessageSeq)
+			if !alreadyWebhook {
+				whClone := e.Clone()
+				whClone.ForwardDeadline, whClone.ForwardHops = 0, 0
+				whClone.Type = eventbus.EventChannelWebhook
+				whClone.Ticket = retainTicketOrNil(e.Ticket)
+				if chBus != nil && h.tryAddEventToChannelBus(ctx.ChannelId, ctx.ChannelType, whClone) {
+					queuedToBus = true
+				} else if whClone.MessageSeq > 0 {
+					_ = h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, whClone)
+				} else if whClone.Ticket != nil {
+					whClone.Ticket.Release()
+					whClone.Ticket = nil
+				}
+			}
+		}
+
+		// Stage 2/3: EventChannelDistribute
+		if shouldDistributePersistResult(e) {
+			alreadyDist := e.MessageSeq > 0 && hasWMKey &&
+				(h.seqTracker.HasCommitted(wmKey, StageChannelDistribute, e.MessageSeq) ||
+					h.seqTracker.HasCommitted(wmKey, StagePersistEnqueued, e.MessageSeq))
+			if !alreadyDist {
+				distClone := e.Clone()
+				distClone.ForwardDeadline, distClone.ForwardHops = 0, 0
+				distClone.Type = eventbus.EventChannelDistribute
+				distClone.Ticket = retainTicketOrNil(e.Ticket)
+				dispatched := false
+				if chBus != nil && h.tryAddEventToChannelBus(ctx.ChannelId, ctx.ChannelType, distClone) {
+					queuedToBus = true
+					dispatched = true
+				} else if distClone.MessageSeq > 0 {
+					dispatched = h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageDistribute, eventbus.SlotBitset{}, eventbus.SlotBitset{}, distClone)
+				} else if distClone.Ticket != nil {
+					distClone.Ticket.Release()
+					distClone.Ticket = nil
+				}
+				if dispatched && e.MessageSeq > 0 && hasWMKey {
+					_ = h.seqTracker.RecordCommittedForce(wmKey, StagePersistEnqueued, e.MessageSeq)
+				}
+			}
+		}
+
+		if e.Ticket != nil {
+			e.Ticket.Release()
+			e.Ticket = nil
 		}
 	}
 
-	// ========== 分发 ==========
-	if chBus != nil {
-		for _, e := range events {
-			if skipDistribute[e] || !shouldDistributePersistResult(e) {
-				continue
-			}
-			cloneEvent := e.Clone()
-			cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
-			cloneEvent.Type = eventbus.EventChannelDistribute
-			chBus.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
-		}
-
+	if queuedToBus && chBus != nil {
 		chBus.Advance(ctx.ChannelId, ctx.ChannelType)
 	}
+}
 
+func (h *Handler) hasPersistAfterPlugins() bool {
+	pm := h.pluginManager()
+	if pm == nil {
+		return false
+	}
+	return len(pm.Plugins(types.PluginPersistAfter)) > 0
+}
+
+func (h *Handler) runStage0PluginPersistAfter(
+	channelId string,
+	channelType uint8,
+	wmKey ChannelWatermarkKey,
+	hasWMKey bool,
+	events []*eventbus.Event,
+) {
+	hasPlugins := h.hasPersistAfterPlugins()
+	var leasedEvents []*eventbus.Event
+	for _, e := range events {
+		if e == nil || e.MessageSeq == 0 || e.ReasonCode != wkproto.ReasonSuccess || e.PersistedDuplicate || e.PluginDone {
+			continue
+		}
+		sp, ok := e.Frame.(*wkproto.SendPacket)
+		if !ok || sp == nil || sp.NoPersist {
+			continue
+		}
+		if !hasPlugins {
+			if hasWMKey {
+				_ = h.seqTracker.RecordCommittedForce(wmKey, StagePluginPersistAfter, e.MessageSeq)
+			}
+			e.PluginDone = true
+			continue
+		}
+		if !hasWMKey {
+			leasedEvents = append(leasedEvents, e)
+			continue
+		}
+		skip, leased := h.seqTracker.BeginStage(wmKey, StagePluginPersistAfter, e.MessageSeq)
+		if skip {
+			if h.seqTracker.HasCommitted(wmKey, StagePluginPersistAfter, e.MessageSeq) {
+				e.PluginDone = true
+			}
+			continue
+		}
+		if leased {
+			leasedEvents = append(leasedEvents, e)
+		}
+	}
+	if len(leasedEvents) == 0 {
+		return
+	}
+	msgs := h.toPersistMessages(channelId, channelType, leasedEvents)
+	err := h.pluginInvokePersistAfterChecked(channelId, channelType, msgs)
+	if err != nil {
+		for _, e := range leasedEvents {
+			if hasWMKey {
+				h.seqTracker.AbortStage(wmKey, StagePluginPersistAfter, e.MessageSeq)
+			}
+			recEv := e.Clone()
+			recEv.Ticket = retainTicketOrNil(e.Ticket)
+			_ = h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStagePluginAfter, eventbus.SlotBitset{}, eventbus.SlotBitset{}, recEv)
+		}
+		return
+	}
+	for _, e := range leasedEvents {
+		if hasWMKey {
+			h.seqTracker.CommitStage(wmKey, StagePluginPersistAfter, e.MessageSeq)
+		}
+		e.PluginDone = true
+	}
 }
 
 func (h *Handler) executePersistedLocalSideEffects(channelId string, channelType uint8, events []*eventbus.Event) {
-	freshEvents := make([]*eventbus.Event, 0, len(events))
-	for _, e := range events {
-		if e == nil || e.MessageSeq == 0 || e.ReasonCode != wkproto.ReasonSuccess {
-			continue
-		}
-		if h.recordPluginWebhookSideEffect(channelId, channelType, e.MessageSeq) {
-			e.PersistedDuplicate = true
-			continue
-		}
-		freshEvents = append(freshEvents, e)
-	}
-	if len(freshEvents) == 0 {
-		return
-	}
-	allPersisted := h.toPersistMessages(channelId, channelType, freshEvents)
-	h.pluginInvokePersistAfter(channelId, channelType, newlyPersistedMessages(freshEvents, allPersisted))
+	wmKey, hasWMKey := MakeChannelWatermarkKey(channelId, channelType)
+	h.runStage0PluginPersistAfter(channelId, channelType, wmKey, hasWMKey, events)
+
 	chBus := h.channelBus()
-	if options.G != nil && options.G.WebhookOn(types.EventMsgNotify) && chBus != nil {
-		queued := false
-		for _, e := range freshEvents {
-			sendPacket, ok := e.Frame.(*wkproto.SendPacket)
-			if ok && sendPacket != nil && shouldRunPersistSideEffects(e) && !sendPacket.NoPersist {
-				cloneEvent := e.Clone()
-				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
-				cloneEvent.Type = eventbus.EventChannelWebhook
-				chBus.AddEvent(channelId, channelType, cloneEvent)
-				queued = true
+	opts := h.opts()
+	webhookEnabled := opts != nil && opts.WebhookOn(types.EventMsgNotify)
+	if !webhookEnabled {
+		for _, e := range events {
+			if e != nil && e.MessageSeq > 0 && e.ReasonCode == wkproto.ReasonSuccess && !e.PersistedDuplicate {
+				e.WebhookDone = true
 			}
 		}
-		if queued {
-			chBus.Advance(channelId, channelType)
+		return
+	}
+
+	queued := false
+	for _, e := range events {
+		if e == nil || e.MessageSeq == 0 || e.ReasonCode != wkproto.ReasonSuccess || e.PersistedDuplicate || e.WebhookDone {
+			continue
 		}
+		sp, ok := e.Frame.(*wkproto.SendPacket)
+		if !ok || sp == nil || sp.NoPersist {
+			continue
+		}
+		if hasWMKey && h.seqTracker.HasCommitted(wmKey, StageWebhookNotify, e.MessageSeq) {
+			e.WebhookDone = true
+			continue
+		}
+		cloneEvent := e.Clone()
+		cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
+		cloneEvent.Type = eventbus.EventChannelWebhook
+		cloneEvent.Ticket = retainTicketOrNil(e.Ticket)
+		// Mark WebhookDone on the outgoing forwarded event because this node now owns Stage 1 (either via chBus or RecoveryManager).
+		e.WebhookDone = true
+		if chBus != nil && h.tryAddEventToChannelBus(channelId, channelType, cloneEvent) {
+			queued = true
+		} else {
+			_ = h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, cloneEvent)
+		}
+	}
+	if queued && chBus != nil {
+		chBus.Advance(channelId, channelType)
 	}
 }
 
@@ -173,23 +324,23 @@ func shouldRunPersistSideEffects(event *eventbus.Event) bool {
 }
 
 func shouldDistributePersistResult(event *eventbus.Event) bool {
-	// Duplicate proves persistence, not that the earlier process reached the
-	// in-memory distribution stage. Redistribute the canonical message so a
-	// commit followed by a crash cannot strand it; recipients deduplicate by
-	// the canonical message identity.
 	return event.ReasonCode == wkproto.ReasonSuccess
 }
 
 func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, msgs []wkdb.Message) {
-	if len(msgs) == 0 || service.PluginManager == nil {
-		return
+	_ = h.pluginInvokePersistAfterChecked(channelId, channelType, msgs)
+}
+
+func (h *Handler) pluginInvokePersistAfterChecked(channelId string, channelType uint8, msgs []wkdb.Message) error {
+	pm := h.pluginManager()
+	if len(msgs) == 0 || pm == nil {
+		return nil
 	}
-	plugins := service.PluginManager.Plugins(types.PluginPersistAfter)
+	plugins := pm.Plugins(types.PluginPersistAfter)
 	if len(plugins) == 0 {
-		return
+		return nil
 	}
 
-	// 构建插件消息
 	pluginMessages := make([]*pluginproto.Message, 0, len(msgs))
 	for _, msg := range msgs {
 		pluginMessages = append(pluginMessages, &pluginproto.Message{
@@ -211,23 +362,22 @@ func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, 
 		Messages: pluginMessages,
 	}
 
-	// 获取频道领导节点ID
-	leaderId, err := h.cluster().LeaderIdOfChannel(channelId, channelType)
-	if err != nil {
+	cl := h.cluster()
+	if cl == nil {
+		return h.executePluginPersistAfterLocal(channelId, channelType, msgBatch)
+	}
+
+	leaderId, err := cl.LeaderIdOfChannel(channelId, channelType)
+	if err != nil || leaderId == 0 {
 		h.Error("pluginInvokePersistAfter: get channel leader failed", zap.Error(err), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
-		// 如果获取领导节点失败，直接在本地执行
-		h.executePluginPersistAfterLocal(channelId, channelType, msgBatch)
-		return
+		return h.executePluginPersistAfterLocal(channelId, channelType, msgBatch)
 	}
 
-	// 如果当前节点是频道领导节点，直接执行
 	if h.isLocalNode(leaderId) {
-		h.executePluginPersistAfterLocal(channelId, channelType, msgBatch)
-		return
+		return h.executePluginPersistAfterLocal(channelId, channelType, msgBatch)
 	}
 
-	// 当前节点非频道领导节点，转发请求到领导节点执行
-	h.forwardPersistAfterToLeader(leaderId, channelId, channelType, msgBatch)
+	return h.forwardPersistAfterToLeader(leaderId, channelId, channelType, msgBatch)
 }
 
 func newlyPersistedMessages(events []*eventbus.Event, messages []wkdb.Message) []wkdb.Message {
@@ -246,50 +396,58 @@ func newlyPersistedMessages(events []*eventbus.Event, messages []wkdb.Message) [
 	return result
 }
 
-// executePluginPersistAfterLocal 在本地执行插件PersistAfter调用
-func (h *Handler) executePluginPersistAfterLocal(channelId string, channelType uint8, msgBatch *pluginproto.MessageBatch) {
-	if service.PluginManager == nil {
-		return
+func (h *Handler) executePluginPersistAfterLocal(channelId string, channelType uint8, msgBatch *pluginproto.MessageBatch) error {
+	pm := h.pluginManager()
+	if pm == nil {
+		return nil
 	}
-	plugins := service.PluginManager.Plugins(types.PluginPersistAfter)
+	plugins := pm.Plugins(types.PluginPersistAfter)
 	if len(plugins) == 0 {
-		return
+		return nil
 	}
 
 	timeoutCtx, cancel := h.WithTimeout()
 	defer cancel()
 
+	var errs []error
 	for _, pg := range plugins {
 		err := pg.PersistAfter(timeoutCtx, msgBatch)
 		if err != nil {
 			h.Error("plugin persist after error", zap.Error(err), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
+			errs = append(errs, err)
 		}
 	}
+	return errors.Join(errs...)
 }
 
-// forwardPersistAfterToLeader 转发PersistAfter请求到频道领导节点
-func (h *Handler) forwardPersistAfterToLeader(leaderId uint64, channelId string, channelType uint8, msgBatch *pluginproto.MessageBatch) {
-	// 序列化消息批次
+func (h *Handler) forwardPersistAfterToLeader(leaderId uint64, channelId string, channelType uint8, msgBatch *pluginproto.MessageBatch) error {
 	msgData, err := msgBatch.Marshal()
 	if err != nil {
 		h.Error("forwardPersistAfterToLeader: marshal message batch failed", zap.Error(err), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
-		return
+		return err
 	}
 
-	// 使用 ingress.Client 转发请求
 	err = h.client.RequestPersistAfter(leaderId, channelId, channelType, msgData)
 	if err != nil {
 		h.Error("forwardPersistAfterToLeader: request failed", zap.Error(err), zap.Uint64("leaderId", leaderId), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
+		return err
 	}
+	return nil
 }
 
-// 转换成存储消息
 func (h *Handler) toPersistMessages(channelId string, channelType uint8, events []*eventbus.Event) []wkdb.Message {
 	persists := make([]wkdb.Message, 0, len(events))
 	for _, e := range events {
-		sendPacket := e.Frame.(*wkproto.SendPacket)
-		if sendPacket.NoPersist || e.ReasonCode != wkproto.ReasonSuccess {
+		if e == nil {
 			continue
+		}
+		sendPacket, ok := e.Frame.(*wkproto.SendPacket)
+		if !ok || sendPacket == nil || sendPacket.NoPersist || e.ReasonCode != wkproto.ReasonSuccess {
+			continue
+		}
+		fromUID := ""
+		if e.Conn != nil {
+			fromUID = e.Conn.Uid
 		}
 
 		msg := wkdb.Message{
@@ -304,7 +462,7 @@ func (h *Handler) toPersistMessages(channelId string, channelType uint8, events 
 				MessageSeq:  uint32(e.MessageSeq),
 				ClientMsgNo: sendPacket.ClientMsgNo,
 				ClientSeq:   sendPacket.ClientSeq,
-				FromUID:     e.Conn.Uid,
+				FromUID:     fromUID,
 				ChannelID:   channelId,
 				ChannelType: channelType,
 				Expire:      sendPacket.Expire,
@@ -319,9 +477,6 @@ func (h *Handler) toPersistMessages(channelId string, channelType uint8, events 
 	return persists
 }
 
-// applyPersistResults validates the entire response before changing an event.
-// Positional mapping supports several attempts of the same logical message in
-// one batch while leaving non-persistent and permission-denied events alone.
 func applyPersistResults(events []*eventbus.Event, messages []wkdb.Message, results rafttypes.ProposeRespSet) error {
 	if len(messages) != len(results) {
 		return fmt.Errorf("incomplete persistence result")

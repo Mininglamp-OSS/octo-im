@@ -114,7 +114,9 @@ func New(opts *options.Options) *Server {
 
 	// channel event pool
 	s.channelHandler = channelhandler.NewHandler()
+	s.channelHandler.RegisterGlobalPartAHooks()
 	s.channelEventPool = channelevent.NewEventPool(s.channelHandler)
+	s.channelEventPool.SetLeaderWakeupHook(s.channelHandler.NotifyRecoveryWakeup)
 	eventbus.RegisterChannel(s.channelEventPool)
 
 	// push event pool
@@ -236,6 +238,7 @@ func New(opts *options.Options) *Server {
 	)
 	service.Cluster = clusterServer
 	s.clusterServer = clusterServer
+	clusterServer.AddConfigChangeListener(s.channelHandler.NotifyRecoveryWakeup)
 
 	service.Store = clusterServer.GetStore()
 
@@ -374,15 +377,28 @@ func (s *Server) Stop() error {
 
 	s.cancel()
 
+	s.apiServer.Stop()
+
 	s.pluginServer.Stop()
 
+	if s.opts.Demo.On {
+		s.demoServer.Stop()
+	}
+
+	err := s.engine.Stop()
+	if err != nil {
+		s.Error("engine stop error", zap.Error(err))
+	}
+
 	s.userEventPool.Stop()
+
+	if s.channelHandler != nil {
+		s.channelHandler.DrainAndStop(2 * time.Second)
+	}
 
 	s.channelEventPool.Stop()
 
 	s.pushEventPool.Stop()
-
-	s.apiServer.Stop()
 
 	s.retryManager.Stop()
 
@@ -397,21 +413,13 @@ func (s *Server) Stop() error {
 		s.conversationManager.Stop()
 	}
 
-	s.clusterServer.Stop()
-
-	if s.opts.Demo.On {
-		s.demoServer.Stop()
-	}
-
-	err := s.engine.Stop()
-	if err != nil {
-		s.Error("engine stop error", zap.Error(err))
-	}
-	s.trace.Stop()
+	s.webhook.Stop()
 
 	s.tagManager.Stop()
 
-	s.webhook.Stop()
+	s.clusterServer.Stop()
+
+	s.trace.Stop()
 
 	s.Info("Server is stopped")
 

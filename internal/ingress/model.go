@@ -301,4 +301,3 @@ func (r *PersistAfterReq) Decode(data []byte) error {
 	}
 	return nil
 }
-

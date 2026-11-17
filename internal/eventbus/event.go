@@ -102,6 +102,13 @@ type Event struct {
 	// PresenceReconciled marks a local recovery eviction whose logical removal
 	// already happened; the user handler only needs to emit the offline signal.
 	PresenceReconciled bool
+
+	// Post-commit Part A tracking fields (Ticket is never implicitly copied by Clone).
+	HasTargetSlotMask bool
+	TargetSlotMask    SlotBitset
+	Ticket            *PostCommitTicket
+	PluginDone        bool
+	WebhookDone       bool
 }
 
 func (e *Event) Clone() *Event {
@@ -126,6 +133,28 @@ func (e *Event) Clone() *Event {
 		ChannelType:               e.ChannelType,
 		ReqId:                     e.ReqId,
 		PresenceReconciled:        e.PresenceReconciled,
+		HasTargetSlotMask:         e.HasTargetSlotMask,
+		TargetSlotMask:            e.TargetSlotMask.Clone(),
+		PluginDone:                e.PluginDone,
+		WebhookDone:               e.WebhookDone,
+	}
+}
+
+func (e *Event) MergeRecoveryFlagsFrom(other *Event) {
+	if e == nil || other == nil {
+		return
+	}
+	if other.PluginDone {
+		e.PluginDone = true
+	}
+	if other.WebhookDone {
+		e.WebhookDone = true
+	}
+	if e.TagKey == "" && other.TagKey != "" {
+		e.TagKey = other.TagKey
+	}
+	if e.Conn == nil && other.Conn != nil {
+		e.Conn = other.Conn
 	}
 }
 
@@ -162,8 +191,32 @@ func (e *Event) Size() uint64 {
 	return size
 }
 
+func checkWireStringLen(field, val string) error {
+	if len(val) > MaxWireStringBytes {
+		return fmt.Errorf("event %s length %d exceeds wire limit %d", field, len(val), MaxWireStringBytes)
+	}
+	return nil
+}
+
 func (e Event) encodeWithEcoder(enc *wkproto.Encoder) error {
-	var flag uint8 = e.hasConn()<<7 | e.hasFrame()<<6 | e.hasTrack()<<5 | e.hasChannel()<<4 | e.hasReqId()<<3 | e.hasPersistedDuplicate()<<2
+	if err := checkWireStringLen("tagKey", e.TagKey); err != nil {
+		return err
+	}
+	if err := checkWireStringLen("toUid", e.ToUid); err != nil {
+		return err
+	}
+	if e.hasChannel() == 1 {
+		if err := checkWireStringLen("channelId", e.ChannelId); err != nil {
+			return err
+		}
+	}
+	if e.hasReqId() == 1 {
+		if err := checkWireStringLen("reqId", e.ReqId); err != nil {
+			return err
+		}
+	}
+
+	var flag uint8 = e.hasConn()<<7 | e.hasFrame()<<6 | e.hasTrack()<<5 | e.hasChannel()<<4 | e.hasReqId()<<3 | e.hasPersistedDuplicate()<<2 | e.hasPluginDone()<<1 | e.hasWebhookDone()
 	enc.WriteUint8(flag)
 
 	enc.WriteUint8(e.Type.Uint8())
@@ -171,6 +224,9 @@ func (e Event) encodeWithEcoder(enc *wkproto.Encoder) error {
 		data, err := e.Conn.Encode()
 		if err != nil {
 			return err
+		}
+		if len(data) > MaxWireStringBytes {
+			return fmt.Errorf("event conn binary length %d exceeds wire limit %d", len(data), MaxWireStringBytes)
 		}
 		enc.WriteBinary(data)
 	}
@@ -217,7 +273,11 @@ func (e *Event) decodeWithDecoder(dec *wkproto.Decoder) error {
 	hasChannel := (flag >> 4) & 0x01
 	hasReqId := (flag >> 3) & 0x01
 	hasPersistedDuplicate := (flag >> 2) & 0x01
+	hasPluginDone := (flag >> 1) & 0x01
+	hasWebhookDone := flag & 0x01
 	e.PersistedDuplicate = hasPersistedDuplicate == 1
+	e.PluginDone = hasPluginDone == 1
+	e.WebhookDone = hasWebhookDone == 1
 	typeUint8, err := dec.Uint8()
 	if err != nil {
 		return err
@@ -350,6 +410,20 @@ func (e Event) hasPersistedDuplicate() uint8 {
 	return 0
 }
 
+func (e Event) hasPluginDone() uint8 {
+	if e.PluginDone {
+		return 1
+	}
+	return 0
+}
+
+func (e Event) hasWebhookDone() uint8 {
+	if e.WebhookDone {
+		return 1
+	}
+	return 0
+}
+
 type EventBatch []*Event
 
 func (e EventBatch) Encode() ([]byte, error) {
@@ -367,20 +441,29 @@ func (e EventBatch) Encode() ([]byte, error) {
 }
 
 func (e *EventBatch) Decode(data []byte) error {
+	_, err := e.DecodeWithRemainder(data)
+	return err
+}
+
+func (e *EventBatch) DecodeWithRemainder(data []byte) ([]byte, error) {
 	dec := wkproto.NewDecoder(data)
 	count, err := dec.Uint32()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for i := 0; i < int(count); i++ {
 		ev := &Event{}
 		err := ev.decodeWithDecoder(dec)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		*e = append(*e, ev)
 	}
-	return nil
+	rem, err := dec.BinaryAll()
+	if err != nil {
+		return nil, err
+	}
+	return rem, nil
 }
 
 // 用户事件处理者

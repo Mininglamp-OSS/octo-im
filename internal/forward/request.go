@@ -13,6 +13,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -32,11 +33,26 @@ const (
 var (
 	ErrUnavailable    = errors.New("event forwarding unavailable")
 	ErrOutcomeUnknown = errors.New("event forwarding outcome unknown")
+
+	capabilityV2Magic = [4]byte{'W', 'K', 'F', '2'}
+)
+
+type PeerCapMode uint8
+
+const (
+	PeerCapUnknown PeerCapMode = iota
+	PeerCapBaseV1
+	PeerCapPartAV2
+	PeerCapUnsupported
 )
 
 type capabilityEntry struct {
-	supported bool
+	mode      PeerCapMode
 	expiresAt time.Time
+}
+
+func BuildCapabilityBody() []byte {
+	return []byte{'W', 'K', 'F', '2', 1}
 }
 
 // Gate reserves only a bounded fraction of an event worker pool for forwarding
@@ -90,43 +106,98 @@ func OnlyRetryableSends(events []*eventbus.Event) bool {
 }
 
 // CapabilityCache probes a peer before the first side-effecting v1 request.
-// A failed read-only probe can safely select the legacy transport during a
-// rolling upgrade without guessing after an admission response is lost.
+// Transport timeouts return PeerCapUnknown without poisoning the cache.
 type CapabilityCache struct {
 	mu      sync.Mutex
 	entries map[uint64]capabilityEntry
 }
 
-func RegisterCapabilityRoute() {
-	service.Cluster.Route(CapabilityPath, func(c *wkserver.Context) {
-		c.WriteStatus(proto.StatusOK)
+func RegisterCapabilityRouteOn(cl icluster.ICluster) {
+	if cl == nil {
+		return
+	}
+	cl.Route(CapabilityPath, func(c *wkserver.Context) {
+		c.Write(BuildCapabilityBody())
 	})
 }
 
-func (c *CapabilityCache) Supports(ctx context.Context, node uint64) bool {
+func RegisterCapabilityRoute() {
+	RegisterCapabilityRouteOn(service.Cluster)
+}
+
+func (c *CapabilityCache) InvalidateAll() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	clear(c.entries)
+	c.mu.Unlock()
+}
+
+func (c *CapabilityCache) ProbeOn(ctx context.Context, cl icluster.ICluster, node uint64) PeerCapMode {
+	if c == nil {
+		return PeerCapUnknown
+	}
+	if cl == nil {
+		cl = service.Cluster
+	}
+	if cl == nil || node == 0 {
+		return PeerCapUnknown
+	}
 	now := time.Now()
 	c.mu.Lock()
-	if entry, ok := c.entries[node]; ok && now.Before(entry.expiresAt) {
+	if entry, ok := c.entries[node]; ok && entry.mode != PeerCapUnknown && now.Before(entry.expiresAt) {
 		c.mu.Unlock()
-		return entry.supported
+		return entry.mode
 	}
 	c.mu.Unlock()
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-	resp, err := service.Cluster.RequestWithContext(probeCtx, node, CapabilityPath, nil)
+	resp, err := cl.RequestWithContext(probeCtx, node, CapabilityPath, nil)
 	cancel()
-	supported := err == nil && resp != nil && resp.Status == proto.StatusOK
-	if ctx.Err() != nil {
-		return false
+	if err != nil || resp == nil {
+		return PeerCapUnknown
+	}
+
+	var mode PeerCapMode
+	ttl := 5 * time.Second
+	if resp.Status == proto.StatusOK {
+		if len(resp.Body) >= 5 &&
+			resp.Body[0] == capabilityV2Magic[0] &&
+			resp.Body[1] == capabilityV2Magic[1] &&
+			resp.Body[2] == capabilityV2Magic[2] &&
+			resp.Body[3] == capabilityV2Magic[3] &&
+			resp.Body[4] >= 1 {
+			mode = PeerCapPartAV2
+			ttl = 30 * time.Second
+		} else {
+			mode = PeerCapBaseV1
+			ttl = 5 * time.Second
+		}
+	} else {
+		mode = PeerCapUnsupported
+		ttl = 5 * time.Second
 	}
 
 	c.mu.Lock()
 	if c.entries == nil {
 		c.entries = make(map[uint64]capabilityEntry)
 	}
-	c.entries[node] = capabilityEntry{supported: supported, expiresAt: now.Add(5 * time.Second)}
+	c.entries[node] = capabilityEntry{mode: mode, expiresAt: now.Add(ttl)}
 	c.mu.Unlock()
-	return supported
+	return mode
+}
+
+func (c *CapabilityCache) Probe(ctx context.Context, node uint64) PeerCapMode {
+	return c.ProbeOn(ctx, service.Cluster, node)
+}
+
+func (c *CapabilityCache) Supports(ctx context.Context, node uint64) bool {
+	mode := c.ProbeOn(ctx, service.Cluster, node)
+	return mode == PeerCapBaseV1 || mode == PeerCapPartAV2
 }
 
 // Envelope bounds retries across successive owners, including already admitted
@@ -168,24 +239,37 @@ func Decode(data []byte) (body []byte, deadline int64, hops uint8, err error) {
 	return data[9:], deadline, hops, nil
 }
 
+func batchHasPersistedEvent(events []*eventbus.Event) bool {
+	for _, ev := range events {
+		if ev != nil && ev.MessageSeq > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // Request re-resolves authority after explicit retry responses. No background
 // goroutines or additional queue are created; the caller's bounded event worker
 // owns waiting. A transport error is outcome-ambiguous and is never replayed.
 func Request(path string, body []byte, events []*eventbus.Event, target func() uint64, local uint64, accept func([]byte) proto.Status) error {
-	return request(path, body, events, target, local, accept, nil, nil)
+	return RequestOnCluster(service.Cluster, path, body, events, target, local, accept, nil, nil)
 }
 
 // RequestCompatible uses a read-only capability probe before any remote v1
 // admission. Legacy fallback is allowed only while no v1 outcome is ambiguous.
 func RequestCompatible(path string, body []byte, events []*eventbus.Event, target func() uint64, local uint64, accept func([]byte) proto.Status, capabilities *CapabilityCache, legacy func(uint64) error) error {
-	return request(path, body, events, target, local, accept, capabilities, legacy)
+	return RequestOnCluster(service.Cluster, path, body, events, target, local, accept, capabilities, legacy)
 }
 
-func request(path string, body []byte, events []*eventbus.Event, target func() uint64, local uint64, accept func([]byte) proto.Status, capabilities *CapabilityCache, legacy func(uint64) error) error {
+func RequestOnCluster(cl icluster.ICluster, path string, body []byte, events []*eventbus.Event, target func() uint64, local uint64, accept func([]byte) proto.Status, capabilities *CapabilityCache, legacy func(uint64) error) error {
+	if cl == nil {
+		cl = service.Cluster
+	}
 	data, deadline, err := Envelope(body, events)
 	if err != nil {
 		return err
 	}
+	persisted := batchHasPersistedEvent(events)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	zeroTargets := 0
@@ -200,14 +284,32 @@ func request(path string, body []byte, events []*eventbus.Event, target func() u
 			status = accept(data)
 		} else if node != 0 {
 			zeroTargets = 0
-			if capabilities != nil && legacy != nil && !capabilities.Supports(ctx, node) {
-				if err := ctx.Err(); err != nil {
-					return err
+			if cl == nil {
+				return ErrUnavailable
+			}
+			if capabilities != nil {
+				mode := capabilities.ProbeOn(ctx, cl, node)
+				if mode != PeerCapBaseV1 && mode != PeerCapPartAV2 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					// V12-3: Never downgrade persisted (MessageSeq > 0) events to fire-and-forget legacy Send on PeerCapUnknown.
+					if persisted {
+						if mode == PeerCapUnsupported && legacy != nil {
+							return legacy(node)
+						}
+						status = StatusRetry
+						goto nextAttempt
+					}
+					if legacy != nil {
+						return legacy(node)
+					}
+					status = StatusRetry
+					goto nextAttempt
 				}
-				return legacy(node)
 			}
 			attemptCtx, done := context.WithTimeout(ctx, 750*time.Millisecond)
-			resp, requestErr := service.Cluster.RequestWithContext(attemptCtx, node, path, data)
+			resp, requestErr := cl.RequestWithContext(attemptCtx, node, path, data)
 			done()
 			if requestErr != nil || resp == nil {
 				return fmt.Errorf("%w: request outcome unknown", ErrOutcomeUnknown)
@@ -220,6 +322,7 @@ func request(path string, body []byte, events []*eventbus.Event, target func() u
 				return ErrUnavailable
 			}
 		}
+	nextAttempt:
 		if status == proto.StatusOK {
 			return nil
 		}
@@ -244,12 +347,12 @@ func request(path string, body []byte, events []*eventbus.Event, target func() u
 // failure must not contradict the success ACK already sent to the producer.
 func Fail(events []*eventbus.Event, cause error) {
 	if errors.Is(cause, ErrOutcomeUnknown) {
-		// The peer may already have admitted the batch and may still send the
-		// canonical success ACK. Let the client timeout rather than contradict a
-		// possible success with a locally generated terminal failure.
 		return
 	}
 	for _, e := range events {
+		if e == nil || e.MessageSeq > 0 {
+			continue
+		}
 		packet, ok := e.Frame.(*wkproto.SendPacket)
 		if !ok || packet == nil || e.Conn == nil ||
 			(e.Type != eventbus.EventOnSend && e.Type != eventbus.EventChannelOnSend) ||

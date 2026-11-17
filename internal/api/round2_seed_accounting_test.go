@@ -420,27 +420,27 @@ type realSeedClusterNode struct {
 }
 
 type seedTierAccountingResult struct {
-	TierLabel                  string  `json:"tier_label"`
-	TargetMessages             int     `json:"target_messages"`
-	AcceptedMessages           int     `json:"accepted_messages"`
-	CallerRecordedMessageIDs   int     `json:"caller_recorded_message_ids"`
-	CallerRecordedClientNos    int     `json:"caller_recorded_client_msg_nos"`
-	ExplicitFailedMessages     int     `json:"explicit_failed_messages"`
-	PersistedMessages          int     `json:"persisted_messages"`
-	EventbusHandledEvents      int64   `json:"eventbus_handled_events"`
-	EventbusDistributedEvents  int64   `json:"eventbus_distributed_events"`
-	PusherOnlineEvents         int64   `json:"pusher_online_events"`
-	ConversationPushedEvents   int64   `json:"conversation_pushed_events"`
-	PersistedEqualsAccepted    bool    `json:"persisted_equals_accepted"`
-	UniquePersistedMessageIDs  int     `json:"unique_persisted_message_ids"`
-	UniquePersistedClientNos   int     `json:"unique_persisted_client_msg_nos"`
-	MissingAcceptedMessageIDs  int     `json:"missing_accepted_message_ids"`
-	MissingAcceptedClientNos   int     `json:"missing_accepted_client_msg_nos"`
-	DuplicateMessageIDs        int     `json:"duplicate_message_ids"`
-	DuplicateClientMsgNos      int     `json:"duplicate_client_msg_nos"`
-	SequenceGaps               int     `json:"sequence_gaps"`
-	ChannelsVerified           int     `json:"channels_verified"`
-	ElapsedSeconds             float64 `json:"elapsed_seconds"`
+	TierLabel                 string  `json:"tier_label"`
+	TargetMessages            int     `json:"target_messages"`
+	AcceptedMessages          int     `json:"accepted_messages"`
+	CallerRecordedMessageIDs  int     `json:"caller_recorded_message_ids"`
+	CallerRecordedClientNos   int     `json:"caller_recorded_client_msg_nos"`
+	ExplicitFailedMessages    int     `json:"explicit_failed_messages"`
+	PersistedMessages         int     `json:"persisted_messages"`
+	EventbusHandledEvents     int64   `json:"eventbus_handled_events"`
+	EventbusDistributedEvents int64   `json:"eventbus_distributed_events"`
+	PusherOnlineEvents        int64   `json:"pusher_online_events"`
+	ConversationPushedEvents  int64   `json:"conversation_pushed_events"`
+	PersistedEqualsAccepted   bool    `json:"persisted_equals_accepted"`
+	UniquePersistedMessageIDs int     `json:"unique_persisted_message_ids"`
+	UniquePersistedClientNos  int     `json:"unique_persisted_client_msg_nos"`
+	MissingAcceptedMessageIDs int     `json:"missing_accepted_message_ids"`
+	MissingAcceptedClientNos  int     `json:"missing_accepted_client_msg_nos"`
+	DuplicateMessageIDs       int     `json:"duplicate_message_ids"`
+	DuplicateClientMsgNos     int     `json:"duplicate_client_msg_nos"`
+	SequenceGaps              int     `json:"sequence_gaps"`
+	ChannelsVerified          int     `json:"channels_verified"`
+	ElapsedSeconds            float64 `json:"elapsed_seconds"`
 }
 
 func runSeedTierAccounting(t *testing.T, tierLabel string, targetMsgs int, failCh string) seedTierAccountingResult {

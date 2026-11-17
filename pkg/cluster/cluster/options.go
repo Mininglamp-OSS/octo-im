@@ -45,15 +45,15 @@ type Options struct {
 		MaxBatchBytes       int   // 单次 Pebble Batch 最大字节数
 	}
 
-	MaxLogSizePerBatch              uint64        // 每次拉取日志的最大字节数
-	MaxLogCountPerBatch             int           // 每次拉取日志的最大条数
-	LearnerToFollowerMaxApplyLag    uint64        // Learner 晋升 Follower 允许的最大应用滞后条数
-	MaxReadyApplyLag                uint64        // 节点就绪探针允许的最大本地槽位应用滞后条数
-	MaxApplyStallTicks              int           // 节点就绪探针允许的最大连续应用停滞 tick 数
-	MaxSlotApplyWait                time.Duration // 槽领导读取前等待本地应用追平的最大超时时间
-	HandoffDrainTimeoutTick         int           // 迁主/准入排空超时 tick 数
-	MaxConcurrentChannelMigrations  int           // 后台并发执行的频道 Learner 迁移上限
-	ChannelLeaderAutoBalance        bool          // 是否开启后台频道领导权自动均衡
+	MaxLogSizePerBatch             uint64        // 每次拉取日志的最大字节数
+	MaxLogCountPerBatch            int           // 每次拉取日志的最大条数
+	LearnerToFollowerMaxApplyLag   uint64        // Learner 晋升 Follower 允许的最大应用滞后条数
+	MaxReadyApplyLag               uint64        // 节点就绪探针允许的最大本地槽位应用滞后条数
+	MaxApplyStallTicks             int           // 节点就绪探针允许的最大连续应用停滞 tick 数
+	MaxSlotApplyWait               time.Duration // 槽领导读取前等待本地应用追平的最大超时时间
+	HandoffDrainTimeoutTick        int           // 迁主/准入排空超时 tick 数
+	MaxConcurrentChannelMigrations int           // 后台并发执行的频道 Learner 迁移上限
+	ChannelLeaderAutoBalance       bool          // 是否开启后台频道领导权自动均衡
 
 	ServerAddr string // 服务地址
 

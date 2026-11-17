@@ -43,7 +43,7 @@ func (c *clientEvent) OnClose(gc gnet.Conn, err error) (action gnet.Action) {
 }
 
 func (c *clientEvent) OnTraffic(gc gnet.Conn) (action gnet.Action) {
-	c.c.conn().idleTick = 0
+	c.c.conn().idleTick.Store(0)
 	return c.c.conn().onTraffic(gc)
 }
 

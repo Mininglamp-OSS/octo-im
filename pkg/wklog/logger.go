@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -12,6 +13,7 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+var logMu sync.RWMutex
 var logger *zap.Logger      // info日志
 var traceLogger *zap.Logger // 轨迹日志
 var errorLogger *zap.Logger // 错误日志
@@ -23,6 +25,12 @@ var atom = zap.NewAtomicLevel()
 var opts *Options
 
 func Configure(op *Options) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	configureLocked(op)
+}
+
+func configureLocked(op *Options) {
 	atom.SetLevel(op.Level)
 	opts = op
 
@@ -153,76 +161,67 @@ func newEncoderConfig() zapcore.EncoderConfig {
 // 	enc.AppendString(t.Format("2006-01-02 15:04:05.000"))
 // }
 
+func getLoggers() (*zap.Logger, *zap.Logger, *zap.Logger, *zap.Logger, *zap.Logger, *zap.Logger) {
+	logMu.RLock()
+	if logger != nil && traceLogger != nil && errorLogger != nil && warnLogger != nil && panicLogger != nil && focusLogger != nil {
+		l, tl, el, wl, pl, fl := logger, traceLogger, errorLogger, warnLogger, panicLogger, focusLogger
+		logMu.RUnlock()
+		return l, tl, el, wl, pl, fl
+	}
+	logMu.RUnlock()
+
+	logMu.Lock()
+	if logger == nil || traceLogger == nil || errorLogger == nil || warnLogger == nil || panicLogger == nil || focusLogger == nil {
+		configureLocked(NewOptions())
+	}
+	l, tl, el, wl, pl, fl := logger, traceLogger, errorLogger, warnLogger, panicLogger, focusLogger
+	logMu.Unlock()
+	return l, tl, el, wl, pl, fl
+}
+
 // Info Info
 func Info(msg string, fields ...zap.Field) {
-
-	if logger == nil {
-		Configure(NewOptions())
-	}
-	logger.Info(msg, fields...)
-
+	l, _, _, _, _, _ := getLoggers()
+	l.Info(msg, fields...)
 }
 
 // Trace Trace
 func Trace(msg string, fields ...zap.Field) {
-
-	if traceLogger == nil {
-		Configure(NewOptions())
-	}
-	traceLogger.Info(msg, fields...)
-
+	_, tl, _, _, _, _ := getLoggers()
+	tl.Info(msg, fields...)
 }
 
 // Debug Debug
 func Debug(msg string, fields ...zap.Field) {
-
-	if logger == nil {
-		Configure(NewOptions())
-	}
-	logger.Debug(msg, fields...)
-
+	l, _, _, _, _, _ := getLoggers()
+	l.Debug(msg, fields...)
 }
 
 // Error Error
 func Error(msg string, fields ...zap.Field) {
-
-	if errorLogger == nil {
-		Configure(NewOptions())
-	}
-	errorLogger.Error(msg, fields...)
-
+	_, _, el, _, _, _ := getLoggers()
+	el.Error(msg, fields...)
 }
 
 func Fatal(msg string, fields ...zap.Field) {
-
-	if panicLogger == nil {
-		Configure(NewOptions())
-	}
-	panicLogger.Fatal(msg, fields...)
+	_, _, _, _, pl, _ := getLoggers()
+	pl.Fatal(msg, fields...)
 }
-func Panic(msg string, fields ...zap.Field) {
 
-	if panicLogger == nil {
-		Configure(NewOptions())
-	}
-	panicLogger.Panic(msg, fields...)
+func Panic(msg string, fields ...zap.Field) {
+	_, _, _, _, pl, _ := getLoggers()
+	pl.Panic(msg, fields...)
 }
 
 // Warn Warn
 func Warn(msg string, fields ...zap.Field) {
-
-	if warnLogger == nil {
-		Configure(NewOptions())
-	}
-	warnLogger.Warn(msg, fields...)
+	_, _, _, wl, _, _ := getLoggers()
+	wl.Warn(msg, fields...)
 }
 
 func Foucs(msg string, fields ...zap.Field) {
-
-	if focusLogger == nil {
-		Configure(NewOptions())
-	}
-	focusLogger.Info(msg, fields...)
+	_, _, _, _, _, fl := getLoggers()
+	fl.Info(msg, fields...)
 }
 
 func Sync() error {

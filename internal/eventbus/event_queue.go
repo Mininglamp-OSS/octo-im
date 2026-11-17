@@ -32,6 +32,17 @@ func (m *EventQueue) CanAppend(event *Event) bool {
 	return len(m.events) < MaxEventQueueSize
 }
 
+func (m *EventQueue) CanAppendCount(count int, persisted bool) bool {
+	if count <= 0 {
+		return true
+	}
+	limit := MaxEventQueueSize
+	if persisted {
+		limit = MaxPersistedEventQueueSize
+	}
+	return len(m.events)+count <= limit
+}
+
 func (m *EventQueue) Append(event *Event) {
 	m.events = append(m.events, event)
 	m.lastIndex++

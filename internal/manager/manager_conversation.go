@@ -49,61 +49,69 @@ func NewConversationManager(updaterCount int) *ConversationManager {
 	}
 }
 
-// Push 推送消息事件以更新最近会话
-func (c *ConversationManager) Push(channelId string, channelType uint8, tagKey string, events []*eventbus.Event) {
-	if len(events) == 0 {
-		return
-	}
-
-	if channelType == wkproto.ChannelTypeLive { // 直播频道不添加最近会话
-		return
-	}
-
-	var lastMsgSeq uint64 = 0
-	var firstMsgSeq uint64 = 0
-	// 收集发送者的最后已读消息序号（发送者默认已读自己发送的消息）
-	senderReadSeqs := make(map[string]uint64)
+func collectConversationEventSeqs(events []*eventbus.Event) (firstMsgSeq uint64, lastMsgSeq uint64, senderReadSeqs map[string]uint64) {
+	senderReadSeqs = make(map[string]uint64)
 	for _, event := range events {
-		if event.Frame.GetNoPersist() {
+		if event == nil || event.Frame == nil || event.Frame.GetNoPersist() {
 			continue
 		}
-
 		if event.MessageSeq > lastMsgSeq {
 			lastMsgSeq = event.MessageSeq
 		}
-		if firstMsgSeq == 0 {
+		if firstMsgSeq == 0 || (event.MessageSeq > 0 && event.MessageSeq < firstMsgSeq) {
 			firstMsgSeq = event.MessageSeq
 		}
-		// 记录发送者发送的最后消息序号
 		if event.Conn != nil && event.Conn.Uid != "" {
 			if event.MessageSeq > senderReadSeqs[event.Conn.Uid] {
 				senderReadSeqs[event.Conn.Uid] = event.MessageSeq
 			}
 		}
 	}
-	if lastMsgSeq == 0 {
-		return
-	}
+	return firstMsgSeq, lastMsgSeq, senderReadSeqs
+}
 
-	// 如果是 CMD 频道，则直接更新会话
+func shouldUpdateConversationForChannel(channelId string, channelType uint8, firstMsgSeq uint64) bool {
+	if channelType == wkproto.ChannelTypeLive {
+		return false
+	}
 	if options.G.IsCmdChannel(channelId) {
-		index := c.getShardIndex(channelId)
-		c.updaters[index].push(channelId, channelType, tagKey, lastMsgSeq, senderReadSeqs)
-		return
+		return true
 	}
-
-	// 如果是个人频道并且开启了白名单，则不需要更新最近会话（白名单添加时已处理）
 	if channelType == wkproto.ChannelTypePerson && !options.G.WhitelistOffOfPerson {
+		return false
+	}
+	if channelType == wkproto.ChannelTypeCustomerService || channelType == wkproto.ChannelTypePerson {
+		return firstMsgSeq == 1
+	}
+	return false
+}
+
+// Push 推送消息事件以更新最近会话
+func (c *ConversationManager) Push(channelId string, channelType uint8, tagKey string, events []*eventbus.Event) {
+	if len(events) == 0 {
 		return
 	}
-
-	// 客服频道或个人频道在收到首条消息时需要更新会话
-	if channelType == wkproto.ChannelTypeCustomerService || channelType == wkproto.ChannelTypePerson {
-		if firstMsgSeq == 1 {
-			index := c.getShardIndex(channelId)
-			c.updaters[index].push(channelId, channelType, tagKey, lastMsgSeq, senderReadSeqs)
-		}
+	firstMsgSeq, lastMsgSeq, senderReadSeqs := collectConversationEventSeqs(events)
+	if lastMsgSeq == 0 || !shouldUpdateConversationForChannel(channelId, channelType, firstMsgSeq) {
+		return
 	}
+	index := c.getShardIndex(channelId)
+	c.updaters[index].push(channelId, channelType, tagKey, lastMsgSeq, senderReadSeqs)
+}
+
+// PushForTargetUsers updates pending conversations strictly for deliverMask-authorized targetUIDs (closing V11-1),
+// merging into existing pending updates without resurrecting deleted conversations on already-delivered slots
+// or skipping newly migrated-in slots when LastMsgSeq/TagKey match.
+func (c *ConversationManager) PushForTargetUsers(channelId string, channelType uint8, tagKey string, targetUIDs []string, events []*eventbus.Event) {
+	if len(events) == 0 || len(targetUIDs) == 0 {
+		return
+	}
+	firstMsgSeq, lastMsgSeq, senderReadSeqs := collectConversationEventSeqs(events)
+	if lastMsgSeq == 0 || !shouldUpdateConversationForChannel(channelId, channelType, firstMsgSeq) {
+		return
+	}
+	index := c.getShardIndex(channelId)
+	c.updaters[index].pushUsers(channelId, channelType, tagKey, lastMsgSeq, senderReadSeqs, targetUIDs)
 }
 
 // Start 启动管理器
@@ -198,10 +206,10 @@ store:
 			c.Error("store conversations failed", zap.Error(err), zap.Int("count", len(conversations)))
 			return
 		}
-		// 同步成功后，从缓存中移除这些待更新项
+		// 同步成功后，按已同步的 (channel, uid, readToMsgSeq) 精确清理缓存，避免误删尚未刷新的其它用户或并发新到达的更新
 		for _, conversation := range conversations {
 			updater := c.updaters[c.getShardIndex(conversation.ChannelId)]
-			updater.removeChannelUpdate(conversation.ChannelId, conversation.ChannelType)
+			updater.removeSyncedUserChannelUpdate(conversation.ChannelId, conversation.ChannelType, conversation.Uid, conversation.ReadToMsgSeq)
 		}
 	}
 }
@@ -398,16 +406,114 @@ func (c *conversationUpdater) getUserChannels(uid string, conversationType wkdb.
 	return channels
 }
 
-// getChannelUpdates 获取当前分片中所有的待同步频道信息
+// pushUsers merges targetUIDs into pendingUpdates[key] monotonically.
+func (c *conversationUpdater) pushUsers(channelId string, channelType uint8, tagKey string, lastMsgSeq uint64, senderReadSeqs map[string]uint64, targetUIDs []string) {
+	if len(targetUIDs) == 0 {
+		return
+	}
+	key := wkutil.ChannelToKey(channelId, channelType)
+
+	c.Lock()
+	defer c.Unlock()
+
+	update := c.pendingUpdates[key]
+	if update == nil {
+		userReadSeqs := make(map[string]uint64, len(targetUIDs))
+		for _, uid := range targetUIDs {
+			if uid == "" || options.G.IsSystemUid(uid) {
+				continue
+			}
+			userReadSeqs[uid] = senderReadSeqs[uid]
+			if c.userIndex[uid] == nil {
+				c.userIndex[uid] = make(map[string]struct{})
+			}
+			c.userIndex[uid][key] = struct{}{}
+		}
+		if len(userReadSeqs) == 0 {
+			return
+		}
+		c.pendingUpdates[key] = &channelUpdate{
+			ChannelId:    channelId,
+			ChannelType:  channelType,
+			UserReadSeqs: userReadSeqs,
+			TagKey:       tagKey,
+			LastMsgSeq:   lastMsgSeq,
+		}
+		return
+	}
+
+	if update.UserReadSeqs == nil {
+		update.UserReadSeqs = make(map[string]uint64, len(targetUIDs))
+	}
+	for _, uid := range targetUIDs {
+		if uid == "" || options.G.IsSystemUid(uid) {
+			continue
+		}
+		seq := senderReadSeqs[uid]
+		if cur, exists := update.UserReadSeqs[uid]; !exists || seq > cur {
+			update.UserReadSeqs[uid] = seq
+		}
+		if c.userIndex[uid] == nil {
+			c.userIndex[uid] = make(map[string]struct{})
+		}
+		c.userIndex[uid][key] = struct{}{}
+	}
+	if lastMsgSeq > update.LastMsgSeq {
+		update.LastMsgSeq = lastMsgSeq
+	}
+	if tagKey != "" {
+		update.TagKey = tagKey
+	}
+}
+
+// getChannelUpdates 获取当前分片中所有的待同步频道信息快照（深拷贝 UserReadSeqs 防止与并发更新发生 data race）
 func (c *conversationUpdater) getChannelUpdates() []*channelUpdate {
 	c.RLock()
 	defer c.RUnlock()
 
 	updates := make([]*channelUpdate, 0, len(c.pendingUpdates))
 	for _, update := range c.pendingUpdates {
-		updates = append(updates, update)
+		if update == nil {
+			continue
+		}
+		copiedSeqs := make(map[string]uint64, len(update.UserReadSeqs))
+		for uid, seq := range update.UserReadSeqs {
+			copiedSeqs[uid] = seq
+		}
+		updates = append(updates, &channelUpdate{
+			ChannelId:    update.ChannelId,
+			ChannelType:  update.ChannelType,
+			UserReadSeqs: copiedSeqs,
+			TagKey:       update.TagKey,
+			LastMsgSeq:   update.LastMsgSeq,
+		})
 	}
 	return updates
+}
+
+func (c *conversationUpdater) removeSyncedUserChannelUpdate(channelId string, channelType uint8, uid string, syncedReadSeq uint64) {
+	key := wkutil.ChannelToKey(channelId, channelType)
+	c.Lock()
+	defer c.Unlock()
+
+	update := c.pendingUpdates[key]
+	if update == nil {
+		return
+	}
+	curSeq, exists := update.UserReadSeqs[uid]
+	if !exists || curSeq > syncedReadSeq {
+		return
+	}
+	delete(update.UserReadSeqs, uid)
+	if keys, ok := c.userIndex[uid]; ok {
+		delete(keys, key)
+		if len(keys) == 0 {
+			delete(c.userIndex, uid)
+		}
+	}
+	if len(update.UserReadSeqs) == 0 {
+		delete(c.pendingUpdates, key)
+	}
 }
 
 // removeChannelUpdate 同步完成后移除频道信息

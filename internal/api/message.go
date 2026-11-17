@@ -159,8 +159,12 @@ func (m *message) send(c *wkhttp.Context) {
 
 		clientMsgNo := fmt.Sprintf("%s0", wkutil.GenUUID())
 		// 发送消息
-		_, err := sendMessageToChannel(req, tmpChannelId, tmpChannelType, clientMsgNo)
+		_, err := sendMessageToChannel(c.Request.Context(), req, tmpChannelId, tmpChannelType, clientMsgNo)
 		if err != nil {
+			if errors.Is(err, eventbus.ErrPostCommitBackpressure) || errors.Is(err, eventbus.ErrTransientBudgetFull) {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"msg": err.Error(), "status": http.StatusServiceUnavailable})
+				return
+			}
 			c.ResponseError(err)
 			return
 		}
@@ -175,8 +179,12 @@ func (m *message) send(c *wkhttp.Context) {
 	}
 
 	// 发送消息
-	messageId, err := sendMessageToChannel(req, channelId, channelType, clientMsgNo)
+	messageId, err := sendMessageToChannel(c.Request.Context(), req, channelId, channelType, clientMsgNo)
 	if err != nil {
+		if errors.Is(err, eventbus.ErrPostCommitBackpressure) || errors.Is(err, eventbus.ErrTransientBudgetFull) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"msg": err.Error(), "status": http.StatusServiceUnavailable})
+			return
+		}
 		c.ResponseError(err)
 		return
 	}
@@ -365,6 +373,34 @@ func persistHTTPChannelMessages(ctx context.Context, fakeChannelId string, chann
 	return lastErr
 }
 
+func validateWireIdentifiers(channelId, fakeChannelId, fromUID, clientMsgNo, tagKey string) error {
+	if len(channelId) > eventbus.MaxWireStringBytes || len(fakeChannelId) > eventbus.MaxWireStringBytes {
+		return eventbus.ErrWireChannelIDTooLong
+	}
+	if len(fromUID) > eventbus.MaxWireStringBytes || len(clientMsgNo) > eventbus.MaxWireStringBytes || len(tagKey) > eventbus.MaxWireStringBytes {
+		return errors.New("message identifier exceeds wire framing limit (32767 bytes)")
+	}
+	return nil
+}
+
+func admitChannelEventWithFallback(fakeChannelId string, channelType uint8, ev *eventbus.Event) {
+	if ev == nil {
+		return
+	}
+	ev.Track.Record(track.PositionStart)
+	if eventbus.Channel != nil && eventbus.Channel.TrySendMessage(fakeChannelId, channelType, ev) {
+		eventbus.Channel.Advance(fakeChannelId, channelType)
+		return
+	}
+	if ev.MessageSeq > 0 && eventbus.EnqueuePersistedRecoveryFallback(fakeChannelId, channelType, ev) {
+		return
+	}
+	if ev.Ticket != nil {
+		ev.Ticket.Release()
+		ev.Ticket = nil
+	}
+}
+
 func buildChannelSendEvent(req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (string, *eventbus.Event, error) {
 	if options.IsSpecialChar(channelId) {
 		return "", nil, errors.New("频道ID不合法！")
@@ -379,6 +415,10 @@ func buildChannelSendEvent(req messageSendReq, channelId string, channelType uin
 
 	if req.Header.SyncOnce == 1 && !options.G.IsOnlineCmdChannel(channelId) && channelType != wkproto.ChannelTypeTemp { // 命令消息，将原频道转换为cmd频道
 		fakeChannelId = options.G.OrginalConvertCmdChannel(fakeChannelId)
+	}
+
+	if err := validateWireIdentifiers(channelId, fakeChannelId, req.FromUID, clientMsgNo, req.TagKey); err != nil {
+		return "", nil, err
 	}
 
 	var setting wkproto.Setting
@@ -418,17 +458,37 @@ func buildChannelSendEvent(req messageSendReq, channelId string, channelType uin
 	return fakeChannelId, event, nil
 }
 
-func sendMessageToChannel(req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (int64, error) {
+func sendMessageToChannel(ctx context.Context, req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (int64, error) {
 	fakeChannelId, event, err := buildChannelSendEvent(req, channelId, channelType, clientMsgNo)
 	if err != nil {
 		return 0, err
 	}
-	if err := persistHTTPChannelMessages(context.Background(), fakeChannelId, channelType, []*eventbus.Event{event}); err != nil {
+	sp := event.Frame.(*wkproto.SendPacket)
+	if !sp.NoPersist && service.Store != nil && service.Store.HasChannel() {
+		tks, rErr := eventbus.DefaultPostCommitBudget.ReserveWithGrace(ctx, 200*time.Millisecond, fakeChannelId, []*eventbus.Event{event})
+		if rErr != nil {
+			return 0, rErr
+		}
+		event.Ticket = tks[0]
+	} else if sp.NoPersist {
+		tks, rErr := eventbus.DefaultTransientBudget.ReserveWithGrace(ctx, 50*time.Millisecond, fakeChannelId, []*eventbus.Event{event})
+		if rErr != nil {
+			if errors.Is(rErr, eventbus.ErrPostCommitBackpressure) {
+				return 0, eventbus.ErrTransientBudgetFull
+			}
+			return 0, rErr
+		}
+		event.Ticket = tks[0]
+	}
+
+	if err := persistHTTPChannelMessages(ctx, fakeChannelId, channelType, []*eventbus.Event{event}); err != nil {
+		if event.Ticket != nil {
+			event.Ticket.Release()
+			event.Ticket = nil
+		}
 		return 0, err
 	}
-	event.Track.Record(track.PositionStart)
-	eventbus.Channel.SendMessage(fakeChannelId, channelType, event)
-	eventbus.Channel.Advance(fakeChannelId, channelType)
+	admitChannelEventWithFallback(fakeChannelId, channelType, event)
 
 	return event.MessageId, nil
 }
@@ -499,6 +559,40 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 	if c.Request != nil && c.Request.Context() != nil {
 		reqCtx = c.Request.Context()
 	}
+
+	// Upfront full-batch budget reservation BEFORE any Raft AppendMessages writes.
+	if len(groups) > 0 {
+		totalEvents := 0
+		for _, grp := range groups {
+			totalEvents += len(grp.events)
+		}
+		allEvents := make([]*eventbus.Event, 0, totalEvents)
+		repChannelID := groups[0].fakeChannelId
+		for _, grp := range groups {
+			allEvents = append(allEvents, grp.events...)
+		}
+		isNoPersist := wkutil.IntToBool(req.Header.NoPersist)
+		if !isNoPersist && service.Store != nil && service.Store.HasChannel() {
+			tks, rErr := eventbus.DefaultPostCommitBudget.ReserveWithGrace(reqCtx, 200*time.Millisecond, repChannelID, allEvents)
+			if rErr != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"msg": rErr.Error(), "status": http.StatusServiceUnavailable})
+				return
+			}
+			for i, ev := range allEvents {
+				ev.Ticket = tks[i]
+			}
+		} else if isNoPersist {
+			tks, rErr := eventbus.DefaultTransientBudget.ReserveWithGrace(reqCtx, 50*time.Millisecond, repChannelID, allEvents)
+			if rErr != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"msg": rErr.Error(), "status": http.StatusServiceUnavailable})
+				return
+			}
+			for i, ev := range allEvents {
+				ev.Ticket = tks[i]
+			}
+		}
+	}
+
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 16)
 	for _, grp := range groups {
@@ -524,6 +618,12 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 	}
 	for _, grp := range groups {
 		if grp.err != nil {
+			for _, ev := range grp.events {
+				if ev != nil && ev.Ticket != nil {
+					ev.Ticket.Release()
+					ev.Ticket = nil
+				}
+			}
 			for _, sub := range grp.subscribers {
 				failUids = append(failUids, sub)
 				reasons = append(reasons, grp.err.Error())
@@ -537,10 +637,8 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 					acceptedClientMsgNos = append(acceptedClientMsgNos, sp.ClientMsgNo)
 				}
 			}
-			ev.Track.Record(track.PositionStart)
-			eventbus.Channel.SendMessage(grp.fakeChannelId, wkproto.ChannelTypePerson, ev)
+			admitChannelEventWithFallback(grp.fakeChannelId, wkproto.ChannelTypePerson, ev)
 		}
-		eventbus.Channel.Advance(grp.fakeChannelId, wkproto.ChannelTypePerson)
 	}
 	if includeAcceptedIds {
 		c.JSON(http.StatusOK, gin.H{
@@ -1257,7 +1355,7 @@ func (m *message) sendEvent(req *eventAppendReq, fakeChannelID string, eventKey 
 		Data:      data,
 	}
 
-	eventbus.Channel.SendMessage(fakeChannelID, req.ChannelType, &eventbus.Event{
+	evObj := &eventbus.Event{
 		Conn: &eventbus.Conn{
 			Uid:      req.FromUID,
 			DeviceId: options.G.SystemDeviceId,
@@ -1265,7 +1363,16 @@ func (m *message) sendEvent(req *eventAppendReq, fakeChannelID string, eventKey 
 		Type:      eventbus.EventChannelDistribute,
 		Frame:     event,
 		MessageId: messageId,
-	})
+	}
+	if tks, ok := eventbus.DefaultTransientBudget.TryReserve(fakeChannelID, []*eventbus.Event{evObj}); ok {
+		evObj.Ticket = tks[0]
+		if eventbus.Channel != nil && eventbus.Channel.TrySendMessage(fakeChannelID, req.ChannelType, evObj) {
+			eventbus.Channel.Advance(fakeChannelID, req.ChannelType)
+		} else {
+			evObj.Ticket.Release()
+			evObj.Ticket = nil
+		}
+	}
 }
 
 func (m *message) eventSync(c *wkhttp.Context) {

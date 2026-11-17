@@ -18,7 +18,9 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/auth"
 	"github.com/WuKongIM/WuKongIM/pkg/auth/resource"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/slot"
 	"github.com/WuKongIM/WuKongIM/pkg/network"
+	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
@@ -602,6 +604,10 @@ type slotDigestResp struct {
 }
 
 func (s *Server) slotDigestGet(c *wkhttp.Context) {
+	if !s.opts.Auth.HasPermissionWithContext(c, resource.All, auth.ActionRead) {
+		c.ResponseErrorWithStatus(http.StatusForbidden, errors.New("没有权限"))
+		return
+	}
 	idStr := c.Param("id")
 	id, err := strconv.ParseUint(idStr, 10, 32)
 	if err != nil {
@@ -623,39 +629,56 @@ func (s *Server) slotDigestGet(c *wkhttp.Context) {
 	}
 	toIdx := committedIdx
 	if toStr := c.Query("to"); toStr != "" {
-		if parsed, err := strconv.ParseUint(toStr, 10, 64); err == nil {
-			toIdx = parsed
+		parsed, err := strconv.ParseUint(toStr, 10, 64)
+		if err != nil {
+			c.ResponseError(errors.New("invalid to parameter"))
+			return
 		}
+		toIdx = parsed
 	}
 	fromIdx := uint64(1)
 	if toIdx > 1000 {
 		fromIdx = toIdx - 999
 	}
 	if fromStr := c.Query("from"); fromStr != "" {
-		if parsed, err := strconv.ParseUint(fromStr, 10, 64); err == nil && parsed > 0 {
-			fromIdx = parsed
+		parsed, err := strconv.ParseUint(fromStr, 10, 64)
+		if err != nil || parsed == 0 {
+			c.ResponseError(errors.New("invalid from parameter"))
+			return
 		}
+		fromIdx = parsed
 	}
-	logs, err := s.slotServer.GetLogsRange(slotId, fromIdx, toIdx)
-	if err != nil {
-		c.ResponseError(err)
+	if toIdx > 0 && toIdx < fromIdx {
+		c.ResponseError(errors.New("to must be greater than or equal to from"))
+		return
+	}
+	if toIdx >= fromIdx && toIdx-fromIdx >= slot.MaxSlotLogsRangeCount {
+		c.ResponseError(slot.ErrSlotLogsRangeTooLarge)
 		return
 	}
 	h := sha256.New()
 	var buf [16]byte
-	for _, lg := range logs {
-		binary.BigEndian.PutUint64(buf[0:8], lg.Index)
-		binary.BigEndian.PutUint32(buf[8:12], lg.Term)
-		binary.BigEndian.PutUint32(buf[12:16], crc32.ChecksumIEEE(lg.Data))
-		_, _ = h.Write(buf[:])
-		_, _ = h.Write(lg.Data)
+	logCount := 0
+	if toIdx >= fromIdx {
+		logCount, err = s.slotServer.WalkLogsRange(slotId, fromIdx, toIdx, slot.MaxSlotLogsRangeCount, func(lg rafttype.Log) error {
+			binary.BigEndian.PutUint64(buf[0:8], lg.Index)
+			binary.BigEndian.PutUint32(buf[8:12], lg.Term)
+			binary.BigEndian.PutUint32(buf[12:16], crc32.ChecksumIEEE(lg.Data))
+			_, _ = h.Write(buf[:])
+			_, _ = h.Write(lg.Data)
+			return nil
+		})
+		if err != nil {
+			c.ResponseError(err)
+			return
+		}
 	}
 	c.JSON(http.StatusOK, &slotDigestResp{
 		NodeId:         s.opts.ConfigOptions.NodeId,
 		SlotId:         slotId,
 		FromIndex:      fromIdx,
 		ToIndex:        toIdx,
-		LogCount:       len(logs),
+		LogCount:       logCount,
 		AppliedIndex:   appliedIdx,
 		CommittedIndex: committedIdx,
 		LastLogIndex:   lastLog.Index,

@@ -2,6 +2,7 @@ package options
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/user"
 	"path"
@@ -1315,6 +1316,9 @@ func (o *Options) ConfigureDataDir() {
 func (o *Options) Check() error {
 	if o.Cluster.NodeId == 0 {
 		return errors.New("cluster.nodeId must be set")
+	}
+	if o.Cluster.SlotCount <= 0 || uint64(o.Cluster.SlotCount) > math.MaxUint32 {
+		return errors.New("cluster.slotCount must be in 1..4294967295")
 	}
 	if o.Db.ShardNum <= 0 {
 		return errors.New("db.shardNum must be greater than 0")

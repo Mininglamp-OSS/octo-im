@@ -33,6 +33,11 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 		}()
 	}
 
+	if wk.dblock != nil && wk.dblock.messageAppendLock != nil {
+		wk.dblock.messageAppendLock.lockByChannel(channelId, channelType)
+		defer wk.dblock.messageAppendLock.unlockByChannel(channelId, channelType)
+	}
+
 	maxMsgs := wk.opts.MaxMessagesPerBatch
 	if maxMsgs <= 0 {
 		maxMsgs = 256
@@ -40,6 +45,11 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 	maxBytes := wk.opts.MaxBatchBytes
 	if maxBytes == 0 {
 		maxBytes = 2 * 1024 * 1024
+	}
+
+	persistedLastSeq, _, err := wk.GetChannelLastMessageSeq(channelId, channelType)
+	if err != nil {
+		return err
 	}
 
 	batchDB := wk.channelBatchDb(channelId, channelType)
@@ -60,22 +70,38 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 
 		sub := msgs[start:end]
 		batch := batchDB.NewBatch()
+		maxSubSeq := persistedLastSeq
+		wroteAny := false
 		for _, msg := range sub {
+			msgSeq := uint64(msg.MessageSeq)
+			if msgSeq > 0 && msgSeq <= persistedLastSeq {
+				continue
+			}
 			if err := wk.writeMessage(channelId, channelType, msg, batch); err != nil {
 				return err
 			}
+			wroteAny = true
+			if msgSeq > maxSubSeq {
+				maxSubSeq = msgSeq
+			}
 		}
-		lastMsg := sub[len(sub)-1]
-		if err := wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch); err != nil {
-			return err
-		}
-		if err := batch.CommitWait(); err != nil {
-			return err
-		}
-		wk.channelSeqCache.setChannelLastSeq(channelId, channelType, uint64(lastMsg.MessageSeq))
-		for _, msg := range sub {
-			if msg.FromUID != "" {
-				wk.userLastMsgSeqCache.updateIfGreater(msg.FromUID, channelId, channelType, uint64(msg.MessageSeq))
+		if wroteAny {
+			if maxSubSeq > persistedLastSeq {
+				if err := wk.setChannelLastMessageSeq(channelId, channelType, maxSubSeq, batch); err != nil {
+					return err
+				}
+			}
+			if err := batch.CommitWait(); err != nil {
+				return err
+			}
+			if maxSubSeq > persistedLastSeq {
+				persistedLastSeq = maxSubSeq
+				wk.channelSeqCache.setChannelLastSeq(channelId, channelType, persistedLastSeq)
+			}
+			for _, msg := range sub {
+				if msg.FromUID != "" {
+					wk.userLastMsgSeqCache.updateIfGreater(msg.FromUID, channelId, channelType, uint64(msg.MessageSeq))
+				}
 			}
 		}
 		start = end
@@ -787,9 +813,16 @@ func (wk *wukongDB) SearchMessages(req MessageSearchReq) ([]Message, error) {
 		}
 	}
 
+	preallocCap := req.Limit
+	if preallocCap < 0 {
+		preallocCap = 0
+	} else if preallocCap > 256 {
+		preallocCap = 256
+	}
+
 	if strings.TrimSpace(req.ChannelId) != "" && req.ChannelType != 0 {
 		db := wk.channelDb(req.ChannelId, req.ChannelType)
-		msgs := make([]Message, 0, req.Limit)
+		msgs := make([]Message, 0, preallocCap)
 		fnc := iterFnc(&msgs)
 
 		startSeq := req.OffsetMessageSeq
@@ -820,7 +853,7 @@ func (wk *wukongDB) SearchMessages(req MessageSearchReq) ([]Message, error) {
 
 	}
 
-	allMsgs := make([]Message, 0, req.Limit*len(wk.dbs))
+	allMsgs := make([]Message, 0, preallocCap*len(wk.dbs))
 	for _, db := range wk.dbs {
 		msgs := make([]Message, 0)
 		fnc := iterFnc(&msgs)
@@ -1218,7 +1251,13 @@ func (wk *wukongDB) loadMsgsWithDb(db *pebble.DB, req BatchMsgRequest) ([]Messag
 	})
 	defer iter.Close()
 
-	msgs := make([]Message, 0, req.Limit)
+	preallocCap := req.Limit
+	if preallocCap < 0 {
+		preallocCap = 0
+	} else if preallocCap > 256 {
+		preallocCap = 256
+	}
+	msgs := make([]Message, 0, preallocCap)
 	err = wk.iteratorChannelMessages(iter, req.Limit, func(m Message) bool {
 		msgs = append(msgs, m)
 		return true
@@ -1481,7 +1520,7 @@ func (wk *wukongDB) parseChannelMessagesWithLimitSize(iter *pebble.Iterator, lim
 				}
 				size += msgSize
 				msgs = append(msgs, preMessage)
-				if (limitSize != 0 && size >= limitSize) || (limitSize != 0 && maxCount > 0 && len(msgs) >= maxCount) {
+				if (limitSize != 0 && size >= limitSize) || (maxCount > 0 && len(msgs) >= maxCount) {
 					lastNeedAppend = false
 					break
 				}
@@ -1528,7 +1567,7 @@ func (wk *wukongDB) parseChannelMessagesWithLimitSize(iter *pebble.Iterator, lim
 	if lastNeedAppend {
 		msgSize := uint64(preMessage.Size())
 		if len(msgs) == 0 || limitSize == 0 || size+msgSize <= limitSize {
-			if limitSize == 0 || maxCount <= 0 || len(msgs) < maxCount {
+			if maxCount <= 0 || len(msgs) < maxCount {
 				msgs = append(msgs, preMessage)
 			}
 		}

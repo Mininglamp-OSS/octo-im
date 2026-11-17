@@ -17,6 +17,7 @@ type dblock struct {
 	userLock               *userLock
 	addOrUpdateChannelLock *addOrUpdateChannelLock
 	conversationLock       *conversationLock
+	messageAppendLock      *channelClusterConfigLock
 }
 
 func newDBLock() *dblock {
@@ -29,6 +30,7 @@ func newDBLock() *dblock {
 		totalLock:              newTotalLock(),
 		addOrUpdateChannelLock: newAddOrUpdateChannelLock(),
 		conversationLock:       newConversationLock(),
+		messageAppendLock:      newChannelClusterConfigLock(),
 	}
 
 }
@@ -41,6 +43,7 @@ func (d *dblock) start() {
 	d.userLock.StartCleanLoop()
 	d.addOrUpdateChannelLock.StartCleanLoop()
 	d.conversationLock.StartCleanLoop()
+	d.messageAppendLock.StartCleanLoop()
 }
 
 func (d *dblock) stop() {
@@ -51,6 +54,7 @@ func (d *dblock) stop() {
 	d.userLock.StopCleanLoop()
 	d.addOrUpdateChannelLock.StopCleanLoop()
 	d.conversationLock.StopCleanLoop()
+	d.messageAppendLock.StopCleanLoop()
 }
 
 type channelClusterConfigLock struct {

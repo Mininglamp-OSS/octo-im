@@ -238,4 +238,3 @@ func TrustedPeerURLHeadersOnCluster(cl icluster.ICluster, rawURL string, base ma
 	}
 	return setTrustedPeerTokenHeader(headers, managerToken)
 }
-

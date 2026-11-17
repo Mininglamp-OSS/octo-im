@@ -53,23 +53,81 @@ func newChannelHandler(channelId string, channelType uint8, poller *poller) *cha
 	return uh
 }
 
-func (c *channelHandler) addEvent(event *eventbus.Event) {
+func isPersistedChannelEvent(event *eventbus.Event) bool {
+	return event != nil && (event.MessageSeq > 0 || event.Type == eventbus.EventChannelDistribute || event.Type == eventbus.EventChannelWebhook)
+}
+
+func (c *channelHandler) tryAddEvent(event *eventbus.Event) bool {
 	if event == nil {
-		return
+		return true
 	}
 	c.pending.Lock()
 	defer c.pending.Unlock()
 	if !c.pending.eventQueue.CanAppend(event) {
-		c.Warn("addEvent: channel event queue full, dropping event",
-			zap.String("channelId", c.channelId),
-			zap.Uint8("channelType", c.channelType),
-			zap.Int("queueLen", c.pending.eventQueue.Len()))
-		return
+		return false
 	}
 	event.Index = c.pending.eventQueue.LastIndex() + 1
 	c.pending.eventQueue.Append(event)
-
 	c.lastActive = fasttime.UnixTimestamp()
+	return true
+}
+
+func (c *channelHandler) tryAddBatch(events []*eventbus.Event) bool {
+	if len(events) == 0 {
+		return true
+	}
+	nonNil := 0
+	persisted := true
+	for _, ev := range events {
+		if ev == nil {
+			continue
+		}
+		nonNil++
+		if !isPersistedChannelEvent(ev) {
+			persisted = false
+		}
+	}
+	if nonNil == 0 {
+		return true
+	}
+	c.pending.Lock()
+	defer c.pending.Unlock()
+	if !c.pending.eventQueue.CanAppendCount(nonNil, persisted) {
+		return false
+	}
+	for _, ev := range events {
+		if ev == nil {
+			continue
+		}
+		ev.Index = c.pending.eventQueue.LastIndex() + 1
+		c.pending.eventQueue.Append(ev)
+	}
+	c.lastActive = fasttime.UnixTimestamp()
+	return true
+}
+
+func (c *channelHandler) addEvent(event *eventbus.Event) {
+	if event == nil {
+		return
+	}
+	if c.tryAddEvent(event) {
+		return
+	}
+	if event.MessageSeq > 0 && eventbus.EnqueuePersistedRecoveryFallback(c.channelId, c.channelType, event) {
+		c.Warn("addEvent: channel queue full, spilled persisted event into recovery manager",
+			zap.String("channelId", c.channelId),
+			zap.Uint8("channelType", c.channelType),
+			zap.Uint64("messageSeq", event.MessageSeq))
+		return
+	}
+	if event.Ticket != nil {
+		event.Ticket.Release()
+		event.Ticket = nil
+	}
+	c.Warn("addEvent: channel event queue full, dropping event",
+		zap.String("channelId", c.channelId),
+		zap.Uint8("channelType", c.channelType),
+		zap.Int("queueLen", c.pendingQueueLen()))
 }
 
 func (c *channelHandler) hasEvent() bool {
@@ -174,6 +232,10 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 					ev.ForwardDeadline = defaultDeadline
 				}
 				if nowMs >= ev.ForwardDeadline {
+					if ev.Ticket != nil {
+						ev.Ticket.Release()
+						ev.Ticket = nil
+					}
 					forward.Fail([]*eventbus.Event{ev}, forward.ErrUnavailable)
 					continue
 				}
@@ -185,8 +247,22 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 					maxDeferredHops = ev.ForwardHops
 				}
 			}
-			c.addEvent(ev)
-			requeued = true
+			if c.tryAddEvent(ev) {
+				requeued = true
+				continue
+			}
+			if ev.MessageSeq > 0 && eventbus.EnqueuePersistedRecoveryFallback(c.channelId, c.channelType, ev) {
+				c.Warn("advanceEvents: channel queue full during leader-0 defer, routed persisted event to recovery manager",
+					zap.String("channelId", c.channelId),
+					zap.Uint8("channelType", c.channelType),
+					zap.Uint64("messageSeq", ev.MessageSeq))
+				continue
+			}
+			if ev.Ticket != nil {
+				ev.Ticket.Release()
+				ev.Ticket = nil
+			}
+			forward.Fail([]*eventbus.Event{ev}, forward.ErrUnavailable)
 		}
 		if requeued {
 			if c.leaderRetryScheduled.CompareAndSwap(false, true) {
@@ -220,25 +296,34 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 
 // checkAndUpdateLeaderIdChange 检查并更新leaderId变化
 func (c *channelHandler) checkAndUpdateLeaderIdChange() error {
+	var notifyWakeup bool
 	c.pending.Lock()
-	defer c.pending.Unlock()
+	prevLeader := c.slotLeaderId
 	cl := service.Cluster
 	if c.poller != nil && c.poller.eventPool != nil {
 		cl = c.poller.eventPool.cluster()
 	}
 	if cl == nil {
+		c.pending.Unlock()
 		return errors.New("checkAndUpdateLeaderIdChange: cluster is nil")
 	}
 	slotLeaderId, err := cl.SlotLeaderIdOfChannel(c.channelId, c.channelType)
 	if err != nil {
+		c.pending.Unlock()
 		c.Error("checkLeaderIdChange: get leader id failed", zap.Error(err), zap.String("channelId", c.channelId), zap.Uint8("channelType", c.channelType))
 		return err
 	}
 	if slotLeaderId == 0 {
+		c.pending.Unlock()
 		c.Warn("checkLeaderIdChange: leader id is 0", zap.String("channelId", c.channelId), zap.Uint8("channelType", c.channelType))
 		return errors.New("checkAndUpdateLeaderIdChange： leader id is 0")
 	}
 	c.slotLeaderId = slotLeaderId
+	notifyWakeup = prevLeader != slotLeaderId
+	c.pending.Unlock()
+	if notifyWakeup && c.poller != nil && c.poller.eventPool != nil {
+		c.poller.eventPool.notifyLeaderWakeup()
+	}
 	return nil
 }
 

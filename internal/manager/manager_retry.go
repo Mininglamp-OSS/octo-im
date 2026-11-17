@@ -55,19 +55,36 @@ func (r *RetryManager) RetryMessageCount() int {
 	return count
 }
 
+func (r *RetryManager) queueIndex(messageId int64) int {
+	n := len(r.retryQueues)
+	if n == 0 {
+		return 0
+	}
+	return int(uint64(messageId) % uint64(n))
+}
+
 func (r *RetryManager) AddRetry(msg *types.RetryMessage) {
-	index := msg.MessageId % int64(len(r.retryQueues))
+	if msg == nil || msg.MessageId <= 0 || len(r.retryQueues) == 0 {
+		return
+	}
+	index := r.queueIndex(msg.MessageId)
 	r.retryQueues[index].startInFlightTimeout(msg)
 }
 
 func (r *RetryManager) RemoveRetry(conn *eventbus.Conn, messageId int64) error {
-	index := messageId % int64(len(r.retryQueues))
+	if messageId <= 0 || len(r.retryQueues) == 0 {
+		return nil
+	}
+	index := r.queueIndex(messageId)
 	return r.retryQueues[index].finishMessage(conn, messageId)
 }
 
 // 获取重试消息
 func (r *RetryManager) RetryMessage(conn *eventbus.Conn, messageId int64) *types.RetryMessage {
-	index := messageId % int64(len(r.retryQueues))
+	if messageId <= 0 || len(r.retryQueues) == 0 {
+		return nil
+	}
+	index := r.queueIndex(messageId)
 
 	return r.retryQueues[index].getInFlightMessage(conn, messageId)
 }

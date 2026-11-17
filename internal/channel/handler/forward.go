@@ -15,11 +15,27 @@ func (h *Handler) SetForwardRoutes() {
 	if cl == nil {
 		return
 	}
+	forward.RegisterCapabilityRouteOn(cl)
 	cl.Route(forward.ChannelPath, func(c *wkserver.Context) { c.WriteStatus(h.acceptForward(c.Body())) })
 }
 
 func (h *Handler) AcceptForward(data []byte) proto.Status {
 	return h.acceptForward(data)
+}
+
+func isDurableForwardEvent(e *eventbus.Event) bool {
+	if e == nil {
+		return false
+	}
+	if e.MessageSeq > 0 {
+		return true
+	}
+	if e.Type == eventbus.EventChannelOnSend {
+		if sp, ok := e.Frame.(*wkproto.SendPacket); ok && sp != nil && !sp.NoPersist {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) acceptForward(data []byte) proto.Status {
@@ -33,7 +49,7 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 	}
 	eventType := req.events[0].Type
 	for _, e := range req.events {
-		if e.Type != eventType || !validChannelForwardEvent(e) {
+		if e == nil || e.Type != eventType || !validChannelForwardEvent(e) {
 			return forward.StatusInvalid
 		}
 		if !h.notForwardToLeader(e.Type) || (e.Type == eventbus.EventChannelDistribute && strings.TrimSpace(e.TagKey) == "") {
@@ -51,15 +67,73 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 	if chBus == nil {
 		return forward.StatusRetry
 	}
+
+	var durableIdx []int
+	var durableEvs []*eventbus.Event
+	var transientIdx []int
+	var transientEvs []*eventbus.Event
+	for i, e := range req.events {
+		if isDurableForwardEvent(e) {
+			durableIdx = append(durableIdx, i)
+			durableEvs = append(durableEvs, e)
+		} else {
+			transientIdx = append(transientIdx, i)
+			transientEvs = append(transientEvs, e)
+		}
+	}
+
+	var durableTickets []*eventbus.PostCommitTicket
+	if len(durableEvs) > 0 {
+		var ok bool
+		durableTickets, ok = h.postCommitBudget().TryReserve(req.channelId, durableEvs)
+		if !ok {
+			return forward.StatusRetry
+		}
+	}
+	var transientTickets []*eventbus.PostCommitTicket
+	if len(transientEvs) > 0 {
+		var ok bool
+		transientTickets, ok = h.transientBudget().TryReserve(req.channelId, transientEvs)
+		if !ok {
+			for _, tk := range durableTickets {
+				tk.Release()
+			}
+			return forward.StatusRetry
+		}
+	}
+
+	for i, idx := range durableIdx {
+		req.events[idx].Ticket = durableTickets[i]
+	}
+	for i, idx := range transientIdx {
+		req.events[idx].Ticket = transientTickets[i]
+	}
+
 	for _, e := range req.events {
 		e.ForwardDeadline, e.ForwardHops = deadline, hops
 		if req.fromNode != 0 && e.Type == eventbus.EventChannelOnSend && e.MessageSeq > 0 {
-			// The persisting ingress node already ran node-local PluginPersistAfter and EventChannelWebhook;
-			// record that fact on the receiving slot leader so cross-node retries across leadership handoffs
-			// never duplicate plugin/webhook side effects.
-			_ = h.recordPluginWebhookSideEffect(req.channelId, req.channelType, e.MessageSeq)
+			if !e.PluginDone && !e.WebhookDone {
+				// BaseV1 / pre-PartA sender ran local side effects before forwarding without explicit wire flags.
+				e.PluginDone = true
+				e.WebhookDone = true
+			}
+			if e.PluginDone {
+				_ = h.recordPluginSideEffect(req.channelId, req.channelType, e.MessageSeq)
+			}
+			if e.WebhookDone {
+				_ = h.recordWebhookSideEffect(req.channelId, req.channelType, e.MessageSeq)
+			}
 		}
-		chBus.AddEvent(req.channelId, req.channelType, e)
+	}
+
+	if !h.tryAddBatchToChannelBus(req.channelId, req.channelType, req.events) {
+		for _, e := range req.events {
+			if e != nil && e.Ticket != nil {
+				e.Ticket.Release()
+				e.Ticket = nil
+			}
+		}
+		return forward.StatusRetry
 	}
 	chBus.Advance(req.channelId, req.channelType)
 	return proto.StatusOK

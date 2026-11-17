@@ -44,20 +44,30 @@ func (s *Server) needJoin() (bool, error) {
 		return false, nil
 	}
 	seedNodeId, _, err := seedNode(s.opts.Seed)
+	if err != nil {
+		return false, err
+	}
 	seedNode := s.cfgServer.Node(seedNodeId)
-	return seedNode == nil, err
+	return seedNode == nil, nil
 }
 
 func seedNode(seed string) (uint64, string, error) {
-	seedArray := strings.Split(seed, "@")
-	if len(seedArray) < 2 {
+	trimmed := strings.TrimSpace(seed)
+	seedArray := strings.Split(trimmed, "@")
+	if len(seedArray) != 2 {
 		return 0, "", errors.New("seed format error")
 	}
-	seedNodeIDStr := seedArray[0]
-	seedAddr := seedArray[1]
+	seedNodeIDStr := strings.TrimSpace(seedArray[0])
+	seedAddr := strings.TrimSpace(seedArray[1])
+	if seedNodeIDStr == "" || seedAddr == "" {
+		return 0, "", errors.New("seed format error")
+	}
 	seedNodeID, err := strconv.ParseUint(seedNodeIDStr, 10, 64)
-	if err != nil {
-		return 0, "", err
+	if err != nil || seedNodeID == 0 {
+		if err != nil {
+			return 0, "", err
+		}
+		return 0, "", errors.New("seed node id must be greater than 0")
 	}
 	return seedNodeID, seedAddr, nil
 }

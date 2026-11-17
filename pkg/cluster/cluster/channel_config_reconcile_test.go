@@ -263,4 +263,3 @@ func TestQAReturn_MultiBatchMigrationDeferAndReleaseConvergesWithout30sWait(t *t
 	}, 2*time.Second, 10*time.Millisecond)
 	require.Less(t, time.Since(start), 2*time.Second)
 }
-

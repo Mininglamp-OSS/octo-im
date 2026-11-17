@@ -844,7 +844,7 @@ func TestBase21cd8f88_RedProof_P2_H3_StaleStoreRespAdvancesStoredIndexPastTrunca
 	n.BecomeFollower(2, 1)
 	_ = n.Step(types.Event{
 		Type: types.SyncResp, From: 1, To: 2, Term: 2, Index: 3,
-		Logs: []types.Log{{Index: 3, Term: 2, Data: []byte("m3")}, {Index: 4, Term: 2, Data: []byte("m4")}},
+		Logs:   []types.Log{{Index: 3, Term: 2, Data: []byte("m3")}, {Index: 4, Term: 2, Data: []byte("m4")}},
 		Reason: types.ReasonOk,
 	})
 	_ = n.Ready() // starts in-flight StoreReq up to index 4

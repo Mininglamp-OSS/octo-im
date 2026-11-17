@@ -72,7 +72,19 @@ type Server struct {
 
 	channelKeyLock *keylock.KeyLock // 频道锁
 
+	configListenersMu sync.RWMutex
+	configListeners   []func()
+
 	sync.Mutex
+}
+
+func (s *Server) AddConfigChangeListener(fn func()) {
+	if s == nil || fn == nil {
+		return
+	}
+	s.configListenersMu.Lock()
+	s.configListeners = append(s.configListeners, fn)
+	s.configListenersMu.Unlock()
 }
 
 func New(opts *Options) *Server {
@@ -194,6 +206,11 @@ func New(opts *Options) *Server {
 }
 
 func (s *Server) Start() error {
+	if strings.TrimSpace(s.opts.Seed) != "" {
+		if _, _, err := seedNode(s.opts.Seed); err != nil {
+			return err
+		}
+	}
 
 	s.channelKeyLock.StartCleanLoop()
 
@@ -248,17 +265,13 @@ func (s *Server) Start() error {
 		s.addOrUpdateNodes(nodeMap)
 	}
 
-	// 如果有种子节点，但节点连接不存在，则建立连接
+	// 配置中的种子节点地址作为权威入口地址：节点不存在或地址已变更时同步更新连接
 	if strings.TrimSpace(s.opts.Seed) != "" {
-		nodeMap := make(map[uint64]string)
 		seedNodeId, addr, err := seedNode(s.opts.Seed)
 		if err != nil {
 			return err
 		}
-		if !s.nodeManager.exist(seedNodeId) {
-			nodeMap[seedNodeId] = addr
-			s.addOrUpdateNodes(nodeMap)
-		}
+		s.addOrUpdateNodes(map[uint64]string{seedNodeId: addr})
 	}
 
 	// 如果有新加入的节点 则执行加入逻辑
@@ -285,6 +298,10 @@ func (s *Server) Stop() {
 	s.cancelFnc()
 	s.store.Stop()
 	s.db.Close()
+	if s.blockCache != nil {
+		s.blockCache.Unref()
+		s.blockCache = nil
+	}
 	s.channelKeyLock.StopCleanLoop()
 }
 
@@ -323,6 +340,15 @@ func (s *Server) OnConfigChange(cfg *types.Config) {
 		nodeMap[node.Id] = node.ClusterAddr
 	}
 	s.addOrUpdateNodes(nodeMap)
+
+	s.configListenersMu.RLock()
+	listeners := append([]func(){}, s.configListeners...)
+	s.configListenersMu.RUnlock()
+	for _, fn := range listeners {
+		if fn != nil {
+			fn()
+		}
+	}
 }
 
 func (s *Server) slotApplyLogs(slotId uint32, logs []rafttype.Log) error {

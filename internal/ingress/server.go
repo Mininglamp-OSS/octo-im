@@ -112,26 +112,35 @@ func (i *Ingress) handlePersistAfter(c *wkserver.Context) {
 	}
 
 	// 在领导节点上执行插件调用
-	i.executePluginPersistAfter(req.ChannelId, req.ChannelType, msgBatch)
+	if err := i.executePluginPersistAfter(req.ChannelId, req.ChannelType, msgBatch); err != nil {
+		c.WriteErr(err)
+		return
+	}
 	c.WriteOk()
 }
 
 // executePluginPersistAfter 在本地执行插件PersistAfter调用
-func (i *Ingress) executePluginPersistAfter(channelId string, channelType uint8, msgBatch *pluginproto.MessageBatch) {
+func (i *Ingress) executePluginPersistAfter(channelId string, channelType uint8, msgBatch *pluginproto.MessageBatch) error {
+	if service.PluginManager == nil {
+		return nil
+	}
 	plugins := service.PluginManager.Plugins(types.PluginPersistAfter)
 	if len(plugins) == 0 {
-		return
+		return nil
 	}
 
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), options.G.Channel.ProcessTimeout)
 	defer cancel()
 
+	var errs []error
 	for _, pg := range plugins {
 		err := pg.PersistAfter(timeoutCtx, msgBatch)
 		if err != nil {
 			i.Error("plugin persist after error", zap.Error(err), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
+			errs = append(errs, err)
 		}
 	}
+	return errors.Join(errs...)
 }
 
 func (i *Ingress) handleGetTag(c *wkserver.Context) {
@@ -421,4 +430,3 @@ func (i *Ingress) handleGetSubscribers(c *wkserver.Context) {
 	}
 	c.Write(data)
 }
-

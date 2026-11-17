@@ -30,8 +30,9 @@ type PebbleShardLogStorage struct {
 	noSync   *pebble.WriteOptions
 	wklog.Log
 
-	stopper syncutil.Stopper
-	s       *Server
+	stopper     *syncutil.Stopper
+	lifecycleMu sync.Mutex
+	s           *Server
 
 	// slotLocks serializes operations for the same raft slot without coupling
 	// unrelated slots that happen to share one physical Pebble DB shard.
@@ -107,7 +108,7 @@ func NewPebbleShardLogStorage(s *Server, path string, shardNum uint32) *PebbleSh
 			Sync: false,
 		},
 		Log:     wklog.NewWKLog(fmt.Sprintf("PebbleShardLogStorage[%s]", path)),
-		stopper: *syncutil.NewStopper(),
+		stopper: syncutil.NewStopper(),
 		s:       s,
 	}
 }
@@ -154,10 +155,18 @@ func (p *PebbleShardLogStorage) defaultPebbleOptions() *pebble.Options {
 }
 
 func (p *PebbleShardLogStorage) Open() error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+
+	if len(p.dbs) > 0 || len(p.batchDbs) > 0 {
+		p.closeResourcesLocked()
+	}
+
 	if err := wkdb.ValidatePebbleShardDir(p.path, int(p.shardNum)); err != nil {
 		return err
 	}
 
+	p.stopper = syncutil.NewStopper()
 	p.dbs = nil
 	p.batchDbs = nil
 
@@ -173,12 +182,7 @@ func (p *PebbleShardLogStorage) Open() error {
 		opts.EventListener = &listener
 		db, err := pebble.Open(fmt.Sprintf("%s/shard%03d", p.path, i), opts)
 		if err != nil {
-			for _, bdb := range p.batchDbs {
-				bdb.Stop()
-			}
-			for _, openDB := range p.dbs {
-				_ = openDB.Close()
-			}
+			p.closeResourcesLocked()
 			return err
 		}
 		p.dbs = append(p.dbs, db)
@@ -191,18 +195,32 @@ func (p *PebbleShardLogStorage) Open() error {
 	return nil
 }
 
-func (p *PebbleShardLogStorage) Close() error {
+func (p *PebbleShardLogStorage) closeResourcesLocked() {
 	for _, db := range p.batchDbs {
-		db.Stop()
-	}
-	for _, db := range p.dbs {
-		if err := db.Close(); err != nil {
-			p.Error("close db error", zap.Error(err))
+		if db != nil {
+			db.Stop()
 		}
 	}
+	for _, db := range p.dbs {
+		if db != nil {
+			if err := db.Close(); err != nil {
+				p.Error("close db error", zap.Error(err))
+			}
+		}
+	}
+	p.batchDbs = nil
+	p.dbs = nil
+	if p.stopper != nil {
+		p.stopper.Stop()
+		p.stopper = nil
+	}
+}
 
-	p.stopper.Stop()
+func (p *PebbleShardLogStorage) Close() error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 
+	p.closeResourcesLocked()
 	return nil
 }
 
@@ -469,7 +487,7 @@ func (p *PebbleShardLogStorage) GetLogs(shardNo string, startLogIndex uint64, en
 		}
 		logs = append(logs, log)
 		size += logSize
-		if (limitSize != 0 && size >= limitSize) || (limitSize != 0 && maxCount > 0 && uint64(len(logs)) >= maxCount) {
+		if (limitSize != 0 && size >= limitSize) || (maxCount > 0 && uint64(len(logs)) >= maxCount) {
 			break
 		}
 	}

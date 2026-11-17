@@ -49,14 +49,14 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		var ok bool
 		release, ok = rg.tryAcquireGetLogs(r.Key(), rg.opts.MaxLogSizePerBatch)
 		if !ok {
-			// Fair backpressure: return an empty response without blocking the event loop
-			// so realtime proposals and heartbeats remain unaffected.
+			// Fair backpressure: return a retryable error without blocking the event loop
+			// so realtime proposals and heartbeats remain unaffected and the lagging replica retries sync.
 			rg.AddEventFor(r, types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
 				Term:   e.Term,
 				Index:  e.Index,
-				Reason: types.ReasonOk,
+				Reason: types.ReasonError,
 			})
 			return
 		}
@@ -91,7 +91,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 				Type:   types.GetLogsResp,
 				Term:   e.Term,
 				Index:  e.Index,
-				Reason: types.ReasonOk,
+				Reason: types.ReasonError,
 			})
 			return
 		}

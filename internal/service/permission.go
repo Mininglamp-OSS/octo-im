@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -343,6 +344,15 @@ func isLegacyAllowSendDecodeError(body []byte) bool {
 		strings.Contains(msg, "EOF")
 }
 
+func exceedsWireStringLimit(vals ...string) bool {
+	for _, v := range vals {
+		if len(v) > math.MaxInt16 {
+			return true
+		}
+	}
+	return false
+}
+
 // CheckOrProbeLegacyPeer returns true when nodeId is a legacy 21cd8f88 node that does not
 // implement the extended channel permission / pre-persisted event protocol.
 func (p *PermissionService) CheckOrProbeLegacyPeer(nodeId uint64, channelId string, channelType uint8) bool {
@@ -357,6 +367,9 @@ func (p *PermissionService) CheckOrProbeLegacyPeer(nodeId uint64, channelId stri
 		return false
 	}
 	realFakeChannelId := normalizePermissionChannelId(channelId)
+	if exceedsWireStringLimit(realFakeChannelId) {
+		return false
+	}
 	enc := wkproto.NewEncoder()
 	defer enc.End()
 	enc.WriteBytes([]byte{0xff, 0xff, 1})
@@ -474,6 +487,9 @@ func (p *PermissionService) requestChannelPermissionFromNode(toNodeId uint64, ch
 		return wkproto.ReasonSystemError, errors.New("cluster not initialized")
 	}
 	realFakeChannelId := normalizePermissionChannelId(channelId)
+	if exceedsWireStringLimit(realFakeChannelId) {
+		return wkproto.ReasonSystemError, errors.New("channel_id exceeds wire framing limit")
+	}
 
 	if !p.IsLegacyPeer(toNodeId) {
 		probeEnc := wkproto.NewEncoder()
@@ -626,6 +642,9 @@ func (p *PermissionService) requestCommChannelPermissionFromNode(toNodeId uint64
 		return wkproto.ReasonSystemError, errors.New("cluster not initialized")
 	}
 	realFakeChannelId := normalizePermissionChannelId(channelId)
+	if exceedsWireStringLimit(realFakeChannelId, sender.UID, sender.DeviceID) {
+		return wkproto.ReasonSystemError, errors.New("identifier exceeds wire framing limit")
+	}
 
 	if !p.IsLegacyPeer(toNodeId) {
 		enc := wkproto.NewEncoder()

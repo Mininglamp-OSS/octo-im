@@ -19,12 +19,12 @@ import (
 )
 
 type Raft struct {
-	stopper   *syncutil.Stopper
-	opts      *Options
-	node      *Node
-	execMu    sync.Mutex
-	advanceC  chan struct{}
-	stepC     chan stepReq
+	stopper  *syncutil.Stopper
+	opts     *Options
+	node     *Node
+	execMu   sync.Mutex
+	advanceC chan struct{}
+	stepC    chan stepReq
 	wklog.Log
 	pause     atomic.Bool // 是否暂停
 	pauseCond *sync.Cond

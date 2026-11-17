@@ -963,6 +963,7 @@ func TestRound3_BFR3_3_RemoteSlotPermissionWireDuplicateAndForwardGate(t *testin
 	}
 	opts.Poller.ChannelGoroutine = 4 // forwardGate limit = 1
 	chHandler := handler.NewHandler()
+	t.Cleanup(func() { chHandler.Stop() })
 	chHandler.OnEvent(&eventbus.ChannelContext{
 		ChannelId:    "g_persisted_gate",
 		ChannelType:  wkproto.ChannelTypeGroup,
@@ -1214,6 +1215,7 @@ func TestRound4_BFR4_1_MixedVersion21cd8f88AndAmbiguousForwardDedupAndForwardGat
 	// Forwarding an already-persisted EventChannelOnSend (MessageSeq > 0) to a legacy 21cd8f88 slot leader
 	// must convert the wire event to EventChannelDistribute so the 21cd8f88 slot leader never re-runs AppendMessages.
 	chHandler := handler.NewHandler()
+	t.Cleanup(func() { chHandler.Stop() })
 	chHandler.OnEvent(&eventbus.ChannelContext{
 		ChannelId:    "g_legacy_21cd8f88",
 		ChannelType:  wkproto.ChannelTypeGroup,
@@ -1244,6 +1246,7 @@ func TestRound4_BFR4_1_MixedVersion21cd8f88AndAmbiguousForwardDedupAndForwardGat
 		},
 	}
 	leaderHandler := handler.NewHandler()
+	t.Cleanup(func() { leaderHandler.Stop() })
 	leaderHandler.BindNode(1002, leaderBus)
 
 	persistedEv1 := &eventbus.Event{
@@ -1453,7 +1456,7 @@ func TestRound5_BFR5_1_2_PostCommitRetention_PerChannelWatermarkDedup_LegacyAuth
 
 	// 2. BF-R5-1a: Failed legacy forward followed by leadership transition to local node must NOT suppress EventChannelDistribute
 	var distributedSeq42 atomic.Int32
-	var requeuedEvents []*eventbus.Event
+	var requeuedOnSend atomic.Int32
 	captureBus := &r3CaptureChannelBus{
 		onAdd: func(channelId string, channelType uint8, ev *eventbus.Event) {
 			if ev == nil {
@@ -1463,11 +1466,12 @@ func TestRound5_BFR5_1_2_PostCommitRetention_PerChannelWatermarkDedup_LegacyAuth
 				distributedSeq42.Add(1)
 			}
 			if ev.Type == eventbus.EventChannelOnSend && ev.MessageSeq == 42 {
-				requeuedEvents = append(requeuedEvents, ev.Clone())
+				requeuedOnSend.Add(1)
 			}
 		},
 	}
 	h := handler.NewHandler()
+	t.Cleanup(func() { h.Stop() })
 	h.BindNode(1001, captureBus)
 
 	failForwardRPC.Store(true)
@@ -1479,7 +1483,7 @@ func TestRound5_BFR5_1_2_PostCommitRetention_PerChannelWatermarkDedup_LegacyAuth
 		MessageSeq: 42,
 		ReasonCode: wkproto.ReasonSuccess,
 	}
-	// First attempt: SlotLeaderId is legacy node 1002, forward fails:
+	// First attempt: SlotLeaderId is legacy node 1002, forward fails and is retained in RecoveryManager (never requeued onto chBus per BF-R7-1b):
 	h.OnEvent(&eventbus.ChannelContext{
 		ChannelId:    "g_legacy_acl",
 		ChannelType:  wkproto.ChannelTypeGroup,
@@ -1488,17 +1492,20 @@ func TestRound5_BFR5_1_2_PostCommitRetention_PerChannelWatermarkDedup_LegacyAuth
 		Events:       []*eventbus.Event{ev42.Clone()},
 	})
 	require.Equal(t, int32(0), distributedSeq42.Load(), "failed legacy forward must not count as distributed")
-	require.Len(t, requeuedEvents, 1, "failed legacy forward must requeue the persisted EventChannelOnSend")
-	retryEv := requeuedEvents[0]
+	require.Equal(t, int32(0), requeuedOnSend.Load(), "failed forward must not blindly requeue onto chBus (BF-R7-1b)")
+	recCh, recInMem, _, _ := h.InspectRecoveryQueue()
+	require.Equal(t, 1, recCh)
+	require.Equal(t, 1, recInMem, "failed forward must be retained in RecoveryManager")
+	h.Stop()
 
-	// Slot leadership transitions to local node 1001; retryEv is processed locally:
+	// Slot leadership transitions to local node 1001; EventChannelDistribute must NOT be suppressed:
 	currentLeader.Store(1001)
 	h.OnEvent(&eventbus.ChannelContext{
 		ChannelId:    "g_legacy_acl",
 		ChannelType:  wkproto.ChannelTypeGroup,
 		EventType:    eventbus.EventChannelOnSend,
 		SlotLeaderId: 1001,
-		Events:       []*eventbus.Event{retryEv},
+		Events:       []*eventbus.Event{ev42.Clone()},
 	})
 	require.Equal(t, int32(1), distributedSeq42.Load(), "EventChannelDistribute must execute after failed legacy forward when leadership moves to upgraded node")
 
@@ -1512,6 +1519,7 @@ func TestRound5_BFR5_1_2_PostCommitRetention_PerChannelWatermarkDedup_LegacyAuth
 		},
 	}
 	dedupHandler := handler.NewHandler()
+	t.Cleanup(func() { dedupHandler.Stop() })
 	dedupHandler.BindNode(1001, dedupBus)
 
 	batch := make([]*eventbus.Event, 0, 1000)
@@ -1966,10 +1974,11 @@ func TestRound6_BFR6_1_NonOneStartWatermarkAndBoundedForwardRecoveryAndCrossNode
 		Events:       failBatch,
 	})
 
-	chCount, inMem, compacted, _ := recHandler.InspectRecoveryQueue()
+	chCount, inMem, compacted, dormant := recHandler.InspectRecoveryQueue()
 	require.Equal(t, 1, chCount)
-	require.Equal(t, 64, inMem, "per-channel in-memory recovery events must be bounded at 64")
-	require.Equal(t, totalRecoverMsgs-64, compacted, "overflow persisted events must be compacted into [minSeq, maxSeq] range without dropping")
+	require.Equal(t, totalRecoverMsgs, inMem, "ticket-bounded Part A RecoveryManager retains all 120 events in memory without lossy numeric range compaction")
+	require.Equal(t, 0, compacted, "Part A removes [minCompactedSeq, maxCompactedSeq] / st.LoadMsg range scans (BF-R7-1c)")
+	require.Equal(t, 0, dormant, "Part A removes dead-end dormant flag in favor of CooldownProbe (BF-R7-1d)")
 	require.Equal(t, int64(totalRecoverMsgs), pluginRec.calls.Load(), "PluginPersistAfter must execute once per persisted message")
 	require.Equal(t, int32(totalRecoverMsgs), webhookCount.Load(), "EventChannelWebhook must execute once per persisted message")
 
@@ -1981,6 +1990,7 @@ func TestRound6_BFR6_1_NonOneStartWatermarkAndBoundedForwardRecoveryAndCrossNode
 	}, 3*time.Second, 20*time.Millisecond, "all 120 persisted messages (including compacted store-reloaded range) must be recovered on slot leader")
 	require.Equal(t, int64(totalRecoverMsgs), pluginRec.calls.Load(), "recovery replay must NOT duplicate PluginPersistAfter")
 	require.Equal(t, int32(totalRecoverMsgs), webhookCount.Load(), "recovery replay must NOT duplicate EventChannelWebhook")
+	recHandler.Stop()
 
 	// 3. BF-R6-1c: Cross-node ErrOutcomeUnknown followed by slot-leader handoff (1002 -> 1003)
 	//    must produce zero duplicate push, unread/conversation, plugin, or webhook side effects.
