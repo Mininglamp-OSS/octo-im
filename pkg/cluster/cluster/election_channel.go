@@ -49,6 +49,9 @@ func (s *Server) getOrCreateChannelClusterConfigAttempt(ctx context.Context, cha
 		s.Error("not slot leader", zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
 		return wkdb.EmptyChannelClusterConfig, errors.New("not slot leader")
 	}
+	if err := s.waitLocalSlotApplied(ctx, s.getSlotId(channelId)); err != nil {
+		return wkdb.EmptyChannelClusterConfig, err
+	}
 
 	cfg, err := s.db.GetChannelClusterConfig(channelId, channelType)
 	if err != nil && err != wkdb.ErrNotFound {
@@ -67,6 +70,9 @@ func (s *Server) getOrCreateChannelClusterConfigAttempt(ctx context.Context, cha
 			return wkdb.EmptyChannelClusterConfig, err
 		}
 		cfg.ConfVersion = version
+		if cfg.LeaderId == s.opts.ConfigOptions.NodeId && s.channelServer != nil {
+			_, _ = s.reconcileLocalChannelConfig(ctx, cfg)
+		}
 		return cfg, nil
 	}
 
@@ -97,13 +103,43 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 		return current, err
 	}
 	cfg.ConfVersion = version
+	if cfg.LeaderId == s.opts.ConfigOptions.NodeId && s.channelServer != nil {
+		_, _ = s.reconcileLocalChannelConfig(ctx, cfg)
+	}
 	return cfg, nil
+}
+
+func (s *Server) hasPendingSlotLearner(nodeId uint64) bool {
+	if s.cfgServer == nil {
+		return false
+	}
+	for _, st := range s.cfgServer.Slots() {
+		if wkutil.ArrayContainsUint64(st.Learners, nodeId) {
+			return true
+		}
+	}
+	return false
 }
 
 // 视情况是否需要加入新的副本
 func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, error) {
 	if len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
 		return false, nil
+	}
+	// If an active learner migration target went offline, cancel the stuck
+	// migration so the channel is not permanently blocked.
+	if s.cfgServer != nil && cfg.MigrateTo != 0 && !s.cfgServer.NodeIsOnline(cfg.MigrateTo) {
+		if wkutil.ArrayContainsUint64(cfg.Learners, cfg.MigrateTo) {
+			cfg.Learners = wkutil.RemoveUint64(cfg.Learners, cfg.MigrateTo)
+			cfg.MigrateFrom = 0
+			cfg.MigrateTo = 0
+			return true, nil
+		}
+		if cfg.MigrateFrom == cfg.LeaderId && wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo) {
+			cfg.MigrateFrom = 0
+			cfg.MigrateTo = 0
+			return true, nil
+		}
 	}
 	// An interrupted expansion can leave equal, nonzero migration endpoints
 	// after its learner disappeared. If the target is not a replica either,
@@ -113,6 +149,9 @@ func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, err
 	orphanedExpansion := len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 &&
 		cfg.MigrateFrom == cfg.MigrateTo && !wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo)
 	if len(cfg.Learners) > 0 || (cfg.MigrateFrom != 0 || cfg.MigrateTo != 0) && !orphanedExpansion {
+		return false, nil
+	}
+	if s.cfgServer == nil {
 		return false, nil
 	}
 	allowVoteNodes := s.cfgServer.AllowVoteAndJoinedOnlineNodes()
@@ -126,9 +165,15 @@ func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, err
 
 	newReplicaIds := make([]uint64, 0, len(allowVoteNodes)-len(cfg.Replicas))
 	for _, node := range allowVoteNodes {
-		if !wkutil.ArrayContainsUint64(cfg.Replicas, node.Id) {
+		if !wkutil.ArrayContainsUint64(cfg.Replicas, node.Id) && !s.hasPendingSlotLearner(node.Id) {
 			newReplicaIds = append(newReplicaIds, node.Id)
 		}
+	}
+	if len(newReplicaIds) == 0 {
+		return false, nil
+	}
+	if s.configReconciler != nil && !s.configReconciler.tryAcquireMigration(channelConfigKey{id: cfg.ChannelId, typ: cfg.ChannelType}) {
+		return false, nil
 	}
 	// 打乱顺序，防止每次都是相同的节点加入
 	rand.Shuffle(len(newReplicaIds), func(i, j int) {

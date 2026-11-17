@@ -34,7 +34,7 @@ func (wk *wukongDB) AddDenylist(channelId string, channelType uint8, members []M
 		return err
 
 	}
-	err = w.Commit(wk.sync)
+	err = wk.commitBatch(db, w, wk.sync)
 	if err != nil {
 		return err
 	}
@@ -131,7 +131,7 @@ func (wk *wukongDB) RemoveDenylist(channelId string, channelType uint8, uids []s
 		return err
 	}
 
-	err = w.Commit(wk.sync)
+	err = wk.commitBatch(db, w, wk.sync)
 	if err != nil {
 		return err
 	}
@@ -175,7 +175,7 @@ func (wk *wukongDB) RemoveAllDenylist(channelId string, channelType uint8) error
 
 	}
 
-	err = batch.Commit(wk.sync)
+	err = wk.commitBatch(db, batch, wk.sync)
 	if err != nil {
 		return err
 	}

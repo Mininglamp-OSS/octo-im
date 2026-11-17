@@ -1,5 +1,7 @@
 package eventbus
 
+import "context"
+
 func RegisterChannel(channel IChannel) {
 	Channel = newChannelPlus(channel)
 }
@@ -13,6 +15,10 @@ type IChannel interface {
 	Advance(channelId string, channelType uint8)
 }
 
+type channelCapacityWaiter interface {
+	WaitCapacity(ctx context.Context, channelId string, channelType uint8, batchSize int) error
+}
+
 type channelPlus struct {
 	channel IChannel
 }
@@ -21,6 +27,16 @@ func newChannelPlus(channel IChannel) *channelPlus {
 	return &channelPlus{
 		channel: channel,
 	}
+}
+
+func (c *channelPlus) WaitCapacity(ctx context.Context, channelId string, channelType uint8, batchSize int) error {
+	if c == nil || c.channel == nil {
+		return nil
+	}
+	if w, ok := c.channel.(channelCapacityWaiter); ok && w != nil {
+		return w.WaitCapacity(ctx, channelId, channelType, batchSize)
+	}
+	return nil
 }
 
 // AddEvent 添加事件

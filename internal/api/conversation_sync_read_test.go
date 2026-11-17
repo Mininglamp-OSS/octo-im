@@ -41,6 +41,13 @@ func (c *recentReadCluster) ValidateLocalChannelRead(ctx context.Context, cfg wk
 	return ctx.Err()
 }
 func (c *recentReadCluster) NodeInfoById(id uint64) *clustertypes.Node { return c.nodes[id] }
+func (c *recentReadCluster) Nodes() []*clustertypes.Node {
+	res := make([]*clustertypes.Node, 0, len(c.nodes))
+	for _, n := range c.nodes {
+		res = append(res, n)
+	}
+	return res
+}
 func (c *recentReadCluster) SlotLeaderOfChannel(string, uint8) (*clustertypes.Node, error) {
 	return &clustertypes.Node{Id: 1}, nil
 }

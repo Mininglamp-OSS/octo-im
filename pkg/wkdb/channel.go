@@ -30,7 +30,8 @@ func (wk *wukongDB) AddChannel(channelInfo ChannelInfo) (uint64, error) {
 		return 0, err
 	}
 
-	w := wk.channelDb(channelInfo.ChannelId, channelInfo.ChannelType).NewBatch()
+	db := wk.channelDb(channelInfo.ChannelId, channelInfo.ChannelType)
+	w := db.NewBatch()
 	defer w.Close()
 
 	if err := wk.writeChannelInfo(primaryKey, channelInfo, w); err != nil {
@@ -45,7 +46,7 @@ func (wk *wukongDB) AddChannel(channelInfo ChannelInfo) (uint64, error) {
 	// 	}
 	// }
 
-	err = w.Commit(wk.sync)
+	err = wk.commitBatch(db, w, wk.sync)
 	if err != nil {
 		return 0, err
 	}
@@ -77,7 +78,8 @@ func (wk *wukongDB) UpdateChannel(channelInfo ChannelInfo) error {
 		return err
 	}
 
-	w := wk.channelDb(channelInfo.ChannelId, channelInfo.ChannelType).NewBatch()
+	db := wk.channelDb(channelInfo.ChannelId, channelInfo.ChannelType)
+	w := db.NewBatch()
 	defer w.Close()
 
 	oldChannelInfo, err := wk.GetChannel(channelInfo.ChannelId, channelInfo.ChannelType)
@@ -104,7 +106,7 @@ func (wk *wukongDB) UpdateChannel(channelInfo ChannelInfo) error {
 		return err
 	}
 
-	err = w.Commit(wk.sync)
+	err = wk.commitBatch(db, w, wk.sync)
 	if err != nil {
 		return err
 	}
@@ -455,7 +457,8 @@ func (wk *wukongDB) DeleteChannel(channelId string, channelType uint8) error {
 	if id == 0 {
 		return nil
 	}
-	batch := wk.channelDb(channelId, channelType).NewBatch()
+	db := wk.channelDb(channelId, channelType)
+	batch := db.NewBatch()
 	defer batch.Close()
 
 	// 删除数据
@@ -474,7 +477,7 @@ func (wk *wukongDB) DeleteChannel(channelId string, channelType uint8) error {
 		return err
 	}
 
-	err = batch.Commit(wk.sync)
+	err = wk.commitBatch(db, batch, wk.sync)
 	if err != nil {
 		return err
 	}
@@ -491,7 +494,7 @@ func (wk *wukongDB) UpdateChannelAppliedIndex(channelId string, channelType uint
 
 	indexBytes := make([]byte, 8)
 	wk.endian.PutUint64(indexBytes, index)
-	return wk.channelDb(channelId, channelType).Set(key.NewChannelCommonColumnKey(channelId, channelType, key.TableChannelCommon.Column.AppliedIndex), indexBytes, wk.sync)
+	return wk.setKV(wk.channelDb(channelId, channelType), key.NewChannelCommonColumnKey(channelId, channelType, key.TableChannelCommon.Column.AppliedIndex), indexBytes, wk.sync)
 }
 
 func (wk *wukongDB) GetChannelAppliedIndex(channelId string, channelType uint8) (uint64, error) {

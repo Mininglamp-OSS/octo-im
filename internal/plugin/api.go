@@ -104,6 +104,14 @@ func (s *Server) handleGetPlugins(c *wkhttp.Context) {
 
 // 处理插件的路由
 func (s *Server) handlePluginRoute(c *wkhttp.Context) {
+	action := auth.ActionWrite
+	if c.Request != nil && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead || c.Request.Method == http.MethodOptions) {
+		action = auth.ActionRead
+	}
+	if options.G != nil && !options.G.Auth.HasPermissionWithContext(c, resource.All, action) {
+		c.ResponseErrorWithStatus(http.StatusForbidden, errors.New("没有权限"))
+		return
+	}
 	pluginNo := c.Param("plugin")
 	plugin := s.pluginManager.get(pluginNo)
 	if plugin == nil {
@@ -436,8 +444,10 @@ func (s *Server) handlePluginBindList(c *wkhttp.Context) {
 			c.ResponseError(fmt.Errorf("node id is 0"))
 			return
 		}
+		targetNode := node
+		reqHeaders := service.TrustedPeerNodeHeaders(targetNode, c.CopyRequestHeader(c.Request))
 		eg.Go(func() error {
-			pluginUsers, err := s.forwardSearchPluginUsers(reqUrl, nodeId)
+			pluginUsers, err := s.forwardSearchPluginUsers(reqUrl, nodeId, reqHeaders)
 			if err != nil {
 				return err
 			}
@@ -474,10 +484,10 @@ func (s *Server) handlePluginBindList(c *wkhttp.Context) {
 	c.JSON(http.StatusOK, uniqueResps)
 }
 
-func (s *Server) forwardSearchPluginUsers(url string, nodeId uint64) ([]*pluginUserResp, error) {
+func (s *Server) forwardSearchPluginUsers(url string, nodeId uint64, headers map[string]string) ([]*pluginUserResp, error) {
 	resp, err := network.Get(url, map[string]string{
 		"node_id": fmt.Sprintf("%d", nodeId),
-	}, nil)
+	}, headers)
 	if err != nil {
 		return nil, err
 	}

@@ -11,7 +11,8 @@ func (wk *wukongDB) AddSystemUids(uids []string) error {
 
 	wk.metrics.AddSystemUidsAdd(1)
 
-	w := wk.defaultShardDB().NewBatch()
+	db := wk.defaultShardDB()
+	w := db.NewBatch()
 	defer w.Close()
 	for _, uid := range uids {
 		id := key.HashWithString(uid)
@@ -19,14 +20,15 @@ func (wk *wukongDB) AddSystemUids(uids []string) error {
 			return err
 		}
 	}
-	return w.Commit(wk.sync)
+	return wk.commitBatch(db, w, wk.sync)
 }
 
 func (wk *wukongDB) RemoveSystemUids(uids []string) error {
 
 	wk.metrics.RemoveSystemUidsAdd(1)
 
-	w := wk.defaultShardDB().NewBatch()
+	db := wk.defaultShardDB()
+	w := db.NewBatch()
 	defer w.Close()
 	for _, uid := range uids {
 		id := key.HashWithString(uid)
@@ -34,7 +36,7 @@ func (wk *wukongDB) RemoveSystemUids(uids []string) error {
 			return err
 		}
 	}
-	return w.Commit(wk.sync)
+	return wk.commitBatch(db, w, wk.sync)
 }
 
 func (wk *wukongDB) GetSystemUids() ([]string, error) {

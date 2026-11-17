@@ -2,8 +2,12 @@ package cluster
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"net/http"
 	"sort"
 	"strconv"
@@ -582,4 +586,80 @@ func (s *Server) slotElection(c *wkhttp.Context) {
 	}
 
 	c.ResponseOK()
+}
+
+type slotDigestResp struct {
+	NodeId         uint64 `json:"node_id"`
+	SlotId         uint32 `json:"slot_id"`
+	FromIndex      uint64 `json:"from_index"`
+	ToIndex        uint64 `json:"to_index"`
+	LogCount       int    `json:"log_count"`
+	AppliedIndex   uint64 `json:"applied_index"`
+	CommittedIndex uint64 `json:"committed_index"`
+	LastLogIndex   uint64 `json:"last_log_index"`
+	LastLogTerm    uint32 `json:"last_log_term"`
+	DigestSHA256   string `json:"digest_sha256"`
+}
+
+func (s *Server) slotDigestGet(c *wkhttp.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	slotId := uint32(id)
+	st := s.slotServer.GetSlotRaft(slotId)
+	if st == nil {
+		c.ResponseError(errors.New("slot raft not found"))
+		return
+	}
+	appliedIdx := st.AppliedIndex()
+	committedIdx := st.CommittedIndex()
+	lastLog, err := s.slotServer.LastLog(slotId)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	toIdx := committedIdx
+	if toStr := c.Query("to"); toStr != "" {
+		if parsed, err := strconv.ParseUint(toStr, 10, 64); err == nil {
+			toIdx = parsed
+		}
+	}
+	fromIdx := uint64(1)
+	if toIdx > 1000 {
+		fromIdx = toIdx - 999
+	}
+	if fromStr := c.Query("from"); fromStr != "" {
+		if parsed, err := strconv.ParseUint(fromStr, 10, 64); err == nil && parsed > 0 {
+			fromIdx = parsed
+		}
+	}
+	logs, err := s.slotServer.GetLogsRange(slotId, fromIdx, toIdx)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	h := sha256.New()
+	var buf [16]byte
+	for _, lg := range logs {
+		binary.BigEndian.PutUint64(buf[0:8], lg.Index)
+		binary.BigEndian.PutUint32(buf[8:12], lg.Term)
+		binary.BigEndian.PutUint32(buf[12:16], crc32.ChecksumIEEE(lg.Data))
+		_, _ = h.Write(buf[:])
+		_, _ = h.Write(lg.Data)
+	}
+	c.JSON(http.StatusOK, &slotDigestResp{
+		NodeId:         s.opts.ConfigOptions.NodeId,
+		SlotId:         slotId,
+		FromIndex:      fromIdx,
+		ToIndex:        toIdx,
+		LogCount:       len(logs),
+		AppliedIndex:   appliedIdx,
+		CommittedIndex: committedIdx,
+		LastLogIndex:   lastLog.Index,
+		LastLogTerm:    lastLog.Term,
+		DigestSHA256:   hex.EncodeToString(h.Sum(nil)),
+	})
 }

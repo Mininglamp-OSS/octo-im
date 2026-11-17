@@ -99,69 +99,69 @@ func (s *conversation) clearConversationUnread(c *wkhttp.Context) {
 		return
 	}
 
-	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson) // 获取频道的领导节点
-	if err != nil {
-		s.Error("获取频道所在节点失败！", zap.Error(err), zap.String("channelID", req.UID), zap.Uint8("channelType", wkproto.ChannelTypePerson))
-		c.ResponseError(errors.New("获取频道所在节点失败！"))
-		return
-	}
-	leaderIsSelf := leaderInfo.Id == options.G.Cluster.NodeId
-	if !leaderIsSelf {
-		s.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
-		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
-		return
-	}
-
-	fakeChannelId := req.ChannelID
-	if req.ChannelType == wkproto.ChannelTypePerson {
-		fakeChannelId = options.GetFakeChannelIDWith(req.UID, req.ChannelID)
-
-	}
-
-	conversation, err := service.Store.GetConversation(req.UID, fakeChannelId, req.ChannelType)
-	if err != nil && err != wkdb.ErrNotFound {
-		s.Error("Failed to query conversation", zap.Error(err))
-		c.ResponseError(err)
-		return
-	}
-	updatedAt := time.Now()
-	if wkdb.IsEmptyConversation(conversation) {
-		createdAt := time.Now()
-		conversation = wkdb.Conversation{
-			Type:        wkdb.ConversationTypeChat,
-			Uid:         req.UID,
-			ChannelId:   fakeChannelId,
-			ChannelType: req.ChannelType,
-			CreatedAt:   &createdAt,
-			UpdatedAt:   &updatedAt,
+	for attempt := 0; attempt < 3; attempt++ {
+		if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
+			return
 		}
+
+		fakeChannelId := req.ChannelID
+		if req.ChannelType == wkproto.ChannelTypePerson {
+			fakeChannelId = options.GetFakeChannelIDWith(req.UID, req.ChannelID)
+		}
+
+		conversation, err := service.Store.GetConversation(req.UID, fakeChannelId, req.ChannelType)
+		if err != nil && err != wkdb.ErrNotFound {
+			s.Error("Failed to query conversation", zap.Error(err))
+			c.ResponseError(err)
+			return
+		}
+		updatedAt := time.Now()
+		if wkdb.IsEmptyConversation(conversation) {
+			createdAt := time.Now()
+			conversation = wkdb.Conversation{
+				Type:        wkdb.ConversationTypeChat,
+				Uid:         req.UID,
+				ChannelId:   fakeChannelId,
+				ChannelType: req.ChannelType,
+				CreatedAt:   &createdAt,
+				UpdatedAt:   &updatedAt,
+			}
+		}
+
+		// 获取此频道最新的消息
+		lastMsgSeq, err := s.getChannelLastMsgSeq(c.Request.Context(), fakeChannelId, req.ChannelType)
+		if err != nil {
+			s.Error("Failed to query last message", zap.Error(err))
+			respondConversationReadRetry(c)
+			return
+		}
+
+		// 如果已读消息序号大于等于未读消息序号，则不更新
+		if conversation.ReadToMsgSeq >= lastMsgSeq {
+			c.ResponseOK()
+			return
+		}
+
+		conversation.ReadToMsgSeq = lastMsgSeq
+		conversation.UpdatedAt = &updatedAt
+
+		err = service.Store.AddOrUpdateUserConversationsForLocalLeader(req.UID, []wkdb.Conversation{conversation})
+		if err == nil {
+			c.ResponseOK()
+			return
+		}
+		if !isTransientConversationSlotHandoffError(err) {
+			s.Error("Failed to add conversation", zap.Error(err))
+			c.ResponseError(err)
+			return
+		}
+		if attempt == 2 {
+			s.Error("Failed to add conversation during slot handoff", zap.Error(err))
+			respondConversationReadRetry(c)
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
-
-	// 获取此频道最新的消息
-	lastMsgSeq, err := s.getChannelLastMsgSeq(c.Request.Context(), fakeChannelId, req.ChannelType)
-	if err != nil {
-		s.Error("Failed to query last message", zap.Error(err))
-		respondConversationReadRetry(c)
-		return
-	}
-
-	// 如果已读消息序号大于等于未读消息序号，则不更新
-	if conversation.ReadToMsgSeq >= lastMsgSeq {
-		c.ResponseOK()
-		return
-	}
-
-	conversation.ReadToMsgSeq = lastMsgSeq
-	conversation.UpdatedAt = &updatedAt
-
-	err = service.Store.AddOrUpdateUserConversations(req.UID, []wkdb.Conversation{conversation})
-	if err != nil {
-		s.Error("Failed to add conversation", zap.Error(err))
-		c.ResponseError(err)
-		return
-	}
-
-	c.ResponseOK()
 }
 
 func (s *conversation) setConversationUnread(c *wkhttp.Context) {
@@ -191,86 +191,83 @@ func (s *conversation) setConversationUnread(c *wkhttp.Context) {
 		return
 	}
 
-	if options.G.ClusterOn() {
-		leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson) // 获取频道的领导节点
+	for attempt := 0; attempt < 3; attempt++ {
+		if options.G.ClusterOn() {
+			if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
+				return
+			}
+		}
+
+		fakeChannelId := req.ChannelID
+		if req.ChannelType == wkproto.ChannelTypePerson {
+			fakeChannelId = options.GetFakeChannelIDWith(req.UID, req.ChannelID)
+		}
+		// 获取此频道最新的消息
+		lastMsgSeq, err := s.getChannelLastMsgSeq(c.Request.Context(), fakeChannelId, req.ChannelType)
 		if err != nil {
-			s.Error("获取频道所在节点失败！", zap.Error(err), zap.String("channelID", req.UID), zap.Uint8("channelType", wkproto.ChannelTypePerson))
-			c.ResponseError(errors.New("获取频道所在节点失败！"))
+			s.Error("Failed to query last message", zap.Error(err))
+			respondConversationReadRetry(c)
 			return
 		}
-		leaderIsSelf := leaderInfo.Id == options.G.Cluster.NodeId
-		if !leaderIsSelf {
-			s.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
-			c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+		if lastMsgSeq == 0 {
+			c.ResponseOK()
 			return
 		}
-	}
 
-	fakeChannelId := req.ChannelID
-	if req.ChannelType == wkproto.ChannelTypePerson {
-		fakeChannelId = options.GetFakeChannelIDWith(req.UID, req.ChannelID)
+		conversation, err := service.Store.GetConversation(req.UID, fakeChannelId, req.ChannelType)
+		if err != nil && err != wkdb.ErrNotFound {
+			s.Error("Failed to query conversation", zap.Error(err))
+			c.ResponseError(err)
+			return
+		}
+		updatedAt := time.Now()
+		if wkdb.IsEmptyConversation(conversation) {
+			createdAt := time.Now()
 
-	}
-	// 获取此频道最新的消息
-	lastMsgSeq, err := s.getChannelLastMsgSeq(c.Request.Context(), fakeChannelId, req.ChannelType)
-	if err != nil {
-		s.Error("Failed to query last message", zap.Error(err))
-		respondConversationReadRetry(c)
-		return
-	}
-	if lastMsgSeq == 0 {
-		c.ResponseOK()
-		return
-	}
-
-	conversation, err := service.Store.GetConversation(req.UID, fakeChannelId, req.ChannelType)
-	if err != nil && err != wkdb.ErrNotFound {
-		s.Error("Failed to query conversation", zap.Error(err))
-		c.ResponseError(err)
-		return
-	}
-	updatedAt := time.Now()
-	if wkdb.IsEmptyConversation(conversation) {
-		createdAt := time.Now()
-
-		conversation = wkdb.Conversation{
-			Uid:         req.UID,
-			Type:        wkdb.ConversationTypeChat,
-			ChannelId:   fakeChannelId,
-			ChannelType: req.ChannelType,
-			CreatedAt:   &createdAt,
-			UpdatedAt:   &updatedAt,
+			conversation = wkdb.Conversation{
+				Uid:         req.UID,
+				Type:        wkdb.ConversationTypeChat,
+				ChannelId:   fakeChannelId,
+				ChannelType: req.ChannelType,
+				CreatedAt:   &createdAt,
+				UpdatedAt:   &updatedAt,
+			}
 		}
 
-	} else {
+		var readedMsgSeq uint64 = lastMsgSeq
 
+		if uint64(req.Unread) > lastMsgSeq {
+			readedMsgSeq = lastMsgSeq - 1
+		} else if req.Unread > 0 {
+			readedMsgSeq = lastMsgSeq - uint64(req.Unread)
+		}
+
+		// 如果已读消息序号大于等于未读消息序号，则不更新
+		if conversation.ReadToMsgSeq >= readedMsgSeq {
+			c.ResponseOK()
+			return
+		}
+
+		conversation.ReadToMsgSeq = readedMsgSeq
+		conversation.UpdatedAt = &updatedAt
+
+		err = service.Store.AddOrUpdateUserConversationsForLocalLeader(req.UID, []wkdb.Conversation{conversation})
+		if err == nil {
+			c.ResponseOK()
+			return
+		}
+		if !isTransientConversationSlotHandoffError(err) {
+			s.Error("Failed to add conversation", zap.Error(err))
+			c.ResponseError(err)
+			return
+		}
+		if attempt == 2 {
+			s.Error("Failed to add conversation during slot handoff", zap.Error(err))
+			respondConversationReadRetry(c)
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
-
-	var readedMsgSeq uint64 = lastMsgSeq
-
-	if uint64(req.Unread) > lastMsgSeq {
-		readedMsgSeq = lastMsgSeq - 1
-	} else if req.Unread > 0 {
-		readedMsgSeq = lastMsgSeq - uint64(req.Unread)
-	}
-
-	// 如果已读消息序号大于等于未读消息序号，则不更新
-	if conversation.ReadToMsgSeq >= readedMsgSeq {
-		c.ResponseOK()
-		return
-	}
-
-	conversation.ReadToMsgSeq = readedMsgSeq
-	conversation.UpdatedAt = &updatedAt
-
-	err = service.Store.AddOrUpdateUserConversations(req.UID, []wkdb.Conversation{conversation})
-	if err != nil {
-		s.Error("Failed to add conversation", zap.Error(err))
-		c.ResponseError(err)
-		return
-	}
-
-	c.ResponseOK()
 }
 
 func (s *conversation) deleteConversation(c *wkhttp.Context) {
@@ -286,43 +283,42 @@ func (s *conversation) deleteConversation(c *wkhttp.Context) {
 		return
 	}
 
-	if options.G.ClusterOn() {
-		leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson) // 获取频道的领导节点
+	for attempt := 0; attempt < 3; attempt++ {
+		if options.G.ClusterOn() {
+			if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
+				return
+			}
+		}
+		fakeChannelId := req.ChannelID
+		if req.ChannelType == wkproto.ChannelTypePerson {
+			fakeChannelId = options.GetFakeChannelIDWith(req.UID, req.ChannelID)
+		}
+
+		// 获取频道最后一条消息序号
+		lastMsgSeq, err := s.getChannelLastMsgSeq(c.Request.Context(), fakeChannelId, req.ChannelType)
 		if err != nil {
-			s.Error("获取频道所在节点失败！", zap.Error(err), zap.String("channelID", req.UID), zap.Uint8("channelType", wkproto.ChannelTypePerson))
-			c.ResponseError(errors.New("获取频道所在节点失败！"))
+			s.Error("获取频道最后一条消息序号失败！", zap.Error(err))
+			respondConversationReadRetry(c)
 			return
 		}
-		leaderIsSelf := leaderInfo.Id == options.G.Cluster.NodeId
 
-		if !leaderIsSelf {
-			s.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
-			c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+		err = service.Store.UpdateConversationDeletedAtMsgSeq(req.UID, fakeChannelId, req.ChannelType, lastMsgSeq)
+		if err == nil {
+			c.ResponseOK()
 			return
 		}
+		if !isTransientConversationSlotHandoffError(err) {
+			s.Error("更新最近会话的已删除的消息序号位置失败！", zap.Error(err))
+			c.ResponseError(err)
+			return
+		}
+		if attempt == 2 {
+			s.Error("更新最近会话的已删除的消息序号位置失败（槽切主中）！", zap.Error(err))
+			respondConversationReadRetry(c)
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
-	fakeChannelId := req.ChannelID
-	if req.ChannelType == wkproto.ChannelTypePerson {
-		fakeChannelId = options.GetFakeChannelIDWith(req.UID, req.ChannelID)
-
-	}
-
-	// 获取频道最后一条消息序号
-	lastMsgSeq, err := s.getChannelLastMsgSeq(c.Request.Context(), fakeChannelId, req.ChannelType)
-	if err != nil {
-		s.Error("获取频道最后一条消息序号失败！", zap.Error(err))
-		respondConversationReadRetry(c)
-		return
-	}
-
-	err = service.Store.UpdateConversationDeletedAtMsgSeq(req.UID, fakeChannelId, req.ChannelType, lastMsgSeq)
-	if err != nil {
-		s.Error("更新最近会话的已删除的消息序号位置失败！", zap.Error(err))
-		c.ResponseError(err)
-		return
-	}
-
-	c.ResponseOK()
 }
 
 func (s *conversation) syncUserConversation(c *wkhttp.Context) {
@@ -343,17 +339,7 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 		return
 	}
 
-	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson) // 获取频道的领导节点
-	if err != nil {
-		s.Error("获取频道所在节点失败！!", zap.Error(err), zap.String("channelID", req.UID), zap.Uint8("channelType", wkproto.ChannelTypePerson))
-		c.ResponseError(errors.New("获取频道所在节点失败！"))
-		return
-	}
-	leaderIsSelf := leaderInfo.Id == options.G.Cluster.NodeId
-
-	if !leaderIsSelf {
-		s.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
-		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+	if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
 		return
 	}
 
@@ -619,17 +605,7 @@ func (s *conversation) conversationChannels(c *wkhttp.Context) {
 		return
 	}
 
-	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson) // 获取频道的领导节点
-	if err != nil {
-		s.Error("获取频道所在节点失败！!", zap.Error(err), zap.String("channelID", req.UID), zap.Uint8("channelType", wkproto.ChannelTypePerson))
-		c.ResponseError(errors.New("获取频道所在节点失败！"))
-		return
-	}
-	leaderIsSelf := leaderInfo.Id == options.G.Cluster.NodeId
-
-	if !leaderIsSelf {
-		s.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
-		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+	if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
 		return
 	}
 
@@ -730,17 +706,7 @@ func (s *conversation) syncConversationByChannels(c *wkhttp.Context) {
 	req.Channels = unique
 
 	// 集群路由
-	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson)
-	if err != nil {
-		s.Error("获取频道所在节点失败！", zap.Error(err), zap.String("channelID", req.UID), zap.Uint8("channelType", wkproto.ChannelTypePerson))
-		c.ResponseError(errors.New("获取频道所在节点失败！"))
-		return
-	}
-	leaderIsSelf := leaderInfo.Id == options.G.Cluster.NodeId
-
-	if !leaderIsSelf {
-		s.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
-		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+	if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
 		return
 	}
 

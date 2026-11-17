@@ -1,12 +1,15 @@
 package slot
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/slot/key"
@@ -32,7 +35,65 @@ type PebbleShardLogStorage struct {
 
 	// slotLocks serializes operations for the same raft slot without coupling
 	// unrelated slots that happen to share one physical Pebble DB shard.
-	slotLocks sync.Map // map[string]*sync.Mutex
+	slotLocks    sync.Map // map[string]*sync.Mutex
+	lastWriteErr atomic.Value
+}
+
+type slotWriteErrorHolder struct {
+	err error
+}
+
+func (p *PebbleShardLogStorage) RecordWriteError(err error) {
+	if p == nil {
+		return
+	}
+	p.lastWriteErr.Store(slotWriteErrorHolder{err: err})
+}
+
+func (p *PebbleShardLogStorage) RecordShardWriteError(shardIdx int, err error) {
+	if p == nil {
+		return
+	}
+	if shardIdx >= 0 && shardIdx < len(p.batchDbs) && p.batchDbs[shardIdx] != nil {
+		p.batchDbs[shardIdx].RecordWriteError(err)
+		return
+	}
+	p.RecordWriteError(err)
+}
+
+func (p *PebbleShardLogStorage) recordShardWriteError(shardNo string, err error) {
+	if p == nil {
+		return
+	}
+	if shardNo == "" {
+		p.RecordWriteError(err)
+		return
+	}
+	p.RecordShardWriteError(int(p.shardId(shardNo)), err)
+}
+
+func (p *PebbleShardLogStorage) ShardIndex(shardNo string) int {
+	if p == nil || shardNo == "" {
+		return 0
+	}
+	return int(p.shardId(shardNo))
+}
+
+func (p *PebbleShardLogStorage) LastWriteError() error {
+	if p == nil {
+		return nil
+	}
+	if v, ok := p.lastWriteErr.Load().(slotWriteErrorHolder); ok && v.err != nil {
+		return v.err
+	}
+	for _, bdb := range p.batchDbs {
+		if bdb != nil {
+			if err := bdb.LastWriteError(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func NewPebbleShardLogStorage(s *Server, path string, shardNum uint32) *PebbleShardLogStorage {
@@ -67,11 +128,20 @@ func (p *PebbleShardLogStorage) defaultPebbleOptions() *pebble.Options {
 		sz = sz * levelSizeMultiplier
 		lopts = append(lopts, opt)
 	}
+	memTableSize := 16 * 1024 * 1024
+	var blockCache *pebble.Cache
+	if p.s != nil && p.s.opts != nil {
+		if p.s.opts.SlotMemTableSize > 0 {
+			memTableSize = p.s.opts.SlotMemTableSize
+		}
+		blockCache = p.s.opts.BlockCache
+	}
 	return &pebble.Options{
 		Levels:             lopts,
 		FormatMajorVersion: pebble.FormatNewest,
+		Cache:              blockCache,
 		// 控制写缓冲区的大小。较大的写缓冲区可以减少磁盘写入次数，但会占用更多内存。
-		MemTableSize: 128 * 1024 * 1024,
+		MemTableSize: memTableSize,
 		// 当队列中的MemTables的大小超过 MemTableStopWritesThreshold*MemTableSize 时，将停止写入，
 		// 直到被刷到磁盘，这个值不能小于2
 		MemTableStopWritesThreshold: 4,
@@ -84,12 +154,31 @@ func (p *PebbleShardLogStorage) defaultPebbleOptions() *pebble.Options {
 }
 
 func (p *PebbleShardLogStorage) Open() error {
+	if err := wkdb.ValidatePebbleShardDir(p.path, int(p.shardNum)); err != nil {
+		return err
+	}
 
-	opts := p.defaultPebbleOptions()
+	p.dbs = nil
+	p.batchDbs = nil
 
 	for i := 0; i < int(p.shardNum); i++ {
+		shardIdx := i
+		opts := p.defaultPebbleOptions()
+		listener := pebble.MakeLoggingEventListener(nil)
+		listener.BackgroundError = func(err error) {
+			if err != nil {
+				p.RecordShardWriteError(shardIdx, err)
+			}
+		}
+		opts.EventListener = &listener
 		db, err := pebble.Open(fmt.Sprintf("%s/shard%03d", p.path, i), opts)
 		if err != nil {
+			for _, bdb := range p.batchDbs {
+				bdb.Stop()
+			}
+			for _, openDB := range p.dbs {
+				_ = openDB.Close()
+			}
 			return err
 		}
 		p.dbs = append(p.dbs, db)
@@ -114,6 +203,51 @@ func (p *PebbleShardLogStorage) Close() error {
 
 	p.stopper.Stop()
 
+	return nil
+}
+
+// CheckWriteHealth verifies that all local slot Pebble shards are open and their directories remain writable.
+func (p *PebbleShardLogStorage) CheckWriteHealth() error {
+	if p == nil {
+		return errors.New("slot storage is nil")
+	}
+	if err := p.LastWriteError(); err != nil {
+		return fmt.Errorf("slot storage write error: %w", err)
+	}
+	if len(p.dbs) == 0 || len(p.dbs) < int(p.shardNum) {
+		return errors.New("slot storage shards not open")
+	}
+	info, err := os.Stat(p.path)
+	if err != nil {
+		return fmt.Errorf("slot storage directory %s stat failed: %w", p.path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("slot storage path %s is not a directory", p.path)
+	}
+	if info.Mode().Perm()&0200 == 0 {
+		return fmt.Errorf("slot storage directory %s is read-only (mode=%v)", p.path, info.Mode().Perm())
+	}
+	for i, db := range p.dbs {
+		if db == nil {
+			return fmt.Errorf("slot storage shard[%d] is nil", i)
+		}
+		if i < len(p.batchDbs) && p.batchDbs[i] != nil {
+			if err := p.batchDbs[i].LastWriteError(); err != nil {
+				return fmt.Errorf("slot storage shard[%d] write error: %w", i, err)
+			}
+		}
+		shardDir := fmt.Sprintf("%s/shard%03d", p.path, i)
+		shardInfo, err := os.Stat(shardDir)
+		if err != nil {
+			return fmt.Errorf("slot storage shard directory %s stat failed: %w", shardDir, err)
+		}
+		if !shardInfo.IsDir() {
+			return fmt.Errorf("slot storage shard path %s is not a directory", shardDir)
+		}
+		if shardInfo.Mode().Perm()&0200 == 0 {
+			return fmt.Errorf("slot storage shard directory %s is read-only (mode=%v)", shardDir, shardInfo.Mode().Perm())
+		}
+	}
 	return nil
 }
 
@@ -227,15 +361,13 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 		batch.Set(keyData, logData)
 	}
 
-	return batch.CommitWait()
+	err := batch.CommitWait()
+	p.recordShardWriteError(shardNo, err)
+	return err
 }
 
 // TruncateLogTo 截断日志
 func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) error {
-	if index == 0 {
-		return errors.New("index must be greater than 0")
-	}
-
 	// 加锁保护，防止与 Apply 并发执行导致 appliedIndex > lastLogIndex
 	lock := p.slotLock(shardNo)
 	lock.Lock()
@@ -257,13 +389,13 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 		return err
 	}
 	if index < appliedIdx {
-		p.Foucs("applied must be less than index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx), zap.Uint64("lastIndex", lastIndex), zap.String("shardNo", shardNo))
-		return nil
+		return types.ErrCommittedLogConflict
 	}
 
 	keyData := key.NewLogKey(shardNo, index+1)
 	maxKeyData := key.NewLogKey(shardNo, math.MaxUint64)
 	err = p.shardDB(shardNo).DeleteRange(keyData, maxKeyData, p.sync)
+	p.recordShardWriteError(shardNo, err)
 	if err != nil {
 		return err
 	}
@@ -309,6 +441,10 @@ func (p *PebbleShardLogStorage) GetLogs(shardNo string, startLogIndex uint64, en
 	defer iter.Close()
 	var logs []types.Log
 
+	var maxCount uint64
+	if p.s != nil && p.s.opts != nil && p.s.opts.MaxLogCountPerBatch > 0 {
+		maxCount = p.s.opts.MaxLogCountPerBatch
+	}
 	var size uint64
 	for iter.First(); iter.Valid(); iter.Next() {
 
@@ -327,13 +463,21 @@ func (p *PebbleShardLogStorage) GetLogs(shardNo string, startLogIndex uint64, en
 			return nil, err
 		}
 		log.Time = time.Unix(0, int64(tm))
+		logSize := uint64(log.LogSize())
+		if len(logs) > 0 && limitSize != 0 && size+logSize > limitSize {
+			break
+		}
 		logs = append(logs, log)
-		size += uint64(log.LogSize())
-		if limitSize != 0 && size >= limitSize {
+		size += logSize
+		if (limitSize != 0 && size >= limitSize) || (limitSize != 0 && maxCount > 0 && uint64(len(logs)) >= maxCount) {
 			break
 		}
 	}
 	return logs, nil
+}
+
+func sameLog(a, b types.Log) bool {
+	return a.Index == b.Index && a.Term == b.Term && a.Id == b.Id && bytes.Equal(a.Data, b.Data)
 }
 
 func (p *PebbleShardLogStorage) Apply(shardNo string, logs []types.Log) error {
@@ -513,7 +657,9 @@ func (p *PebbleShardLogStorage) SetAppliedIndex(shardNo string, index uint64) er
 
 	batch := p.shardBatchDB(shardNo).NewBatch()
 	batch.Set(maxIndexKeyData, append(maxIndexdata, lastTimeData...))
-	return batch.CommitWait()
+	err := batch.CommitWait()
+	p.recordShardWriteError(shardNo, err)
+	return err
 
 }
 
@@ -541,6 +687,7 @@ func (p *PebbleShardLogStorage) SetLeaderTermStartIndex(shardNo string, term uin
 	var indexData = make([]byte, 8)
 	binary.BigEndian.PutUint64(indexData, index)
 	err := p.shardDB(shardNo).Set(leaderTermStartIndexKeyData, indexData, p.sync)
+	p.recordShardWriteError(shardNo, err)
 	return err
 }
 
@@ -608,7 +755,9 @@ func (p *PebbleShardLogStorage) DeleteLeaderTermStartIndexGreaterThanTerm(shardN
 			return err
 		}
 	}
-	return batch.Commit(p.sync)
+	err = batch.Commit(p.sync)
+	p.recordShardWriteError(shardNo, err)
+	return err
 }
 
 // type localStorage struct {
@@ -762,7 +911,9 @@ func (p *PebbleShardLogStorage) DeleteLeaderTermStartIndexGreaterThanTerm(shardN
 // }
 
 func (p *PebbleShardLogStorage) SaveHardState(shardNo string, state types.HardState) error {
-	return p.shardDB(shardNo).Set(key.NewHardStateKey(shardNo), state.Marshal(), pebble.Sync)
+	err := p.shardDB(shardNo).Set(key.NewHardStateKey(shardNo), state.Marshal(), pebble.Sync)
+	p.recordShardWriteError(shardNo, err)
+	return err
 }
 
 func (p *PebbleShardLogStorage) hardState(shardNo string) (types.HardState, error) {

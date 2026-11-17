@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
@@ -75,6 +76,37 @@ func (s *Store) AddOrUpdateUserConversations(uid string, conversations []wkdb.Co
 		return err
 	}
 	slotId := s.opts.Slot.GetSlotId(uid)
+	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
+	return err
+}
+
+// AddOrUpdateUserConversationsForLocalLeader persists a local read-modify-write
+// conversation update only if the current node is still the slot leader for uid.
+func (s *Store) AddOrUpdateUserConversationsForLocalLeader(uid string, conversations []wkdb.Conversation) error {
+	if len(conversations) == 0 {
+		return nil
+	}
+	for i, c := range conversations {
+		if c.Id == 0 {
+			conversations[i].Id = s.wdb.NextPrimaryKey()
+		}
+	}
+	data, err := EncodeCMDAddOrUpdateUserConversations(uid, conversations)
+	if err != nil {
+		return err
+	}
+	cmd := NewCMD(CMDAddOrUpdateUserConversations, data)
+	cmdData, err := cmd.Marshal()
+	if err != nil {
+		return err
+	}
+	slotId := s.opts.Slot.GetSlotId(uid)
+	if localProposer, ok := s.opts.Slot.(interface {
+		ProposeUntilAppliedForLocal(slotId uint32, data []byte) (*rafttypes.ProposeResp, error)
+	}); ok {
+		_, err = localProposer.ProposeUntilAppliedForLocal(slotId, cmdData)
+		return err
+	}
 	_, err = s.opts.Slot.ProposeUntilApplied(slotId, cmdData)
 	return err
 }

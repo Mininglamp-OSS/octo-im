@@ -72,7 +72,7 @@ func (r *Raft) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []types
 		}
 		maxLogIndex := resps[len(resps)-1].Index
 		// 如果最大的日志下标大于已应用的日志下标，则不需要等待
-		if r.node.queue.appliedIndex >= maxLogIndex {
+		if r.node.AppliedIndex() >= maxLogIndex {
 			needWait = false
 		}
 		if needWait {
@@ -82,7 +82,7 @@ func (r *Raft) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []types
 		resps, err = r.proposeBatch(ctx, reqs, func(logs []types.Log) {
 			maxLogIndex := logs[len(logs)-1].Index
 			// 如果最大的日志下标大于已应用的日志下标，则不需要等待
-			if r.node.queue.appliedIndex >= maxLogIndex {
+			if r.node.AppliedIndex() >= maxLogIndex {
 				needWait = false
 			}
 			if needWait {
@@ -110,29 +110,42 @@ func (r *Raft) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []types
 }
 
 func (r *Raft) proposeBatch(ctx context.Context, reqs types.ProposeReqSet, stepBefore func(logs []types.Log)) ([]*types.ProposeResp, error) {
+	if len(reqs) == 0 {
+		return nil, errors.New("raft: empty proposal batch")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	r.node.Lock()
 	defer r.node.Unlock()
-	lastLogIndex := r.node.queue.lastLogIndex
+	lastLogIndex := r.node.LastLogIndex()
+	term := r.node.LastTerm()
 	logs := make([]types.Log, 0, len(reqs))
 	for i, req := range reqs {
 		logIndex := lastLogIndex + 1 + uint64(i)
 		logs = append(logs, types.Log{
 			Id:    req.Id,
-			Term:  r.node.cfg.Term,
+			Term:  term,
 			Index: logIndex,
 			Data:  req.Data,
 		})
 	}
 
+	release, err := r.node.AdmitProposalBatch(logs)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	if stepBefore != nil {
 		stepBefore(logs)
 	}
 
-	err := r.StepWait(ctx, types.Event{
+	err = r.stepWaitWithComplete(ctx, types.Event{
 		Type: types.Propose,
 		Logs: logs,
-	})
+	}, release)
 	if err != nil {
 		return nil, err
 	}

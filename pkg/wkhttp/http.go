@@ -10,6 +10,26 @@ import (
 	"github.com/sendgrid/rest"
 )
 
+var (
+	noRedirectRestClient = &rest.Client{
+		HTTPClient: &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+	// PeerHeadersHook optionally enriches forwarded headers for verified internal cluster peer URLs.
+	PeerHeadersHook func(targetURL string, base map[string]string) map[string]string
+)
+
+func init() {
+	if rest.DefaultClient != nil && rest.DefaultClient.HTTPClient != nil {
+		rest.DefaultClient.HTTPClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+}
+
 type WKHttp struct {
 	r    *gin.Engine
 	pool sync.Pool
@@ -127,15 +147,19 @@ func (c *Context) ForwardWithBody(url string, body []byte) {
 	for key, value := range values {
 		queryMap[key] = value[0]
 	}
+	headers := c.CopyRequestHeader(c.Request)
+	if PeerHeadersHook != nil {
+		headers = PeerHeadersHook(url, headers)
+	}
 	req := rest.Request{
 		Method:      rest.Method(strings.ToUpper(c.Request.Method)),
 		BaseURL:     url,
-		Headers:     c.CopyRequestHeader(c.Request),
+		Headers:     headers,
 		Body:        body,
 		QueryParams: queryMap,
 	}
 
-	resp, err := rest.API(req)
+	resp, err := noRedirectRestClient.Send(req)
 	if err != nil {
 		c.ResponseError(err)
 		return

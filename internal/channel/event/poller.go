@@ -3,6 +3,7 @@ package event
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -29,6 +30,8 @@ type poller struct {
 
 	contextPool *sync.Pool
 	advanceC    chan struct{}
+	needAdvance atomic.Bool
+	rrCursor    int
 }
 
 func newPoller(index int, eventPool *EventPool) *poller {
@@ -114,18 +117,30 @@ func (p *poller) clear() {
 
 func (p *poller) handleEvents() {
 	p.waitlist.readHandlers(&p.tmpHandlers)
-	var err error
-	for _, h := range p.tmpHandlers {
-		if h.hasEvent() && h.processing.CompareAndSwap(false, true) {
-			err = p.handlePool.Submit(func() {
-				events := h.events()
-				h.advanceEvents(events)
-			})
-			if err != nil {
-				h.processing.Store(false)
-				p.Error("submit channel handle task failed", zap.String("error", err.Error()))
+	n := len(p.tmpHandlers)
+	if n > 0 {
+		start := p.rrCursor % n
+		var err error
+		for i := 0; i < n; i++ {
+			idx := (start + i) % n
+			h := p.tmpHandlers[idx]
+			if h.hasEvent() && h.processing.CompareAndSwap(false, true) {
+				err = p.handlePool.Submit(func() {
+					events := h.events()
+					h.advanceEvents(events)
+				})
+				if err != nil {
+					h.processing.Store(false)
+					p.needAdvance.Store(true)
+					p.rrCursor = idx
+					break
+				}
+				p.rrCursor = (idx + 1) % n
 			}
 		}
+	}
+	for i := range p.tmpHandlers {
+		p.tmpHandlers[i] = nil
 	}
 	p.tmpHandlers = p.tmpHandlers[:0]
 	if cap(p.tmpHandlers) > 1024 {
@@ -142,6 +157,16 @@ func (p *poller) advance() {
 
 func (p *poller) handler(channelId string, channelType uint8) *channelHandler {
 	return p.waitlist.get(channelId, channelType)
+}
+
+func (p *poller) pendingQueueLen(channelId string, channelType uint8) int {
+	p.RLock()
+	h := p.handler(channelId, channelType)
+	p.RUnlock()
+	if h == nil {
+		return 0
+	}
+	return h.pendingQueueLen()
 }
 
 func (p *poller) getContext() *eventbus.ChannelContext {

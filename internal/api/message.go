@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
+	clusterchannel "github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
 	cluster "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkcache"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -220,12 +222,13 @@ func (m *message) requestSetSubscribersForTmpChannel(tmpChannelId string, uids [
 	request := rest.Request{
 		Method:  rest.Method("POST"),
 		BaseURL: reqURL,
+		Headers: service.TrustedPeerNodeHeaders(nodeInfo, nil),
 		Body: []byte(wkutil.ToJSON(map[string]interface{}{
 			"channel_id": tmpChannelId,
 			"uids":       uids,
 		})),
 	}
-	resp, err := rest.Send(request)
+	resp, err := service.SendPeerRequest(request)
 	if err != nil {
 		return err
 	}
@@ -235,15 +238,136 @@ func (m *message) requestSetSubscribersForTmpChannel(tmpChannelId string, uids [
 	return nil
 }
 
-func sendMessageToChannel(req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (int64, error) {
+func persistHTTPChannelMessages(ctx context.Context, fakeChannelId string, channelType uint8, events []*eventbus.Event) error {
+	if len(events) == 0 || service.Store == nil || !service.Store.HasChannel() {
+		return nil
+	}
+	if service.Permission != nil {
+		reasonCode, err := service.Permission.HasPermissionForChannel(fakeChannelId, channelType)
+		if err != nil {
+			return err
+		}
+		if reasonCode != wkproto.ReasonSuccess {
+			return fmt.Errorf("channel permission denied: %s", reasonCode.String())
+		}
+		for _, ev := range events {
+			if ev == nil || ev.Conn == nil {
+				continue
+			}
+			rc, sErr := service.Permission.HasPermissionForSender(fakeChannelId, channelType, service.SenderInfo{
+				UID:      ev.Conn.Uid,
+				DeviceID: ev.Conn.DeviceId,
+			})
+			if sErr != nil {
+				return sErr
+			}
+			if rc != wkproto.ReasonSuccess {
+				return fmt.Errorf("sender permission denied: %s", rc.String())
+			}
+		}
+	}
 
-	// m.s.monitor.SendPacketInc(req.Header.NoPersist != 1)
-	// m.s.monitor.SendSystemMsgInc()
+	eligible := make([]*eventbus.Event, 0, len(events))
+	persists := make([]wkdb.Message, 0, len(events))
+	nowUnix := int32(time.Now().Unix())
+	for _, e := range events {
+		if e == nil {
+			continue
+		}
+		sendPacket, ok := e.Frame.(*wkproto.SendPacket)
+		if !ok || sendPacket == nil || sendPacket.NoPersist {
+			continue
+		}
+		if strings.TrimSpace(sendPacket.ClientMsgNo) == "" {
+			sendPacket.ClientMsgNo = fmt.Sprintf("http-%d", e.MessageId)
+		}
+		eligible = append(eligible, e)
+		persists = append(persists, wkdb.Message{
+			RecvPacket: wkproto.RecvPacket{
+				Framer: wkproto.Framer{
+					RedDot:    sendPacket.Framer.RedDot,
+					SyncOnce:  sendPacket.Framer.SyncOnce,
+					NoPersist: sendPacket.Framer.NoPersist,
+				},
+				Setting:     sendPacket.Setting,
+				MessageID:   e.MessageId,
+				MessageSeq:  uint32(e.MessageSeq),
+				ClientMsgNo: sendPacket.ClientMsgNo,
+				ClientSeq:   sendPacket.ClientSeq,
+				FromUID:     e.Conn.Uid,
+				ChannelID:   fakeChannelId,
+				ChannelType: channelType,
+				Expire:      sendPacket.Expire,
+				Timestamp:   nowUnix,
+				Topic:       sendPacket.Topic,
+				StreamNo:    sendPacket.StreamNo,
+				Payload:     sendPacket.Payload,
+			},
+		})
+	}
+	if len(persists) == 0 {
+		return nil
+	}
 
-	// var messageID = m.s.dispatch.processor.genMessageID()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := 8 * time.Second
+	if options.G != nil && options.G.Channel.ProcessTimeout > 0 {
+		timeout = options.G.Channel.ProcessTimeout
+	}
+	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
+	if eventbus.Channel != nil {
+		if err := eventbus.Channel.WaitCapacity(deadlineCtx, fakeChannelId, channelType, len(eligible)); err != nil {
+			return err
+		}
+	}
+
+	delay := 15 * time.Millisecond
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := deadlineCtx.Err(); err != nil {
+			if lastErr != nil {
+				return lastErr
+			}
+			return err
+		}
+		results, err := service.Store.AppendMessages(deadlineCtx, fakeChannelId, channelType, persists)
+		if err == nil {
+			if len(results) != len(eligible) {
+				return fmt.Errorf("incomplete persistence result: got %d want %d", len(results), len(eligible))
+			}
+			for i, r := range results {
+				if r == nil || r.CanonicalID == 0 || r.Index == 0 {
+					return fmt.Errorf("invalid persistence result at %d", i)
+				}
+				eligible[i].MessageId = int64(r.CanonicalID)
+				eligible[i].MessageSeq = r.Index
+				eligible[i].PersistedDuplicate = r.Duplicate
+				eligible[i].ReasonCode = wkproto.ReasonSuccess
+			}
+			return nil
+		}
+		lastErr = err
+		retryable := clusterchannel.IsRetryableSendError(err) && !clusterchannel.IsAmbiguousSendError(err)
+		if !retryable || attempt == 7 {
+			return err
+		}
+		select {
+		case <-deadlineCtx.Done():
+			return lastErr
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, 100*time.Millisecond)
+	}
+	return lastErr
+}
+
+func buildChannelSendEvent(req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (string, *eventbus.Event, error) {
 	if options.IsSpecialChar(channelId) {
-		return 0, errors.New("频道ID不合法！")
+		return "", nil, errors.New("频道ID不合法！")
 	}
 
 	fakeChannelId := channelId
@@ -282,19 +406,31 @@ func sendMessageToChannel(req messageSendReq, channelId string, channelType uint
 			Uid:      req.FromUID,
 			DeviceId: options.G.SystemDeviceId,
 		},
-		Type:      eventbus.EventChannelOnSend,
-		Frame:     sendPacket,
-		MessageId: messageId,
-		TagKey:    req.TagKey,
+		Type:       eventbus.EventChannelOnSend,
+		Frame:      sendPacket,
+		MessageId:  messageId,
+		ReasonCode: wkproto.ReasonSuccess,
+		TagKey:     req.TagKey,
 		Track: track.Message{
 			PreStart: time.Now(),
 		},
 	}
-	eventbus.Channel.SendMessage(fakeChannelId, channelType, event)
+	return fakeChannelId, event, nil
+}
+
+func sendMessageToChannel(req messageSendReq, channelId string, channelType uint8, clientMsgNo string) (int64, error) {
+	fakeChannelId, event, err := buildChannelSendEvent(req, channelId, channelType, clientMsgNo)
+	if err != nil {
+		return 0, err
+	}
+	if err := persistHTTPChannelMessages(context.Background(), fakeChannelId, channelType, []*eventbus.Event{event}); err != nil {
+		return 0, err
+	}
 	event.Track.Record(track.PositionStart)
+	eventbus.Channel.SendMessage(fakeChannelId, channelType, event)
 	eventbus.Channel.Advance(fakeChannelId, channelType)
 
-	return messageId, nil
+	return event.MessageId, nil
 }
 
 func (m *message) sendBatch(c *wkhttp.Context) {
@@ -321,11 +457,21 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 		c.ResponseError(errors.New("payload不能为空！"))
 		return
 	}
-	failUids := make([]string, 0)
-	reasons := make([]string, 0)
+	type subBatchGroup struct {
+		fakeChannelId string
+		subscribers   []string
+		events        []*eventbus.Event
+		err           error
+	}
+	var (
+		failUids = make([]string, 0)
+		reasons  = make([]string, 0)
+		groups   = make([]*subBatchGroup, 0, 32)
+		groupMap = make(map[string]*subBatchGroup, 32)
+	)
 	for _, subscriber := range req.Subscribers {
 		clientMsgNo := fmt.Sprintf("%s0", wkutil.GenUUID())
-		_, err := sendMessageToChannel(messageSendReq{
+		fakeChannelId, ev, err := buildChannelSendEvent(messageSendReq{
 			Header:      req.Header,
 			FromUID:     req.FromUID,
 			ChannelID:   subscriber,
@@ -335,7 +481,75 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 		if err != nil {
 			failUids = append(failUids, subscriber)
 			reasons = append(reasons, err.Error())
+			continue
 		}
+		grp, ok := groupMap[fakeChannelId]
+		if !ok {
+			grp = &subBatchGroup{
+				fakeChannelId: fakeChannelId,
+			}
+			groupMap[fakeChannelId] = grp
+			groups = append(groups, grp)
+		}
+		grp.subscribers = append(grp.subscribers, subscriber)
+		grp.events = append(grp.events, ev)
+	}
+
+	reqCtx := context.Background()
+	if c.Request != nil && c.Request.Context() != nil {
+		reqCtx = c.Request.Context()
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 16)
+	for _, grp := range groups {
+		grp := grp
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			grp.err = persistHTTPChannelMessages(reqCtx, grp.fakeChannelId, wkproto.ChannelTypePerson, grp.events)
+		}()
+	}
+	wg.Wait()
+
+	includeAcceptedIds := strings.TrimSpace(c.GetHeader("X-WK-Include-Accepted-Ids")) == "1"
+	var (
+		acceptedMsgIds       []int64
+		acceptedClientMsgNos []string
+	)
+	if includeAcceptedIds {
+		acceptedMsgIds = make([]int64, 0, len(req.Subscribers))
+		acceptedClientMsgNos = make([]string, 0, len(req.Subscribers))
+	}
+	for _, grp := range groups {
+		if grp.err != nil {
+			for _, sub := range grp.subscribers {
+				failUids = append(failUids, sub)
+				reasons = append(reasons, grp.err.Error())
+			}
+			continue
+		}
+		for _, ev := range grp.events {
+			if includeAcceptedIds && ev != nil {
+				acceptedMsgIds = append(acceptedMsgIds, ev.MessageId)
+				if sp, ok := ev.Frame.(*wkproto.SendPacket); ok && sp != nil {
+					acceptedClientMsgNos = append(acceptedClientMsgNos, sp.ClientMsgNo)
+				}
+			}
+			ev.Track.Record(track.PositionStart)
+			eventbus.Channel.SendMessage(grp.fakeChannelId, wkproto.ChannelTypePerson, ev)
+		}
+		eventbus.Channel.Advance(grp.fakeChannelId, wkproto.ChannelTypePerson)
+	}
+	if includeAcceptedIds {
+		c.JSON(http.StatusOK, gin.H{
+			"fail_uids":      failUids,
+			"reason":         reasons,
+			"message_ids":    acceptedMsgIds,
+			"client_msg_nos": acceptedClientMsgNos,
+		})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"fail_uids": failUids,
@@ -1191,7 +1405,7 @@ func (m *message) syncMessages(c *wkhttp.Context) {
 		limit = 10000
 	}
 
-	if req.ChannelType == wkproto.ChannelTypePerson {
+	if req.ChannelType == wkproto.ChannelTypePerson && !strings.Contains(req.ChannelID, "@") {
 		fakeChannelID = options.GetFakeChannelIDWith(req.LoginUID, req.ChannelID)
 	}
 
@@ -1561,11 +1775,15 @@ func (m *message) getChannelLastMessage(c *wkhttp.Context) {
 
 	fakeChannelId := channelId
 	if channelType == wkproto.ChannelTypePerson {
-		if strings.TrimSpace(loginUid) == "" {
-			c.ResponseError(errors.New("login_uid不能为空"))
-			return
+		if strings.Contains(channelId, "@") {
+			fakeChannelId = channelId
+		} else {
+			if strings.TrimSpace(loginUid) == "" {
+				c.ResponseError(errors.New("login_uid不能为空"))
+				return
+			}
+			fakeChannelId = options.GetFakeChannelIDWith(loginUid, channelId)
 		}
-		fakeChannelId = options.GetFakeChannelIDWith(loginUid, channelId)
 	}
 
 	leaderInfo, err := service.Cluster.LeaderOfChannelForRead(fakeChannelId, channelType)

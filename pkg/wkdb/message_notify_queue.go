@@ -39,14 +39,15 @@ func (wk *wukongDB) GetMessagesOfNotifyQueue(count int) ([]Message, error) {
 	}
 
 	if len(errorKeys) > 0 {
-		batch := wk.defaultShardDB().NewBatch()
+		db := wk.defaultShardDB()
+		batch := db.NewBatch()
 		defer batch.Close()
 		for _, key := range errorKeys {
 			if err := batch.Delete(key, wk.noSync); err != nil {
 				return nil, err
 			}
 		}
-		if err := batch.Commit(wk.sync); err != nil {
+		if err := wk.commitBatch(db, batch, wk.sync); err != nil {
 			return nil, err
 		}
 	}
@@ -56,13 +57,14 @@ func (wk *wukongDB) GetMessagesOfNotifyQueue(count int) ([]Message, error) {
 // RemoveMessagesOfNotifyQueueCount 移除指定数量的通知队列的消息
 func (wk *wukongDB) RemoveMessagesOfNotifyQueueCount(count int) error {
 
-	iter := wk.defaultShardDB().NewIter(&pebble.IterOptions{
+	db := wk.defaultShardDB()
+	iter := db.NewIter(&pebble.IterOptions{
 		LowerBound: key.NewMessageNotifyQueueKey(0),
 		UpperBound: key.NewMessageNotifyQueueKey(math.MaxUint64),
 	})
 	defer iter.Close()
 
-	batch := wk.defaultShardDB().NewBatch()
+	batch := db.NewBatch()
 	defer batch.Close()
 
 	for i := 0; iter.First() && i < count; i++ {
@@ -71,7 +73,7 @@ func (wk *wukongDB) RemoveMessagesOfNotifyQueueCount(count int) error {
 		}
 		iter.Next()
 	}
-	return batch.Commit(wk.sync)
+	return wk.commitBatch(db, batch, wk.sync)
 }
 
 // RemoveMessagesOfNotifyQueue 移除通知队列的消息
@@ -79,7 +81,8 @@ func (wk *wukongDB) RemoveMessagesOfNotifyQueue(messageIDs []int64) error {
 
 	wk.metrics.RemoveMessagesOfNotifyQueueAdd(1)
 
-	batch := wk.defaultShardDB().NewBatch()
+	db := wk.defaultShardDB()
+	batch := db.NewBatch()
 	defer batch.Close()
 
 	for _, messageID := range messageIDs {
@@ -87,7 +90,7 @@ func (wk *wukongDB) RemoveMessagesOfNotifyQueue(messageIDs []int64) error {
 			return err
 		}
 	}
-	return batch.Commit(wk.sync)
+	return wk.commitBatch(db, batch, wk.sync)
 }
 
 func (wk *wukongDB) writeMessageOfNotifyQueue(msg Message, w *Batch) error {

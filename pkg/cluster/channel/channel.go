@@ -48,17 +48,25 @@ func createChannel(cfg wkdb.ChannelClusterConfig, s *Server, rg *raftgroup.RaftG
 		return nil, err
 	}
 
+	nodeOpts := []raft.Option{
+		raft.WithKey(channelKey),
+		raft.WithSaveHardState(func(state types.HardState) error { return s.storage.db.SaveRaftHardState(channelKey, state) }),
+		raft.WithAutoSuspend(true),
+		raft.WithAutoDestory(true),
+		raft.WithNodeId(s.opts.NodeId),
+		raft.WithDestoryAfterIdleTick(s.opts.DestoryAfterIdleTick),
+	}
+	if s.opts.LearnerToFollowerMaxApplyLag > 0 {
+		nodeOpts = append(nodeOpts, raft.WithLearnerToFollowerMaxApplyLag(s.opts.LearnerToFollowerMaxApplyLag))
+	}
+	if s.opts.MaxAdmissionDrainTicks > 0 {
+		nodeOpts = append(nodeOpts, raft.WithMaxAdmissionDrainTicks(s.opts.MaxAdmissionDrainTicks))
+	}
 	ch.Node = raft.NewNode(
 		lastLogStartIndex,
 		state,
-		raft.NewOptions(
-			raft.WithKey(channelKey),
-			raft.WithSaveHardState(func(state types.HardState) error { return s.storage.db.SaveRaftHardState(channelKey, state) }),
-			raft.WithAutoSuspend(true),
-			raft.WithAutoDestory(true),
-			raft.WithNodeId(s.opts.NodeId),
-			raft.WithDestoryAfterIdleTick(s.opts.DestoryAfterIdleTick),
-		))
+		raft.NewOptions(nodeOpts...),
+	)
 
 	return ch, nil
 }
@@ -126,19 +134,24 @@ func (ch *Channel) resumeConfig(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		resumed := false
 		err := ch.rg.Do(ctx, ch.channelKey, func(r raftgroup.IRaft) error {
 			if r != ch {
 				return raftgroup.ErrRaftNotExist
 			}
-			if ch.needsConfigResume && ch.IsLeader() && len(ch.Config().Replicas) == 1 {
+			if ch.needsConfigResume && ch.IsLeader() {
 				if !ch.LeaderReadReady() {
 					return ErrConfigNotReady
 				}
 				ch.ResumeReplication()
+				resumed = true
 			}
 			ch.needsConfigResume = false
 			return nil
 		})
+		if resumed {
+			ch.rg.Advance()
+		}
 		if !errors.Is(err, ErrConfigNotReady) {
 			return err
 		}

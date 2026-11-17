@@ -89,9 +89,27 @@ func (s *Server) handleCmd(cmd *CMD) error {
 		return s.handleNodeJoined(cmd)
 	case CMDTypeSlotMigrate: // 槽迁移
 		return s.handleSlotMigrate(cmd)
+	case CMDTypeNodeStatusChange: // 节点状态改变
+		return s.handleNodeStatusChange(cmd)
 	case CMDTypeSlotStatusChange: // 槽状态改变
 		return s.handleSlotStatusChange(cmd)
+	default:
+		if cmd.version == 1 || cmd.version == 2 {
+			s.Error("unknown clusterconfig cmd type", zap.String("cmdType", cmd.CmdType.String()), zap.Uint16("rawType", uint16(cmd.CmdType)))
+			return fmt.Errorf("unknown clusterconfig cmd type: %d", cmd.CmdType)
+		}
+		s.Warn("ignoring raw non-CMD clusterconfig payload", zap.Uint16("version", cmd.version), zap.Uint16("rawType", uint16(cmd.CmdType)))
+		return nil
 	}
+}
+
+func (s *Server) handleNodeStatusChange(cmd *CMD) error {
+	nodeId, status, err := DecodeNodeStatusChange(cmd.Data)
+	if err != nil {
+		s.Error("decode node status change err", zap.Error(err))
+		return err
+	}
+	s.config.updateNodeStatus(nodeId, status)
 	return nil
 }
 

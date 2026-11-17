@@ -36,7 +36,7 @@ func (a *rpc) conversationChannels(c *wkrpc.Context) {
 		"uid": req.Uid,
 	}
 	reqBody := wkutil.ToJSON(reqBodyMap)
-	resp, err := a.post(forwardUrl, []byte(reqBody))
+	resp, err := a.post(forwardUrl, []byte(reqBody), service.TrustedPeerNodeHeaders(leaderInfo, nil))
 	if err != nil {
 		a.Error("转发请求失败！", zap.Error(err))
 		c.WriteErr(err)
@@ -85,15 +85,16 @@ func (a *rpc) conversationChannels(c *wkrpc.Context) {
 }
 
 // ForwardWithBody 转发请求
-func (a *rpc) post(url string, body []byte) (*rest.Response, error) {
+func (a *rpc) post(url string, body []byte, headers map[string]string) (*rest.Response, error) {
 
 	req := rest.Request{
 		Method:  rest.Post,
 		BaseURL: url,
+		Headers: headers,
 		Body:    body,
 	}
 
-	resp, err := rest.Send(req)
+	resp, err := service.SendPeerRequest(req)
 	if err != nil {
 		return nil, err
 	}

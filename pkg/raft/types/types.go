@@ -197,6 +197,8 @@ type Event struct {
 	CommittedIndex uint64
 	// StoredIndex 已存储日志下标
 	StoredIndex uint64
+	// AppliedIndex 已应用日志下标（排他性下标，即 appliedIndex + 1，0 表示未携带）
+	AppliedIndex uint64
 	// 最新的日志任期（与Term不同。Term是当前服务的任期）
 	LastLogTerm uint32
 	// 配置版本
@@ -213,6 +215,9 @@ type Event struct {
 
 	// 不参与编码
 	TermStartIndexInfo *TermStartIndexInfo
+	TruncateID         uint64 // local storage request identity; never sent on the wire
+	RoleChangeID       uint64 // local leader-handoff request identity; never sent on the wire
+	StoreEpoch         uint64 // local queue revision identity; never sent on the wire
 	StartIndex         uint64
 	EndIndex           uint64
 }
@@ -231,6 +236,7 @@ const (
 	logsFlag
 	reasonFlag
 	speedFlag
+	appliedIndexFlag
 )
 
 func (e Event) Marshal() ([]byte, error) {
@@ -301,6 +307,9 @@ func (e Event) Marshal() ([]byte, error) {
 	}
 	if flag&speedFlag != 0 {
 		enc.WriteUint8(uint8(e.Speed))
+	}
+	if flag&appliedIndexFlag != 0 {
+		enc.WriteUint64(e.AppliedIndex)
 	}
 
 	return enc.Bytes(), nil
@@ -462,6 +471,13 @@ func (e *Event) Unmarshal(data []byte) error {
 		}
 		e.Speed = Speed(speed)
 	}
+	if flag&appliedIndexFlag != 0 {
+		appliedIndex, err := dec.Uint64()
+		if err != nil {
+			return err
+		}
+		e.AppliedIndex = appliedIndex
+	}
 	return nil
 }
 
@@ -506,6 +522,9 @@ func (e Event) getFlag() uint32 {
 	if e.Speed != SpeedFast {
 		flag |= speedFlag
 	}
+	if e.AppliedIndex != 0 {
+		flag |= appliedIndexFlag
+	}
 	return flag
 }
 
@@ -531,6 +550,9 @@ func (e Event) Size() uint64 {
 		size += 8
 	}
 	if e.StoredIndex != 0 {
+		size += 8
+	}
+	if e.AppliedIndex != 0 {
 		size += 8
 	}
 	if e.LastLogTerm != 0 {

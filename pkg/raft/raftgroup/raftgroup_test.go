@@ -106,8 +106,8 @@ func TestPropose(t *testing.T) {
 	node1Store := rg1.Options().Storage.(*testStorage)
 	node2Store := rg2.Options().Storage.(*testStorage)
 
-	logs1 := node1Store.logs["ch001"]
-	logs2 := node2Store.logs["ch001"]
+	logs1 := node1Store.getLogsSnapshot("ch001")
+	logs2 := node2Store.getLogsSnapshot("ch001")
 	assert.Equal(t, 1, len(logs1))
 	assert.Equal(t, 1, len(logs2))
 
@@ -237,8 +237,8 @@ func TestProposeBatch(t *testing.T) {
 	node1Store := rg1.Options().Storage.(*testStorage)
 	node2Store := rg2.Options().Storage.(*testStorage)
 
-	assert.Equal(t, len(reqs), len(node1Store.logs["ch001"]))
-	assert.Equal(t, len(reqs), len(node2Store.logs["ch001"]))
+	assert.Equal(t, len(reqs), len(node1Store.getLogsSnapshot("ch001")))
+	assert.Equal(t, len(reqs), len(node2Store.getLogsSnapshot("ch001")))
 
 }
 
@@ -330,6 +330,12 @@ func newTestStorage() *testStorage {
 	}
 }
 
+func (t *testStorage) getLogsSnapshot(key string) []types.Log {
+	t.RLock()
+	defer t.RUnlock()
+	return append([]types.Log(nil), t.logs[key]...)
+}
+
 func (t *testStorage) AppendLogs(key string, logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) error {
 	t.Lock()
 	defer t.Unlock()
@@ -351,6 +357,8 @@ func (t *testStorage) Apply(key string, logs []types.Log) error {
 }
 
 func (t *testStorage) GetTermStartIndex(key string, term uint32) (uint64, error) {
+	t.RLock()
+	defer t.RUnlock()
 
 	termStartIndex, ok := t.termStartIndexs[key]
 	if !ok {
@@ -360,6 +368,8 @@ func (t *testStorage) GetTermStartIndex(key string, term uint32) (uint64, error)
 }
 
 func (t *testStorage) LeaderLastLogTerm(key string) (uint32, error) {
+	t.RLock()
+	defer t.RUnlock()
 
 	logs, ok := t.logs[key]
 	if !ok {
@@ -371,6 +381,8 @@ func (t *testStorage) LeaderLastLogTerm(key string) (uint32, error) {
 }
 
 func (t *testStorage) LeaderTermGreaterEqThan(key string, term uint32) (uint32, error) {
+	t.RLock()
+	defer t.RUnlock()
 
 	termStartIndex, ok := t.termStartIndexs[key]
 	if !ok {
@@ -398,12 +410,14 @@ func (t *testStorage) GetLogs(key string, start, end, maxSize uint64) ([]types.L
 		return nil, nil
 	}
 	if start-1+maxSize > uint64(len(logs)) {
-		return logs[start-1:], nil
+		return append([]types.Log(nil), logs[start-1:]...), nil
 	}
-	return logs[start-1 : end-1+maxSize], nil
+	return append([]types.Log(nil), logs[start-1:end-1+maxSize]...), nil
 }
 
 func (t *testStorage) GetState(key string) (*types.RaftState, error) {
+	t.RLock()
+	defer t.RUnlock()
 
 	logs, ok := t.logs[key]
 	if !ok {

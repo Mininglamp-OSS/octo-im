@@ -30,7 +30,18 @@ func newSlot(slot *types.Slot, s *Server) *Slot {
 	if err != nil {
 		st.Panic("get last term failed", zap.Error(err))
 	}
-	node := raft.NewNode(lastLogIndex, state, raft.NewOptions(raft.WithKey(shardNo), raft.WithNodeId(s.opts.NodeId), raft.WithSaveHardState(func(state rafttypes.HardState) error { return s.storage.SaveHardState(shardNo, state) })))
+	nodeOpts := []raft.Option{
+		raft.WithKey(shardNo),
+		raft.WithNodeId(s.opts.NodeId),
+		raft.WithSaveHardState(func(state rafttypes.HardState) error { return s.storage.SaveHardState(shardNo, state) }),
+	}
+	if s.opts.LearnerToFollowerMaxApplyLag > 0 {
+		nodeOpts = append(nodeOpts, raft.WithLearnerToFollowerMaxApplyLag(s.opts.LearnerToFollowerMaxApplyLag))
+	}
+	if s.opts.MaxAdmissionDrainTicks > 0 {
+		nodeOpts = append(nodeOpts, raft.WithMaxAdmissionDrainTicks(s.opts.MaxAdmissionDrainTicks))
+	}
+	node := raft.NewNode(lastLogIndex, state, raft.NewOptions(nodeOpts...))
 	st.Node = node
 
 	return st

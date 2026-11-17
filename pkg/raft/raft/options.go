@@ -54,6 +54,12 @@ type Options struct {
 	// FollowerToLeaderMinLogGap 跟随者转换为领导者的最小日志差距
 	FollowerToLeaderMinLogGap uint64
 
+	// LearnerToFollowerMaxApplyLag 学习者晋升或计划切主前允许的最大已提交应用差距
+	LearnerToFollowerMaxApplyLag uint64
+
+	// MaxAdmissionDrainTicks 计划切主暂停提案等待排空/追赶的最大tick数
+	MaxAdmissionDrainTicks int
+
 	// AutoSuspend 是否允许自动挂起
 	AutoSuspend bool
 
@@ -78,10 +84,12 @@ func NewOptions(opt ...Option) *Options {
 		MaxLogCountPerBatch:        1000,
 		GoPoolSize:                 1000,
 		ProposeTimeout:             time.Second * 5,
-		LearnerToFollowerMinLogGap: 100,
-		LearnerToLeaderMinLogGap:   100,
-		FollowerToLeaderMinLogGap:  100,
-		SuspendAfterEmptySyncTick:  10,
+		LearnerToFollowerMinLogGap:   100,
+		LearnerToLeaderMinLogGap:     100,
+		FollowerToLeaderMinLogGap:    100,
+		LearnerToFollowerMaxApplyLag: 8,
+		MaxAdmissionDrainTicks:       100,
+		SuspendAfterEmptySyncTick:    10,
 		AutoSuspend:                false,
 		AutoDestory:                false,
 		DestoryAfterIdleTick:       10 * 60 * 30, // 如果TickInterval是100ms, 那么10 * 60 * 30这个值是30分钟，具体时间根据TickInterval来定
@@ -224,4 +232,16 @@ func WithAutoDestory(autoDestory bool) Option {
 
 func WithSaveHardState(save func(types.HardState) error) Option {
 	return func(opts *Options) { opts.SaveHardState = save }
+}
+
+func WithLearnerToFollowerMaxApplyLag(lag uint64) Option {
+	return func(opts *Options) {
+		opts.LearnerToFollowerMaxApplyLag = lag
+	}
+}
+
+func WithMaxAdmissionDrainTicks(ticks int) Option {
+	return func(opts *Options) {
+		opts.MaxAdmissionDrainTicks = ticks
+	}
 }

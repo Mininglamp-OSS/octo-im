@@ -12,8 +12,17 @@ type TagReq struct {
 	NodeId      uint64 // 获取属于指定节点的uids
 }
 
+func (t *TagReq) Encode() ([]byte, error) {
+	return t.encode()
+}
+
+func (t *TagReq) Decode(data []byte) error {
+	return t.decode(data)
+}
+
 func (t *TagReq) encode() ([]byte, error) {
 	enc := wkproto.NewEncoder()
+	defer enc.End()
 	enc.WriteString(t.TagKey)
 	enc.WriteString(t.ChannelId)
 	enc.WriteUint8(t.ChannelType)
@@ -42,6 +51,14 @@ func (t *TagReq) decode(data []byte) error {
 type TagResp struct {
 	TagKey string
 	Uids   []string
+}
+
+func (t *TagResp) Encode() ([]byte, error) {
+	return t.encode()
+}
+
+func (t *TagResp) Decode(data []byte) error {
+	return t.decode(data)
 }
 
 func (t *TagResp) encode() ([]byte, error) {

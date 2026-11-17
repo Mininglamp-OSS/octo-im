@@ -274,6 +274,15 @@ func (c *Config) updateSlots(slots []*types.Slot) {
 	for _, slot := range slots {
 		for i, s := range c.cfg.Slots {
 			if s.Id == slot.Id {
+				if s.Term > 0 && slot.Term < s.Term {
+					break
+				}
+				if s.Status == types.SlotStatus_SlotStatusCandidate && slot.Status == types.SlotStatus_SlotStatusNormal && s.Term > 0 && slot.Term <= s.Term {
+					break
+				}
+				if s.Term > 0 && slot.Term == s.Term && s.Leader != 0 && slot.Leader != 0 && slot.Leader != s.Leader {
+					break
+				}
 				c.cfg.Slots[i] = slot
 				break
 			}
@@ -418,7 +427,7 @@ func (c *Config) node(id uint64) *types.Node {
 	defer c.mu.RUnlock()
 	for _, n := range c.cfg.Nodes {
 		if n.Id == id {
-			return n
+			return n.Clone()
 		}
 	}
 	return nil

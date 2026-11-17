@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"go.uber.org/zap"
@@ -14,12 +15,27 @@ import (
 
 type Client struct {
 	wklog.Log
+	boundCluster icluster.ICluster
 }
 
 func NewClient() *Client {
 	return &Client{
 		Log: wklog.NewWKLog("ingress.Client"),
 	}
+}
+
+func (c *Client) BindCluster(cl icluster.ICluster) {
+	if c == nil {
+		return
+	}
+	c.boundCluster = cl
+}
+
+func (c *Client) cluster() icluster.ICluster {
+	if c != nil && c.boundCluster != nil {
+		return c.boundCluster
+	}
+	return service.Cluster
 }
 
 // 请求获取指定节点的用户
@@ -52,7 +68,7 @@ func (c *Client) UpdateTag(nodeId uint64, req *TagUpdateReq) error {
 	}
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
-	resp, err := service.Cluster.RequestWithContext(timeoutCtx, nodeId, "/wk/ingress/updateTag", data)
+	resp, err := c.cluster().RequestWithContext(timeoutCtx, nodeId, "/wk/ingress/updateTag", data)
 	if err != nil {
 		return err
 	}
@@ -69,7 +85,7 @@ func (c *Client) AddTag(nodeId uint64, req *TagAddReq) error {
 	}
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
-	resp, err := service.Cluster.RequestWithContext(timeoutCtx, nodeId, "/wk/ingress/addTag", data)
+	resp, err := c.cluster().RequestWithContext(timeoutCtx, nodeId, "/wk/ingress/addTag", data)
 	if err != nil {
 		return err
 	}
@@ -124,7 +140,7 @@ func (c *Client) RequestSubscribers(toNodeId uint64, channelId string, channelTy
 func (c *Client) request(toNodeId uint64, path string, body []byte) (*proto.Response, error) {
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*2)
 	defer cancel()
-	resp, err := service.Cluster.RequestWithContext(timeoutCtx, toNodeId, path, body)
+	resp, err := c.cluster().RequestWithContext(timeoutCtx, toNodeId, path, body)
 	if err != nil {
 		c.Error("request failed", zap.Error(err), zap.String("path", path), zap.Int("body", len(body)))
 		return nil, err
@@ -156,7 +172,7 @@ func (c *Client) RequestPersistAfter(toNodeId uint64, channelId string, channelT
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
-	resp, err := service.Cluster.RequestWithContext(timeoutCtx, toNodeId, "/wk/ingress/persistAfter", data)
+	resp, err := c.cluster().RequestWithContext(timeoutCtx, toNodeId, "/wk/ingress/persistAfter", data)
 	if err != nil {
 		c.Error("RequestPersistAfter: request failed", zap.Error(err), zap.Uint64("toNodeId", toNodeId), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
 		return err

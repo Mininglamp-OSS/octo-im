@@ -153,7 +153,7 @@ func (wk *wukongDB) AppendMessageEventWithState(event *MessageEvent) (*MessageEv
 		return nil, nil, err
 	}
 
-	if err := batch.Commit(wk.sync); err != nil {
+	if err := wk.commitBatch(db, batch, wk.sync); err != nil {
 		return nil, nil, err
 	}
 	return event, mergedState, nil

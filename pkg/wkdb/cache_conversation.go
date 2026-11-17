@@ -167,10 +167,10 @@ func (c *ConversationCache) updateUserConversationsInCache(uid string, updatedCo
 			}
 
 			// 检查是否有新增的会话（在updatedMap中剩余的）
-			// 将新增的会话添加到缓存中
-			for _, newConv := range updatedMap {
-				newConversations = append(newConversations, newConv)
-				updated = true
+			// 新增会话可能受 excludeChannelTypes 过滤或改变 limit 截断边界，直接失效该缓存键
+			if len(updatedMap) > 0 {
+				c.lastConversationsCache.Remove(key)
+				continue
 			}
 
 			// 如果有更新，重新缓存

@@ -217,3 +217,50 @@ func TestConfigReadHintForDivergenceButNotNewerRuntime(t *testing.T) {
 	require.Equal(t, 3, hints)
 	require.True(t, conversationStateReady(raftgroup.ReadState{}, cfg), "an orphan learner alone must not block dormant reads")
 }
+
+func TestQAReturn_MultiBatchMigrationDeferAndReleaseConvergesWithout30sWait(t *testing.T) {
+	r := newChannelConfigReconciler(context.Background())
+	r.maxMigrations = 8
+	r.owned = func(channelConfigKey) bool { return true }
+	r.page = func(uint64, int) ([]wkdb.ChannelClusterConfig, error) { return nil, nil }
+
+	const totalChannels = 32
+	var promoted sync.Map
+	var promotedCount atomic.Int32
+
+	r.process = func(ctx context.Context, key channelConfigKey) error {
+		if _, done := promoted.Load(key); done {
+			r.releaseMigration(key)
+			return nil
+		}
+		if !r.tryAcquireMigration(key) {
+			// Migration slots full: defer for 50ms without dropping from pending
+			r.deferReconcile(key, 50*time.Millisecond)
+			return nil
+		}
+		// Simulate learner catch-up completing on next pass and releasing slot
+		go func(k channelConfigKey) {
+			time.Sleep(25 * time.Millisecond)
+			promoted.Store(k, true)
+			promotedCount.Add(1)
+			r.releaseMigration(k)
+		}(key)
+		r.deferReconcile(key, 40*time.Millisecond)
+		return nil
+	}
+
+	for i := 0; i < totalChannels; i++ {
+		r.add(channelConfigKey{id: fmt.Sprintf("ch_%03d", i), typ: 2}, false)
+	}
+	start := time.Now()
+	r.start()
+	t.Cleanup(r.stop)
+
+	require.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return promotedCount.Load() == totalChannels && len(r.pending) == 0 && len(r.activeMigrations) == 0
+	}, 2*time.Second, 10*time.Millisecond)
+	require.Less(t, time.Since(start), 2*time.Second)
+}
+

@@ -243,7 +243,17 @@ type Options struct {
 		ChannelDestoryAfterIdleTick int // 频道空闲多久后销毁（如果TickInterval是100ms, 那么10 * 60 * 30这个值是30分钟，具体时间根据TickInterval来定）
 		SlotReactorSubCount         int // 槽reactor sub的数量
 
-		PongMaxTick int // 节点超过多少tick没有回应心跳就认为是掉线
+		PongMaxTick                    int           // 节点超过多少tick没有回应心跳就认为是掉线
+		MaxLogSizePerBatch             uint64        // 每次拉取日志的最大字节数
+		MaxLogCountPerBatch            int           // 每次拉取日志的最大条数
+		LearnerToFollowerMaxApplyLag   uint64        // Learner 晋升 Follower 允许的最大应用滞后条数
+		MaxReadyApplyLag               uint64        // 节点就绪探针允许的最大本地槽位应用滞后条数
+		MaxApplyStallTicks             int           // 节点就绪探针允许的最大连续应用停滞 tick 数
+		MaxSlotApplyWait               time.Duration // 槽领导读取前等待本地应用追平的最大超时时间
+		HandoffDrainTimeoutTick        int           // 迁主/准入排空超时 tick 数
+		MaxConcurrentChannelMigrations int           // 后台并发执行的频道 Learner 迁移上限
+		RejectConnBeforeReady          bool          // 节点就绪前是否拒绝外部客户端连接
+		ChannelLeaderAutoBalance       bool          // 是否开启后台频道领导权自动均衡
 	}
 
 	Trace struct {
@@ -298,9 +308,13 @@ type Options struct {
 	}
 
 	Db struct {
-		ShardNum     int // 频道db分片数量
-		SlotShardNum int // 槽db分片数量
-		MemTableSize int // MemTable大小
+		ShardNum            int   // 频道db分片数量
+		SlotShardNum        int   // 槽db分片数量
+		MemTableSize        int   // MemTable大小
+		SlotMemTableSize    int   // 槽db MemTable大小
+		BlockCacheSize      int64 // 共享 Pebble BlockCache 大小
+		MaxMessagesPerBatch int   // 单次 Pebble Batch 最大消息数
+		MaxBatchBytes       int   // 单次 Pebble Batch 最大字节数
 	}
 
 	Auth auth.AuthConfig // 认证配置
@@ -560,44 +574,64 @@ func New(op ...Option) *Options {
 			Addr: "0.0.0.0:5172",
 		},
 		Cluster: struct {
-			NodeId                      uint64
-			Addr                        string
-			ServerAddr                  string
-			APIUrl                      string
-			ReqTimeout                  time.Duration
-			RecentReadMaxChannels       int
-			RecentReadMaxTimeout        time.Duration
-			Role                        Role
-			Seed                        string
-			SlotReplicaCount            int
-			ChannelReplicaCount         int
-			SlotCount                   int
-			InitNodes                   []*Node
-			TickInterval                time.Duration
-			HeartbeatIntervalTick       int
-			ElectionIntervalTick        int
-			ChannelReactorSubCount      int
-			ChannelDestoryAfterIdleTick int
-			SlotReactorSubCount         int
-			PongMaxTick                 int
+			NodeId                         uint64
+			Addr                           string
+			ServerAddr                     string
+			APIUrl                         string
+			ReqTimeout                     time.Duration
+			RecentReadMaxChannels          int
+			RecentReadMaxTimeout           time.Duration
+			Role                           Role
+			Seed                           string
+			SlotReplicaCount               int
+			ChannelReplicaCount            int
+			SlotCount                      int
+			InitNodes                      []*Node
+			TickInterval                   time.Duration
+			HeartbeatIntervalTick          int
+			ElectionIntervalTick           int
+			ChannelReactorSubCount         int
+			ChannelDestoryAfterIdleTick    int
+			SlotReactorSubCount            int
+			PongMaxTick                    int
+			MaxLogSizePerBatch             uint64
+			MaxLogCountPerBatch            int
+			LearnerToFollowerMaxApplyLag   uint64
+			MaxReadyApplyLag               uint64
+			MaxApplyStallTicks             int
+			MaxSlotApplyWait               time.Duration
+			HandoffDrainTimeoutTick        int
+			MaxConcurrentChannelMigrations int
+			RejectConnBeforeReady          bool
+			ChannelLeaderAutoBalance       bool
 		}{
-			NodeId:                      1001,
-			Addr:                        "tcp://0.0.0.0:11110",
-			ServerAddr:                  "",
-			ReqTimeout:                  time.Second * 10,
-			RecentReadMaxChannels:       10000,
-			RecentReadMaxTimeout:        time.Minute,
-			Role:                        RoleReplica,
-			SlotCount:                   64,
-			SlotReplicaCount:            3,
-			ChannelReplicaCount:         3,
-			TickInterval:                time.Millisecond * 150,
-			HeartbeatIntervalTick:       1,
-			ElectionIntervalTick:        10,
-			ChannelReactorSubCount:      128,
-			ChannelDestoryAfterIdleTick: (1000 / 150) * 60 * 10, // 10分钟 (150表示tick间隔时间)
-			SlotReactorSubCount:         16,
-			PongMaxTick:                 30,
+			NodeId:                         1001,
+			Addr:                           "tcp://0.0.0.0:11110",
+			ServerAddr:                     "",
+			ReqTimeout:                     time.Second * 10,
+			RecentReadMaxChannels:          10000,
+			RecentReadMaxTimeout:           time.Minute,
+			Role:                           RoleReplica,
+			SlotCount:                      64,
+			SlotReplicaCount:               3,
+			ChannelReplicaCount:            3,
+			TickInterval:                   time.Millisecond * 150,
+			HeartbeatIntervalTick:          1,
+			ElectionIntervalTick:           10,
+			ChannelReactorSubCount:         128,
+			ChannelDestoryAfterIdleTick:    (1000 / 150) * 60 * 10, // 10分钟 (150表示tick间隔时间)
+			SlotReactorSubCount:            16,
+			PongMaxTick:                    30,
+			MaxLogSizePerBatch:             2 * 1024 * 1024,
+			MaxLogCountPerBatch:            500,
+			LearnerToFollowerMaxApplyLag:   8,
+			MaxReadyApplyLag:               64,
+			MaxApplyStallTicks:             50,
+			MaxSlotApplyWait:               500 * time.Millisecond,
+			HandoffDrainTimeoutTick:        100,
+			MaxConcurrentChannelMigrations: 8,
+			RejectConnBeforeReady:          true,
+			ChannelLeaderAutoBalance:       false,
 		},
 		Trace: struct {
 			ServiceName      string
@@ -699,13 +733,21 @@ func New(op ...Option) *Options {
 			// DeliverWorkerCountPerNode: 10,
 		},
 		Db: struct {
-			ShardNum     int
-			SlotShardNum int
-			MemTableSize int
+			ShardNum            int
+			SlotShardNum        int
+			MemTableSize        int
+			SlotMemTableSize    int
+			BlockCacheSize      int64
+			MaxMessagesPerBatch int
+			MaxBatchBytes       int
 		}{
-			ShardNum:     8,
-			SlotShardNum: 8,
-			MemTableSize: 16 * 1024 * 1024,
+			ShardNum:            8,
+			SlotShardNum:        8,
+			MemTableSize:        16 * 1024 * 1024,
+			SlotMemTableSize:    16 * 1024 * 1024,
+			BlockCacheSize:      16 * 1024 * 1024,
+			MaxMessagesPerBatch: 256,
+			MaxBatchBytes:       2 * 1024 * 1024,
 		},
 
 		Jwt: struct {
@@ -747,6 +789,9 @@ func New(op ...Option) *Options {
 
 	for _, o := range op {
 		o(opts)
+	}
+	if opts.messageIdGen == nil {
+		opts.messageIdGen, _ = snowflake.NewNode(int64(opts.Cluster.NodeId % 1024))
 	}
 
 	return opts
@@ -1008,6 +1053,16 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.Cluster.ChannelDestoryAfterIdleTick = o.getInt("cluster.channelDestoryAfterIdleTick", o.Cluster.ChannelDestoryAfterIdleTick)
 	o.Cluster.SlotReactorSubCount = o.getInt("cluster.slotReactorSubCount", o.Cluster.SlotReactorSubCount)
 	o.Cluster.APIUrl = o.getString("cluster.apiUrl", o.Cluster.APIUrl)
+	o.Cluster.MaxLogSizePerBatch = o.getUint64("cluster.maxLogSizePerBatch", o.Cluster.MaxLogSizePerBatch)
+	o.Cluster.MaxLogCountPerBatch = o.getInt("cluster.maxLogCountPerBatch", o.Cluster.MaxLogCountPerBatch)
+	o.Cluster.LearnerToFollowerMaxApplyLag = o.getUint64("cluster.learnerToFollowerMaxApplyLag", o.Cluster.LearnerToFollowerMaxApplyLag)
+	o.Cluster.MaxReadyApplyLag = o.getUint64("cluster.maxReadyApplyLag", o.Cluster.MaxReadyApplyLag)
+	o.Cluster.MaxApplyStallTicks = o.getInt("cluster.maxApplyStallTicks", o.Cluster.MaxApplyStallTicks)
+	o.Cluster.MaxSlotApplyWait = o.getDuration("cluster.maxSlotApplyWait", o.Cluster.MaxSlotApplyWait)
+	o.Cluster.HandoffDrainTimeoutTick = o.getInt("cluster.handoffDrainTimeoutTick", o.Cluster.HandoffDrainTimeoutTick)
+	o.Cluster.MaxConcurrentChannelMigrations = o.getInt("cluster.maxConcurrentChannelMigrations", o.Cluster.MaxConcurrentChannelMigrations)
+	o.Cluster.RejectConnBeforeReady = o.getBool("cluster.rejectConnBeforeReady", o.Cluster.RejectConnBeforeReady)
+	o.Cluster.ChannelLeaderAutoBalance = o.getBool("cluster.channelLeaderAutoBalance", o.Cluster.ChannelLeaderAutoBalance)
 
 	// =================== trace ===================
 	o.Trace.ServiceName = o.getString("trace.serviceName", o.Trace.ServiceName)
@@ -1055,6 +1110,10 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.Db.ShardNum = o.getInt("db.shardNum", o.Db.ShardNum)
 	o.Db.SlotShardNum = o.getInt("db.slotShardNum", o.Db.SlotShardNum)
 	o.Db.MemTableSize = o.getInt("db.memTableSize", o.Db.MemTableSize)
+	o.Db.SlotMemTableSize = o.getInt("db.slotMemTableSize", o.Db.MemTableSize)
+	o.Db.BlockCacheSize = o.getInt64("db.blockCacheSize", o.Db.BlockCacheSize)
+	o.Db.MaxMessagesPerBatch = o.getInt("db.maxMessagesPerBatch", o.Db.MaxMessagesPerBatch)
+	o.Db.MaxBatchBytes = o.getInt("db.maxBatchBytes", o.Db.MaxBatchBytes)
 
 	// =================== auth ===================
 	o.configureAuth()
@@ -1256,6 +1315,42 @@ func (o *Options) ConfigureDataDir() {
 func (o *Options) Check() error {
 	if o.Cluster.NodeId == 0 {
 		return errors.New("cluster.nodeId must be set")
+	}
+	if o.Db.ShardNum <= 0 {
+		return errors.New("db.shardNum must be greater than 0")
+	}
+	if o.Db.SlotShardNum <= 0 {
+		return errors.New("db.slotShardNum must be greater than 0")
+	}
+	if o.Db.MemTableSize <= 0 {
+		return errors.New("db.memTableSize must be greater than 0")
+	}
+	if o.Db.SlotMemTableSize <= 0 {
+		return errors.New("db.slotMemTableSize must be greater than 0")
+	}
+	if o.Db.BlockCacheSize < 0 {
+		return errors.New("db.blockCacheSize must be non-negative")
+	}
+	if o.Db.MaxMessagesPerBatch <= 0 {
+		return errors.New("db.maxMessagesPerBatch must be greater than 0")
+	}
+	if o.Db.MaxBatchBytes <= 0 {
+		return errors.New("db.maxBatchBytes must be greater than 0")
+	}
+	if o.Cluster.MaxLogSizePerBatch == 0 {
+		return errors.New("cluster.maxLogSizePerBatch must be greater than 0")
+	}
+	if o.Cluster.MaxLogCountPerBatch <= 0 {
+		return errors.New("cluster.maxLogCountPerBatch must be greater than 0")
+	}
+	if o.Cluster.MaxSlotApplyWait < 0 {
+		return errors.New("cluster.maxSlotApplyWait must be non-negative")
+	}
+	if o.Cluster.HandoffDrainTimeoutTick <= 0 {
+		return errors.New("cluster.handoffDrainTimeoutTick must be greater than 0")
+	}
+	if o.Cluster.MaxConcurrentChannelMigrations <= 0 {
+		return errors.New("cluster.maxConcurrentChannelMigrations must be greater than 0")
 	}
 
 	return nil

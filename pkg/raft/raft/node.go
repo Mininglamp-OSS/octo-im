@@ -37,6 +37,7 @@ type Node struct {
 	persistedHardState types.HardState
 	membershipRequests map[uint64]uint64 // peer -> newer applied config version requested
 	applyFailures      int
+	storeFailures      int
 	applyRetryTicks    int // only Tick advances retries; role changes do not reset it
 	electionState          // 选举状态
 	syncState              // 同步状态
@@ -45,8 +46,22 @@ type Node struct {
 	onlySync           bool // 是否只同步,不做截断判断
 	// softState softState // 软状态
 	sync.Mutex
-	truncating  bool // 截断中
-	stopPropose bool // 停止提案
+	stateMu                 sync.RWMutex
+	admissionMu             sync.Mutex
+	truncating              bool // 截断中; survives role changes until physical I/O completes
+	truncateID              uint64
+	truncateRetry           *types.Event
+	stopPropose             bool // 停止提案
+	handoff                 *leaderHandoff
+	roleChangeID            uint64 // monotonic across role changes and retries
+	drainingAdmissions      bool
+	messageAdmissions       map[uint64]struct{}
+	proposalAdmissions      map[uint64]int
+	proposalBatches         int
+	admissionDrainTicks     int
+	admissionDrainCooldown  int
+	bootstrapCommittedIndex uint64
+	applyingTicks           int
 
 	suspend bool // 挂起
 
@@ -80,6 +95,14 @@ func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Opti
 	n.persistedHardState = raftState.HardState
 	// 初始化日志队列
 	n.queue = newQueue(opts.Key, raftState.AppliedIndex, raftState.LastLogIndex)
+	n.bootstrapCommittedIndex = raftState.LastLogIndex
+	if raftState.LastLogIndex > 0 && raftState.LastTerm > 0 {
+		startIdx := lastTermStartLogIndex
+		if startIdx == 0 || startIdx > raftState.LastLogIndex {
+			startIdx = 1
+		}
+		n.queue.recordTermRange(startIdx, raftState.LastLogIndex, raftState.LastTerm)
+	}
 
 	// 初始化选举状态
 	n.votes = make(map[uint64]bool)
@@ -116,16 +139,20 @@ func (n *Node) Key() string {
 
 // LastLogIndex 获取最后一条日志下标
 func (n *Node) LastLogIndex() uint64 {
-	return n.queue.lastLogIndex
+	return n.queue.LastLogIndex()
 }
 
 // LastLogTerm 获取最后一条日志任期
 func (n *Node) LastLogTerm() uint32 {
+	n.stateMu.RLock()
+	defer n.stateMu.RUnlock()
 	return n.lastTermStartIndex.Term
 }
 
 // LastTerm 当前领导任期
 func (n *Node) LastTerm() uint32 {
+	n.stateMu.RLock()
+	defer n.stateMu.RUnlock()
 	return n.cfg.Term
 }
 
@@ -134,7 +161,7 @@ func (n *Node) HasReady() bool {
 	if n.hasUnpersistedHardState() {
 		return true
 	}
-	if n.queue.hasNextStoreLogs() {
+	if !n.truncating && n.queue.hasNextStoreLogs() {
 		return true
 	}
 	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
@@ -145,6 +172,8 @@ func (n *Node) HasReady() bool {
 
 // Suspend 是否挂起
 func (n *Node) Suspend() bool {
+	n.stateMu.RLock()
+	defer n.stateMu.RUnlock()
 	return n.suspend
 }
 
@@ -162,12 +191,12 @@ func (n *Node) Ready() []types.Event {
 		n.persistedHardState = state
 	}
 
-	if n.queue.hasNextStoreLogs() {
+	if !n.truncating && n.queue.hasNextStoreLogs() {
 		logs := n.queue.nextStoreLogs(0)
 		if len(logs) > 0 {
 			var termStartIndexInfo *types.TermStartIndexInfo
 			for _, log := range logs {
-				if n.lastTermStartIndex.Term != log.Term || log.Index == 1 {
+				if n.lastTermStartIndex.Term != log.Term || log.Index == 1 || (n.lastTermStartIndex.Index > 0 && log.Index < n.lastTermStartIndex.Index) {
 					termStartIndexInfo = &types.TermStartIndexInfo{
 						Term:  log.Term,
 						Index: log.Index,
@@ -183,6 +212,9 @@ func (n *Node) Ready() []types.Event {
 	if n.applyRetryTicks == 0 && n.queue.hasNextApplyLogs() {
 		start, end := n.queue.nextApplyLogs()
 		if start > 0 {
+			n.stateMu.Lock()
+			n.applyingTicks = 0
+			n.stateMu.Unlock()
 			n.sendApplyReq(start, end)
 		}
 	}
@@ -193,14 +225,20 @@ func (n *Node) Ready() []types.Event {
 }
 
 func (n *Node) LeaderId() uint64 {
+	n.stateMu.RLock()
+	defer n.stateMu.RUnlock()
 	return n.cfg.Leader
 }
 
 func (n *Node) Config() types.Config {
-	return n.cfg
+	n.stateMu.RLock()
+	defer n.stateMu.RUnlock()
+	return n.cfg.Clone()
 }
 
 func (n *Node) IsLeader() bool {
+	n.stateMu.RLock()
+	defer n.stateMu.RUnlock()
 	return n.cfg.Leader == n.opts.NodeId
 }
 
@@ -217,11 +255,11 @@ func (n *Node) isLearner(nodeId uint64) bool {
 }
 
 func (n *Node) CommittedIndex() uint64 {
-	return n.queue.committedIndex
+	return n.queue.CommittedIndex()
 }
 
 func (n *Node) AppliedIndex() uint64 {
-	return n.queue.appliedIndex
+	return n.queue.AppliedIndex()
 }
 
 func (n *Node) NodeId() uint64 {
@@ -233,6 +271,8 @@ func (n *Node) GetReplicaLastLogIndex(replicaId uint64) uint64 {
 	if replicaId == n.opts.NodeId {
 		return n.LastLogIndex()
 	}
+	n.stateMu.RLock()
+	defer n.stateMu.RUnlock()
 	syncInfo := n.replicaSync[replicaId]
 	if syncInfo != nil && syncInfo.LastSyncIndex > 0 {
 		return syncInfo.LastSyncIndex - 1
@@ -241,7 +281,9 @@ func (n *Node) GetReplicaLastLogIndex(replicaId uint64) uint64 {
 }
 
 func (n *Node) KeepAlive() {
+	n.stateMu.Lock()
 	n.idleTick = 0
+	n.stateMu.Unlock()
 }
 func (n *Node) advance() {
 	if n.opts.Advance != nil {
@@ -255,8 +297,8 @@ func (n *Node) NewPropose(data []byte) types.Event {
 		Type: types.Propose,
 		Logs: []types.Log{
 			{
-				Term:  n.cfg.Term,
-				Index: n.queue.lastLogIndex + 1,
+				Term:  n.LastTerm(),
+				Index: n.LastLogIndex() + 1,
 				Data:  data,
 			},
 		},
@@ -264,6 +306,8 @@ func (n *Node) NewPropose(data []byte) types.Event {
 }
 
 func (n *Node) updateLastTermStartIndex(term uint32, index uint64) {
+	n.stateMu.Lock()
 	n.lastTermStartIndex.Term = term
 	n.lastTermStartIndex.Index = index
+	n.stateMu.Unlock()
 }

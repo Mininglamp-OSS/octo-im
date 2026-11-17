@@ -34,13 +34,22 @@ type Options struct {
 
 	//DestoryAfterIdleTick 频道空闲多久后销毁（如果TickInterval是100ms, 那么10 * 60 * 30这个值是30分钟，具体时间根据TickInterval来定）
 	DestoryAfterIdleTick int
+
+	MaxLogSizePerBatch           uint64
+	MaxLogCountPerBatch          uint64
+	LearnerToFollowerMaxApplyLag uint64
+	MaxAdmissionDrainTicks       int
 }
 
 func NewOptions(opt ...Option) *Options {
 	opts := &Options{
-		GroupCount:             100,
-		ChannelMaxReplicaCount: 3,
-		DestoryAfterIdleTick:   10 * 60 * 30, // 大约30分钟，如果raft的TickInterval是100ms
+		GroupCount:                   100,
+		ChannelMaxReplicaCount:       3,
+		DestoryAfterIdleTick:         10 * 60 * 30, // 大约30分钟，如果raft的TickInterval是100ms
+		MaxLogSizePerBatch:           2 * 1024 * 1024,
+		MaxLogCountPerBatch:          500,
+		LearnerToFollowerMaxApplyLag: 8,
+		MaxAdmissionDrainTicks:       100,
 	}
 	for _, o := range opt {
 		o(opts)
@@ -113,5 +122,29 @@ func WithOnSaveConfig(fn func(channelId string, channelType uint8, cfg types.Con
 func WithDestoryAfterIdleTick(tick int) Option {
 	return func(o *Options) {
 		o.DestoryAfterIdleTick = tick
+	}
+}
+
+func WithMaxLogSizePerBatch(maxBytes uint64) Option {
+	return func(o *Options) {
+		o.MaxLogSizePerBatch = maxBytes
+	}
+}
+
+func WithMaxLogCountPerBatch(maxCount uint64) Option {
+	return func(o *Options) {
+		o.MaxLogCountPerBatch = maxCount
+	}
+}
+
+func WithLearnerToFollowerMaxApplyLag(lag uint64) Option {
+	return func(o *Options) {
+		o.LearnerToFollowerMaxApplyLag = lag
+	}
+}
+
+func WithMaxAdmissionDrainTicks(ticks int) Option {
+	return func(o *Options) {
+		o.MaxAdmissionDrainTicks = ticks
 	}
 }

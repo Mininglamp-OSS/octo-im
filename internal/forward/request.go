@@ -25,7 +25,8 @@ const (
 	StatusRetry    proto.Status = 3
 	StatusInvalid  proto.Status = 4
 	Budget                      = 5 * time.Second
-	maxHops                     = 4
+	MaxHops                     = 4
+	maxHops                     = MaxHops
 )
 
 var (

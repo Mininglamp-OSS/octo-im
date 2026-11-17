@@ -2,6 +2,7 @@ package raft_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -119,9 +120,9 @@ func TestPropose(t *testing.T) {
 	raft2.WaitUtilCommit(timeoutCtx, 1)
 	raft3.WaitUtilCommit(timeoutCtx, 1)
 
-	node1Logs := raft1.Options().Storage.(*testStorage).logs
-	node2Logs := raft2.Options().Storage.(*testStorage).logs
-	node3Logs := raft3.Options().Storage.(*testStorage).logs
+	node1Logs := raft1.Options().Storage.(*testStorage).getLogsSnapshot()
+	node2Logs := raft2.Options().Storage.(*testStorage).getLogsSnapshot()
+	node3Logs := raft3.Options().Storage.(*testStorage).getLogsSnapshot()
 
 	assert.Equal(t, 1, len(node1Logs))
 	assert.Equal(t, 1, len(node2Logs))
@@ -199,14 +200,17 @@ func TestLogConflict1(t *testing.T) {
 
 	time.Sleep(time.Millisecond * 400)
 
+	s1Logs := s1Storage.getLogsSnapshot()
+	s2Logs := s2Storage.getLogsSnapshot()
+	s3Logs := s3Storage.getLogsSnapshot()
 	for i := 0; i < 2; i++ {
-		assert.Equal(t, s1Storage.logs[i].Data, s2Storage.logs[i].Data)
-		assert.Equal(t, s1Storage.logs[i].Term, s2Storage.logs[i].Term)
-		assert.Equal(t, s1Storage.logs[i].Index, s2Storage.logs[i].Index)
+		assert.Equal(t, s1Logs[i].Data, s2Logs[i].Data)
+		assert.Equal(t, s1Logs[i].Term, s2Logs[i].Term)
+		assert.Equal(t, s1Logs[i].Index, s2Logs[i].Index)
 
-		assert.Equal(t, s3Storage.logs[i].Data, s2Storage.logs[i].Data)
-		assert.Equal(t, s3Storage.logs[i].Term, s2Storage.logs[i].Term)
-		assert.Equal(t, s3Storage.logs[i].Index, s2Storage.logs[i].Index)
+		assert.Equal(t, s3Logs[i].Data, s2Logs[i].Data)
+		assert.Equal(t, s3Logs[i].Term, s2Logs[i].Term)
+		assert.Equal(t, s3Logs[i].Index, s2Logs[i].Index)
 	}
 
 }
@@ -279,14 +283,17 @@ func TestLogConflict2(t *testing.T) {
 
 	time.Sleep(time.Millisecond * 400)
 
+	s1Logs := s1Storage.getLogsSnapshot()
+	s2Logs := s2Storage.getLogsSnapshot()
+	s3Logs := s3Storage.getLogsSnapshot()
 	for i := 0; i < 2; i++ {
-		assert.Equal(t, s1Storage.logs[i].Data, s2Storage.logs[i].Data)
-		assert.Equal(t, s1Storage.logs[i].Term, s2Storage.logs[i].Term)
-		assert.Equal(t, s1Storage.logs[i].Index, s2Storage.logs[i].Index)
+		assert.Equal(t, s1Logs[i].Data, s2Logs[i].Data)
+		assert.Equal(t, s1Logs[i].Term, s2Logs[i].Term)
+		assert.Equal(t, s1Logs[i].Index, s2Logs[i].Index)
 
-		assert.Equal(t, s3Storage.logs[i].Data, s2Storage.logs[i].Data)
-		assert.Equal(t, s3Storage.logs[i].Term, s2Storage.logs[i].Term)
-		assert.Equal(t, s3Storage.logs[i].Index, s2Storage.logs[i].Index)
+		assert.Equal(t, s3Logs[i].Data, s2Logs[i].Data)
+		assert.Equal(t, s3Logs[i].Term, s2Logs[i].Term)
+		assert.Equal(t, s3Logs[i].Index, s2Logs[i].Index)
 	}
 
 }
@@ -320,9 +327,9 @@ func TestProposeUntilApplied(t *testing.T) {
 	raft2.WaitUtilCommit(timeoutCtx, 1)
 	raft3.WaitUtilCommit(timeoutCtx, 1)
 
-	node1Logs := raft1.Options().Storage.(*testStorage).logs
-	node2Logs := raft2.Options().Storage.(*testStorage).logs
-	node3Logs := raft3.Options().Storage.(*testStorage).logs
+	node1Logs := raft1.Options().Storage.(*testStorage).getLogsSnapshot()
+	node2Logs := raft2.Options().Storage.(*testStorage).getLogsSnapshot()
+	node3Logs := raft3.Options().Storage.(*testStorage).getLogsSnapshot()
 
 	assert.Equal(t, 1, len(node1Logs))
 	assert.Equal(t, 1, len(node2Logs))
@@ -353,6 +360,8 @@ func (t *testTransport) Send(event types.Event) {
 }
 
 type testStorage struct {
+	mu              sync.RWMutex
+	appliedIndex    uint64
 	hardState       types.HardState
 	nodeId          uint64
 	logs            []types.Log
@@ -365,7 +374,15 @@ func newTestStorage(nodeId uint64) *testStorage {
 	}
 }
 
+func (s *testStorage) getLogsSnapshot() []types.Log {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]types.Log(nil), s.logs...)
+}
+
 func (s *testStorage) AppendLogs(logs []types.Log, termStartIndex *types.TermStartIndexInfo) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.logs = append(s.logs, logs...)
 	if termStartIndex != nil {
 		s.termStartIndexs = append(s.termStartIndexs, termStartIndex)
@@ -374,14 +391,23 @@ func (s *testStorage) AppendLogs(logs []types.Log, termStartIndex *types.TermSta
 }
 
 func (s *testStorage) saveTermStartIndex(termStartIndex *types.TermStartIndexInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.termStartIndexs = append(s.termStartIndexs, termStartIndex)
 }
 
 func (s *testStorage) GetLogs(start, end uint64, limitSize uint64) ([]types.Log, error) {
-	return s.logs[start-1:], nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if start == 0 || int(start-1) >= len(s.logs) {
+		return nil, nil
+	}
+	return append([]types.Log(nil), s.logs[start-1:]...), nil
 }
 
 func (s *testStorage) GetState() (types.RaftState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if len(s.logs) == 0 {
 		return types.RaftState{HardState: s.hardState}, nil
 	}
@@ -390,11 +416,13 @@ func (s *testStorage) GetState() (types.RaftState, error) {
 		HardState:    s.hardState,
 		LastLogIndex: lastLog.Index,
 		LastTerm:     lastLog.Term,
-		AppliedIndex: lastLog.Index,
+		AppliedIndex: s.appliedIndex,
 	}, nil
 }
 
 func (s *testStorage) GetTermStartIndex(term uint32) (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, tsi := range s.termStartIndexs {
 		if tsi.Term == term {
 			return tsi.Index, nil
@@ -404,6 +432,8 @@ func (s *testStorage) GetTermStartIndex(term uint32) (uint64, error) {
 }
 
 func (s *testStorage) TruncateLogTo(index uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if int(index) > len(s.logs) {
 		return nil
 	}
@@ -412,6 +442,8 @@ func (s *testStorage) TruncateLogTo(index uint64) error {
 }
 
 func (s *testStorage) DeleteLeaderTermStartIndexGreaterThanTerm(term uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	newTermStartIndexs := make([]*types.TermStartIndexInfo, 0)
 	for _, tsi := range s.termStartIndexs {
 		if tsi.Term <= term {
@@ -423,7 +455,8 @@ func (s *testStorage) DeleteLeaderTermStartIndexGreaterThanTerm(term uint32) err
 }
 
 func (s *testStorage) LeaderTermGreaterEqThan(term uint32) (uint32, error) {
-
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, tsi := range s.termStartIndexs {
 		if tsi.Term >= term {
 			return tsi.Term, nil
@@ -433,6 +466,8 @@ func (s *testStorage) LeaderTermGreaterEqThan(term uint32) (uint32, error) {
 }
 
 func (s *testStorage) LeaderLastTerm() (uint32, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if len(s.termStartIndexs) == 0 {
 		return 0, nil
 	}
@@ -440,7 +475,11 @@ func (s *testStorage) LeaderLastTerm() (uint32, error) {
 }
 
 func (s *testStorage) Apply(logs []types.Log) error {
-
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(logs) > 0 {
+		s.appliedIndex = logs[len(logs)-1].Index
+	}
 	return nil
 }
 
@@ -536,4 +575,9 @@ func raftStop(rafts ...*raft.Raft) {
 	}
 }
 
-func (s *testStorage) SaveHardState(state types.HardState) error { s.hardState = state; return nil }
+func (s *testStorage) SaveHardState(state types.HardState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hardState = state
+	return nil
+}

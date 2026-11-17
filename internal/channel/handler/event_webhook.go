@@ -10,7 +10,7 @@ import (
 
 func (h *Handler) webhook(ctx *eventbus.ChannelContext) {
 	var err error
-	if options.G.WebhookOn(types.EventMsgNotify) {
+	if options.G != nil && options.G.WebhookOn(types.EventMsgNotify) && service.Webhook != nil {
 		err = service.Webhook.AppendMessageOfNotifyQueue(h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, ctx.Events))
 		if err != nil {
 			h.Error("webhook append message of notify queue failed", zap.Error(err), zap.Int("msgs", len(ctx.Events)), zap.String("channelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))

@@ -10,6 +10,8 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/types"
+	"github.com/WuKongIM/WuKongIM/pkg/auth"
+	"github.com/WuKongIM/WuKongIM/pkg/auth/resource"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
@@ -59,6 +61,10 @@ func (t *tag) get(c *wkhttp.Context) {
 }
 
 func (t *tag) remove(c *wkhttp.Context) {
+	if options.G != nil && !options.G.Auth.HasPermissionWithContext(c, resource.All, auth.ActionWrite) {
+		c.ResponseErrorWithStatus(http.StatusForbidden, errors.New("没有权限"))
+		return
+	}
 	var req struct {
 		TagKey      string `json:"tag_key"`
 		ChannelId   string `json:"channel_id"`

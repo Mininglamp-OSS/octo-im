@@ -73,6 +73,11 @@ func channelProposalResponseError(resp *proto.Response) error {
 
 // RequestSlotProposeBatchUntilApplied 向指定节点请求槽提案
 func (r *rpcClient) RequestSlotProposeBatchUntilApplied(nodeId uint64, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+	return r.RequestSlotProposeBatchUntilAppliedWithContext(context.Background(), nodeId, slotId, reqs)
+}
+
+// RequestSlotProposeBatchUntilAppliedWithContext 向指定节点请求槽提案（受调用方 ctx 截止时间约束）
+func (r *rpcClient) RequestSlotProposeBatchUntilAppliedWithContext(ctx context.Context, nodeId uint64, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
 	req := &slotProposeReq{
 		SlotId: slotId,
 		reqs:   reqs,
@@ -81,7 +86,7 @@ func (r *rpcClient) RequestSlotProposeBatchUntilApplied(nodeId uint64, slotId ui
 	if err != nil {
 		return nil, err
 	}
-	body, err := r.request(nodeId, "/rpc/slot/propose", data)
+	body, err := r.requestWithContext(ctx, nodeId, "/rpc/slot/propose", data)
 	if err != nil {
 		return nil, err
 	}
@@ -237,13 +242,27 @@ func (r *rpcClient) RequestClusterLogs(nodeId uint64, req *clusterLogsReq) ([]ra
 }
 
 func (r *rpcClient) request(nodeId uint64, path string, body []byte) ([]byte, error) {
+	return r.requestWithContext(context.Background(), nodeId, path, body)
+}
+
+func (r *rpcClient) requestWithContext(ctx context.Context, nodeId uint64, path string, body []byte) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	node := r.s.nodeManager.node(nodeId)
 	if node == nil {
 		return nil, fmt.Errorf("node[%d] not exist", nodeId)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	timeout := time.Second * 5
+	if r.s != nil && r.s.opts != nil && r.s.opts.ReqTimeout > 0 {
+		timeout = r.s.opts.ReqTimeout
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	resp, err := node.RequestWithContext(timeoutCtx, path, body)

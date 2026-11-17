@@ -210,9 +210,21 @@ func New(opts *options.Options) *Server {
 			cluster.WithRole(role),
 			cluster.WithServerAddr(s.opts.Cluster.ServerAddr),
 			cluster.WithDBSlotShardNum(s.opts.Db.SlotShardNum),
-			cluster.WithDBSlotMemTableSize(s.opts.Db.MemTableSize),
+			cluster.WithDBSlotMemTableSize(s.opts.Db.SlotMemTableSize),
 			cluster.WithDBWKDbShardNum(s.opts.Db.ShardNum),
 			cluster.WithDBWKDbMemTableSize(s.opts.Db.MemTableSize),
+			cluster.WithDBBlockCacheSize(s.opts.Db.BlockCacheSize),
+			cluster.WithDBMaxMessagesPerBatch(s.opts.Db.MaxMessagesPerBatch),
+			cluster.WithDBMaxBatchBytes(s.opts.Db.MaxBatchBytes),
+			cluster.WithMaxLogSizePerBatch(s.opts.Cluster.MaxLogSizePerBatch),
+			cluster.WithMaxLogCountPerBatch(s.opts.Cluster.MaxLogCountPerBatch),
+			cluster.WithLearnerToFollowerMaxApplyLag(s.opts.Cluster.LearnerToFollowerMaxApplyLag),
+			cluster.WithMaxReadyApplyLag(s.opts.Cluster.MaxReadyApplyLag),
+			cluster.WithMaxApplyStallTicks(s.opts.Cluster.MaxApplyStallTicks),
+			cluster.WithMaxSlotApplyWait(s.opts.Cluster.MaxSlotApplyWait),
+			cluster.WithHandoffDrainTimeoutTick(s.opts.Cluster.HandoffDrainTimeoutTick),
+			cluster.WithMaxConcurrentChannelMigrations(s.opts.Cluster.MaxConcurrentChannelMigrations),
+			cluster.WithChannelLeaderAutoBalance(s.opts.Cluster.ChannelLeaderAutoBalance),
 			cluster.WithAuth(s.opts.Auth),
 			cluster.WithIsCmdChannel(s.opts.IsCmdChannel),
 			cluster.WithAppVersion(version.Version),
@@ -586,6 +598,13 @@ func (s *Server) getDocsStatus() string {
 }
 
 func (s *Server) onConnect(conn wknet.Conn) error {
+	if s.opts != nil && s.opts.ClusterOn() && s.opts.Cluster.RejectConnBeforeReady && s.clusterServer != nil {
+		if err := s.clusterServer.CheckLocalServiceReady(); err != nil {
+			s.Warn("rejecting client connection before local service is ready", zap.Error(err))
+			_ = conn.Close()
+			return err
+		}
+	}
 	conn.SetMaxIdle(time.Second * 2) // 在认证之前，连接最多空闲2秒
 	s.trace.Metrics.App().ConnCountAdd(1)
 

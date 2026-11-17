@@ -144,21 +144,27 @@ func (m *managerServer) jwtAndTokenAuthMiddleware() wkhttp.HandlerFunc {
 			return
 		}
 
-		// 管理token认证
 		token := c.GetHeader("token")
-		if strings.TrimSpace(token) != "" && token == options.G.ManagerToken {
-			c.Set("username", options.G.ManagerUID)
-			c.Next()
+		configuredToken := strings.TrimSpace(options.G.ManagerToken)
+		if configuredToken != "" && strings.TrimSpace(token) != "" && token != options.G.ManagerToken {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid manager token"})
+			c.Abort()
 			return
 		}
 
-		// 认证jwt
+		// 认证jwt（若显式携带Authorization，则优先按JWT身份鉴权，避免低权限JWT通过网关token提权）
 		authorization := c.GetHeader("Authorization")
 		if authorization == "" {
 			authorization = c.Query("Authorization")
 		}
 
 		if authorization == "" {
+			// 管理token认证
+			if configuredToken != "" && strings.TrimSpace(token) != "" && token == options.G.ManagerToken {
+				c.Set("username", options.G.ManagerUID)
+				c.Next()
+				return
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is required"})
 			c.Abort()
 			return

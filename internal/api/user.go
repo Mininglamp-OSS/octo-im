@@ -216,7 +216,7 @@ func (u *user) requestOnlineStatus(nodeId uint64, uids []string) ([]*Onlinestatu
 		return nil, errors.New("节点信息不存在")
 	}
 	reqURL := fmt.Sprintf("%s/user/onlinestatus", nodeInfo.ApiServerAddr)
-	resp, err := network.Post(reqURL, []byte(wkutil.ToJSON(uids)), nil)
+	resp, err := network.Post(reqURL, []byte(wkutil.ToJSON(uids)), service.TrustedPeerNodeHeaders(nodeInfo, nil))
 	if err != nil {
 		u.Error("获取在线用户状态失败！", zap.Error(err), zap.String("reqURL", reqURL))
 		return nil, err
@@ -458,7 +458,7 @@ func (u *user) requestSystemUidsAddToCache(nodeInfo *types.Node, uids []string) 
 	reqURL := fmt.Sprintf("%s/user/systemuids_add_to_cache", nodeInfo.ApiServerAddr)
 	resp, err := network.Post(reqURL, []byte(wkutil.ToJSON(map[string]interface{}{
 		"uids": uids,
-	})), nil)
+	})), service.TrustedPeerNodeHeaders(nodeInfo, nil))
 	if err != nil {
 		u.Error("添加系统账号到缓存失败！", zap.Error(err), zap.String("reqURL", reqURL))
 		return err
@@ -553,7 +553,7 @@ func (u *user) requestSystemUidsRemoveFromCache(nodeInfo *types.Node, uids []str
 	reqURL := fmt.Sprintf("%s/user/systemuids_remove_from_cache", nodeInfo.ApiServerAddr)
 	resp, err := network.Post(reqURL, []byte(wkutil.ToJSON(map[string]interface{}{
 		"uids": uids,
-	})), nil)
+	})), service.TrustedPeerNodeHeaders(nodeInfo, nil))
 	if err != nil {
 		u.Error("移除系统账号从缓存失败！", zap.Error(err), zap.String("reqURL", reqURL))
 		return err

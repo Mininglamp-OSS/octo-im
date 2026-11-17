@@ -20,7 +20,7 @@ func (wk *wukongDB) AddOrUpdatePluginUsers(pluginUsers []PluginUser) error {
 			return err
 		}
 	}
-	return batch.Commit(wk.sync)
+	return wk.commitBatch(db, batch, wk.sync)
 }
 
 func (wk *wukongDB) RemovePluginUser(pluginNo string, uid string) error {
@@ -36,7 +36,7 @@ func (wk *wukongDB) RemovePluginUser(pluginNo string, uid string) error {
 	if err != nil {
 		return err
 	}
-	return batch.Commit(wk.sync)
+	return wk.commitBatch(db, batch, wk.sync)
 }
 
 func (wk *wukongDB) getPluginId(pluginNo, uid string) uint64 {

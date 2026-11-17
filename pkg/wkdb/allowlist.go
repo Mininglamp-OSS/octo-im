@@ -35,7 +35,7 @@ func (wk *wukongDB) AddAllowlist(channelId string, channelType uint8, members []
 		return err
 	}
 
-	err = w.Commit(wk.sync)
+	err = wk.commitBatch(db, w, wk.sync)
 	if err != nil {
 		return err
 	}
@@ -162,7 +162,7 @@ func (wk *wukongDB) RemoveAllowlist(channelId string, channelType uint8, uids []
 		return err
 	}
 
-	err = w.Commit(wk.sync)
+	err = wk.commitBatch(db, w, wk.sync)
 	if err != nil {
 		return err
 	}
@@ -206,7 +206,7 @@ func (wk *wukongDB) RemoveAllAllowlist(channelId string, channelType uint8) erro
 		return err
 	}
 
-	err = batch.Commit(wk.sync)
+	err = wk.commitBatch(db, batch, wk.sync)
 	if err != nil {
 		return err
 	}

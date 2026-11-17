@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,10 +11,11 @@ import (
 )
 
 type conversationConfigReader struct {
-	nodeID uint64
-	leader func() uint64
-	state  func(context.Context) (raftgroup.ReadState, error)
-	load   func() (wkdb.ChannelClusterConfig, error)
+	nodeID  uint64
+	maxWait time.Duration
+	leader  func() uint64
+	state   func(context.Context) (raftgroup.ReadState, error)
+	load    func() (wkdb.ChannelClusterConfig, error)
 }
 
 func sameConversationLeader(before, after raftgroup.ReadState) bool {
@@ -33,16 +35,28 @@ func (r conversationConfigReader) read(ctx context.Context) (wkdb.ChannelCluster
 	// wait; chasing their growing committed index would require an idle slot.
 	current := before
 	if current.AppliedIndex < before.CommittedIndex {
+		waitCtx := ctx
+		cancel := func() {}
+		if r.maxWait > 0 {
+			waitCtx, cancel = context.WithTimeout(ctx, r.maxWait)
+		}
+		defer cancel()
 		ticker := time.NewTicker(time.Millisecond)
 		defer ticker.Stop()
 		for current.AppliedIndex < before.CommittedIndex {
 			select {
-			case <-ctx.Done():
-				return wkdb.EmptyChannelClusterConfig, ctx.Err()
+			case <-waitCtx.Done():
+				if err := ctx.Err(); err != nil {
+					return wkdb.EmptyChannelClusterConfig, fmt.Errorf("%w: %w", ErrConversationReadRetry, err)
+				}
+				return wkdb.EmptyChannelClusterConfig, fmt.Errorf("%w: metadata slot apply wait exceeded %s: %w", ErrConversationReadRetry, r.maxWait, errors.Join(waitCtx.Err()))
 			case <-ticker.C:
 			}
-			current, err = r.state(ctx)
+			current, err = r.state(waitCtx)
 			if err != nil {
+				if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+					return wkdb.EmptyChannelClusterConfig, fmt.Errorf("%w: metadata slot apply wait exceeded %s: %w", ErrConversationReadRetry, r.maxWait, err)
+				}
 				return wkdb.EmptyChannelClusterConfig, err
 			}
 			if !sameConversationLeader(before, current) || r.leader() != r.nodeID {

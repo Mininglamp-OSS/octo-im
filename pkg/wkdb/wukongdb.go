@@ -6,7 +6,12 @@ import (
 	"fmt"
 	"hash"
 	"hash/fnv"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
@@ -48,7 +53,124 @@ type wukongDB struct {
 	cacheManager        *CacheManager              // 缓存管理器
 	performanceMonitor  *PerformanceMonitor        // 性能监控器
 
+	blockCache     *pebble.Cache
+	ownsBlockCache bool
+	metricsDone    chan struct{}
+	closeOnce      sync.Once
+	lastWriteErr   atomic.Value
+
 	h hash.Hash32
+}
+
+type writeErrorHolder struct {
+	err error
+}
+
+func (wk *wukongDB) RecordWriteError(err error) {
+	if wk == nil {
+		return
+	}
+	wk.lastWriteErr.Store(writeErrorHolder{err: err})
+}
+
+func (wk *wukongDB) RecordShardWriteError(shardIdx int, err error) {
+	if wk == nil {
+		return
+	}
+	if shardIdx >= 0 && shardIdx < len(wk.wkdbs) && wk.wkdbs[shardIdx] != nil {
+		wk.wkdbs[shardIdx].RecordWriteError(err)
+		return
+	}
+	wk.RecordWriteError(err)
+}
+
+func (wk *wukongDB) recordShardWriteErrorByDB(db *pebble.DB, err error) {
+	if wk == nil {
+		return
+	}
+	if db != nil {
+		for i, candidate := range wk.dbs {
+			if candidate == db {
+				wk.RecordShardWriteError(i, err)
+				return
+			}
+		}
+	}
+	wk.RecordWriteError(err)
+}
+
+func (wk *wukongDB) commitBatch(db *pebble.DB, batch *pebble.Batch, wo *pebble.WriteOptions) error {
+	err := batch.Commit(wo)
+	wk.recordShardWriteErrorByDB(db, err)
+	return err
+}
+
+func (wk *wukongDB) setKV(db *pebble.DB, k, v []byte, wo *pebble.WriteOptions) error {
+	err := db.Set(k, v, wo)
+	wk.recordShardWriteErrorByDB(db, err)
+	return err
+}
+
+func (wk *wukongDB) deleteRangeKV(db *pebble.DB, start, end []byte, wo *pebble.WriteOptions) error {
+	err := db.DeleteRange(start, end, wo)
+	wk.recordShardWriteErrorByDB(db, err)
+	return err
+}
+
+func (wk *wukongDB) LastWriteError() error {
+	if wk == nil {
+		return nil
+	}
+	if v, ok := wk.lastWriteErr.Load().(writeErrorHolder); ok && v.err != nil {
+		return v.err
+	}
+	for _, bdb := range wk.wkdbs {
+		if bdb != nil {
+			if err := bdb.LastWriteError(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ValidatePebbleShardDir verifies that a non-empty Pebble shard directory was not
+// previously initialized with a different shard count, preventing silent key misrouting.
+func ValidatePebbleShardDir(parentDir string, configuredShardNum int) error {
+	if configuredShardNum <= 0 {
+		return fmt.Errorf("invalid pebble shardNum %d for %s", configuredShardNum, parentDir)
+	}
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	existingCount := 0
+	maxShardIdx := -1
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "shard") {
+			continue
+		}
+		idx, err := strconv.Atoi(strings.TrimPrefix(name, "shard"))
+		if err != nil || idx < 0 {
+			continue
+		}
+		existingCount++
+		if idx > maxShardIdx {
+			maxShardIdx = idx
+		}
+	}
+	if existingCount > 0 && (existingCount != configuredShardNum || maxShardIdx != configuredShardNum-1) {
+		return fmt.Errorf("pebble shard count mismatch in %s: existing shard directories=%d (max index=%d), configured shardNum=%d; changing shardNum on a non-empty data directory is not supported",
+			parentDir, existingCount, maxShardIdx, configuredShardNum)
+	}
+	return nil
 }
 
 func NewWukongDB(opts *Options) DB {
@@ -125,6 +247,7 @@ func (wk *wukongDB) defaultPebbleOptions() *pebble.Options {
 	return &pebble.Options{
 		Levels:             lopts,
 		FormatMajorVersion: pebble.FormatNewest,
+		Cache:              wk.blockCache,
 		// 控制写缓冲区的大小。较大的写缓冲区可以减少磁盘写入次数，但会占用更多内存。
 		MemTableSize: wk.opts.MemTableSize,
 		// 当队列中的MemTables的大小超过 MemTableStopWritesThreshold*MemTableSize 时，将停止写入，
@@ -139,14 +262,48 @@ func (wk *wukongDB) defaultPebbleOptions() *pebble.Options {
 }
 
 func (wk *wukongDB) Open() error {
+	dbRoot := filepath.Join(wk.opts.DataDir, "wukongimdb")
+	if err := ValidatePebbleShardDir(dbRoot, int(wk.shardNum)); err != nil {
+		return err
+	}
+
+	wk.dbs = nil
+	wk.wkdbs = nil
+	wk.closeOnce = sync.Once{}
+	wk.cancelCtx, wk.cancelFunc = context.WithCancel(context.Background())
+
+	if wk.opts.BlockCache != nil {
+		wk.blockCache = wk.opts.BlockCache
+		wk.ownsBlockCache = false
+	} else if wk.opts.BlockCacheSize > 0 {
+		wk.blockCache = pebble.NewCache(wk.opts.BlockCacheSize)
+		wk.ownsBlockCache = true
+	}
 
 	wk.dblock.start()
 
-	opts := wk.defaultPebbleOptions()
 	for i := 0; i < int(wk.shardNum); i++ {
-
-		db, err := pebble.Open(filepath.Join(wk.opts.DataDir, "wukongimdb", fmt.Sprintf("shard%03d", i)), opts)
+		shardIdx := i
+		opts := wk.defaultPebbleOptions()
+		listener := pebble.MakeLoggingEventListener(nil)
+		listener.BackgroundError = func(err error) {
+			if err != nil {
+				wk.RecordShardWriteError(shardIdx, err)
+			}
+		}
+		opts.EventListener = &listener
+		db, err := pebble.Open(filepath.Join(dbRoot, fmt.Sprintf("shard%03d", i)), opts)
 		if err != nil {
+			for _, bdb := range wk.wkdbs {
+				bdb.Stop()
+			}
+			for _, openDB := range wk.dbs {
+				_ = openDB.Close()
+			}
+			if wk.ownsBlockCache && wk.blockCache != nil {
+				wk.blockCache.Unref()
+				wk.blockCache = nil
+			}
 			return err
 		}
 		wk.dbs = append(wk.dbs, db)
@@ -156,6 +313,7 @@ func (wk *wukongDB) Open() error {
 		wk.wkdbs = append(wk.wkdbs, wkdb)
 	}
 
+	wk.metricsDone = make(chan struct{})
 	go wk.collectMetricsLoop()
 
 	// 启动缓存管理器
@@ -164,24 +322,84 @@ func (wk *wukongDB) Open() error {
 	return nil
 }
 
-func (wk *wukongDB) Close() error {
-	wk.cancelFunc()
-
-	// 停止缓存管理器
-	if wk.cacheManager != nil {
-		wk.cacheManager.Stop()
+// CheckWriteHealth verifies that all local Pebble shards are open and their directories remain writable.
+func (wk *wukongDB) CheckWriteHealth() error {
+	if wk == nil {
+		return fmt.Errorf("wukongdb is nil")
 	}
-
-	for _, db := range wk.dbs {
-		if err := db.Close(); err != nil {
-			wk.Error("close db error", zap.Error(err))
+	if wk.cancelCtx != nil && wk.cancelCtx.Err() != nil {
+		return fmt.Errorf("wukongdb closed: %w", wk.cancelCtx.Err())
+	}
+	if err := wk.LastWriteError(); err != nil {
+		return fmt.Errorf("wukongdb write error: %w", err)
+	}
+	if len(wk.dbs) == 0 || len(wk.dbs) < int(wk.shardNum) {
+		return fmt.Errorf("wukongdb shards not open")
+	}
+	dbRoot := filepath.Join(wk.opts.DataDir, "wukongimdb")
+	info, err := os.Stat(dbRoot)
+	if err != nil {
+		return fmt.Errorf("wukongdb directory %s stat failed: %w", dbRoot, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("wukongdb path %s is not a directory", dbRoot)
+	}
+	if info.Mode().Perm()&0200 == 0 {
+		return fmt.Errorf("wukongdb directory %s is read-only (mode=%v)", dbRoot, info.Mode().Perm())
+	}
+	for i, db := range wk.dbs {
+		if db == nil {
+			return fmt.Errorf("wukongdb shard[%d] is nil", i)
+		}
+		if i < len(wk.wkdbs) && wk.wkdbs[i] != nil {
+			if err := wk.wkdbs[i].LastWriteError(); err != nil {
+				return fmt.Errorf("wukongdb shard[%d] write error: %w", i, err)
+			}
+		}
+		shardDir := filepath.Join(dbRoot, fmt.Sprintf("shard%03d", i))
+		shardInfo, err := os.Stat(shardDir)
+		if err != nil {
+			return fmt.Errorf("wukongdb shard directory %s stat failed: %w", shardDir, err)
+		}
+		if !shardInfo.IsDir() {
+			return fmt.Errorf("wukongdb shard path %s is not a directory", shardDir)
+		}
+		if shardInfo.Mode().Perm()&0200 == 0 {
+			return fmt.Errorf("wukongdb shard directory %s is read-only (mode=%v)", shardDir, shardInfo.Mode().Perm())
 		}
 	}
+	return nil
+}
 
-	for _, wkd := range wk.wkdbs {
-		wkd.Stop()
-	}
-	wk.dblock.stop()
+func (wk *wukongDB) Close() error {
+	wk.closeOnce.Do(func() {
+		wk.cancelFunc()
+		if wk.metricsDone != nil {
+			<-wk.metricsDone
+		}
+
+		// 停止缓存管理器
+		if wk.cacheManager != nil {
+			wk.cacheManager.Stop()
+		}
+
+		for _, wkd := range wk.wkdbs {
+			wkd.Stop()
+		}
+
+		for _, db := range wk.dbs {
+			if err := db.Close(); err != nil {
+				wk.Error("close db error", zap.Error(err))
+			}
+		}
+
+		if wk.ownsBlockCache && wk.blockCache != nil {
+			wk.blockCache.Unref()
+			wk.blockCache = nil
+		}
+
+		wk.dblock.stop()
+	})
 	return nil
 }
 
@@ -239,20 +457,29 @@ func (wk *wukongDB) GetChannelShardIndex(channelId string, channelType uint8) ui
 }
 
 func (wk *wukongDB) collectMetricsLoop() {
+	if wk.metricsDone != nil {
+		defer close(wk.metricsDone)
+	}
 	tk := time.NewTicker(time.Second * 1)
 	defer tk.Stop()
 
 	for {
 		select {
-		case <-tk.C:
-			wk.collectMetrics()
 		case <-wk.cancelCtx.Done():
 			return
+		case <-tk.C:
+			if wk.cancelCtx.Err() != nil {
+				return
+			}
+			wk.collectMetrics()
 		}
 	}
 }
 
 func (wk *wukongDB) collectMetrics() {
+	if wk.cancelCtx.Err() != nil || trace.GlobalTrace == nil || trace.GlobalTrace.Metrics == nil || trace.GlobalTrace.Metrics.DB() == nil {
+		return
+	}
 
 	for i := uint32(0); i < uint32(wk.shardNum); i++ {
 		ms := wk.dbs[i].Metrics()
@@ -380,8 +607,26 @@ type BatchDB struct {
 
 	batchChan chan *Batch
 
-	stopper *syncutil.Stopper
-	Index   int
+	stopper      *syncutil.Stopper
+	Index        int
+	lastWriteErr atomic.Value
+}
+
+func (wk *BatchDB) RecordWriteError(err error) {
+	if wk == nil {
+		return
+	}
+	wk.lastWriteErr.Store(writeErrorHolder{err: err})
+}
+
+func (wk *BatchDB) LastWriteError() error {
+	if wk == nil {
+		return nil
+	}
+	if v, ok := wk.lastWriteErr.Load().(writeErrorHolder); ok {
+		return v.err
+	}
+	return nil
 }
 
 func NewBatchDB(index int, db *pebble.DB) *BatchDB {
@@ -480,6 +725,7 @@ func (wk *BatchDB) executeBatch(bs []*Batch) {
 	// trace.GlobalTrace.Metrics.DB().CommitAdd(1)
 	err := bt.Commit(pebble.Sync)
 	if err != nil {
+		wk.RecordWriteError(err)
 		for _, b := range bs {
 			b.err = err
 			if b.waitC != nil {
@@ -489,16 +735,18 @@ func (wk *BatchDB) executeBatch(bs []*Batch) {
 		return
 	}
 
-	// end := time.Since(start)
-	// fmt.Println("executeBatch耗时--->", end, len(bs))
-
+	var batchErr error
 	for _, b := range bs {
+		if b.err != nil && batchErr == nil {
+			batchErr = b.err
+		}
 		if b.waitC != nil {
 			b.waitC <- b.err
 		}
 		// 释放资源
 		b.release()
 	}
+	wk.RecordWriteError(batchErr)
 
 }
 

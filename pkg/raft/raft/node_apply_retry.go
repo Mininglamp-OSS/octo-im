@@ -11,10 +11,13 @@ const (
 )
 
 func (n *Node) backoffApply() {
+	n.stateMu.Lock()
 	if n.applyFailures < applyRetryLimit {
 		n.applyFailures++
 	}
-	if n.applyFailures >= applyRetryLimit {
+	failures := n.applyFailures
+	n.stateMu.Unlock()
+	if failures >= applyRetryLimit {
 		n.applyRetryTicks = applyProbeTicks
 		// An explicit persistent-failure alarm, at most once per probe window.
 		n.Error("raft apply retry limit reached; inspect storage/config errors; probing after cooldown",
@@ -23,5 +26,5 @@ func (n *Node) backoffApply() {
 			zap.Int("retryAfterTicks", n.applyRetryTicks))
 		return
 	}
-	n.applyRetryTicks = 1 << (n.applyFailures - 1)
+	n.applyRetryTicks = 1 << (failures - 1)
 }

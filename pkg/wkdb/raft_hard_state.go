@@ -9,7 +9,7 @@ import (
 )
 
 func (wk *wukongDB) SaveRaftHardState(shardNo string, state types.HardState) error {
-	return wk.shardDB(shardNo).Set(key.NewRaftHardStateKey(shardNo), state.Marshal(), pebble.Sync)
+	return wk.setKV(wk.shardDB(shardNo), key.NewRaftHardStateKey(shardNo), state.Marshal(), pebble.Sync)
 }
 
 func (wk *wukongDB) RaftHardState(shardNo string) (types.HardState, error) {

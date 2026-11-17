@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -44,14 +45,20 @@ func NewServer(opts *Options) *Server {
 	}
 	s.storage = newStorage(opts.DB, s)
 	for i := 0; i < opts.GroupCount; i++ {
-		rg := raftgroup.New(
-			raftgroup.NewOptions(
-				raftgroup.WithLogPrefix("channel"),
-				raftgroup.WithNotNeedApplied(false),
-				raftgroup.WithTransport(opts.Transport),
-				raftgroup.WithStorage(s.storage),
-				raftgroup.WithEvent(s)),
-		)
+		rgOpts := []raftgroup.Option{
+			raftgroup.WithLogPrefix("channel"),
+			raftgroup.WithNotNeedApplied(false),
+			raftgroup.WithTransport(opts.Transport),
+			raftgroup.WithStorage(s.storage),
+			raftgroup.WithEvent(s),
+		}
+		if opts.MaxLogSizePerBatch > 0 {
+			rgOpts = append(rgOpts, raftgroup.WithMaxLogSizePerBatch(opts.MaxLogSizePerBatch))
+		}
+		if opts.MaxLogCountPerBatch > 0 {
+			rgOpts = append(rgOpts, raftgroup.WithMaxLogCountPerBatch(opts.MaxLogCountPerBatch))
+		}
+		rg := raftgroup.New(raftgroup.NewOptions(rgOpts...))
 		s.raftGroups = append(s.raftGroups, rg)
 	}
 	s.wake.channels = make(map[string]bool)
@@ -74,6 +81,33 @@ func (s *Server) Stop() {
 	for _, rg := range s.raftGroups {
 		rg.Stop()
 	}
+}
+
+func (s *Server) CheckLocalHealth(maxStallTicks int, maxReadyLag uint64) error {
+	if s == nil {
+		return nil
+	}
+	for _, rg := range s.raftGroups {
+		if rg == nil {
+			continue
+		}
+		for _, r := range rg.GetRafts() {
+			ch, ok := r.(*Channel)
+			if !ok || ch == nil || ch.Node == nil {
+				continue
+			}
+			if ch.ApplyFailureCount() > 0 {
+				return fmt.Errorf("local channel[%s] has %d apply failures", ch.Key(), ch.ApplyFailureCount())
+			}
+			if ch.StoreFailureCount() > 0 {
+				return fmt.Errorf("local channel[%s] has %d store failures", ch.Key(), ch.StoreFailureCount())
+			}
+			if maxStallTicks > 0 && ch.ApplyingTicks() > maxStallTicks {
+				return fmt.Errorf("local channel[%s] apply stalled for %d ticks", ch.Key(), ch.ApplyingTicks())
+			}
+		}
+	}
+	return nil
 }
 
 // 唤醒频道领导

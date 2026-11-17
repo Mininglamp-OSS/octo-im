@@ -33,6 +33,13 @@ type ICluster interface {
 	CheckClusterStatus() error
 }
 
+type ILocalHealthChecker interface {
+	// CheckLocalProcessHealth checks if the local node process is alive.
+	CheckLocalProcessHealth() error
+	// CheckLocalServiceReady checks if the local node is ready to accept external traffic.
+	CheckLocalServiceReady() error
+}
+
 type IClusterSlot interface {
 	// GetOrCreateChannelClusterConfigFromSlotLeader 从频道槽领导获取或创建频道分布式配置
 	GetOrCreateChannelClusterConfigFromSlotLeader(channelId string, channelType uint8) (wkdb.ChannelClusterConfig, error)

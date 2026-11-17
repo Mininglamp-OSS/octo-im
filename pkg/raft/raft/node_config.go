@@ -32,6 +32,7 @@ func (n *Node) switchRemoteConfig(cfg types.Config) error {
 func (n *Node) switchConfig(newCfg types.Config) error {
 
 	oldCfg := n.cfg
+	handoff := n.handoff
 	if n.cfg.Version > newCfg.Version {
 		n.Error("config version is lower than current version", zap.Uint64("newVersion", newCfg.Version), zap.Uint64("currentVersion", oldCfg.Version))
 		return ErrConfigVersionStale
@@ -89,7 +90,18 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	if newCfg.Leader == None {
 		newCfg.Leader = n.cfg.Leader
 	}
+	n.stateMu.Lock()
 	n.cfg = newCfg
+	n.stateMu.Unlock()
+	n.reconcileLeaderHandoff(handoff)
+	// Membership maintenance must progress without a new business write.
+	// A same-leader config update otherwise leaves quiet followers suspended
+	// and unable to acknowledge the intermediate membership or promote D.
+	if len(newCfg.Learners) > 0 || newCfg.MigrateFrom != 0 || newCfg.MigrateTo != 0 {
+		n.stateMu.Lock()
+		n.suspend = false
+		n.stateMu.Unlock()
+	}
 
 	return nil
 }

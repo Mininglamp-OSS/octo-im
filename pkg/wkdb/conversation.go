@@ -224,7 +224,9 @@ func (wk *wukongDB) UpdateConversationDeletedAtMsgSeq(uid string, channelId stri
 	if id == 0 {
 		return nil
 	}
-	w := wk.shardDB(uid).NewBatch()
+	db := wk.shardDB(uid)
+	w := db.NewBatch()
+	defer w.Close()
 	var deletedAtMsgSeqBytes = make([]byte, 8)
 	wk.endian.PutUint64(deletedAtMsgSeqBytes, deletedAtMsgSeq)
 	err = w.Set(key.NewConversationColumnKey(uid, id, key.TableConversation.Column.DeletedAtMsgSeq), deletedAtMsgSeqBytes, wk.noSync)
@@ -232,7 +234,7 @@ func (wk *wukongDB) UpdateConversationDeletedAtMsgSeq(uid string, channelId stri
 		return err
 	}
 	wk.conversationCache.InvalidateUserConversations(uid)
-	return w.Commit(wk.sync)
+	return wk.commitBatch(db, w, wk.sync)
 }
 
 func (wk *wukongDB) UpdateConversationIfSeqGreaterAsync(uid, channelId string, channelType uint8, readToMsgSeq uint64) error {
@@ -278,7 +280,9 @@ func (wk *wukongDB) UpdateConversationIfSeqGreater(uid, channelId string, channe
 		return nil
 	}
 
-	w := wk.shardDB(uid).NewBatch()
+	db := wk.shardDB(uid)
+	w := db.NewBatch()
+	defer w.Close()
 	// readedToMsgSeq
 	var msgSeqBytes = make([]byte, 8)
 	wk.endian.PutUint64(msgSeqBytes, readToMsgSeq)
@@ -296,7 +300,7 @@ func (wk *wukongDB) UpdateConversationIfSeqGreater(uid, channelId string, channe
 		return err
 	}
 	wk.conversationCache.InvalidateUserConversations(uid)
-	return w.Commit(wk.sync)
+	return wk.commitBatch(db, w, wk.sync)
 }
 
 // GetConversations 获取指定用户的最近会话

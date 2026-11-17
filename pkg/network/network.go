@@ -11,6 +11,34 @@ import (
 	"github.com/sendgrid/rest"
 )
 
+var (
+	noRedirectHTTPClient = &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	noRedirectRestClient = &rest.Client{
+		HTTPClient: noRedirectHTTPClient,
+	}
+	// PeerHeadersHook optionally enriches headers for verified internal cluster peer URLs.
+	PeerHeadersHook func(targetURL string, base map[string]string) map[string]string
+)
+
+func init() {
+	if rest.DefaultClient != nil && rest.DefaultClient.HTTPClient != nil {
+		rest.DefaultClient.HTTPClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+}
+
+func applyPeerHeaders(urlStr string, headers map[string]string) map[string]string {
+	if PeerHeadersHook != nil {
+		return PeerHeadersHook(urlStr, headers)
+	}
+	return headers
+}
+
 func Post(url string, body []byte, headers map[string]string) (resp *rest.Response, err error) {
 
 	return RequestBoy(url, body, headers, rest.Post)
@@ -32,9 +60,9 @@ func RequestBoyForQueryParam(url string, queryParams map[string]string, headers 
 		Method:      method,
 		BaseURL:     url,
 		QueryParams: queryParams,
-		Headers:     headers,
+		Headers:     applyPeerHeaders(url, headers),
 	}
-	response, err := rest.API(request)
+	response, err := noRedirectRestClient.Send(request)
 	if err != nil {
 		return nil, err
 	}
@@ -48,9 +76,9 @@ func RequestBoy(url string, body []byte, headers map[string]string, method rest.
 		Method:  method,
 		BaseURL: url,
 		Body:    body,
-		Headers: headers,
+		Headers: applyPeerHeaders(url, headers),
 	}
-	response, err := rest.API(request)
+	response, err := noRedirectRestClient.Send(request)
 	if err != nil {
 		return nil, err
 	}
@@ -62,10 +90,10 @@ func Get(url string, queryParams map[string]string, headers map[string]string) (
 	request := rest.Request{
 		Method:      rest.Get,
 		BaseURL:     url,
-		Headers:     headers,
+		Headers:     applyPeerHeaders(url, headers),
 		QueryParams: queryParams,
 	}
-	response, err := rest.API(request)
+	response, err := noRedirectRestClient.Send(request)
 	if err != nil {
 
 		return nil, err
@@ -79,10 +107,10 @@ func GetJson(url string, queryParams map[string]string, headers map[string]strin
 	request := rest.Request{
 		Method:      rest.Get,
 		BaseURL:     url,
-		Headers:     headers,
+		Headers:     applyPeerHeaders(url, headers),
 		QueryParams: queryParams,
 	}
-	response, err := rest.API(request)
+	response, err := noRedirectRestClient.Send(request)
 	if err != nil {
 
 		return nil, err

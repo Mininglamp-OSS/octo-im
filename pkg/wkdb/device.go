@@ -168,7 +168,7 @@ func (wk *wukongDB) AddDevice(d Device) error {
 	if err != nil {
 		return err
 	}
-	err = batch.Commit(wk.sync)
+	err = wk.commitBatch(db, batch, wk.sync)
 	if err != nil {
 		return err
 	}
@@ -209,7 +209,7 @@ func (wk *wukongDB) UpdateDevice(d Device) error {
 	if err != nil {
 		return err
 	}
-	err = batch.Commit(wk.sync)
+	err = wk.commitBatch(db, batch, wk.sync)
 	if err != nil {
 		return err
 	}
@@ -261,7 +261,7 @@ func (wk *wukongDB) SearchDevice(req DeviceSearchReq) ([]Device, error) {
 		}
 		if has { // 如果有触发索引，则无需全局查询
 			allDevices = append(allDevices, devices...)
-			continue
+			break
 		}
 
 		start := uint64(req.OffsetCreatedAt)

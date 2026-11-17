@@ -16,9 +16,11 @@ func (n *Node) BecomeCandidate() {
 	n.stepFunc = n.stepCandidate
 	n.reset()
 	n.tickFnc = n.tickCandidate
+	n.stateMu.Lock()
 	n.voteFor = n.opts.NodeId
 	n.cfg.Leader = 0
 	n.cfg.Role = types.RoleCandidate
+	n.stateMu.Unlock()
 	n.Info("become candidate", zap.Uint32("term", n.cfg.Term), zap.Int("nextElectionTimeout", n.randomizedElectionTimeout), zap.Uint64s("replicas", n.cfg.Replicas))
 }
 
@@ -30,8 +32,10 @@ func (n *Node) BecomeFollower(term uint32, leaderId uint64) {
 	n.stepFunc = n.stepFollower
 	n.reset()
 	n.tickFnc = n.tickFollower
+	n.stateMu.Lock()
 	n.cfg.Leader = leaderId
 	n.cfg.Role = types.RoleFollower
+	n.stateMu.Unlock()
 
 	if n.opts.Key == "clusterconfig" {
 		n.Info("become follower", zap.Uint32("term", n.cfg.Term), zap.Uint64("leaderId", leaderId), zap.Uint64s("replicas", n.cfg.Replicas))
@@ -49,8 +53,10 @@ func (n *Node) BecomeLeader(term uint32) {
 	n.stepFunc = n.stepLeader
 	n.reset()
 	n.tickFnc = n.tickLeader
+	n.stateMu.Lock()
 	n.cfg.Leader = n.opts.NodeId
 	n.cfg.Role = types.RoleLeader
+	n.stateMu.Unlock()
 
 	if n.opts.Key == "clusterconfig" {
 		n.Info("become leader", zap.Uint32("term", n.cfg.Term), zap.Uint64s("replicas", n.cfg.Replicas))
@@ -68,8 +74,10 @@ func (n *Node) BecomeLearner(term uint32, leaderId uint64) {
 	n.stepFunc = n.stepLearner
 	n.reset()
 	n.tickFnc = n.tickLearner
+	n.stateMu.Lock()
 	n.cfg.Leader = leaderId
 	n.cfg.Role = types.RoleLearner
+	n.stateMu.Unlock()
 
 	if n.opts.Key == "clusterconfig" {
 		n.Info("become learner", zap.Uint32("term", n.cfg.Term), zap.Uint64("leaderId", leaderId), zap.Uint64s("replicas", n.cfg.Replicas))
@@ -84,10 +92,12 @@ func (n *Node) reset() {
 	n.electionState = electionState{
 		votes: make(map[uint64]bool),
 	}
-	n.stopPropose = false
+	n.clearLeaderHandoff()
+	n.stateMu.Lock()
 	n.syncState.replicaSync = make(map[uint64]*SyncInfo)
 	n.onlySync = false
 	n.suspend = false
+	n.stateMu.Unlock()
 	// 重置选举超时时间
 	n.resetRandomizedElectionTimeout()
 }

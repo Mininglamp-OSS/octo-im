@@ -8,6 +8,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/plugin"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	cluster "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -47,18 +48,7 @@ func newApiServer(s *Server) *apiServer {
 func (s *apiServer) start() {
 
 	s.r.Use(s.jwtAndTokenAuthSetMiddleware()) // 如果存在jwt则解析jwt将信息放入上下文（并不做验证）
-	s.r.Use(func(c *wkhttp.Context) {         // 管理者权限判断
-		if strings.TrimSpace(options.G.ManagerToken) == "" {
-			c.Next()
-			return
-		}
-		managerToken := c.GetHeader("token")
-		if managerToken != options.G.ManagerToken {
-			c.AbortWithStatus(http.StatusUnauthorized)
-			return
-		}
-		c.Next()
-	})
+	s.r.Use(s.managerTokenMiddleware())       // 管理者权限判断
 
 	// 跨域
 	s.r.Use(wkhttp.CORSMiddleware())
@@ -82,9 +72,40 @@ func (s *apiServer) stop() {
 
 func (s *apiServer) setRoutes() {
 
+	s.r.GET("/healthz", func(c *wkhttp.Context) {
+		if checker, ok := service.Cluster.(icluster.ILocalHealthChecker); ok {
+			if err := checker.CheckLocalProcessHealth(); err != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "message": err.Error()})
+				return
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	s.r.GET("/readyz", func(c *wkhttp.Context) {
+		if checker, ok := service.Cluster.(icluster.ILocalHealthChecker); ok {
+			if err := checker.CheckLocalServiceReady(); err != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "message": err.Error()})
+				return
+			}
+		} else if service.Cluster != nil {
+			if err := service.Cluster.CheckClusterStatus(); err != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "message": err.Error()})
+				return
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
 	s.r.GET("/health", func(c *wkhttp.Context) {
 
 		// 检查分布式集群是否正常
+		if checker, ok := service.Cluster.(icluster.ILocalHealthChecker); ok {
+			if err := checker.CheckLocalServiceReady(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err.Error()})
+				return
+			}
+		}
 		clusterServer, ok := service.Cluster.(*cluster.Server)
 		if ok {
 			err := clusterServer.CheckClusterStatus()
@@ -159,42 +180,73 @@ func (s *apiServer) setRoutes() {
 
 func (s *apiServer) jwtAndTokenAuthSetMiddleware() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
-
-		// 认证jwt
 		authorization := c.GetHeader("Authorization")
 		if authorization == "" {
 			authorization = c.Query("Authorization")
 		}
 
-		if authorization == "" {
+		if strings.TrimSpace(authorization) == "" {
 			c.Next()
 			return
 		}
-		authorization = strings.TrimPrefix(authorization, "Bearer ")
-		if authorization == "" {
-			c.Next()
+		if !strings.HasPrefix(authorization, "Bearer ") {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		rawJWT := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
+		if rawJWT == "" {
+			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
 
-		jwtToken, err := jwt.ParseWithClaims(authorization, jwt.MapClaims{}, func(token *jwt.Token) (interface{}, error) {
+		jwtToken, err := jwt.ParseWithClaims(rawJWT, jwt.MapClaims{}, func(token *jwt.Token) (interface{}, error) {
 			return []byte(options.G.Jwt.Secret), nil
 		})
-		if err != nil {
-			c.Next()
+		if err != nil || jwtToken == nil || !jwtToken.Valid {
+			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
-
-		if !jwtToken.Valid {
-			c.Next()
+		mapClaims, ok := jwtToken.Claims.(jwt.MapClaims)
+		if !ok {
+			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
-		mapCaims := jwtToken.Claims.(jwt.MapClaims)
-		if mapCaims["username"] == "" {
-			c.Next()
+		username, _ := mapClaims["username"].(string)
+		if strings.TrimSpace(username) == "" {
+			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
-		c.Set("username", mapCaims["username"])
+		c.Set("username", username)
 		c.Next()
+	}
+}
+
+func (s *apiServer) managerTokenMiddleware() wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		if c.Request != nil && c.Request.URL != nil {
+			switch c.Request.URL.Path {
+			case "/health", "/healthz", "/readyz":
+				c.Next()
+				return
+			}
+		}
+		configuredToken := strings.TrimSpace(options.G.ManagerToken)
+		if configuredToken == "" {
+			if c.GetString("username") == "" && strings.TrimSpace(c.GetHeader("Authorization")) == "" && strings.TrimSpace(c.Query("Authorization")) == "" {
+				c.Set("username", options.G.ManagerUID)
+			}
+			c.Next()
+			return
+		}
+		managerToken := c.GetHeader("token")
+		if managerToken == options.G.ManagerToken {
+			if c.GetString("username") == "" && strings.TrimSpace(c.GetHeader("Authorization")) == "" && strings.TrimSpace(c.Query("Authorization")) == "" {
+				c.Set("username", options.G.ManagerUID)
+			}
+			c.Next()
+			return
+		}
+		c.AbortWithStatus(http.StatusUnauthorized)
 	}
 }
 

@@ -4,8 +4,10 @@ import "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 
 func (n *Node) setTerm(term uint32) {
 	if term > n.cfg.Term {
+		n.stateMu.Lock()
 		n.voteFor = None
 		n.cfg.Term = term
+		n.stateMu.Unlock()
 	}
 }
 

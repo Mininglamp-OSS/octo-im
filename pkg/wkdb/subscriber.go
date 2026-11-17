@@ -208,7 +208,7 @@ func (wk *wukongDB) RemoveAllSubscriber(channelId string, channelType uint8) err
 	// 	return err
 	// }
 
-	err = batch.Commit(wk.sync)
+	err = wk.commitBatch(db, batch, wk.sync)
 	if err != nil {
 		return err
 	}

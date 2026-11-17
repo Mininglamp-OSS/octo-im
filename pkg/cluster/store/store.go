@@ -36,6 +36,10 @@ func (s *Store) DB() wkdb.DB {
 	return s.wdb
 }
 
+func (s *Store) HasChannel() bool {
+	return s != nil && s.opts != nil && s.opts.Channel != nil
+}
+
 // GetShardNum 获取数据库分片数量
 func (s *Store) GetShardNum() int {
 	return s.wdb.GetShardNum()

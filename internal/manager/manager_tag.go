@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
@@ -18,9 +19,24 @@ import (
 type TagManager struct {
 	bluckets []*tagBlucket
 	// 获取当前节点版本号
-	nodeVersion func() uint64
+	nodeVersion  func() uint64
+	boundCluster icluster.ICluster
 	wklog.Log
 	sync.RWMutex
+}
+
+func (t *TagManager) BindCluster(c icluster.ICluster) {
+	if t == nil {
+		return
+	}
+	t.boundCluster = c
+}
+
+func (t *TagManager) cluster() icluster.ICluster {
+	if t != nil && t.boundCluster != nil {
+		return t.boundCluster
+	}
+	return service.Cluster
 }
 
 func NewTagManager(blucketCount int, nodeVersion func() uint64) *TagManager {
@@ -63,7 +79,7 @@ func (t *TagManager) MakeTagWithTagKey(tagKey string, uids []string) (*types.Tag
 		return nil, err
 	}
 	t.getBlucketByTagKey(tagKey).setTag(tag)
-	return tag, nil
+	return tag.Clone(), nil
 }
 
 func (t *TagManager) MakeTagNotCacheWithTagKey(tagKey string, uids []string) (*types.Tag, error) {
@@ -85,24 +101,29 @@ func (t *TagManager) MakeTagNotCacheWithTagKey(tagKey string, uids []string) (*t
 }
 
 func (t *TagManager) AddUsers(tagKey string, uids []string) error {
-
-	t.Lock()
-	defer t.Unlock()
-
-	tag := t.getTag(tagKey)
-	if tag == nil {
-		return errors.TagNotExist(tagKey)
-	}
-	// 去除已经存在的用户
-	t.removeExistUidsInTag(tag, uids)
-
 	// 计算用户所在的节点
 	nodes, err := t.calcUsersInNode(uids)
 	if err != nil {
 		return err
 	}
+
+	t.Lock()
+	defer t.Unlock()
+
+	blucket := t.getBlucketByTagKey(tagKey)
+	blucket.tag.Lock()
+	defer blucket.tag.Unlock()
+
+	tag := blucket.tag.m[tagKey]
+	if tag == nil {
+		return errors.TagNotExist(tagKey)
+	}
+	next := tag.Clone()
+	// 去除已经存在的用户
+	t.removeExistUidsInTag(next, uids)
 	// 合并节点
-	t.mergeNodes(tag, nodes)
+	t.mergeNodes(next, nodes)
+	blucket.tag.m[tagKey] = next
 
 	return nil
 }
@@ -121,25 +142,37 @@ func (t *TagManager) removeExistUidsInTag(tag *types.Tag, uids []string) {
 }
 
 func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
+	type uidLeader struct {
+		uid      string
+		leaderId uint64
+	}
+	resolved := make([]uidLeader, 0, len(uids))
+	for _, uid := range uids {
+		slotId := t.cluster().GetSlotId(uid)
+		leaderId := t.cluster().SlotLeaderId(slotId)
+		if leaderId == 0 {
+			return errors.TagSlotLeaderIsZero
+		}
+		resolved = append(resolved, uidLeader{uid: uid, leaderId: leaderId})
+	}
 
 	t.Lock()
 	defer t.Unlock()
 
-	tag := t.getTag(tagKey)
+	blucket := t.getBlucketByTagKey(tagKey)
+	blucket.tag.Lock()
+	defer blucket.tag.Unlock()
+
+	tag := blucket.tag.m[tagKey]
 	if tag == nil {
 		return errors.TagNotExist(tagKey)
 	}
-
-	for _, uid := range uids {
-		slotId := service.Cluster.GetSlotId(uid)
-		leaderId := service.Cluster.SlotLeaderId(slotId)
-		if leaderId == 0 {
-			return errors.TagSlotLeaderIsZero
-		}
-		for _, node := range tag.Nodes {
-			if node.LeaderId == leaderId {
+	next := tag.Clone()
+	for _, item := range resolved {
+		for _, node := range next.Nodes {
+			if node.LeaderId == item.leaderId {
 				for i, nodeUid := range node.Uids {
-					if nodeUid == uid {
+					if nodeUid == item.uid {
 						node.Uids = append(node.Uids[:i], node.Uids[i+1:]...)
 						break
 					}
@@ -148,6 +181,7 @@ func (t *TagManager) RemoveUsers(tagKey string, uids []string) error {
 			}
 		}
 	}
+	blucket.tag.m[tagKey] = next
 	return nil
 }
 
@@ -168,43 +202,43 @@ func (t *TagManager) GetUsers(tagKey string) []string {
 }
 
 func (t *TagManager) Get(tagKey string) *types.Tag {
-	tag := t.getTag(tagKey)
-	if tag == nil {
+	currentVer := t.nodeVersion()
+	blucket := t.getBlucketByTagKey(tagKey)
+	tag, tagVer, expired := blucket.getAndTouchTag(tagKey, currentVer)
+	if expired {
+		t.Warn("tag is expired, tagNodeVersion < currentNodeVersion ", zap.String("tagKey", tagKey), zap.Uint64("tagNodeVersion", tagVer), zap.Uint64("currentNodeVersion", currentVer))
 		return nil
 	}
-	if tag.NodeVersion < t.nodeVersion() {
-		t.Warn("tag is expired, tagNodeVersion < currentNodeVersion ", zap.String("tagKey", tagKey), zap.Uint64("tagNodeVersion", tag.NodeVersion), zap.Uint64("currentNodeVersion", t.nodeVersion()))
-		return nil
-	}
-	tag.LastGetTime = time.Now()
-	tag.GetCount.Inc()
 	return tag
 }
 
 func (t *TagManager) Exist(tagKey string) bool {
-	return t.getTag(tagKey) != nil
+	return t.existTag(tagKey)
 }
 
 func (t *TagManager) RenameTag(oldTagKey, newTagKey string) error {
-	tag := t.getTag(oldTagKey)
+	t.Lock()
+	defer t.Unlock()
+	oldBlucket := t.getBlucketByTagKey(oldTagKey)
+	oldBlucket.tag.Lock()
+	tag := oldBlucket.tag.m[oldTagKey]
 	if tag == nil {
+		oldBlucket.tag.Unlock()
 		return errors.TagNotExist(oldTagKey)
 	}
-	tag.Key = newTagKey
-	tag.LastGetTime = time.Now()
-	t.setTag(tag)
-	t.removeTag(oldTagKey)
+	next := tag.Clone()
+	next.Key = newTagKey
+	next.LastGetTime = time.Now()
+	delete(oldBlucket.tag.m, oldTagKey)
+	oldBlucket.tag.Unlock()
+	t.setTag(next)
 	return nil
 }
 
 func (t *TagManager) SetChannelTag(fakeChannelId string, channelType uint8, tagKey string) {
 	blucket := t.getBlucketByChannel(fakeChannelId, channelType)
 	blucket.setChannelTag(fakeChannelId, channelType, tagKey)
-	tag := t.getTag(tagKey)
-	if tag != nil {
-		tag.ChannelId = fakeChannelId
-		tag.ChannelType = channelType
-	}
+	t.getBlucketByTagKey(tagKey).bindTagChannel(tagKey, fakeChannelId, channelType)
 }
 
 func (t *TagManager) GetChannelTag(fakeChannelId string, channelType uint8) string {
@@ -296,8 +330,8 @@ func (t *TagManager) calcUsersInNode(uids []string) ([]*types.Node, error) {
 
 	var nodeMap = make(map[uint64]*types.Node)
 	for _, uid := range uids {
-		slotId := service.Cluster.GetSlotId(uid)
-		leaderId := service.Cluster.SlotLeaderId(slotId)
+		slotId := t.cluster().GetSlotId(uid)
+		leaderId := t.cluster().SlotLeaderId(slotId)
 		if leaderId == 0 {
 			return nil, errors.TagSlotLeaderIsZero
 		}

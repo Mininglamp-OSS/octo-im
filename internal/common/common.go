@@ -11,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/types"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -21,7 +22,10 @@ import (
 type Service struct {
 	client *ingress.Client
 	wklog.Log
-	timingWheel *timingwheel.TimingWheel
+	timingWheel     *timingwheel.TimingWheel
+	boundNodeId     uint64
+	boundCluster    icluster.ICluster
+	boundTagManager service.ITagManager
 }
 
 func NewService() *Service {
@@ -31,6 +35,49 @@ func NewService() *Service {
 		Log:         wklog.NewWKLog("common.Service"),
 		timingWheel: timingwheel.NewTimingWheel(options.G.TimingWheelTick, options.G.TimingWheelSize),
 	}
+}
+
+func (s *Service) BindDeps(nodeId uint64, cl icluster.ICluster, tm service.ITagManager, cli *ingress.Client) {
+	if s == nil {
+		return
+	}
+	s.boundNodeId = nodeId
+	s.boundCluster = cl
+	s.boundTagManager = tm
+	if cli != nil {
+		s.client = cli
+	}
+}
+
+func (s *Service) localNodeId() uint64 {
+	if s != nil && s.boundNodeId != 0 {
+		return s.boundNodeId
+	}
+	if options.G != nil {
+		return options.G.Cluster.NodeId
+	}
+	return 0
+}
+
+func (s *Service) isLocalNode(nodeId uint64) bool {
+	if s != nil && s.boundNodeId != 0 {
+		return s.boundNodeId == nodeId
+	}
+	return options.G != nil && options.G.IsLocalNode(nodeId)
+}
+
+func (s *Service) cluster() icluster.ICluster {
+	if s != nil && s.boundCluster != nil {
+		return s.boundCluster
+	}
+	return service.Cluster
+}
+
+func (s *Service) tagManager() service.ITagManager {
+	if s != nil && s.boundTagManager != nil {
+		return s.boundTagManager
+	}
+	return service.TagManager
 }
 
 func (s *Service) Start() error {
@@ -72,21 +119,22 @@ func (s *Service) GetOrRequestAndMakeTag(fakeChannelId string, channelType uint8
 	// 	realFakeChannelId = options.G.CmdChannelConvertOrginalChannel(fakeChannelId)
 	// }
 
+	tm := s.tagManager()
 	var tag *types.Tag
 	if tagKey == "" {
-		tagKey = service.TagManager.GetChannelTag(fakeChannelId, channelType)
+		tagKey = tm.GetChannelTag(fakeChannelId, channelType)
 	}
 	if tagKey != "" {
-		tag = service.TagManager.Get(tagKey)
+		tag = tm.Get(tagKey)
 	}
 	if tag != nil {
 		return tag, nil
 	}
 	if channelType == wkproto.ChannelTypePerson {
-		return s.getOrMakePersonTag(fakeChannelId)
+		return s.getOrMakePersonTag(fakeChannelId, tagKey)
 	}
 
-	slotLeaderId, err := service.Cluster.SlotLeaderIdOfChannel(fakeChannelId, channelType)
+	slotLeaderId, err := s.cluster().SlotLeaderIdOfChannel(fakeChannelId, channelType)
 	if err != nil {
 		wklog.Error("GetOrRequestTag: getLeaderOfChannel failed", zap.Error(err), zap.String("channelId", fakeChannelId), zap.Uint8("channelType", channelType))
 		return nil, err
@@ -98,7 +146,7 @@ func (s *Service) GetOrRequestAndMakeTag(fakeChannelId string, channelType uint8
 
 	// tagKey在频道的领导节点是一定存在的，
 	// 如果不存在可能就是失效了，这里直接忽略,只能等下条消息触发重构tag
-	if options.G.IsLocalNode(slotLeaderId) {
+	if s.isLocalNode(slotLeaderId) {
 		wklog.Warn("tag not exist in leader node", zap.String("tagKey", tagKey), zap.String("fakeChannelId", fakeChannelId), zap.Uint8("channelType", channelType))
 		return nil, errors.TagNotExist(tagKey)
 	}
@@ -115,34 +163,43 @@ func (s *Service) GetOrRequestAndMakeTag(fakeChannelId string, channelType uint8
 		return nil, err
 	}
 
-	tag, err = service.TagManager.MakeTagWithTagKey(tagKey, tagResp.Uids)
+	tag, err = tm.MakeTagWithTagKey(tagKey, tagResp.Uids)
 	if err != nil {
 		s.Error("GetOrRequestTag: make tag failed", zap.Error(err))
 		return nil, err
 	}
-	service.TagManager.SetChannelTag(fakeChannelId, channelType, tagKey)
+	tm.SetChannelTag(fakeChannelId, channelType, tagKey)
 	return tag, nil
 }
 
 func (s *Service) GetOrRequestAndMakeTagWithLocal(fakeChannelId string, channelType uint8, tagKey string) (*types.Tag, error) {
-	return s.GetOrRequestAndMakeTag(fakeChannelId, channelType, tagKey, options.G.Cluster.NodeId)
+	return s.GetOrRequestAndMakeTag(fakeChannelId, channelType, tagKey, s.localNodeId())
 }
 
 // 获取个人频道的投递tag
-func (s *Service) getOrMakePersonTag(fakeChannelId string) (*types.Tag, error) {
+func (s *Service) getOrMakePersonTag(fakeChannelId string, tagKey string) (*types.Tag, error) {
 
 	realFakeChannelId := fakeChannelId
-	if options.G.IsCmdChannel(fakeChannelId) {
+	if options.G != nil && options.G.IsCmdChannel(fakeChannelId) {
 		realFakeChannelId = options.G.CmdChannelConvertOrginalChannel(fakeChannelId)
 	}
 	// 处理普通假个人频道
 	u1, u2 := options.GetFromUIDAndToUIDWith(realFakeChannelId)
 	subscribers := []string{u1, u2}
-	tag, err := service.TagManager.MakeTag(subscribers)
+	tm := s.tagManager()
+	var (
+		tag *types.Tag
+		err error
+	)
+	if tagKey != "" {
+		tag, err = tm.MakeTagWithTagKey(tagKey, subscribers)
+	} else {
+		tag, err = tm.MakeTag(subscribers)
+	}
 	if err != nil {
 		return nil, err
 	}
-	service.TagManager.SetChannelTag(fakeChannelId, wkproto.ChannelTypePerson, tag.Key)
+	tm.SetChannelTag(fakeChannelId, wkproto.ChannelTypePerson, tag.Key)
 	return tag, nil
 }
 

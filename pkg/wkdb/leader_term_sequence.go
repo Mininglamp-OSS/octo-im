@@ -83,5 +83,5 @@ func (wk *wukongDB) DeleteLeaderTermStartIndexGreaterThanTerm(shardNo string, te
 
 	wk.metrics.DeleteLeaderTermStartIndexGreaterThanTermAdd(1)
 
-	return wk.shardDB(shardNo).DeleteRange(key.NewLeaderTermSequenceTermKey(shardNo, term+1), key.NewLeaderTermSequenceTermKey(shardNo, math.MaxUint32), wk.sync)
+	return wk.deleteRangeKV(wk.shardDB(shardNo), key.NewLeaderTermSequenceTermKey(shardNo, term+1), key.NewLeaderTermSequenceTermKey(shardNo, math.MaxUint32), wk.sync)
 }

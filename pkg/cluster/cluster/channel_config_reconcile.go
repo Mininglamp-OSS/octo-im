@@ -31,6 +31,8 @@ type channelConfigReconciler struct {
 	wg                           sync.WaitGroup
 	mu                           sync.Mutex
 	pending                      map[channelConfigKey]*configTask
+	activeMigrations             map[channelConfigKey]time.Time
+	maxMigrations                int
 	capacity                     int
 	notify                       chan struct{}
 	scanNow                      chan struct{}
@@ -44,8 +46,73 @@ type channelConfigReconciler struct {
 
 func newChannelConfigReconciler(parent context.Context) *channelConfigReconciler {
 	ctx, cancel := context.WithCancel(parent)
-	return &channelConfigReconciler{ctx: ctx, cancel: cancel, pending: make(map[channelConfigKey]*configTask),
-		capacity: 4096, notify: make(chan struct{}, 1), scanNow: make(chan struct{}, 1)}
+	return &channelConfigReconciler{
+		ctx:              ctx,
+		cancel:           cancel,
+		pending:          make(map[channelConfigKey]*configTask),
+		activeMigrations: make(map[channelConfigKey]time.Time),
+		maxMigrations:    8,
+		capacity:         4096,
+		notify:           make(chan struct{}, 1),
+		scanNow:          make(chan struct{}, 1),
+	}
+}
+
+func (r *channelConfigReconciler) tryAcquireMigration(key channelConfigKey) bool {
+	if r == nil {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.maxMigrations <= 0 {
+		return true
+	}
+	now := time.Now()
+	for k, since := range r.activeMigrations {
+		if now.Sub(since) > 30*time.Second {
+			delete(r.activeMigrations, k)
+		}
+	}
+	if _, ok := r.activeMigrations[key]; ok {
+		return true
+	}
+	if len(r.activeMigrations) >= r.maxMigrations {
+		return false
+	}
+	r.activeMigrations[key] = now
+	return true
+}
+
+func (r *channelConfigReconciler) releaseMigration(key channelConfigKey) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	_, existed := r.activeMigrations[key]
+	delete(r.activeMigrations, key)
+	r.mu.Unlock()
+	if existed {
+		r.rescan()
+		select {
+		case r.notify <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (r *channelConfigReconciler) deferReconcile(key channelConfigKey, delay time.Duration) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if task := r.pending[key]; task != nil {
+		task.revision++
+		due := time.Now().Add(delay)
+		if task.due.Before(due) {
+			task.due = due
+		}
+	}
 }
 
 func (r *channelConfigReconciler) add(key channelConfigKey, changed bool) bool {
@@ -95,7 +162,10 @@ func (r *channelConfigReconciler) finish(key channelConfigKey, revision uint64, 
 		delete(r.pending, key)
 		r.completed++
 	} else {
-		task.due = time.Now()
+		now := time.Now()
+		if task.due.Before(now) {
+			task.due = now
+		}
 		if err != nil {
 			r.retries++
 			task.failures++
@@ -213,6 +283,9 @@ func (r *channelConfigReconciler) scanLoop() {
 
 func (s *Server) initChannelConfigReconciler() {
 	r := newChannelConfigReconciler(s.cancelCtx)
+	if s.opts != nil && s.opts.MaxConcurrentChannelMigrations > 0 {
+		r.maxMigrations = s.opts.MaxConcurrentChannelMigrations
+	}
 	r.process = s.reconcileChannelConfig
 	r.page = s.db.GetChannelClusterConfigs
 	r.owned = func(key channelConfigKey) bool {
@@ -245,10 +318,16 @@ func (s *Server) onChannelConfigSaved(id string, typ uint8) {
 func (s *Server) reconcileChannelConfig(ctx context.Context, key channelConfigKey) error {
 	cfg, err := s.loadConversationConfig(ctx, key.id, key.typ)
 	if errors.Is(err, wkdb.ErrNotFound) {
+		if s.configReconciler != nil {
+			s.configReconciler.releaseMigration(key)
+		}
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 && s.configReconciler != nil {
+		s.configReconciler.releaseMigration(key)
 	}
 	owner, err := s.SlotLeaderIdOfChannel(key.id, key.typ)
 	if err != nil {
@@ -267,6 +346,12 @@ func (s *Server) reconcileChannelConfig(ctx context.Context, key channelConfigKe
 		if err != nil {
 			return err
 		}
+		if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 && s.configReconciler != nil {
+			s.configReconciler.releaseMigration(key)
+		}
+		if s.channelNeedsFollowUpReconcile(cfg) && s.configReconciler != nil {
+			s.configReconciler.deferReconcile(key, 150*time.Millisecond)
+		}
 	}
 	if !validConversationConfig(cfg, key.id, key.typ) {
 		return ErrConversationReadRetry
@@ -276,4 +361,14 @@ func (s *Server) reconcileChannelConfig(ctx context.Context, key channelConfigKe
 		return err
 	}
 	return s.requestChannelConfigReconcile(ctx, cfg)
+}
+
+func (s *Server) channelNeedsFollowUpReconcile(cfg wkdb.ChannelClusterConfig) bool {
+	if len(cfg.Learners) > 0 || cfg.MigrateFrom != 0 || cfg.MigrateTo != 0 {
+		return true
+	}
+	if s.cfgServer == nil || len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
+		return false
+	}
+	return len(s.cfgServer.AllowVoteAndJoinedOnlineNodes()) > len(cfg.Replicas)
 }

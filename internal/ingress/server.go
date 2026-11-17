@@ -8,6 +8,8 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
@@ -18,6 +20,10 @@ import (
 
 type Ingress struct {
 	wklog.Log
+	boundCluster    icluster.ICluster
+	boundTagManager service.ITagManager
+	boundPermission *service.PermissionService
+	boundStore      *store.Store
 }
 
 func New() *Ingress {
@@ -27,19 +33,63 @@ func New() *Ingress {
 	}
 }
 
+func (i *Ingress) BindDeps(cl icluster.ICluster, tm service.ITagManager, perm *service.PermissionService, st *store.Store) {
+	if i == nil {
+		return
+	}
+	i.boundCluster = cl
+	i.boundTagManager = tm
+	i.boundPermission = perm
+	i.boundStore = st
+}
+
+func (i *Ingress) cluster() icluster.ICluster {
+	if i != nil && i.boundCluster != nil {
+		return i.boundCluster
+	}
+	return service.Cluster
+}
+
+func (i *Ingress) tagManager() service.ITagManager {
+	if i != nil && i.boundTagManager != nil {
+		return i.boundTagManager
+	}
+	return service.TagManager
+}
+
+func (i *Ingress) permissionService() *service.PermissionService {
+	if i != nil && i.boundPermission != nil {
+		return i.boundPermission
+	}
+	return service.Permission
+}
+
+func (i *Ingress) store() *store.Store {
+	if i != nil && i.boundStore != nil {
+		return i.boundStore
+	}
+	return service.Store
+}
+
 func (i *Ingress) SetRoutes() {
+	cl := i.cluster()
+	if cl == nil {
+		return
+	}
 	// 获取tag
-	service.Cluster.Route("/wk/ingress/getTag", i.handleGetTag)
+	cl.Route("/wk/ingress/getTag", i.handleGetTag)
 	// 判断接受者是否允许发送消息
-	service.Cluster.Route("/wk/ingress/allowSend", i.handleAllowSend)
+	cl.Route("/wk/ingress/allowSend", i.handleAllowSend)
+	// 判断频道是否允许发送消息（封禁/解散检查）
+	cl.Route("/wk/ingress/hasPermissionForChannel", i.handleHasPermissionForChannel)
 	// 更新tag
-	service.Cluster.Route("/wk/ingress/updateTag", i.handleUpdateTag)
+	cl.Route("/wk/ingress/updateTag", i.handleUpdateTag)
 	// 添加tag
-	service.Cluster.Route("/wk/ingress/addTag", i.handleAddTag)
+	cl.Route("/wk/ingress/addTag", i.handleAddTag)
 	// 获取订阅者
-	service.Cluster.Route("/wk/ingress/getSubscribers", i.handleGetSubscribers)
+	cl.Route("/wk/ingress/getSubscribers", i.handleGetSubscribers)
 	// 处理转发的PersistAfter插件调用请求
-	service.Cluster.Route("/wk/ingress/persistAfter", i.handlePersistAfter)
+	cl.Route("/wk/ingress/persistAfter", i.handlePersistAfter)
 }
 
 // handlePersistAfter 处理转发的PersistAfter插件调用请求
@@ -100,10 +150,10 @@ func (i *Ingress) handleGetTag(c *wkserver.Context) {
 	}
 
 	if req.TagKey == "" {
-		req.TagKey = service.TagManager.GetChannelTag(req.ChannelId, req.ChannelType)
+		req.TagKey = i.tagManager().GetChannelTag(req.ChannelId, req.ChannelType)
 	}
 
-	tag := service.TagManager.Get(req.TagKey)
+	tag := i.tagManager().Get(req.TagKey)
 	if tag == nil {
 		i.Error("handleGetTag: tag not exist", zap.Error(err), zap.String("tagKey", req.TagKey))
 		c.WriteErr(errors.New("handleGetTag: tag not exist"))
@@ -133,15 +183,80 @@ func (i *Ingress) handleGetTag(c *wkserver.Context) {
 }
 
 func (i *Ingress) handleAllowSend(ctx *wkserver.Context) {
+	body := ctx.Body()
+	if len(body) >= 3 && body[0] == 0xff && body[1] == 0xff {
+		dec := wkproto.NewDecoder(body[3:])
+		switch body[2] {
+		case 1:
+			channelId, err := dec.String()
+			if err != nil {
+				ctx.WriteErr(err)
+				return
+			}
+			channelType, err := dec.Uint8()
+			if err != nil {
+				ctx.WriteErr(err)
+				return
+			}
+			perm := i.permissionService()
+			if perm == nil {
+				ctx.Write([]byte{1, byte(wkproto.ReasonSuccess)})
+				return
+			}
+			rc, err := perm.HasPermissionForChannelLocal(channelId, channelType)
+			if err != nil {
+				ctx.WriteErr(err)
+				return
+			}
+			ctx.Write([]byte{1, byte(rc)})
+			return
+		case 2:
+			channelId, err := dec.String()
+			if err != nil {
+				ctx.WriteErr(err)
+				return
+			}
+			channelType, err := dec.Uint8()
+			if err != nil {
+				ctx.WriteErr(err)
+				return
+			}
+			fromUid, err := dec.String()
+			if err != nil {
+				ctx.WriteErr(err)
+				return
+			}
+			deviceId, err := dec.String()
+			if err != nil {
+				ctx.WriteErr(err)
+				return
+			}
+			perm := i.permissionService()
+			if perm == nil {
+				ctx.Write([]byte{1, byte(wkproto.ReasonSuccess)})
+				return
+			}
+			rc, err := perm.HasPermissionForCommChannelLocal(channelId, channelType, service.SenderInfo{
+				UID:      fromUid,
+				DeviceID: deviceId,
+			})
+			if err != nil {
+				ctx.WriteErr(err)
+				return
+			}
+			ctx.Write([]byte{1, byte(rc)})
+			return
+		}
+	}
 	req := &AllowSendReq{}
-	err := req.decode(ctx.Body())
+	err := req.decode(body)
 	if err != nil {
 		i.Error("handleAllowSend Unmarshal err", zap.Error(err))
 		ctx.WriteErr(err)
 		return
 	}
 
-	reasonCode, err := service.Permission.AllowSendForPersonLocal(req.From, req.To)
+	reasonCode, err := i.permissionService().AllowSendForPersonLocal(req.From, req.To)
 	if err != nil {
 		i.Error("handleAllowSend: allowSend failed", zap.Error(err))
 		ctx.WriteErr(err)
@@ -153,6 +268,31 @@ func (i *Ingress) handleAllowSend(ctx *wkserver.Context) {
 		return
 	}
 	ctx.WriteErrorAndStatus(errors.New("not allow send"), proto.Status(reasonCode))
+}
+
+func (i *Ingress) handleHasPermissionForChannel(ctx *wkserver.Context) {
+	req := &ChannelReq{}
+	if err := req.Decode(ctx.Body()); err != nil {
+		i.Error("handleHasPermissionForChannel decode err", zap.Error(err))
+		ctx.WriteErr(err)
+		return
+	}
+	perm := i.permissionService()
+	if perm == nil {
+		ctx.WriteOk()
+		return
+	}
+	reasonCode, err := perm.HasPermissionForChannelLocal(req.ChannelId, req.ChannelType)
+	if err != nil {
+		i.Error("handleHasPermissionForChannel failed", zap.Error(err), zap.String("channelId", req.ChannelId), zap.Uint8("channelType", req.ChannelType))
+		ctx.WriteErr(err)
+		return
+	}
+	if reasonCode == wkproto.ReasonSuccess {
+		ctx.WriteOk()
+		return
+	}
+	ctx.WriteErrorAndStatus(errors.New("channel permission denied"), proto.Status(reasonCode))
 }
 
 func (i *Ingress) handleUpdateTag(c *wkserver.Context) {
@@ -180,32 +320,33 @@ func (i *Ingress) handleUpdateTag(c *wkserver.Context) {
 	// 	realFakeChannelId = options.G.CmdChannelConvertOrginalChannel(req.ChannelId)
 	// }
 
+	tm := i.tagManager()
 	tagKey := req.TagKey
 	if tagKey == "" {
 		if req.ChannelId != "" {
-			tagKey = service.TagManager.GetChannelTag(req.ChannelId, req.ChannelType)
+			tagKey = tm.GetChannelTag(req.ChannelId, req.ChannelType)
 		}
 	}
 	if tagKey != "" {
-		if service.TagManager.Exist(tagKey) {
+		if tm.Exist(tagKey) {
 			if req.Remove {
-				err = service.TagManager.RemoveUsers(tagKey, req.Uids)
+				err = tm.RemoveUsers(tagKey, req.Uids)
 				if err != nil {
 					i.Warn("handleUpdateTag: remove users failed", zap.Error(err))
 				}
 			} else {
-				err = service.TagManager.AddUsers(tagKey, req.Uids)
+				err = tm.AddUsers(tagKey, req.Uids)
 				if err != nil {
 					i.Warn("handleUpdateTag: add users failed", zap.Error(err))
 				}
 			}
 			if req.ChannelTag {
 				newTagKey := wkutil.GenUUID()
-				err = service.TagManager.RenameTag(tagKey, newTagKey)
+				err = tm.RenameTag(tagKey, newTagKey)
 				if err != nil {
 					i.Warn("handleUpdateTag: rename tag failed", zap.Error(err))
 				}
-				service.TagManager.SetChannelTag(req.ChannelId, req.ChannelType, newTagKey)
+				tm.SetChannelTag(req.ChannelId, req.ChannelType, newTagKey)
 			}
 		}
 	}
@@ -233,7 +374,7 @@ func (i *Ingress) handleAddTag(c *wkserver.Context) {
 		return
 	}
 
-	_, err = service.TagManager.MakeTagWithTagKey(req.TagKey, req.Uids)
+	_, err = i.tagManager().MakeTagWithTagKey(req.TagKey, req.Uids)
 	if err != nil {
 		i.Error("handleAddTag: add users failed", zap.Error(err))
 		c.WriteErr(err)
@@ -257,7 +398,7 @@ func (i *Ingress) handleGetSubscribers(c *wkserver.Context) {
 		return
 	}
 
-	members, err := service.Store.GetSubscribers(req.ChannelId, req.ChannelType)
+	members, err := i.store().GetSubscribers(req.ChannelId, req.ChannelType)
 	if err != nil {
 		i.Error("handleGetSubscribers: get subscribers failed", zap.Error(err))
 		c.WriteErr(err)

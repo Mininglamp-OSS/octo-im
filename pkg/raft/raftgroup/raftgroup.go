@@ -2,6 +2,7 @@ package raftgroup
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/track"
@@ -24,7 +25,15 @@ type RaftGroup struct {
 	tmpRafts []IRaft
 	stopped  bool
 
-	goPool *ants.Pool
+	goPool               *ants.Pool
+	workMu               sync.Mutex
+	storageWork          map[string]*storageWork
+	inFlightGetLogs      int
+	inFlightGetLogsBytes uint64
+	inFlightGetLogsKeys  map[string]bool
+	workers              sync.WaitGroup
+	closing              bool
+	stopOnce             sync.Once
 	wklog.Log
 
 	mq *EventQueue
@@ -43,9 +52,11 @@ func New(opts *Options) *RaftGroup {
 		readStateC:        make(chan readStateRequest),
 		ownerC:            make(chan ownerRequest),
 		Log:               wklog.NewWKLog(fmt.Sprintf("RaftGroup[%s]", opts.LogPrefix)),
-		mq:                NewEventQueue(opts.ReceiveQueueLength, false, 0, 0),
-		wait:              newWait(),
-		fowardProposeWait: wt.New(),
+		mq:                  NewEventQueue(opts.ReceiveQueueLength, false, 0, 0),
+		wait:                newWait(),
+		storageWork:         make(map[string]*storageWork),
+		inFlightGetLogsKeys: make(map[string]bool),
+		fowardProposeWait:   wt.New(),
 	}
 	var err error
 	rg.goPool, err = ants.NewPool(opts.GoPoolSize, ants.WithNonblocking(true), ants.WithPanicHandler(func(i interface{}) {
@@ -62,14 +73,26 @@ func (rg *RaftGroup) Options() *Options {
 }
 
 func (rg *RaftGroup) AddRaft(r IRaft) {
+	rg.workMu.Lock()
+	if rg.closing || rg.GetRaft(r.Key()) != nil {
+		rg.workMu.Unlock()
+		return
+	}
 	rg.raftList.push(r)
+	rg.workMu.Unlock()
 	if rg.opts.Event != nil {
 		rg.opts.Event.OnAddRaft(r)
 	}
 }
 
 func (rg *RaftGroup) RemoveRaft(r IRaft) {
+	rg.workMu.Lock()
+	if rg.GetRaft(r.Key()) != r {
+		rg.workMu.Unlock()
+		return
+	}
 	rg.raftList.remove(r.Key())
+	rg.workMu.Unlock()
 	if rg.opts.Event != nil {
 		rg.opts.Event.OnRemoveRaft(r)
 	}
@@ -102,7 +125,14 @@ func (rg *RaftGroup) Start() error {
 }
 
 func (rg *RaftGroup) Stop() {
-	rg.stopper.Stop()
+	rg.stopOnce.Do(func() {
+		rg.workMu.Lock()
+		rg.closing = true
+		rg.workMu.Unlock()
+		rg.stopper.Stop()
+		rg.workers.Wait()
+		rg.goPool.Release()
+	})
 }
 
 func (rg *RaftGroup) Advance() {
@@ -116,7 +146,7 @@ func (rg *RaftGroup) Advance() {
 func (rg *RaftGroup) AddEvent(raftKey string, e types.Event) {
 
 	if e.Type == types.SendPropose {
-		err := rg.goPool.Submit(func() {
+		err := rg.submitWork(nil, false, func() {
 			rg.handleSendPropose(raftKey, e)
 		})
 		if err != nil {
@@ -162,6 +192,7 @@ func (rg *RaftGroup) TryAddEvent(raftKey string, e types.Event) {
 
 func (rg *RaftGroup) loopEvent() {
 	tk := time.NewTicker(rg.opts.TickInterval)
+	defer tk.Stop()
 	for !rg.stopped {
 		rg.readyEvents()
 		select {
@@ -200,6 +231,20 @@ func (rg *RaftGroup) readyEvents() {
 	}
 }
 
+func isRealtimeOrControlEvent(t types.EventType) bool {
+	switch t {
+	case types.Ping, types.VoteReq, types.VoteResp, types.Propose,
+		types.StoreResp, types.ApplyResp, types.TruncateReq, types.TruncateResp, types.ConfChange,
+		types.ConfigReq, types.ConfigResp,
+		types.LearnerToFollowerReq, types.LearnerToFollowerResp,
+		types.LearnerToLeaderReq, types.LearnerToLeaderResp,
+		types.FollowerToLeaderReq, types.FollowerToLeaderResp:
+		return true
+	default:
+		return false
+	}
+}
+
 // 处理收到的事件
 func (rg *RaftGroup) handleReceivedEvents() bool {
 	events := rg.mq.Get()
@@ -207,14 +252,23 @@ func (rg *RaftGroup) handleReceivedEvents() bool {
 		return false
 	}
 	hasEvent := false
-	for _, e := range events {
+	processOne := func(e Event) {
+		if e.onComplete != nil {
+			defer e.onComplete()
+		}
 		raft := rg.raftList.get(e.RaftKey)
+		if e.instance != nil && e.instance != raft {
+			if e.WaitC != nil {
+				e.WaitC <- ErrRaftNotExist
+			}
+			return
+		}
 		if raft == nil {
 			rg.Warn("raft not found", zap.String("raftKey", e.RaftKey), zap.String("event", e.Event.Type.String()))
 			if e.WaitC != nil {
 				e.WaitC <- ErrRaftNotExist
 			}
-			continue
+			return
 		}
 
 		// 轨迹记录
@@ -225,11 +279,28 @@ func (rg *RaftGroup) handleReceivedEvents() bool {
 		}
 		hasEvent = true
 		err := raft.Step(e.Event)
+		if err == nil && e.Type == types.ApplyResp && e.Reason == types.ReasonOk {
+			rg.wait.didApply(e.RaftKey, e.Index)
+		}
 		if err != nil {
 			rg.Error("step failed", zap.Error(err), zap.String("handleKey", raft.Key()))
 		}
 		if e.WaitC != nil {
 			e.WaitC <- err
+		}
+	}
+
+	// Pass 1: process control, heartbeat, realtime proposals, and local I/O completions first
+	// so catch-up bursts cannot starve heartbeats or realtime traffic.
+	for _, e := range events {
+		if isRealtimeOrControlEvent(e.Type) {
+			processOne(e)
+		}
+	}
+	// Pass 2: process remaining catch-up / sync events.
+	for _, e := range events {
+		if !isRealtimeOrControlEvent(e.Type) {
+			processOne(e)
 		}
 	}
 	return hasEvent

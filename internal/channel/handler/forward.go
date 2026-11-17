@@ -1,17 +1,25 @@
 package handler
 
 import (
+	"strings"
+
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/forward"
-	"github.com/WuKongIM/WuKongIM/internal/options"
-	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
 
 func (h *Handler) SetForwardRoutes() {
-	service.Cluster.Route(forward.ChannelPath, func(c *wkserver.Context) { c.WriteStatus(h.acceptForward(c.Body())) })
+	cl := h.cluster()
+	if cl == nil {
+		return
+	}
+	cl.Route(forward.ChannelPath, func(c *wkserver.Context) { c.WriteStatus(h.acceptForward(c.Body())) })
+}
+
+func (h *Handler) AcceptForward(data []byte) proto.Status {
+	return h.acceptForward(data)
 }
 
 func (h *Handler) acceptForward(data []byte) proto.Status {
@@ -28,18 +36,32 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 		if e.Type != eventType || !validChannelForwardEvent(e) {
 			return forward.StatusInvalid
 		}
-		if !h.notForwardToLeader(e.Type) {
-			leader, err := service.Cluster.SlotLeaderIdOfChannel(req.channelId, req.channelType)
-			if err != nil || leader == 0 || !options.G.IsLocalNode(leader) {
+		if !h.notForwardToLeader(e.Type) || (e.Type == eventbus.EventChannelDistribute && strings.TrimSpace(e.TagKey) == "") {
+			cl := h.cluster()
+			if cl == nil {
+				return forward.StatusRetry
+			}
+			leader, err := cl.SlotLeaderIdOfChannel(req.channelId, req.channelType)
+			if err != nil || leader == 0 || !h.isLocalNode(leader) {
 				return forward.StatusRetry
 			}
 		}
 	}
+	chBus := h.channelBus()
+	if chBus == nil {
+		return forward.StatusRetry
+	}
 	for _, e := range req.events {
 		e.ForwardDeadline, e.ForwardHops = deadline, hops
-		eventbus.Channel.AddEvent(req.channelId, req.channelType, e)
+		if req.fromNode != 0 && e.Type == eventbus.EventChannelOnSend && e.MessageSeq > 0 {
+			// The persisting ingress node already ran node-local PluginPersistAfter and EventChannelWebhook;
+			// record that fact on the receiving slot leader so cross-node retries across leadership handoffs
+			// never duplicate plugin/webhook side effects.
+			_ = h.recordPluginWebhookSideEffect(req.channelId, req.channelType, e.MessageSeq)
+		}
+		chBus.AddEvent(req.channelId, req.channelType, e)
 	}
-	eventbus.Channel.Advance(req.channelId, req.channelType)
+	chBus.Advance(req.channelId, req.channelType)
 	return proto.StatusOK
 }
 

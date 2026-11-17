@@ -29,7 +29,7 @@ func (wk *wukongDB) IncMessageCount(v int) error {
 	count += v
 	wk.endian.PutUint64(result, uint64(count))
 
-	return db.Set(keyBytes, result, wk.sync)
+	return wk.setKV(db, keyBytes, result, wk.sync)
 
 }
 
@@ -57,7 +57,7 @@ func (wk *wukongDB) IncUserCount(v int) error {
 	count += v
 	wk.endian.PutUint64(result, uint64(count))
 
-	return db.Set(keyBytes, result, wk.sync)
+	return wk.setKV(db, keyBytes, result, wk.sync)
 }
 
 func (wk *wukongDB) IncDeviceCount(v int) error {
@@ -84,7 +84,7 @@ func (wk *wukongDB) IncDeviceCount(v int) error {
 	count += v
 	wk.endian.PutUint64(result, uint64(count))
 
-	return db.Set(keyBytes, result, wk.sync)
+	return wk.setKV(db, keyBytes, result, wk.sync)
 }
 
 func (wk *wukongDB) IncSessionCount(v int) error {
@@ -111,7 +111,7 @@ func (wk *wukongDB) IncSessionCount(v int) error {
 	count += v
 	wk.endian.PutUint64(result, uint64(count))
 
-	return db.Set(keyBytes, result, wk.sync)
+	return wk.setKV(db, keyBytes, result, wk.sync)
 }
 
 func (wk *wukongDB) IncChannelCount(v int) error {
@@ -138,7 +138,7 @@ func (wk *wukongDB) IncChannelCount(v int) error {
 	count += v
 	wk.endian.PutUint64(result, uint64(count))
 
-	return db.Set(keyBytes, result, wk.sync)
+	return wk.setKV(db, keyBytes, result, wk.sync)
 }
 
 func (wk *wukongDB) IncConversationCount(v int) error {
@@ -165,7 +165,7 @@ func (wk *wukongDB) IncConversationCount(v int) error {
 	count += v
 	wk.endian.PutUint64(result, uint64(count))
 
-	return db.Set(keyBytes, result, wk.sync)
+	return wk.setKV(db, keyBytes, result, wk.sync)
 }
 
 func (wk *wukongDB) GetTotalMessageCount() (int, error) {
@@ -331,7 +331,7 @@ func (wk *wukongDB) IncChannelClusterConfigCount(v int) error {
 	count += v
 	wk.endian.PutUint64(result, uint64(count))
 
-	return db.Set(keyBytes, result, wk.sync)
+	return wk.setKV(db, keyBytes, result, wk.sync)
 }
 
 func (wk *wukongDB) GetTotalChannelClusterConfigCount() (int, error) {

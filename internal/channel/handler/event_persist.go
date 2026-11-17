@@ -26,28 +26,51 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	}
 
 	// ========== 存储消息 ==========
-	persists := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, events)
+	unpersistedEvents := make([]*eventbus.Event, 0, len(events))
+	alreadyPersisted := false
+	skipDistribute := make(map[*eventbus.Event]bool)
+	for _, e := range events {
+		if e != nil && e.MessageSeq > 0 && e.ReasonCode == wkproto.ReasonSuccess {
+			alreadyPersisted = true
+			if h.recordPluginWebhookSideEffect(ctx.ChannelId, ctx.ChannelType, e.MessageSeq) {
+				e.PersistedDuplicate = true
+			}
+			if h.recordDistributeSideEffect(ctx.ChannelId, ctx.ChannelType, e.MessageSeq) {
+				skipDistribute[e] = true
+			}
+			continue
+		}
+		unpersistedEvents = append(unpersistedEvents, e)
+	}
+	persists := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, unpersistedEvents)
 	if len(persists) > 0 {
 
 		timeoutCtx, cancel := h.WithTimeout()
 		defer cancel()
-		results, err := service.Store.AppendMessages(timeoutCtx, ctx.ChannelId, ctx.ChannelType, persists)
+		results, err := h.store().AppendMessages(timeoutCtx, ctx.ChannelId, ctx.ChannelType, persists)
 		if err != nil {
 			h.Error("store message failed", zap.Error(err), zap.Int("events", len(persists)), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-			markPersistFailure(events, err)
+			markPersistFailure(unpersistedEvents, err)
 		}
 
 		if err == nil {
-			err = applyPersistResults(events, persists, results)
+			err = applyPersistResults(unpersistedEvents, persists, results)
 			if err != nil {
 				h.Error("invalid persistence response", zap.Error(err))
-				markPersistFailure(events, err)
+				markPersistFailure(unpersistedEvents, err)
+			} else {
+				for _, e := range unpersistedEvents {
+					if e != nil && e.MessageSeq > 0 && e.ReasonCode == wkproto.ReasonSuccess && !e.PersistedDuplicate {
+						_ = h.recordPluginWebhookSideEffect(ctx.ChannelId, ctx.ChannelType, e.MessageSeq)
+						_ = h.recordDistributeSideEffect(ctx.ChannelId, ctx.ChannelType, e.MessageSeq)
+					}
+				}
 			}
 		}
-		if err == nil {
-			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, newlyPersistedMessages(events, persists))
-		}
-
+	}
+	if len(persists) > 0 || alreadyPersisted {
+		allPersisted := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, events)
+		h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, newlyPersistedMessages(events, allPersisted))
 	}
 
 	if options.G.Logger.TraceOn {
@@ -58,32 +81,71 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		}
 	}
 
+	chBus := h.channelBus()
 	// ========== webhook ==========
-	if options.G.WebhookOn(types.EventMsgNotify) {
+	if options.G.WebhookOn(types.EventMsgNotify) && chBus != nil {
 		for _, e := range events {
 			sendPacket := e.Frame.(*wkproto.SendPacket)
 			if shouldRunPersistSideEffects(e) && !sendPacket.NoPersist {
 				cloneEvent := e.Clone()
 				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 				cloneEvent.Type = eventbus.EventChannelWebhook
-				eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+				chBus.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 			}
 		}
 	}
 
 	// ========== 分发 ==========
-	for _, e := range events {
-		if !shouldDistributePersistResult(e) {
-			continue
+	if chBus != nil {
+		for _, e := range events {
+			if skipDistribute[e] || !shouldDistributePersistResult(e) {
+				continue
+			}
+			cloneEvent := e.Clone()
+			cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
+			cloneEvent.Type = eventbus.EventChannelDistribute
+			chBus.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 		}
-		cloneEvent := e.Clone()
-		cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
-		cloneEvent.Type = eventbus.EventChannelDistribute
-		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
+
+		chBus.Advance(ctx.ChannelId, ctx.ChannelType)
 	}
 
-	eventbus.Channel.Advance(ctx.ChannelId, ctx.ChannelType)
+}
 
+func (h *Handler) executePersistedLocalSideEffects(channelId string, channelType uint8, events []*eventbus.Event) {
+	freshEvents := make([]*eventbus.Event, 0, len(events))
+	for _, e := range events {
+		if e == nil || e.MessageSeq == 0 || e.ReasonCode != wkproto.ReasonSuccess {
+			continue
+		}
+		if h.recordPluginWebhookSideEffect(channelId, channelType, e.MessageSeq) {
+			e.PersistedDuplicate = true
+			continue
+		}
+		freshEvents = append(freshEvents, e)
+	}
+	if len(freshEvents) == 0 {
+		return
+	}
+	allPersisted := h.toPersistMessages(channelId, channelType, freshEvents)
+	h.pluginInvokePersistAfter(channelId, channelType, newlyPersistedMessages(freshEvents, allPersisted))
+	chBus := h.channelBus()
+	if options.G != nil && options.G.WebhookOn(types.EventMsgNotify) && chBus != nil {
+		queued := false
+		for _, e := range freshEvents {
+			sendPacket, ok := e.Frame.(*wkproto.SendPacket)
+			if ok && sendPacket != nil && shouldRunPersistSideEffects(e) && !sendPacket.NoPersist {
+				cloneEvent := e.Clone()
+				cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
+				cloneEvent.Type = eventbus.EventChannelWebhook
+				chBus.AddEvent(channelId, channelType, cloneEvent)
+				queued = true
+			}
+		}
+		if queued {
+			chBus.Advance(channelId, channelType)
+		}
+	}
 }
 
 func markPersistFailure(events []*eventbus.Event, err error) {
@@ -119,7 +181,7 @@ func shouldDistributePersistResult(event *eventbus.Event) bool {
 }
 
 func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, msgs []wkdb.Message) {
-	if len(msgs) == 0 {
+	if len(msgs) == 0 || service.PluginManager == nil {
 		return
 	}
 	plugins := service.PluginManager.Plugins(types.PluginPersistAfter)
@@ -150,7 +212,7 @@ func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, 
 	}
 
 	// 获取频道领导节点ID
-	leaderId, err := service.Cluster.LeaderIdOfChannel(channelId, channelType)
+	leaderId, err := h.cluster().LeaderIdOfChannel(channelId, channelType)
 	if err != nil {
 		h.Error("pluginInvokePersistAfter: get channel leader failed", zap.Error(err), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
 		// 如果获取领导节点失败，直接在本地执行
@@ -159,7 +221,7 @@ func (h *Handler) pluginInvokePersistAfter(channelId string, channelType uint8, 
 	}
 
 	// 如果当前节点是频道领导节点，直接执行
-	if options.G.IsLocalNode(leaderId) {
+	if h.isLocalNode(leaderId) {
 		h.executePluginPersistAfterLocal(channelId, channelType, msgBatch)
 		return
 	}
@@ -186,6 +248,9 @@ func newlyPersistedMessages(events []*eventbus.Event, messages []wkdb.Message) [
 
 // executePluginPersistAfterLocal 在本地执行插件PersistAfter调用
 func (h *Handler) executePluginPersistAfterLocal(channelId string, channelType uint8, msgBatch *pluginproto.MessageBatch) {
+	if service.PluginManager == nil {
+		return
+	}
 	plugins := service.PluginManager.Plugins(types.PluginPersistAfter)
 	if len(plugins) == 0 {
 		return

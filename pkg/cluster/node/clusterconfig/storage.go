@@ -3,7 +3,10 @@ package clusterconfig
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
+	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/clusterconfig/key"
@@ -15,12 +18,55 @@ import (
 )
 
 type PebbleShardLogStorage struct {
-	db     *pebble.DB
-	path   string
-	wo     *pebble.WriteOptions
-	noSync *pebble.WriteOptions
-	s      *Server
+	db           *pebble.DB
+	path         string
+	wo           *pebble.WriteOptions
+	noSync       *pebble.WriteOptions
+	s            *Server
+	closed       atomic.Bool
+	lastWriteErr atomic.Value
 	wklog.Log
+}
+
+type cfgWriteErrorHolder struct {
+	err error
+}
+
+func (p *PebbleShardLogStorage) RecordWriteError(err error) {
+	if p == nil {
+		return
+	}
+	p.lastWriteErr.Store(cfgWriteErrorHolder{err: err})
+}
+
+func (p *PebbleShardLogStorage) LastWriteError() error {
+	if p == nil {
+		return nil
+	}
+	if v, ok := p.lastWriteErr.Load().(cfgWriteErrorHolder); ok {
+		return v.err
+	}
+	return nil
+}
+
+func (p *PebbleShardLogStorage) CheckWriteHealth() error {
+	if p == nil || p.db == nil || p.closed.Load() {
+		return errors.New("clusterconfig storage not open")
+	}
+	if err := p.LastWriteError(); err != nil {
+		return fmt.Errorf("clusterconfig storage write error: %w", err)
+	}
+	info, err := os.Stat(p.path)
+	if err != nil {
+		return fmt.Errorf("clusterconfig storage directory %s stat failed: %w", p.path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("clusterconfig storage path %s is not a directory", p.path)
+	}
+	if info.Mode().Perm()&0200 == 0 {
+		return fmt.Errorf("clusterconfig storage directory %s is read-only (mode=%v)", p.path, info.Mode().Perm())
+	}
+	return nil
 }
 
 func NewPebbleShardLogStorage(path string, s *Server) *PebbleShardLogStorage {
@@ -41,10 +87,16 @@ func (p *PebbleShardLogStorage) Open() error {
 	if err != nil {
 		return err
 	}
+	p.closed.Store(false)
+	p.RecordWriteError(nil)
 	return nil
 }
 
 func (p *PebbleShardLogStorage) Close() error {
+	p.closed.Store(true)
+	if p.db == nil {
+		return nil
+	}
 	err := p.db.Close()
 	if err != nil {
 		return err
@@ -85,6 +137,7 @@ func (p *PebbleShardLogStorage) AppendLogs(logs []types.Log, termStartIndexInfo 
 	}
 
 	err := batch.Commit(p.wo)
+	p.RecordWriteError(err)
 	if err != nil {
 		return err
 	}
@@ -122,22 +175,19 @@ func (p *PebbleShardLogStorage) SaveConfig(cfg types.Config) error {
 
 // TruncateLogTo 截断日志
 func (p *PebbleShardLogStorage) TruncateLogTo(index uint64) error {
-	if index == 0 {
-		return errors.New("index must be greater than 0")
-	}
 	appliedIdx, err := p.AppliedIndex()
 	if err != nil {
 		p.Error("get max index error", zap.Error(err))
 		return err
 	}
 	if index < appliedIdx {
-		p.Error("index must be less than  applied index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx))
-		return nil
+		return types.ErrCommittedLogConflict
 	}
 
 	keyData := key.NewLogKey(index + 1)
 	maxKeyData := key.NewLogKey(math.MaxUint64)
 	err = p.db.DeleteRange(keyData, maxKeyData, p.wo)
+	p.RecordWriteError(err)
 	if err != nil {
 		return err
 	}
@@ -361,6 +411,7 @@ func (p *PebbleShardLogStorage) setAppliedIndex(index uint64) error {
 	binary.BigEndian.PutUint64(lastTimeData, uint64(lastTime))
 
 	err := p.db.Set(maxIndexKeyData, append(maxIndexdata, lastTimeData...), p.wo)
+	p.RecordWriteError(err)
 	return err
 
 }
@@ -399,6 +450,7 @@ func (p *PebbleShardLogStorage) SetLeaderTermStartIndex(term uint32, index uint6
 	var indexData = make([]byte, 8)
 	binary.BigEndian.PutUint64(indexData, index)
 	err := p.db.Set(leaderTermStartIndexKeyData, indexData, p.wo)
+	p.RecordWriteError(err)
 	return err
 }
 
@@ -468,7 +520,9 @@ func (p *PebbleShardLogStorage) DeleteLeaderTermStartIndexGreaterThanTerm(term u
 			return err
 		}
 	}
-	return batch.Commit(p.wo)
+	err = batch.Commit(p.wo)
+	p.RecordWriteError(err)
+	return err
 }
 
 func (p *PebbleShardLogStorage) saveMaxIndexWithWriter(index uint64, w pebble.Writer, o *pebble.WriteOptions) error {
@@ -484,7 +538,9 @@ func (p *PebbleShardLogStorage) saveMaxIndexWithWriter(index uint64, w pebble.Wr
 }
 
 func (p *PebbleShardLogStorage) SaveHardState(state types.HardState) error {
-	return p.db.Set(key.NewHardStateKey(), state.Marshal(), pebble.Sync)
+	err := p.db.Set(key.NewHardStateKey(), state.Marshal(), pebble.Sync)
+	p.RecordWriteError(err)
+	return err
 }
 
 func (p *PebbleShardLogStorage) hardState() (types.HardState, error) {

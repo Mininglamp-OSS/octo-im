@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/forward"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/fasttime"
@@ -31,7 +33,8 @@ type channelHandler struct {
 	// 处理中的下标位置
 	processingIndex uint64
 	// 是否正在处理
-	processing atomic.Bool
+	processing           atomic.Bool
+	leaderRetryScheduled atomic.Bool
 }
 
 func newChannelHandler(channelId string, channelType uint8, poller *poller) *channelHandler {
@@ -51,8 +54,18 @@ func newChannelHandler(channelId string, channelType uint8, poller *poller) *cha
 }
 
 func (c *channelHandler) addEvent(event *eventbus.Event) {
+	if event == nil {
+		return
+	}
 	c.pending.Lock()
 	defer c.pending.Unlock()
+	if !c.pending.eventQueue.CanAppend(event) {
+		c.Warn("addEvent: channel event queue full, dropping event",
+			zap.String("channelId", c.channelId),
+			zap.Uint8("channelType", c.channelType),
+			zap.Int("queueLen", c.pending.eventQueue.Len()))
+		return
+	}
 	event.Index = c.pending.eventQueue.LastIndex() + 1
 	c.pending.eventQueue.Append(event)
 
@@ -68,6 +81,15 @@ func (c *channelHandler) hasEvent() bool {
 	return c.processingIndex < c.pending.eventQueue.LastIndex()
 }
 
+func (c *channelHandler) pendingQueueLen() int {
+	c.pending.RLock()
+	defer c.pending.RUnlock()
+	if c.pending.eventQueue == nil {
+		return 0
+	}
+	return c.pending.eventQueue.Len()
+}
+
 func (u *channelHandler) events() []*eventbus.Event {
 	u.pending.Lock()
 	defer u.pending.Unlock()
@@ -75,12 +97,18 @@ func (u *channelHandler) events() []*eventbus.Event {
 	if len(events) == 0 {
 		return nil
 	}
-	eventLastIndex := events[len(events)-1].Index
-
-	// 截取掉之前的事件
-	u.pending.eventQueue.TruncateTo(eventLastIndex + 1)
-	u.processingIndex = eventLastIndex
+	u.lastActive = fasttime.UnixTimestamp()
 	return events
+}
+
+func (u *channelHandler) completeEvents(eventLastIndex uint64) {
+	u.pending.Lock()
+	defer u.pending.Unlock()
+	if eventLastIndex > u.processingIndex {
+		u.pending.eventQueue.TruncateTo(eventLastIndex + 1)
+		u.processingIndex = eventLastIndex
+	}
+	u.lastActive = fasttime.UnixTimestamp()
 }
 
 // 推进事件
@@ -88,8 +116,15 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 
 	c.processing.Store(true)
 	defer func() {
+		c.pending.Lock()
+		c.lastActive = fasttime.UnixTimestamp()
+		c.pending.Unlock()
 		c.processing.Store(false)
 	}()
+	if len(events) == 0 {
+		return
+	}
+	eventLastIndex := events[len(events)-1].Index
 
 	// 检查和更新leaderId
 	err := c.checkAndUpdateLeaderIdChange()
@@ -98,16 +133,21 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 		c.slotLeaderId = 0
 	}
 
+	var deferredSends []*eventbus.Event
 	// 按类型分组
 	group := c.groupByType(events)
 	// 处理事件
-	for eventType, events := range group {
+	for eventType, grpEvents := range group {
+		if c.slotLeaderId == 0 && (eventType == eventbus.EventChannelOnSend || eventType == eventbus.EventChannelDistribute) {
+			deferredSends = append(deferredSends, grpEvents...)
+			continue
+		}
 		// 从对象池中获取上下文
 		ctx := c.poller.getContext()
 		ctx.ChannelId = c.channelId
 		ctx.ChannelType = c.channelType
 		ctx.EventType = eventType
-		ctx.Events = events
+		ctx.Events = grpEvents
 		ctx.SlotLeaderId = c.slotLeaderId
 		// 处理事件
 		c.handler.OnEvent(ctx)
@@ -116,8 +156,64 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 		c.poller.putContext(ctx)
 	}
 
+	c.completeEvents(eventLastIndex)
+
+	if len(deferredSends) > 0 {
+		nowMs := time.Now().UnixMilli()
+		defaultDeadline := time.Now().Add(5 * time.Second).UnixMilli()
+		requeued := false
+		maxDeferredHops := uint8(0)
+		for _, ev := range deferredSends {
+			if ev == nil {
+				continue
+			}
+			// Already-persisted messages (MessageSeq > 0) and distribution events must never be dropped
+			// during transient leader-0 election windows; retain them with bounded backoff until a slot leader is elected.
+			if ev.MessageSeq == 0 && ev.Type == eventbus.EventChannelOnSend {
+				if ev.ForwardDeadline == 0 {
+					ev.ForwardDeadline = defaultDeadline
+				}
+				if nowMs >= ev.ForwardDeadline {
+					forward.Fail([]*eventbus.Event{ev}, forward.ErrUnavailable)
+					continue
+				}
+			} else {
+				if ev.ForwardHops < 32 {
+					ev.ForwardHops++
+				}
+				if ev.ForwardHops > maxDeferredHops {
+					maxDeferredHops = ev.ForwardHops
+				}
+			}
+			c.addEvent(ev)
+			requeued = true
+		}
+		if requeued {
+			if c.leaderRetryScheduled.CompareAndSwap(false, true) {
+				shift := maxDeferredHops
+				if shift > 5 {
+					shift = 5
+				}
+				delay := time.Duration(25*(1<<shift)) * time.Millisecond
+				if delay > 800*time.Millisecond {
+					delay = 800 * time.Millisecond
+				}
+				time.AfterFunc(delay, func() {
+					c.leaderRetryScheduled.Store(false)
+					if c.poller != nil {
+						c.poller.advance()
+					}
+				})
+			}
+			return
+		}
+	}
+
 	// 推进事件
-	if c.pending.eventQueue.Len() > 0 {
+	c.pending.RLock()
+	hasMore := c.processingIndex < c.pending.eventQueue.LastIndex()
+	c.pending.RUnlock()
+	if hasMore || (c.poller != nil && c.poller.needAdvance.Swap(false)) {
 		c.poller.advance()
 	}
 }
@@ -126,7 +222,14 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 func (c *channelHandler) checkAndUpdateLeaderIdChange() error {
 	c.pending.Lock()
 	defer c.pending.Unlock()
-	slotLeaderId, err := service.Cluster.SlotLeaderIdOfChannel(c.channelId, c.channelType)
+	cl := service.Cluster
+	if c.poller != nil && c.poller.eventPool != nil {
+		cl = c.poller.eventPool.cluster()
+	}
+	if cl == nil {
+		return errors.New("checkAndUpdateLeaderIdChange: cluster is nil")
+	}
+	slotLeaderId, err := cl.SlotLeaderIdOfChannel(c.channelId, c.channelType)
 	if err != nil {
 		c.Error("checkLeaderIdChange: get leader id failed", zap.Error(err), zap.String("channelId", c.channelId), zap.Uint8("channelType", c.channelType))
 		return err
@@ -141,7 +244,17 @@ func (c *channelHandler) checkAndUpdateLeaderIdChange() error {
 
 // isTimeout 判断用户是否超时
 func (c *channelHandler) isTimeout() bool {
-	now, lastActive := fasttime.UnixTimestamp(), c.lastActive
+	if c.processing.Load() {
+		return false
+	}
+	c.pending.RLock()
+	hasPending := c.pending.eventQueue != nil && (c.processingIndex < c.pending.eventQueue.LastIndex() || c.pending.eventQueue.Len() > 0)
+	lastActive := c.lastActive
+	c.pending.RUnlock()
+	if hasPending {
+		return false
+	}
+	now := fasttime.UnixTimestamp()
 	// Avoid unsigned underflow when the wall clock moves backwards.
 	return now > lastActive && now-lastActive > uint64(options.G.Poller.ChannelTimeout.Seconds())
 }

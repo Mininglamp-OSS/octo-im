@@ -163,7 +163,7 @@ func (e *Event) Size() uint64 {
 }
 
 func (e Event) encodeWithEcoder(enc *wkproto.Encoder) error {
-	var flag uint8 = e.hasConn()<<7 | e.hasFrame()<<6 | e.hasTrack()<<5 | e.hasChannel()<<4 | e.hasReqId()<<3
+	var flag uint8 = e.hasConn()<<7 | e.hasFrame()<<6 | e.hasTrack()<<5 | e.hasChannel()<<4 | e.hasReqId()<<3 | e.hasPersistedDuplicate()<<2
 	enc.WriteUint8(flag)
 
 	enc.WriteUint8(e.Type.Uint8())
@@ -216,6 +216,8 @@ func (e *Event) decodeWithDecoder(dec *wkproto.Decoder) error {
 	hasTrack := (flag >> 5) & 0x01
 	hasChannel := (flag >> 4) & 0x01
 	hasReqId := (flag >> 3) & 0x01
+	hasPersistedDuplicate := (flag >> 2) & 0x01
+	e.PersistedDuplicate = hasPersistedDuplicate == 1
 	typeUint8, err := dec.Uint8()
 	if err != nil {
 		return err
@@ -336,6 +338,13 @@ func (e *Event) hasChannel() uint8 {
 
 func (e *Event) hasReqId() uint8 {
 	if e.ReqId != "" {
+		return 1
+	}
+	return 0
+}
+
+func (e Event) hasPersistedDuplicate() uint8 {
+	if e.Type == EventChannelOnSend && e.MessageSeq > 0 && e.PersistedDuplicate {
 		return 1
 	}
 	return 0

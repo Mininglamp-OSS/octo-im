@@ -202,7 +202,7 @@ func (a *rpc) pluginHttpForward(c *wkrpc.Context) {
 			return
 		}
 		pluginUrl := fmt.Sprintf("%s/plugins/%s%s", node.ApiServerAddr, forwardReq.PluginNo, forwardReq.Request.Path)
-		resp, err := a.ForwardWithBody(pluginUrl, forwardReq.Request)
+		resp, err := a.ForwardWithBody(pluginUrl, forwardReq.Request, service.TrustedPeerNodeHeaders(node, forwardReq.Request.Headers))
 		if err != nil {
 			a.Error("plugin http forward failed", zap.Error(err))
 			c.WriteErr(err)
@@ -250,16 +250,16 @@ func (a *rpc) pluginHttpForward(c *wkrpc.Context) {
 	c.Write(data)
 }
 
-func (a *rpc) ForwardWithBody(url string, req *pluginproto.HttpRequest) (*pluginproto.HttpResponse, error) {
+func (a *rpc) ForwardWithBody(url string, req *pluginproto.HttpRequest, headers map[string]string) (*pluginproto.HttpResponse, error) {
 	r := rest.Request{
 		Method:      rest.Method(strings.ToUpper(req.Method)),
 		BaseURL:     url,
-		Headers:     req.Headers,
+		Headers:     headers,
 		Body:        req.Body,
 		QueryParams: req.Query,
 	}
 
-	resp, err := rest.Send(r)
+	resp, err := service.SendPeerRequest(r)
 	if err != nil {
 		return nil, err
 	}

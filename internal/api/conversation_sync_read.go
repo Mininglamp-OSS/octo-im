@@ -12,6 +12,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/types"
+	cluster "github.com/WuKongIM/WuKongIM/pkg/cluster/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
@@ -146,7 +147,7 @@ func (s *request) getRecentMessagesForCluster(parent context.Context, uid string
 			return result, nil
 		}
 		lastErr = err
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, errRecentReadProtocol) || errors.Is(err, errRecentReadDisappeared) {
+		if ctx.Err() != nil || ((!errors.Is(err, cluster.ErrConversationReadRetry)) && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))) || errors.Is(err, errRecentReadProtocol) || errors.Is(err, errRecentReadDisappeared) {
 			return nil, err
 		}
 		select {
@@ -344,14 +345,15 @@ func (s *request) requestSyncMessage(ctx context.Context, nodeID uint64, channel
 	if err != nil {
 		return nil, err
 	}
-	resp, err := rest.SendWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages/v2", Body: data})
+	headers := service.TrustedPeerNodeHeaders(node, nil)
+	resp, err := service.SendPeerRequestWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages/v2", Headers: headers, Body: data})
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		// Old peers have no v2 route. Only route absence permits downgrade;
 		// a v2 failure or malformed response must not bypass its read fences.
-		resp, err = rest.SendWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages", Body: data})
+		resp, err = service.SendPeerRequestWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages", Headers: headers, Body: data})
 		if err != nil {
 			return nil, err
 		}

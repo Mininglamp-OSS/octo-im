@@ -19,7 +19,7 @@ func (wk *wukongDB) AddOrUpdatePlugin(plugin Plugin) error {
 	if err := wk.writePlugin(plugin, batch); err != nil {
 		return err
 	}
-	return batch.Commit(wk.sync)
+	return wk.commitBatch(db, batch, wk.sync)
 }
 
 func (wk *wukongDB) DeletePlugin(no string) error {
@@ -32,7 +32,7 @@ func (wk *wukongDB) DeletePlugin(no string) error {
 		return err
 	}
 
-	return batch.Commit(wk.sync)
+	return wk.commitBatch(db, batch, wk.sync)
 }
 
 func (wk *wukongDB) GetPlugins() ([]Plugin, error) {
@@ -86,7 +86,7 @@ func (wk *wukongDB) UpdatePluginConfig(no string, config map[string]interface{})
 		return err
 	}
 
-	return batch.Commit(wk.sync)
+	return wk.commitBatch(db, batch, wk.sync)
 }
 
 func (wk *wukongDB) GetPluginConfig(no string) (map[string]interface{}, error) {

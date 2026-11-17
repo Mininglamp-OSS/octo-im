@@ -1,18 +1,67 @@
 package event
 
 import (
+	"context"
+	"fmt"
 	"hash/fnv"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"go.uber.org/zap"
 )
 
 type EventPool struct {
-	pollers []*poller
+	pollers      []*poller
 	wklog.Log
-	handler eventbus.ChannelEventHandler
+	handler      eventbus.ChannelEventHandler
+	boundCluster icluster.ICluster
+}
+
+func (e *EventPool) BindCluster(c icluster.ICluster) {
+	if e == nil {
+		return
+	}
+	e.boundCluster = c
+}
+
+func (e *EventPool) cluster() icluster.ICluster {
+	if e != nil && e.boundCluster != nil {
+		return e.boundCluster
+	}
+	return service.Cluster
+}
+
+func (e *EventPool) PendingQueueLen(channelId string, channelType uint8) int {
+	if e == nil || len(e.pollers) == 0 {
+		return 0
+	}
+	p := e.pollerByChannel(channelId, channelType)
+	return p.pendingQueueLen(channelId, channelType)
+}
+
+func (e *EventPool) WaitCapacity(ctx context.Context, channelId string, channelType uint8, batchSize int) error {
+	if e == nil || len(e.pollers) == 0 {
+		return nil
+	}
+	if batchSize <= 0 {
+		batchSize = 1
+	}
+	for {
+		qLen := e.PendingQueueLen(channelId, channelType)
+		if qLen+batchSize <= eventbus.MaxEventQueueSize {
+			return nil
+		}
+		e.Advance(channelId, channelType)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("channel %s/%d event queue backpressure timeout (len=%d): %w", channelId, channelType, qLen, ctx.Err())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 }
 
 func NewEventPool(handler eventbus.ChannelEventHandler) *EventPool {

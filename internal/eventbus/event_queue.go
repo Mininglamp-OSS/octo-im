@@ -6,6 +6,11 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
+const (
+	MaxEventQueueSize          = 65536
+	MaxPersistedEventQueueSize = MaxEventQueueSize + 4096
+)
+
 type EventQueue struct {
 	events           []*Event
 	offsetEventIndex uint64
@@ -20,6 +25,13 @@ func NewEventQueue(prefix string) *EventQueue {
 	}
 }
 
+func (m *EventQueue) CanAppend(event *Event) bool {
+	if event != nil && (event.MessageSeq > 0 || event.Type == EventChannelDistribute || event.Type == EventChannelWebhook) {
+		return len(m.events) < MaxPersistedEventQueueSize
+	}
+	return len(m.events) < MaxEventQueueSize
+}
+
 func (m *EventQueue) Append(event *Event) {
 	m.events = append(m.events, event)
 	m.lastIndex++
@@ -31,8 +43,10 @@ func (m *EventQueue) Len() int {
 
 // [lo,hi)
 func (m *EventQueue) Slice(startEventIndex uint64, endEventIndex uint64) []*Event {
-
-	return m.events[startEventIndex-m.offsetEventIndex : endEventIndex-m.offsetEventIndex : endEventIndex-m.offsetEventIndex]
+	sub := m.events[startEventIndex-m.offsetEventIndex : endEventIndex-m.offsetEventIndex : endEventIndex-m.offsetEventIndex]
+	out := make([]*Event, len(sub))
+	copy(out, sub)
+	return out
 }
 
 func (m *EventQueue) SliceWithSize(startEventIndex uint64, endEventIndex uint64, maxSize uint64) []*Event {
@@ -51,7 +65,19 @@ func (m *EventQueue) SliceWithSize(startEventIndex uint64, endEventIndex uint64,
 
 // truncateTo 裁剪eventIndex之前的消息,不包含eventIndex
 func (m *EventQueue) TruncateTo(eventIndex uint64) {
+	if eventIndex <= m.offsetEventIndex {
+		return
+	}
 	num := m.getArrayIndex(eventIndex)
+	if num < 0 {
+		return
+	}
+	if num > len(m.events) {
+		num = len(m.events)
+	}
+	for i := 0; i < num; i++ {
+		m.events[i] = nil
+	}
 	m.events = m.events[num:]
 	m.offsetEventIndex = eventIndex
 	m.shrinkEventsArray()
@@ -67,7 +93,10 @@ func (m *EventQueue) getArrayIndex(eventIndex uint64) int {
 }
 
 func (m *EventQueue) reset() {
-	m.events = m.events[:0]
+	for i := range m.events {
+		m.events[i] = nil
+	}
+	m.events = nil
 	m.offsetEventIndex = 1
 	m.lastIndex = 0
 }

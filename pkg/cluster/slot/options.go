@@ -4,6 +4,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	"github.com/cockroachdb/pebble"
 )
 
 type Options struct {
@@ -13,6 +14,18 @@ type Options struct {
 	DataDir string
 	// 槽位数据库分片数量
 	SlotDbShardNum int
+	// 槽位数据库MemTable大小
+	SlotMemTableSize int
+	// 共享Pebble BlockCache
+	BlockCache *pebble.Cache
+	// 单批最大日志字节数
+	MaxLogSizePerBatch uint64
+	// 单批最大日志条数
+	MaxLogCountPerBatch uint64
+	// Learner晋升或计划切主前允许的最大应用延迟条数
+	LearnerToFollowerMaxApplyLag uint64
+	// 计划切主排空超时tick数
+	MaxAdmissionDrainTicks int
 	// 节点接口
 	Node icluster.Node
 	// 传输层
@@ -30,8 +43,13 @@ type Options struct {
 
 func NewOptions(opt ...Option) *Options {
 	defaultOpts := &Options{
-		DataDir:        "clusterdata",
-		SlotDbShardNum: 8,
+		DataDir:                      "clusterdata",
+		SlotDbShardNum:               8,
+		SlotMemTableSize:             16 * 1024 * 1024,
+		MaxLogSizePerBatch:           2 * 1024 * 1024,
+		MaxLogCountPerBatch:          500,
+		LearnerToFollowerMaxApplyLag: 8,
+		MaxAdmissionDrainTicks:       100,
 	}
 	for _, o := range opt {
 		o(defaultOpts)
@@ -57,6 +75,42 @@ func WithDataDir(dataDir string) Option {
 func WithSlotDbShardNum(slotDbShardNum int) Option {
 	return func(o *Options) {
 		o.SlotDbShardNum = slotDbShardNum
+	}
+}
+
+func WithSlotMemTableSize(slotMemTableSize int) Option {
+	return func(o *Options) {
+		o.SlotMemTableSize = slotMemTableSize
+	}
+}
+
+func WithBlockCache(cache *pebble.Cache) Option {
+	return func(o *Options) {
+		o.BlockCache = cache
+	}
+}
+
+func WithMaxLogSizePerBatch(maxBytes uint64) Option {
+	return func(o *Options) {
+		o.MaxLogSizePerBatch = maxBytes
+	}
+}
+
+func WithMaxLogCountPerBatch(maxCount uint64) Option {
+	return func(o *Options) {
+		o.MaxLogCountPerBatch = maxCount
+	}
+}
+
+func WithLearnerToFollowerMaxApplyLag(lag uint64) Option {
+	return func(o *Options) {
+		o.LearnerToFollowerMaxApplyLag = lag
+	}
+}
+
+func WithMaxAdmissionDrainTicks(ticks int) Option {
+	return func(o *Options) {
+		o.MaxAdmissionDrainTicks = ticks
 	}
 }
 

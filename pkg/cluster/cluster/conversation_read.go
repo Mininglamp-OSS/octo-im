@@ -87,6 +87,19 @@ func (r conversationReader) latest(ctx context.Context, id string, typ uint8) (u
 			return seq, ctx.Err()
 		}
 		lastErr = fmt.Errorf("attempt %d: %w", attempt+1, err)
+		if attempt == 0 && ctx.Err() == nil {
+			pause := 15 * time.Millisecond
+			if deadline, ok := ctx.Deadline(); ok {
+				if rem := time.Until(deadline); rem < 60*time.Millisecond {
+					pause = max(time.Millisecond, rem/4)
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(pause):
+			}
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -267,8 +280,19 @@ func (s *Server) loadConversationConfig(ctx context.Context, id string, typ uint
 	if leader == s.opts.ConfigOptions.NodeId {
 		return s.loadConversationConfigLocal(ctx, id, typ)
 	}
-	resp, err := s.requestConversationRead(ctx, leader, conversationConfigPath, conversationReadRequest{ChannelID: id, ChannelType: typ})
+	rpcCtx := ctx
+	cancel := func() {}
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem > 2*time.Second {
+			rpcCtx, cancel = context.WithTimeout(ctx, max(1200*time.Millisecond, rem/2))
+		}
+	}
+	resp, err := s.requestConversationRead(rpcCtx, leader, conversationConfigPath, conversationReadRequest{ChannelID: id, ChannelType: typ})
+	cancel()
 	if err != nil {
+		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			return wkdb.EmptyChannelClusterConfig, fmt.Errorf("%w: %v", ErrConversationReadRetry, err)
+		}
 		return wkdb.EmptyChannelClusterConfig, err
 	}
 	if resp.Config == nil {
@@ -286,8 +310,9 @@ func (s *Server) loadConversationConfig(ctx context.Context, id string, typ uint
 func (s *Server) loadConversationConfigLocal(ctx context.Context, id string, typ uint8) (wkdb.ChannelClusterConfig, error) {
 	slotID := s.getSlotId(id)
 	reader := conversationConfigReader{
-		nodeID: s.opts.ConfigOptions.NodeId,
-		leader: func() uint64 { return s.cfgServer.SlotLeaderId(slotID) },
+		nodeID:  s.opts.ConfigOptions.NodeId,
+		maxWait: s.maxSlotApplyWait(),
+		leader:  func() uint64 { return s.cfgServer.SlotLeaderId(slotID) },
 		state: func(ctx context.Context) (raftgroup.ReadState, error) {
 			return s.slotServer.ReadLeaderState(ctx, slotID)
 		},

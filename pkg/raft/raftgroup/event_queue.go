@@ -96,14 +96,29 @@ func (q *EventQueue) Get() []Event {
 		q.rl.Set(0)
 	}
 	if len(q.nodrop) == 0 {
-		return t[:sz]
+		if sz == 0 {
+			return nil
+		}
+		result := make([]Event, sz)
+		copy(result, t[:sz])
+		for i := uint64(0); i < sz; i++ {
+			t[i] = Event{}
+		}
+		return result
 	}
 	// 避免多次分配内存，预分配足够的容量
 	result := make([]Event, 0, len(q.nodrop)+int(sz))
 	result = append(result, q.nodrop...)
+	for i := range q.nodrop {
+		q.nodrop[i] = Event{}
+	}
 	q.nodrop = q.nodrop[:0] // 重置 nodrop 队列
+	q.shrinkNodropArray()
 
 	result = append(result, t[:sz]...)
+	for i := uint64(0); i < sz; i++ {
+		t[i] = Event{}
+	}
 	return result
 }
 

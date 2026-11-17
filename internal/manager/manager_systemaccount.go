@@ -133,7 +133,7 @@ func (s *SystemAccountManager) getOrRequestSystemUids() ([]string, error) {
 
 func (s *SystemAccountManager) requestSystemUids(nodeInfo *types.Node) ([]string, error) {
 
-	resp, err := network.Get(fmt.Sprintf("%s%s", nodeInfo.ApiServerAddr, "/user/systemuids"), nil, nil)
+	resp, err := network.Get(fmt.Sprintf("%s%s", nodeInfo.ApiServerAddr, "/user/systemuids"), nil, service.TrustedPeerNodeHeaders(nodeInfo, nil))
 	if err != nil {
 		return nil, err
 	}

@@ -159,6 +159,9 @@ func (rg *RaftGroup) proposeBatchTimeout(ctx context.Context, raft IRaft, reqs [
 	if len(reqs) == 0 {
 		return nil, errors.New("raftgroup: empty proposal batch")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	raft.Lock()
 	defer raft.Unlock()
@@ -166,15 +169,28 @@ func (rg *RaftGroup) proposeBatchTimeout(ctx context.Context, raft IRaft, reqs [
 	raft.KeepAlive()
 
 	lastLogIndex := raft.LastLogIndex()
+	term := raft.LastTerm()
 	logs := make([]types.Log, 0, len(reqs))
 	for i, req := range reqs {
 		logIndex := lastLogIndex + 1 + uint64(i)
 		logs = append(logs, types.Log{
 			Id:    req.Id,
-			Term:  raft.LastTerm(),
+			Term:  term,
 			Index: logIndex,
 			Data:  req.Data,
 		})
+	}
+
+	var release func()
+	if admitter, ok := raft.(interface {
+		AdmitProposalBatch(logs []types.Log) (func(), error)
+	}); ok {
+		var err error
+		release, err = admitter.AdmitProposalBatch(logs)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 	}
 
 	if addBefore != nil {
@@ -188,7 +204,8 @@ func (rg *RaftGroup) proposeBatchTimeout(ctx context.Context, raft IRaft, reqs [
 			Type: types.Propose,
 			Logs: logs,
 		},
-		WaitC: waitC,
+		WaitC:      waitC,
+		onComplete: release,
 	})
 
 	rg.Advance()

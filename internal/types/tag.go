@@ -39,6 +39,51 @@ func (n *Node) String() string {
 	return fmt.Sprintf("Node{LeaderId:%d, Uids:%v, SlotIds:%v}", n.LeaderId, n.Uids, n.SlotIds)
 }
 
+func (n *Node) Clone() *Node {
+	if n == nil {
+		return nil
+	}
+	var uids []string
+	if len(n.Uids) > 0 {
+		uids = make([]string, len(n.Uids))
+		copy(uids, n.Uids)
+	}
+	var slotIds []uint32
+	if len(n.SlotIds) > 0 {
+		slotIds = make([]uint32, len(n.SlotIds))
+		copy(slotIds, n.SlotIds)
+	}
+	return &Node{
+		LeaderId: n.LeaderId,
+		Uids:     uids,
+		SlotIds:  slotIds,
+	}
+}
+
+func (t *Tag) Clone() *Tag {
+	if t == nil {
+		return nil
+	}
+	var nodes []*Node
+	if len(t.Nodes) > 0 {
+		nodes = make([]*Node, len(t.Nodes))
+		for i, n := range t.Nodes {
+			nodes[i] = n.Clone()
+		}
+	}
+	cp := &Tag{
+		Key:         t.Key,
+		ChannelId:   t.ChannelId,
+		ChannelType: t.ChannelType,
+		Nodes:       nodes,
+		CreatedAt:   t.CreatedAt,
+		LastGetTime: t.LastGetTime,
+		NodeVersion: t.NodeVersion,
+	}
+	cp.GetCount.Store(t.GetCount.Load())
+	return cp
+}
+
 func (t *Tag) GetNodeUsers(nodeId uint64) []string {
 	for _, node := range t.Nodes {
 		if node.LeaderId == nodeId {

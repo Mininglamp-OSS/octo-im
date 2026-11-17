@@ -1,17 +1,19 @@
 package raft
 
 import (
+	"slices"
+
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 )
 
 func (n *Node) sendNotifySync(to uint64) {
 	if to == All {
-		for _, replicaId := range n.cfg.Replicas {
-			if replicaId == n.opts.NodeId {
-				continue
+		notifyPeer := func(peerId uint64) {
+			if peerId == n.opts.NodeId {
+				return
 			}
 			// 解除挂起
-			syncInfo := n.replicaSync[replicaId]
+			syncInfo := n.replicaSync[peerId]
 			if syncInfo != nil {
 				syncInfo.emptySyncTick = 0
 				syncInfo.suspend = false
@@ -19,9 +21,17 @@ func (n *Node) sendNotifySync(to uint64) {
 			n.events = append(n.events, types.Event{
 				Type: types.NotifySync,
 				From: n.opts.NodeId,
-				To:   replicaId,
+				To:   peerId,
 				Term: n.cfg.Term,
 			})
+		}
+		for _, replicaId := range n.cfg.Replicas {
+			notifyPeer(replicaId)
+		}
+		for _, learnerId := range n.cfg.Learners {
+			if !slices.Contains(n.cfg.Replicas, learnerId) {
+				notifyPeer(learnerId)
+			}
 		}
 	} else {
 		// 解除挂起
@@ -45,6 +55,11 @@ func (n *Node) sendSyncReq() {
 	if n.truncating || n.syncing { // 如果在截断中，则发起同步没用
 		return
 	}
+	// During alignment Index and LastLogTerm must describe the same durable
+	// tail, including while a multi-term batch is being persisted.
+	if !n.onlySync && n.queue.storedIndex != n.queue.lastLogIndex {
+		return
+	}
 	n.syncing = true
 	n.syncElapsed = 0
 	n.KeepAlive()
@@ -53,14 +68,16 @@ func (n *Node) sendSyncReq() {
 		reason = types.ReasonOnlySync
 	}
 	n.events = append(n.events, types.Event{
-		Type:        types.SyncReq,
-		From:        n.opts.NodeId,
-		To:          n.cfg.Leader,
-		Term:        n.cfg.Term,
-		StoredIndex: n.queue.storedIndex + 1,
-		Index:       n.queue.lastLogIndex + 1,
-		LastLogTerm: n.lastTermStartIndex.Term,
-		Reason:      reason,
+		Type:          types.SyncReq,
+		From:          n.opts.NodeId,
+		To:            n.cfg.Leader,
+		Term:          n.cfg.Term,
+		StoredIndex:   n.queue.storedIndex + 1,
+		AppliedIndex:  n.queue.appliedIndex + 1,
+		ConfigVersion: n.cfg.Version,
+		Index:         n.queue.lastLogIndex + 1,
+		LastLogTerm:   n.lastTermStartIndex.Term,
+		Reason:        reason,
 	})
 }
 
@@ -142,10 +159,11 @@ func (n *Node) sendPing(to uint64) {
 
 func (n *Node) sendStoreReq(logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) {
 	e := types.Event{
-		Type: types.StoreReq,
-		Term: n.cfg.Term,
-		To:   types.LocalNode,
-		Logs: logs,
+		Type:       types.StoreReq,
+		Term:       n.cfg.Term,
+		To:         types.LocalNode,
+		Logs:       logs,
+		StoreEpoch: n.queue.storeEpoch,
 	}
 
 	if termStartIndexInfo != nil {
@@ -192,8 +210,11 @@ func (n *Node) sendSyncResp(to uint64, syncIndex uint64, logs []types.Log, reson
 }
 
 func (n *Node) sendTruncateReq(index uint64) {
+	n.truncateID++
 	n.events = append(n.events, types.Event{
 		Type:        types.TruncateReq,
+		Term:        n.cfg.Term,
+		TruncateID:  n.truncateID,
 		To:          types.LocalNode,
 		LastLogTerm: n.lastTermStartIndex.Term,
 		Index:       index,
@@ -201,25 +222,20 @@ func (n *Node) sendTruncateReq(index uint64) {
 }
 
 func (n *Node) sendLearnerToLeaderReq(from uint64) {
-
-	n.events = append(n.events, types.Event{
-		Type: types.LearnerToLeaderReq,
-		From: from,
-	})
+	n.sendLeaderHandoffReq(types.LearnerToLeaderReq, from)
 }
 
 func (n *Node) sendLearnerToFollowerReq(from uint64) {
 	n.events = append(n.events, types.Event{
-		Type: types.LearnerToFollowerReq,
-		From: from,
+		Type:          types.LearnerToFollowerReq,
+		From:          from,
+		Term:          n.cfg.Term,
+		ConfigVersion: n.cfg.Version,
 	})
 }
 
 func (n *Node) sendFollowToLeaderReq(from uint64) {
-	n.events = append(n.events, types.Event{
-		Type: types.FollowerToLeaderReq,
-		From: from,
-	})
+	n.sendLeaderHandoffReq(types.FollowerToLeaderReq, from)
 }
 
 func (n *Node) sendConfigReq() {

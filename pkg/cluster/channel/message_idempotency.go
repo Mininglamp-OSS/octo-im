@@ -80,24 +80,50 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 		// No database operation is allowed in a RaftGroup.Do callback.
 		stored := make(map[messageRetryKey]wkdb.Message)
 		lookedUp := make(map[messageRetryKey]bool)
-		for _, m := range messages {
-			if err := ctx.Err(); err != nil {
-				return err
+		if batchLoader, ok := s.opts.DB.(interface {
+			LoadMsgsBySenderClientMsgNos(ctx context.Context, channelId string, channelType uint8, keys [][2]string) (map[[2]string]wkdb.Message, error)
+		}); ok && len(messages) > 1 {
+			pairs := make([][2]string, 0, len(messages))
+			for _, m := range messages {
+				k := messageRetryKey{m.FromUID, m.ClientMsgNo}
+				if m.ClientMsgNo == "" || lookedUp[k] {
+					continue
+				}
+				lookedUp[k] = true
+				if _, ok := pending[k]; ok {
+					continue
+				}
+				pairs = append(pairs, [2]string{m.FromUID, m.ClientMsgNo})
 			}
-			k := messageRetryKey{m.FromUID, m.ClientMsgNo}
-			if m.ClientMsgNo == "" || lookedUp[k] {
-				continue
+			if len(pairs) > 0 {
+				batchFound, err := batchLoader.LoadMsgsBySenderClientMsgNos(ctx, id, typ, pairs)
+				if err != nil {
+					return err
+				}
+				for pair, old := range batchFound {
+					stored[messageRetryKey{pair[0], pair[1]}] = old
+				}
 			}
-			lookedUp[k] = true
-			if _, ok := pending[k]; ok {
-				continue
-			}
-			old, err := s.opts.DB.LoadMsgBySenderClientMsgNo(ctx, id, typ, m.FromUID, m.ClientMsgNo)
-			if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
-				return err
-			}
-			if err == nil {
-				stored[k] = old
+		} else {
+			for _, m := range messages {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				k := messageRetryKey{m.FromUID, m.ClientMsgNo}
+				if m.ClientMsgNo == "" || lookedUp[k] {
+					continue
+				}
+				lookedUp[k] = true
+				if _, ok := pending[k]; ok {
+					continue
+				}
+				old, err := s.opts.DB.LoadMsgBySenderClientMsgNo(ctx, id, typ, m.FromUID, m.ClientMsgNo)
+				if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
+					return err
+				}
+				if err == nil {
+					stored[k] = old
+				}
 			}
 		}
 		return rg.Do(ctx, key, func(r raftgroup.IRaft) error {

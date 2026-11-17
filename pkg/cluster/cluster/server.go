@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
@@ -17,6 +18,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/slot"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
 	"github.com/WuKongIM/WuKongIM/pkg/keylock"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -24,6 +26,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
+	"github.com/cockroachdb/pebble"
 	"github.com/lni/goutils/syncutil"
 	"github.com/panjf2000/ants/v2"
 	"github.com/panjf2000/gnet/v2"
@@ -50,17 +53,22 @@ type Server struct {
 	rpcServer *rpcServer
 	rpcClient *rpcClient
 	// 数据库
-	db wkdb.DB
+	db         wkdb.DB
+	blockCache *pebble.Cache
 	// 配置
 	opts      *Options
 	apiPrefix string // api前缀
 	wklog.Log
-	cancelCtx     context.Context
-	cancelFnc     context.CancelFunc
-	onMessageFnc  func(fromNodeId uint64, msg *proto.Message)
-	onMessagePool *ants.Pool
-	uptime        time.Time // 服务启动时间
-	stopper       *syncutil.Stopper
+	cancelCtx      context.Context
+	cancelFnc      context.CancelFunc
+	onMessageFnc   func(fromNodeId uint64, msg *proto.Message)
+	onMessagePool  *ants.Pool
+	uptime         time.Time // 服务启动时间
+	stopper        *syncutil.Stopper
+	bootstrapReady atomic.Bool
+
+	storageHealthMu    sync.Mutex
+	lastStorageProbeAt time.Time
 
 	channelKeyLock *keylock.KeyLock // 频道锁
 
@@ -95,6 +103,10 @@ func New(opts *Options) *Server {
 	s.rpcServer = newRpcServer(s)
 	s.rpcClient = newRpcClient(s)
 
+	if opts.DB.BlockCacheSize > 0 {
+		s.blockCache = pebble.NewCache(opts.DB.BlockCacheSize)
+	}
+
 	s.db = wkdb.NewWukongDB(
 		wkdb.NewOptions(
 			wkdb.WithShardNum(opts.DB.WKDbShardNum),
@@ -102,6 +114,10 @@ func New(opts *Options) *Server {
 			wkdb.WithNodeId(opts.ConfigOptions.NodeId),
 			wkdb.WithMemTableSize(opts.DB.WKDbMemTableSize),
 			wkdb.WithSlotCount(int(opts.ConfigOptions.SlotCount)),
+			wkdb.WithBlockCache(s.blockCache),
+			wkdb.WithBlockCacheSize(opts.DB.BlockCacheSize),
+			wkdb.WithMaxMessagesPerBatch(opts.DB.MaxMessagesPerBatch),
+			wkdb.WithMaxBatchBytes(uint64(opts.DB.MaxBatchBytes)),
 		),
 	)
 
@@ -128,6 +144,13 @@ func New(opts *Options) *Server {
 	s.slotServer = slot.NewServer(slot.NewOptions(
 		slot.WithNodeId(opts.ConfigOptions.NodeId),
 		slot.WithDataDir(path.Join(opts.DataDir, "cluster")),
+		slot.WithSlotDbShardNum(opts.DB.SlotShardNum),
+		slot.WithSlotMemTableSize(opts.DB.SlotMemTableSize),
+		slot.WithBlockCache(s.blockCache),
+		slot.WithMaxLogSizePerBatch(opts.MaxLogSizePerBatch),
+		slot.WithMaxLogCountPerBatch(uint64(opts.MaxLogCountPerBatch)),
+		slot.WithLearnerToFollowerMaxApplyLag(opts.LearnerToFollowerMaxApplyLag),
+		slot.WithMaxAdmissionDrainTicks(opts.HandoffDrainTimeoutTick),
 		slot.WithTransport(opts.SlotTransport),
 		slot.WithNode(s.cfgServer),
 		slot.WithOnApply(s.slotApplyLogs),
@@ -146,6 +169,10 @@ func New(opts *Options) *Server {
 		channel.WithRPC(s.rpcClient),
 		channel.WithOnSaveConfig(s.onSaveChannelConfig),
 		channel.WithDestoryAfterIdleTick(opts.ConfigOptions.ChannelDestoryAfterIdleTick),
+		channel.WithMaxLogSizePerBatch(opts.MaxLogSizePerBatch),
+		channel.WithMaxLogCountPerBatch(uint64(opts.MaxLogCountPerBatch)),
+		channel.WithLearnerToFollowerMaxApplyLag(opts.LearnerToFollowerMaxApplyLag),
+		channel.WithMaxAdmissionDrainTicks(opts.HandoffDrainTimeoutTick),
 	))
 	s.initChannelConfigReconciler()
 
@@ -366,6 +393,10 @@ func (s *Server) onSaveSlotConfig(slotId uint32, cfg rafttype.Config) error {
 	if slot == nil {
 		s.Error("slot not found", zap.Uint32("slotId", slotId))
 		return errors.New("slot not found")
+	}
+	if !validSlotConfigTransition(slot, cfg) {
+		s.Warn("onSaveSlotConfig: transition rejected", zap.Uint32("slotId", slotId), zap.Any("current", slot), zap.Any("next", cfg))
+		return raft.ErrConfigVersionStale
 	}
 	cloneSlot := slot.Clone()
 	// 更新slot的配置

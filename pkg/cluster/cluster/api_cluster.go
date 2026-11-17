@@ -21,6 +21,10 @@ import (
 )
 
 func (s *Server) channelMigrate(c *wkhttp.Context) {
+	if !s.opts.Auth.HasPermissionWithContext(c, resource.ClusterChannel.Migrate, auth.ActionWrite) {
+		c.ResponseErrorWithStatus(http.StatusForbidden, errors.New("没有权限"))
+		return
+	}
 
 	var req struct {
 		MigrateFrom uint64 `json:"migrate_from"` // 迁移的原节点

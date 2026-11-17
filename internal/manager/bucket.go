@@ -115,15 +115,47 @@ func (b *tagBlucket) checkExpireTags() {
 }
 
 func (b *tagBlucket) setTag(tag *types.Tag) {
+	if tag == nil {
+		return
+	}
+	cloned := tag.Clone()
 	b.tag.Lock()
-	b.tag.m[tag.Key] = tag
+	b.tag.m[cloned.Key] = cloned
 	b.tag.Unlock()
 }
 
 func (b *tagBlucket) getTag(tagKey string) *types.Tag {
 	b.tag.RLock()
 	defer b.tag.RUnlock()
-	return b.tag.m[tagKey]
+	tag := b.tag.m[tagKey]
+	if tag == nil {
+		return nil
+	}
+	return tag.Clone()
+}
+
+func (b *tagBlucket) getAndTouchTag(tagKey string, currentNodeVersion uint64) (*types.Tag, uint64, bool) {
+	b.tag.Lock()
+	defer b.tag.Unlock()
+	tag := b.tag.m[tagKey]
+	if tag == nil {
+		return nil, 0, false
+	}
+	if tag.NodeVersion < currentNodeVersion {
+		return nil, tag.NodeVersion, true
+	}
+	tag.LastGetTime = time.Now()
+	tag.GetCount.Inc()
+	return tag.Clone(), tag.NodeVersion, false
+}
+
+func (b *tagBlucket) bindTagChannel(tagKey string, channelId string, channelType uint8) {
+	b.tag.Lock()
+	defer b.tag.Unlock()
+	if tag := b.tag.m[tagKey]; tag != nil {
+		tag.ChannelId = channelId
+		tag.ChannelType = channelType
+	}
 }
 
 func (b *tagBlucket) removeTag(tagKey string) {
@@ -162,7 +194,9 @@ func (b *tagBlucket) getAllTags() []*types.Tag {
 	defer b.tag.RUnlock()
 	tags := make([]*types.Tag, 0, len(b.tag.m))
 	for _, tag := range b.tag.m {
-		tags = append(tags, tag)
+		if tag != nil {
+			tags = append(tags, tag.Clone())
+		}
 	}
 	return tags
 }

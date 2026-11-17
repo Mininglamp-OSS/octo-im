@@ -3,11 +3,14 @@ package api
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/internal/service"
+	"github.com/WuKongIM/WuKongIM/pkg/auth"
+	"github.com/WuKongIM/WuKongIM/pkg/auth/resource"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -38,6 +41,10 @@ func (cn *connApi) route(r *wkhttp.WKHttp) {
 // 移除连接
 
 func (cn *connApi) remove(c *wkhttp.Context) {
+	if options.G != nil && !options.G.Auth.HasPermissionWithContext(c, resource.All, auth.ActionWrite) {
+		c.ResponseErrorWithStatus(http.StatusForbidden, errors.New("没有权限"))
+		return
+	}
 	var req struct {
 		Uid      string `json:"uid"`        // 用户id
 		ConnID   int64  `json:"conn_id"`    // 连接id
@@ -81,6 +88,10 @@ func (cn *connApi) remove(c *wkhttp.Context) {
 }
 
 func (cn *connApi) kick(c *wkhttp.Context) {
+	if options.G != nil && !options.G.Auth.HasPermissionWithContext(c, resource.All, auth.ActionWrite) {
+		c.ResponseErrorWithStatus(http.StatusForbidden, errors.New("没有权限"))
+		return
+	}
 	var req struct {
 		Uid      string `json:"uid"`        // 用户id
 		ConnID   int64  `json:"conn_id"`    // 连接id

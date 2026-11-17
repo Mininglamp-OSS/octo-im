@@ -19,6 +19,10 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 
 	wk.metrics.AppendMessagesAdd(1)
 
+	if len(msgs) == 0 {
+		return nil
+	}
+
 	if wk.opts.EnableCost {
 		start := time.Now()
 		defer func() {
@@ -29,31 +33,52 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 		}()
 	}
 
-	batch := wk.channelBatchDb(channelId, channelType).NewBatch()
-	for _, msg := range msgs {
-		if err := wk.writeMessage(channelId, channelType, msg, batch); err != nil {
+	maxMsgs := wk.opts.MaxMessagesPerBatch
+	if maxMsgs <= 0 {
+		maxMsgs = 256
+	}
+	maxBytes := wk.opts.MaxBatchBytes
+	if maxBytes == 0 {
+		maxBytes = 2 * 1024 * 1024
+	}
+
+	batchDB := wk.channelBatchDb(channelId, channelType)
+	for start := 0; start < len(msgs); {
+		end := start
+		var subBytes uint64
+		for end < len(msgs) && (end-start) < maxMsgs {
+			msgSize := uint64(msgs[end].Size())
+			if end > start && subBytes+msgSize > maxBytes {
+				break
+			}
+			subBytes += msgSize
+			end++
+			if subBytes >= maxBytes {
+				break
+			}
+		}
+
+		sub := msgs[start:end]
+		batch := batchDB.NewBatch()
+		for _, msg := range sub {
+			if err := wk.writeMessage(channelId, channelType, msg, batch); err != nil {
+				return err
+			}
+		}
+		lastMsg := sub[len(sub)-1]
+		if err := wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch); err != nil {
 			return err
 		}
-
-	}
-	lastMsg := msgs[len(msgs)-1]
-	err := wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch)
-	if err != nil {
-		return err
-	}
-
-	err = batch.CommitWait()
-	if err != nil {
-		return err
-	}
-
-	wk.channelSeqCache.setChannelLastSeq(channelId, channelType, uint64(lastMsg.MessageSeq))
-
-	// 更新用户最后发送消息序号缓存
-	for _, msg := range msgs {
-		if msg.FromUID != "" {
-			wk.userLastMsgSeqCache.updateIfGreater(msg.FromUID, channelId, channelType, uint64(msg.MessageSeq))
+		if err := batch.CommitWait(); err != nil {
+			return err
 		}
+		wk.channelSeqCache.setChannelLastSeq(channelId, channelType, uint64(lastMsg.MessageSeq))
+		for _, msg := range sub {
+			if msg.FromUID != "" {
+				wk.userLastMsgSeqCache.updateIfGreater(msg.FromUID, channelId, channelType, uint64(msg.MessageSeq))
+			}
+		}
+		start = end
 	}
 
 	return nil
@@ -488,11 +513,6 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 
 	wk.metrics.TruncateLogToAdd(1)
 
-	if messageSeq == 0 {
-		return fmt.Errorf("messageSeq[%d] must be greater than 0", messageSeq)
-
-	}
-
 	applied, err := wk.GetChannelAppliedIndex(channelId, channelType)
 	if err != nil {
 		return err
@@ -893,6 +913,59 @@ func (wk *wukongDB) LoadMsgBySenderClientMsgNo(ctx context.Context, channelId st
 	return wk.loadMsgByClientMsgNo(ctx, channelId, channelType, fromUID, clientMsgNo, true)
 }
 
+// LoadMsgsBySenderClientMsgNos checks a batch of (fromUID, clientMsgNo) pairs on a single
+// channel using one shared Pebble snapshot and reusable iterator for non-existent keys.
+func (wk *wukongDB) LoadMsgsBySenderClientMsgNos(ctx context.Context, channelId string, channelType uint8, keys [][2]string) (map[[2]string]Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	db := wk.channelDb(channelId, channelType).NewSnapshot()
+	defer db.Close()
+
+	var lowPrimary, highPrimary [16]byte
+	wk.endian.PutUint64(lowPrimary[:8], key.ChannelToNum(channelId, channelType))
+	copy(highPrimary[:8], lowPrimary[:8])
+	wk.endian.PutUint64(highPrimary[8:], math.MaxUint64)
+
+	iter := db.NewIter(nil)
+	defer iter.Close()
+
+	var found map[[2]string]Message
+	for _, pair := range keys {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		fromUID, clientMsgNo := pair[0], pair[1]
+		if strings.TrimSpace(clientMsgNo) == "" {
+			continue
+		}
+		lowKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, lowPrimary)
+		highKey := key.NewMessageSecondIndexClientMsgNoKey(clientMsgNo, highPrimary)
+		iter.SetBounds(lowKey, highKey)
+		if !iter.First() {
+			if err := iter.Error(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		msg, err := wk.loadMsgByClientMsgNo(ctx, channelId, channelType, fromUID, clientMsgNo, true)
+		if err != nil {
+			if err == ErrNotFound {
+				continue
+			}
+			return nil, err
+		}
+		if found == nil {
+			found = make(map[[2]string]Message)
+		}
+		found[pair] = msg
+	}
+	return found, nil
+}
+
 func (wk *wukongDB) loadMsgByClientMsgNo(ctx context.Context, channelId string, channelType uint8, fromUID, clientMsgNo string, matchSender bool) (Message, error) {
 	if err := ctx.Err(); err != nil {
 		return EmptyMessage, err
@@ -923,6 +996,9 @@ func (wk *wukongDB) loadMsgByClientMsgNo(ctx context.Context, channelId string, 
 		UpperBound: highKey,
 	})
 	defer iter.Close()
+	if !iter.First() {
+		return EmptyMessage, ErrNotFound
+	}
 
 	// Both indexes already exist in legacy stores and sort by channel/sequence.
 	// Intersect them using seeks: a different sender's large client-number
@@ -938,7 +1014,6 @@ func (wk *wukongDB) loadMsgByClientMsgNo(ctx context.Context, channelId string, 
 		defer senderIter.Close()
 		senderIter.First()
 	}
-	iter.First()
 	for iter.Valid() {
 		if err := ctx.Err(); err != nil {
 			return EmptyMessage, err
@@ -1384,6 +1459,7 @@ func (wk *wukongDB) parseChannelMessagesWithLimitSize(iter *pebble.Iterator, lim
 		lastNeedAppend bool = false
 	)
 
+	maxCount := wk.opts.MaxMessageLogCountPerBatch
 	var size uint64 = 0
 	for iter.First(); iter.Valid(); iter.Next() {
 		lastNeedAppend = true
@@ -1398,9 +1474,14 @@ func (wk *wukongDB) parseChannelMessagesWithLimitSize(iter *pebble.Iterator, lim
 
 		if preMessageSeq != messageSeq {
 			if preMessageSeq != 0 {
-				size += uint64(preMessage.Size())
+				msgSize := uint64(preMessage.Size())
+				if len(msgs) > 0 && limitSize != 0 && size+msgSize > limitSize {
+					lastNeedAppend = false
+					break
+				}
+				size += msgSize
 				msgs = append(msgs, preMessage)
-				if limitSize != 0 && size >= limitSize {
+				if (limitSize != 0 && size >= limitSize) || (limitSize != 0 && maxCount > 0 && len(msgs) >= maxCount) {
 					lastNeedAppend = false
 					break
 				}
@@ -1445,7 +1526,12 @@ func (wk *wukongDB) parseChannelMessagesWithLimitSize(iter *pebble.Iterator, lim
 	}
 
 	if lastNeedAppend {
-		msgs = append(msgs, preMessage)
+		msgSize := uint64(preMessage.Size())
+		if len(msgs) == 0 || limitSize == 0 || size+msgSize <= limitSize {
+			if limitSize == 0 || maxCount <= 0 || len(msgs) < maxCount {
+				msgs = append(msgs, preMessage)
+			}
+		}
 	}
 
 	return msgs, nil
