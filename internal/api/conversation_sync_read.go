@@ -235,6 +235,15 @@ func (s *request) recentMessagesAttempt(ctx context.Context, uid string, count i
 				err = withRecentReadSlot(workerCtx, recentPeerSlots, func() error {
 					var peerErr error
 					batches[i], peerErr = s.requestSyncMessage(workerCtx, node, groups[node], uid, count, last)
+					if peerErr != nil && !errors.Is(peerErr, errRecentReadProtocol) {
+						if maintainer, ok := service.Cluster.(icluster.IChannelLeaderMaintainer); ok {
+							for _, chReq := range groups[node] {
+								if chReq != nil {
+									maintainer.MaintainExistingChannelLeader(ctx, chReq.ChannelId, chReq.ChannelType, node)
+								}
+							}
+						}
+					}
 					return peerErr
 				})
 			}
@@ -346,15 +355,29 @@ func (s *request) requestSyncMessage(ctx context.Context, nodeID uint64, channel
 		return nil, err
 	}
 	headers := service.TrustedPeerNodeHeaders(node, nil)
-	resp, err := service.SendPeerRequestWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages/v2", Headers: headers, Body: data})
+	attemptTimeout := min(1200*time.Millisecond, budget)
+	if len(channels) > 256 {
+		attemptTimeout = min(3*time.Second, budget)
+	}
+	attemptCtx, attemptCancel := context.WithTimeout(ctx, attemptTimeout)
+	resp, err := service.SendPeerRequestWithContext(attemptCtx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages/v2", Headers: headers, Body: data})
+	attemptCancel()
 	if err != nil {
+		if ctx.Err() == nil {
+			return nil, fmt.Errorf("%w: peer %d syncMessages/v2 failed: %v", cluster.ErrConversationReadRetry, nodeID, err)
+		}
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		// Old peers have no v2 route. Only route absence permits downgrade;
 		// a v2 failure or malformed response must not bypass its read fences.
-		resp, err = service.SendPeerRequestWithContext(ctx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages", Headers: headers, Body: data})
+		legacyCtx, legacyCancel := context.WithTimeout(ctx, attemptTimeout)
+		resp, err = service.SendPeerRequestWithContext(legacyCtx, rest.Request{Method: rest.Method("POST"), BaseURL: node.ApiServerAddr + "/conversation/syncMessages", Headers: headers, Body: data})
+		legacyCancel()
 		if err != nil {
+			if ctx.Err() == nil {
+				return nil, fmt.Errorf("%w: peer %d syncMessages failed: %v", cluster.ErrConversationReadRetry, nodeID, err)
+			}
 			return nil, err
 		}
 		if err := recentPeerError(resp); err != nil {

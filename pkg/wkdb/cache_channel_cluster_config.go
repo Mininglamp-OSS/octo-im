@@ -2,6 +2,7 @@ package wkdb
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -11,6 +12,7 @@ import (
 
 // ChannelClusterConfigCache 频道集群配置的 LRU 缓存
 type ChannelClusterConfigCache struct {
+	mu sync.Mutex
 	// 集群配置缓存 key: channelId:channelType
 	cache *lru.Cache[string, *ChannelClusterConfigCacheItem]
 
@@ -52,24 +54,31 @@ func NewChannelClusterConfigCache(maxCacheSize int) *ChannelClusterConfigCache {
 // GetChannelClusterConfig 从缓存获取集群配置
 func (c *ChannelClusterConfigCache) GetChannelClusterConfig(channelId string, channelType uint8) (ChannelClusterConfig, bool) {
 	key := c.getConfigKey(channelId, channelType)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if item, ok := c.cache.Get(key); ok {
 		if !item.IsExpired() {
-			return item.Config, true
+			return item.Config.Clone(), true
 		}
-		// 缓存过期，异步删除
-		go func() {
-			c.cache.Remove(key)
-		}()
+		c.cache.Remove(key)
 	}
 	return EmptyChannelClusterConfig, false
 }
 
-// SetChannelClusterConfig 设置集群配置到缓存
+// SetChannelClusterConfig 设置集群配置到缓存（单调递增保护：绝不允许旧 ConfVersion 覆盖缓存中未过期的更高 ConfVersion）
 func (c *ChannelClusterConfigCache) SetChannelClusterConfig(config ChannelClusterConfig) {
 	key := c.getConfigKey(config.ChannelId, config.ChannelType)
+	cloned := config.Clone()
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.cache.Peek(key); ok && existing != nil && !existing.IsExpired() {
+		if existing.Config.ConfVersion > 0 && cloned.ConfVersion < existing.Config.ConfVersion {
+			return
+		}
+	}
 	item := &ChannelClusterConfigCacheItem{
-		Config:   config,
+		Config:   cloned,
 		CachedAt: time.Now(),
 		TTL:      c.cacheTTL,
 	}
@@ -79,7 +88,9 @@ func (c *ChannelClusterConfigCache) SetChannelClusterConfig(config ChannelCluste
 // InvalidateChannelClusterConfig 使指定频道的集群配置缓存失效
 func (c *ChannelClusterConfigCache) InvalidateChannelClusterConfig(channelId string, channelType uint8) {
 	key := c.getConfigKey(channelId, channelType)
+	c.mu.Lock()
 	c.cache.Remove(key)
+	c.mu.Unlock()
 }
 
 // BatchSetChannelClusterConfigs 批量设置集群配置到缓存
@@ -94,24 +105,28 @@ func (c *ChannelClusterConfigCache) BatchInvalidateChannelClusterConfigs(channel
 	ChannelId   string
 	ChannelType uint8
 }) {
+	c.mu.Lock()
 	for _, channel := range channels {
-		c.InvalidateChannelClusterConfig(channel.ChannelId, channel.ChannelType)
+		c.cache.Remove(c.getConfigKey(channel.ChannelId, channel.ChannelType))
 	}
+	c.mu.Unlock()
 }
 
 // InvalidateByLeaderId 使指定 LeaderId 的所有集群配置缓存失效
 func (c *ChannelClusterConfigCache) InvalidateByLeaderId(leaderId uint64) {
+	c.mu.Lock()
 	keys := c.cache.Keys()
 	removedCount := 0
 
 	for _, key := range keys {
-		if item, ok := c.cache.Get(key); ok {
+		if item, ok := c.cache.Peek(key); ok {
 			if item.Config.LeaderId == leaderId {
 				c.cache.Remove(key)
 				removedCount++
 			}
 		}
 	}
+	c.mu.Unlock()
 
 	if removedCount > 0 {
 		c.Debug("Invalidated cluster configs by leader ID",
@@ -122,17 +137,19 @@ func (c *ChannelClusterConfigCache) InvalidateByLeaderId(leaderId uint64) {
 
 // InvalidateBySlotId 使指定 SlotId 的所有集群配置缓存失效
 func (c *ChannelClusterConfigCache) InvalidateBySlotId(slotId uint32, channelSlotIdFunc func(channelId string) uint32) {
+	c.mu.Lock()
 	keys := c.cache.Keys()
 	removedCount := 0
 
 	for _, key := range keys {
-		if item, ok := c.cache.Get(key); ok {
+		if item, ok := c.cache.Peek(key); ok {
 			if channelSlotIdFunc(item.Config.ChannelId) == slotId {
 				c.cache.Remove(key)
 				removedCount++
 			}
 		}
 	}
+	c.mu.Unlock()
 
 	if removedCount > 0 {
 		c.Debug("Invalidated cluster configs by slot ID",
@@ -143,6 +160,8 @@ func (c *ChannelClusterConfigCache) InvalidateBySlotId(slotId uint32, channelSlo
 
 // GetCacheStats 获取缓存统计信息
 func (c *ChannelClusterConfigCache) GetCacheStats() map[string]interface{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return map[string]interface{}{
 		"cluster_config_cache_len": c.cache.Len(),
 		"cluster_config_cache_max": c.maxCacheSize,
@@ -152,7 +171,9 @@ func (c *ChannelClusterConfigCache) GetCacheStats() map[string]interface{} {
 
 // ClearCache 清空所有缓存
 func (c *ChannelClusterConfigCache) ClearCache() {
+	c.mu.Lock()
 	c.cache.Purge()
+	c.mu.Unlock()
 	c.Info("Channel cluster config cache cleared")
 }
 
@@ -163,6 +184,8 @@ func (c *ChannelClusterConfigCache) getConfigKey(channelId string, channelType u
 
 // GetCacheSize 获取当前缓存大小
 func (c *ChannelClusterConfigCache) GetCacheSize() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.cache.Len()
 }
 
@@ -173,25 +196,31 @@ func (c *ChannelClusterConfigCache) GetMaxCacheSize() int {
 
 // SetCacheTTL 设置缓存过期时间
 func (c *ChannelClusterConfigCache) SetCacheTTL(ttl time.Duration) {
+	c.mu.Lock()
 	c.cacheTTL = ttl
+	c.mu.Unlock()
 }
 
 // GetCacheTTL 获取缓存过期时间
 func (c *ChannelClusterConfigCache) GetCacheTTL() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.cacheTTL
 }
 
 // RemoveExpiredItems 清理过期的缓存项
 func (c *ChannelClusterConfigCache) RemoveExpiredItems() int {
+	c.mu.Lock()
 	keys := c.cache.Keys()
 	removedCount := 0
 
 	for _, key := range keys {
-		if item, ok := c.cache.Get(key); ok && item.IsExpired() {
+		if item, ok := c.cache.Peek(key); ok && item.IsExpired() {
 			c.cache.Remove(key)
 			removedCount++
 		}
 	}
+	c.mu.Unlock()
 
 	if removedCount > 0 {
 		c.Debug("Removed expired cluster config cache items", zap.Int("count", removedCount))
@@ -212,11 +241,13 @@ func (c *ChannelClusterConfigCache) WarmUpCache(configs []ChannelClusterConfig) 
 
 // GetCachedChannels 获取已缓存的频道列表
 func (c *ChannelClusterConfigCache) GetCachedChannels() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	keys := c.cache.Keys()
 	channels := make([]string, 0, len(keys))
 
 	for _, key := range keys {
-		if item, ok := c.cache.Get(key); ok && !item.IsExpired() {
+		if item, ok := c.cache.Peek(key); ok && !item.IsExpired() {
 			channels = append(channels, key)
 		}
 	}
@@ -226,13 +257,15 @@ func (c *ChannelClusterConfigCache) GetCachedChannels() []string {
 
 // GetConfigsByLeaderId 获取指定 LeaderId 的所有缓存配置
 func (c *ChannelClusterConfigCache) GetConfigsByLeaderId(leaderId uint64) []ChannelClusterConfig {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	keys := c.cache.Keys()
 	configs := make([]ChannelClusterConfig, 0)
 
 	for _, key := range keys {
-		if item, ok := c.cache.Get(key); ok && !item.IsExpired() {
+		if item, ok := c.cache.Peek(key); ok && !item.IsExpired() {
 			if item.Config.LeaderId == leaderId {
-				configs = append(configs, item.Config)
+				configs = append(configs, item.Config.Clone())
 			}
 		}
 	}
@@ -240,15 +273,17 @@ func (c *ChannelClusterConfigCache) GetConfigsByLeaderId(leaderId uint64) []Chan
 	return configs
 }
 
-// GetConfigsBySlotId 获取指定 SlotId 的所有缓存配置
+// GetConfigsBySlotId 获取指定 SlotId 的所有集群配置
 func (c *ChannelClusterConfigCache) GetConfigsBySlotId(slotId uint32, channelSlotIdFunc func(channelId string) uint32) []ChannelClusterConfig {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	keys := c.cache.Keys()
 	configs := make([]ChannelClusterConfig, 0)
 
 	for _, key := range keys {
-		if item, ok := c.cache.Get(key); ok && !item.IsExpired() {
+		if item, ok := c.cache.Peek(key); ok && !item.IsExpired() {
 			if channelSlotIdFunc(item.Config.ChannelId) == slotId {
-				configs = append(configs, item.Config)
+				configs = append(configs, item.Config.Clone())
 			}
 		}
 	}
@@ -256,20 +291,47 @@ func (c *ChannelClusterConfigCache) GetConfigsBySlotId(slotId uint32, channelSlo
 	return configs
 }
 
-// UpdateConfigVersion 更新指定频道的配置版本（用于版本检查）
+// GetAllCachedConfigs 获取所有未过期的缓存配置
+func (c *ChannelClusterConfigCache) GetAllCachedConfigs() []ChannelClusterConfig {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	keys := c.cache.Keys()
+	configs := make([]ChannelClusterConfig, 0, len(keys))
+
+	for _, key := range keys {
+		if item, ok := c.cache.Peek(key); ok && !item.IsExpired() {
+			configs = append(configs, item.Config.Clone())
+		}
+	}
+
+	return configs
+}
+
+// UpdateConfigVersion 更新指定频道的配置版本（用于版本检查，单调递增保护）
 func (c *ChannelClusterConfigCache) UpdateConfigVersion(channelId string, channelType uint8, version uint64) {
 	key := c.getConfigKey(channelId, channelType)
-	if item, ok := c.cache.Get(key); ok && !item.IsExpired() {
-		item.Config.ConfVersion = version
-		// 更新缓存时间
-		item.CachedAt = time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if item, ok := c.cache.Get(key); ok && item != nil && !item.IsExpired() {
+		if item.Config.ConfVersion > 0 && version < item.Config.ConfVersion {
+			return
+		}
+		updatedCfg := item.Config.Clone()
+		updatedCfg.ConfVersion = version
+		c.cache.Add(key, &ChannelClusterConfigCacheItem{
+			Config:   updatedCfg,
+			CachedAt: time.Now(),
+			TTL:      c.cacheTTL,
+		})
 	}
 }
 
 // GetConfigVersion 获取指定频道的配置版本
 func (c *ChannelClusterConfigCache) GetConfigVersion(channelId string, channelType uint8) (uint64, bool) {
 	key := c.getConfigKey(channelId, channelType)
-	if item, ok := c.cache.Get(key); ok && !item.IsExpired() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if item, ok := c.cache.Get(key); ok && item != nil && !item.IsExpired() {
 		return item.Config.ConfVersion, true
 	}
 	return 0, false

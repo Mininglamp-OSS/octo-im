@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -22,36 +23,50 @@ import (
 // 跳过会话更新的频道类型
 var skipConversationUpdateChannelTypes = []uint8{wkproto.ChannelTypeData, wkproto.ChannelTypeTemp, wkproto.ChannelTypeLive}
 
-func safeGetSlotID(cl icluster.ICluster, v string) uint32 {
+type SlotOwnershipStatus uint8
+
+const (
+	SlotOwnerUnknown SlotOwnershipStatus = iota
+	SlotOwnerLocal
+	SlotOwnerRemote
+)
+
+// lookupUserSlotID resolves uid -> slotID and fails closed on nil cluster or panic,
+// never conflating valid slot 0 with a lookup failure (B1).
+func lookupUserSlotID(cl icluster.ICluster, v string) (slotID uint32, err error) {
 	if cl == nil {
-		return 0
+		return 0, errors.New("cluster is nil")
 	}
-	var slotID uint32
-	func() {
-		defer func() { _ = recover() }()
-		slotID = cl.GetSlotId(v)
+	defer func() {
+		if r := recover(); r != nil {
+			slotID = 0
+			err = fmt.Errorf("GetSlotId panicked for %q: %v", v, r)
+		}
 	}()
-	return slotID
+	return cl.GetSlotId(v), nil
 }
 
-func safeVerifyLocalUserSlot(cl icluster.ICluster, slotID uint32, localNode uint64) bool {
+// verifyUserSlotOwnership checks slot leadership and fails closed (SlotOwnerUnknown) on nil cluster,
+// localNode == 0, leaderID == 0, or panic — never defaulting to local ownership (B1).
+func verifyUserSlotOwnership(cl icluster.ICluster, slotID uint32, localNode uint64) (status SlotOwnershipStatus, leaderID uint64, err error) {
 	if cl == nil || localNode == 0 {
-		return true
+		return SlotOwnerUnknown, 0, errors.New("cluster or localNode unavailable")
 	}
-	leaderID := localNode
-	panicked := false
-	func() {
-		defer func() {
-			if recover() != nil {
-				panicked = true
-			}
-		}()
-		leaderID = cl.SlotLeaderId(slotID)
+	defer func() {
+		if r := recover(); r != nil {
+			status = SlotOwnerUnknown
+			leaderID = 0
+			err = fmt.Errorf("SlotLeaderId panicked for slot %d: %v", slotID, r)
+		}
 	}()
-	if panicked {
-		return true
+	leaderID = cl.SlotLeaderId(slotID)
+	if leaderID == 0 {
+		return SlotOwnerUnknown, 0, fmt.Errorf("slot %d leader is 0", slotID)
 	}
-	return leaderID == localNode
+	if leaderID == localNode {
+		return SlotOwnerLocal, leaderID, nil
+	}
+	return SlotOwnerRemote, leaderID, nil
 }
 
 // 消息分发
@@ -67,6 +82,27 @@ func (h *Handler) distribute(ctx *eventbus.ChannelContext) {
 		h.distributeOnlineCmd(ctx)
 	} else {
 		h.distributeCommon(ctx)
+	}
+}
+
+func (h *Handler) enqueueDistributeRecoveryWithTicket(
+	channelID string,
+	channelType uint8,
+	pendingSlots eventbus.SlotBitset,
+	allRecipientSlots eventbus.SlotBitset,
+	ev *eventbus.Event,
+) {
+	if h == nil || ev == nil || ev.MessageSeq == 0 {
+		if ev != nil && ev.Ticket != nil {
+			ev.Ticket.Release()
+			ev.Ticket = nil
+		}
+		return
+	}
+	_ = h.ensureEventHasTicket(channelID, ev)
+	if !h.recoveryMgr.Enqueue(channelID, channelType, RecoveryStageDistribute, pendingSlots, allRecipientSlots, ev) && ev.Ticket != nil {
+		ev.Ticket.Release()
+		ev.Ticket = nil
 	}
 }
 
@@ -93,7 +129,7 @@ func (h *Handler) distributeCommon(ctx *eventbus.ChannelContext) {
 				continue
 			}
 			if ev.MessageSeq > 0 {
-				_ = h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageDistribute, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
+				h.enqueueDistributeRecoveryWithTicket(ctx.ChannelId, ctx.ChannelType, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
 			} else if ev.Ticket != nil {
 				ev.Ticket.Release()
 				ev.Ticket = nil
@@ -129,7 +165,7 @@ func (h *Handler) distributeOnlineCmd(ctx *eventbus.ChannelContext) {
 				h.Error("distributeOnlineCmd: request tag failed", zap.Error(err), zap.String("tagKey", tagKey), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
 				for _, ev := range events {
 					if ev != nil && ev.MessageSeq > 0 {
-						_ = h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageDistribute, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
+						h.enqueueDistributeRecoveryWithTicket(ctx.ChannelId, ctx.ChannelType, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
 					} else if ev != nil && ev.Ticket != nil {
 						ev.Ticket.Release()
 						ev.Ticket = nil
@@ -157,24 +193,36 @@ func (h *Handler) groupEventsByTagKey(events []*eventbus.Event) map[string][]*ev
 	return tagKeyEvents
 }
 
-func computeTagSlotTopology(cl icluster.ICluster, tag *types.Tag) (allSlots eventbus.SlotBitset, nodeMasks map[uint64]eventbus.SlotBitset) {
+func computeTagSlotTopologyChecked(cl icluster.ICluster, tag *types.Tag) (allSlots eventbus.SlotBitset, nodeMasks map[uint64]eventbus.SlotBitset, hasUnknown bool) {
+	if tag == nil {
+		return eventbus.SlotBitset{}, nil, true
+	}
 	nodeMasks = make(map[uint64]eventbus.SlotBitset, len(tag.Nodes))
 	for _, node := range tag.Nodes {
 		if node == nil {
 			continue
 		}
 		var nm eventbus.SlotBitset
+		hasRecipientUID := false
 		for _, uid := range node.Uids {
 			if uid == "" || (options.G != nil && options.G.IsSystemUid(uid)) {
 				continue
 			}
-			sid := safeGetSlotID(cl, uid)
+			hasRecipientUID = true
+			sid, err := lookupUserSlotID(cl, uid)
+			if err != nil {
+				hasUnknown = true
+				continue
+			}
 			nm.Set(sid)
 			allSlots.Set(sid)
 		}
-		nodeMasks[node.LeaderId] = nm
+		if hasRecipientUID && node.LeaderId == 0 {
+			hasUnknown = true
+		}
+		nodeMasks[node.LeaderId] = nodeMasks[node.LeaderId].Or(nm)
 	}
-	return allSlots, nodeMasks
+	return allSlots, nodeMasks, hasUnknown
 }
 
 func (h *Handler) distributePersistedToRemoteNode(
@@ -194,7 +242,7 @@ func (h *Handler) distributePersistedToRemoteNode(
 	}
 	mode := h.forwardCapabilities.ProbeOn(ctx, cl, toNodeID)
 	if mode != forward.PeerCapPartAV2 && mode != forward.PeerCapBaseV1 {
-		return forward.ErrUnavailable
+		return forward.ErrPeerNoAck
 	}
 
 	wireEvents := make([]*eventbus.Event, 0, len(events))
@@ -233,7 +281,9 @@ func (h *Handler) distributePersistedToRemoteNode(
 }
 
 // deliverLocalUsersForMask delivers events strictly to local node.Uids whose user slot is in allowedMask
-// and still owned by localNode (returning succeededMask and migratedAwayMask per V11-2).
+// and verified as locally owned (B1 + V11-2).
+// If GetSlotId or SlotLeaderId panics, is nil, or returns leader 0 for any UID in a slot, that slot is treated
+// conservatively as Unknown (0 pushes/unread updates for that slot, excluded from succeededMask, retained in retryMask).
 func (h *Handler) deliverLocalUsersForMask(
 	cl icluster.ICluster,
 	localNode uint64,
@@ -247,7 +297,16 @@ func (h *Handler) deliverLocalUsersForMask(
 		return eventbus.SlotBitset{}, eventbus.SlotBitset{}
 	}
 
-	var targetUIDs []string
+	type slotUIDGroup struct {
+		sid  uint32
+		uids []string
+	}
+	var slotOrder []uint32
+	slotUIDs := make(map[uint32][]string)
+	var unknownSlots eventbus.SlotBitset
+	hadSlotIDLookupError := false
+	isTransientNoCluster := cl == nil && !hasPersistedEvents(events)
+
 	for _, node := range tag.Nodes {
 		if node == nil || node.LeaderId != localNode {
 			continue
@@ -256,27 +315,66 @@ func (h *Handler) deliverLocalUsersForMask(
 			if uid == "" || (options.G != nil && options.G.IsSystemUid(uid)) {
 				continue
 			}
-			sid := safeGetSlotID(cl, uid)
+			if isTransientNoCluster {
+				if allowedMask.Has(0) {
+					if _, exists := slotUIDs[0]; !exists {
+						slotOrder = append(slotOrder, 0)
+					}
+					slotUIDs[0] = append(slotUIDs[0], uid)
+				}
+				continue
+			}
+			sid, err := lookupUserSlotID(cl, uid)
+			if err != nil {
+				h.Error("deliverLocalUsersForMask: GetSlotId lookup failed; failing closed for batch",
+					zap.Error(err), zap.String("uid", uid), zap.String("channelId", channelID))
+				hadSlotIDLookupError = true
+				continue
+			}
 			if !allowedMask.Has(sid) {
 				continue
 			}
-			if !safeVerifyLocalUserSlot(cl, sid, localNode) {
+			ownerStatus, _, ownerErr := verifyUserSlotOwnership(cl, sid, localNode)
+			switch ownerStatus {
+			case SlotOwnerUnknown:
+				h.Error("deliverLocalUsersForMask: slot ownership unknown; retaining slot for recovery",
+					zap.Error(ownerErr), zap.Uint32("slotId", sid), zap.String("uid", uid), zap.String("channelId", channelID))
+				unknownSlots.Set(sid)
+			case SlotOwnerRemote:
 				migratedAwayMask.Set(sid)
-				continue
+			case SlotOwnerLocal:
+				if _, exists := slotUIDs[sid]; !exists {
+					slotOrder = append(slotOrder, sid)
+				}
+				slotUIDs[sid] = append(slotUIDs[sid], uid)
 			}
-			succeededMask.Set(sid)
-			targetUIDs = append(targetUIDs, uid)
 		}
 	}
 
-	// Any bit in allowedMask that had no matching local UID in tag.Nodes migrated out of localNode's tag slice.
-	unmatched := allowedMask.AndNot(succeededMask).AndNot(migratedAwayMask)
+	// If any UID's slot ID could not even be resolved, fail closed for the entire allowedMask so no UID is silently skipped.
+	if hadSlotIDLookupError {
+		return eventbus.SlotBitset{}, allowedMask.Clone()
+	}
+
+	var validSucceededSlots eventbus.SlotBitset
+	var targetUIDs []string
+	for _, sid := range slotOrder {
+		// B1: If any UID on sid had Unknown ownership or migrated away, do not partially commit sid.
+		if unknownSlots.Has(sid) || migratedAwayMask.Has(sid) {
+			continue
+		}
+		validSucceededSlots.Set(sid)
+		targetUIDs = append(targetUIDs, slotUIDs[sid]...)
+	}
+
+	// Any bit in allowedMask that had no matching local UID in tag.Nodes (or had Unknown ownership) must be retried/re-routed.
+	unmatched := allowedMask.AndNot(validSucceededSlots).AndNot(migratedAwayMask)
 	if !unmatched.IsZero() {
 		migratedAwayMask = migratedAwayMask.Or(unmatched)
 	}
 
 	if len(targetUIDs) == 0 {
-		return succeededMask, migratedAwayMask
+		return validSucceededSlots, migratedAwayMask
 	}
 
 	var offlineUids []string
@@ -369,6 +467,8 @@ func (h *Handler) deliverLocalUsersForMask(
 		h.pushEvents(offlineEvents, false)
 	}
 
+	// Mark validSucceededSlots only after local push/conversation handoff has completed.
+	succeededMask = validSucceededSlots
 	return succeededMask, migratedAwayMask
 }
 
@@ -377,7 +477,7 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 		h.Error("distributeByTag: leaderId is 0", zap.String("fakeChannelId", channelId), zap.Uint8("channelType", channelType))
 		for _, ev := range events {
 			if ev != nil && ev.MessageSeq > 0 {
-				_ = h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStageDistribute, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
+				h.enqueueDistributeRecoveryWithTicket(channelId, channelType, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
 			} else if ev != nil && ev.Ticket != nil {
 				ev.Ticket.Release()
 				ev.Ticket = nil
@@ -410,15 +510,32 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 	cl := h.cluster()
 	localNode := h.localNodeId()
 	wmKey, hasWMKey := MakeChannelWatermarkKey(channelId, channelType)
-	allRecipientSlots, nodeSlotMasks := computeTagSlotTopology(cl, tag)
+	allRecipientSlots, nodeSlotMasks, hasTopologyUnknown := computeTagSlotTopologyChecked(cl, tag)
+
+	// B1: If topology resolution encountered any GetSlotId failure/panic or leader=0, do NOT treat empty allRecipientSlots as "0 recipients -> done"!
+	if hasTopologyUnknown && allRecipientSlots.IsZero() {
+		for _, ev := range persistedEvents {
+			h.enqueueDistributeRecoveryWithTicket(channelId, channelType, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
+		}
+		return
+	}
 
 	if allRecipientSlots.IsZero() {
 		for _, ev := range persistedEvents {
+			committed := true
 			if hasWMKey {
 				if h.isLocalNode(slotLeaderId) {
-					_ = h.seqTracker.RecordCommittedForce(wmKey, StageChannelDistribute, ev.MessageSeq)
+					if !h.seqTracker.RecordCommittedForce(wmKey, StageChannelDistribute, ev.MessageSeq) {
+						committed = false
+					}
 				}
-				_ = h.seqTracker.RecordCommittedForce(wmKey, StageLocalDistribute, ev.MessageSeq)
+				if !h.seqTracker.RecordCommittedForce(wmKey, StageLocalDistribute, ev.MessageSeq) {
+					committed = false
+				}
+			}
+			if !committed {
+				h.enqueueDistributeRecoveryWithTicket(channelId, channelType, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
+				continue
 			}
 			if ev.Ticket != nil {
 				ev.Ticket.Release()
@@ -429,10 +546,10 @@ func (h *Handler) distributeByTag(slotLeaderId uint64, tag *types.Tag, channelId
 	}
 
 	if h.isLocalNode(slotLeaderId) {
-		h.distributePersistedOnChannelLeader(context.Background(), cl, localNode, wmKey, hasWMKey, tag, allRecipientSlots, nodeSlotMasks, channelId, channelType, persistedEvents)
+		h.distributePersistedOnChannelLeader(context.Background(), cl, localNode, wmKey, hasWMKey, tag, allRecipientSlots, nodeSlotMasks, hasTopologyUnknown, channelId, channelType, persistedEvents)
 		return
 	}
-	h.distributePersistedOnRecipientNode(cl, localNode, wmKey, hasWMKey, tag, allRecipientSlots, nodeSlotMasks, channelId, channelType, persistedEvents)
+	h.distributePersistedOnRecipientNode(cl, localNode, wmKey, hasWMKey, tag, allRecipientSlots, nodeSlotMasks, hasTopologyUnknown, channelId, channelType, persistedEvents)
 }
 
 func (h *Handler) distributePersistedOnChannelLeader(
@@ -444,6 +561,7 @@ func (h *Handler) distributePersistedOnChannelLeader(
 	tag *types.Tag,
 	allRecipientSlots eventbus.SlotBitset,
 	nodeSlotMasks map[uint64]eventbus.SlotBitset,
+	hasTopologyUnknown bool,
 	channelID string,
 	channelType uint8,
 	events []*eventbus.Event,
@@ -461,6 +579,10 @@ func (h *Handler) distributePersistedOnChannelLeader(
 			reqMask = ev.TargetSlotMask.And(allRecipientSlots)
 		}
 		if reqMask.IsZero() {
+			if hasTopologyUnknown {
+				h.enqueueDistributeRecoveryWithTicket(channelID, channelType, ev.TargetSlotMask, allRecipientSlots, ev)
+				continue
+			}
 			if ev.Ticket != nil {
 				ev.Ticket.Release()
 				ev.Ticket = nil
@@ -471,25 +593,32 @@ func (h *Handler) distributePersistedOnChannelLeader(
 			active = append(active, leasedDistEvent{ev: ev, deliverMask: reqMask})
 			continue
 		}
-		deliv, leased := h.seqTracker.BeginSlotStage(wmKey, StageChannelDistribute, ev.MessageSeq, reqMask)
-		if !leased || deliv.IsZero() {
-			if h.seqTracker.HasCommitted(wmKey, StageChannelDistribute, ev.MessageSeq) {
-				if ev.Ticket != nil {
-					ev.Ticket.Release()
-					ev.Ticket = nil
-				}
-			} else {
-				_ = h.recoveryMgr.Enqueue(channelID, channelType, RecoveryStageDistribute, reqMask, allRecipientSlots, ev)
+		deliv, status := h.seqTracker.BeginSlotStageChecked(wmKey, StageChannelDistribute, ev.MessageSeq, reqMask)
+		switch status {
+		case StageBeginAlreadyCommitted:
+			if hasTopologyUnknown {
+				h.enqueueDistributeRecoveryWithTicket(channelID, channelType, reqMask, allRecipientSlots, ev)
+			} else if ev.Ticket != nil {
+				ev.Ticket.Release()
+				ev.Ticket = nil
 			}
-			continue
+		case StageBeginInFlight, StageBeginCapacityRetry:
+			h.enqueueDistributeRecoveryWithTicket(channelID, channelType, reqMask, allRecipientSlots, ev)
+		case StageBeginLeased:
+			active = append(active, leasedDistEvent{ev: ev, deliverMask: deliv, leased: true})
 		}
-		active = append(active, leasedDistEvent{ev: ev, deliverMask: deliv, leased: true})
 	}
 	if len(active) == 0 {
 		return
 	}
 
-	// 1. Remote user-slot leaders: commit remote slot bits ONLY after /wk/forward/channel/v1 returns StatusOK.
+	// 1. Remote user-slot leaders: group by (node.LeaderId, exactMask) so events with different masks
+	// never get widened to a batch union mask (A2).
+	type exactMaskBatch struct {
+		mask eventbus.SlotBitset
+		evs  []*eventbus.Event
+		idxs []int
+	}
 	for _, node := range tag.Nodes {
 		if node == nil || node.LeaderId == localNode || node.LeaderId == 0 {
 			continue
@@ -498,9 +627,7 @@ func (h *Handler) distributePersistedOnChannelLeader(
 		if remoteMask.IsZero() {
 			continue
 		}
-		var batchEvs []*eventbus.Event
-		var batchIdx []int
-		var unionTargetMask eventbus.SlotBitset
+		var groups []exactMaskBatch
 		for i := range active {
 			evMask := active[i].deliverMask.And(remoteMask)
 			if evMask.IsZero() {
@@ -510,24 +637,35 @@ func (h *Handler) distributePersistedOnChannelLeader(
 				active[i].succeeded = active[i].succeeded.Or(evMask)
 				continue
 			}
-			batchEvs = append(batchEvs, active[i].ev)
-			batchIdx = append(batchIdx, i)
-			unionTargetMask = unionTargetMask.Or(evMask)
-		}
-		if len(batchEvs) == 0 {
-			continue
-		}
-		if err := h.distributePersistedToRemoteNode(ctx, node.LeaderId, channelID, channelType, batchEvs, unionTargetMask); err == nil {
-			for _, idx := range batchIdx {
-				evMask := active[idx].deliverMask.And(remoteMask)
-				active[idx].succeeded = active[idx].succeeded.Or(evMask)
+			placed := false
+			for gIdx := range groups {
+				if groups[gIdx].mask.Equal(evMask) {
+					groups[gIdx].evs = append(groups[gIdx].evs, active[i].ev)
+					groups[gIdx].idxs = append(groups[gIdx].idxs, i)
+					placed = true
+					break
+				}
 			}
-		} else {
-			h.Warn("distributePersistedToRemoteNode failed; retaining failed slot mask for recovery",
-				zap.Error(err),
-				zap.Uint64("toNode", node.LeaderId),
-				zap.String("channelId", channelID),
-				zap.Int("batchLen", len(batchEvs)))
+			if !placed {
+				groups = append(groups, exactMaskBatch{
+					mask: evMask.Clone(),
+					evs:  []*eventbus.Event{active[i].ev},
+					idxs: []int{i},
+				})
+			}
+		}
+		for _, grp := range groups {
+			if err := h.distributePersistedToRemoteNode(ctx, node.LeaderId, channelID, channelType, grp.evs, grp.mask); err == nil {
+				for _, idx := range grp.idxs {
+					active[idx].succeeded = active[idx].succeeded.Or(grp.mask)
+				}
+			} else {
+				h.Warn("distributePersistedToRemoteNode failed; retaining failed slot mask for recovery",
+					zap.Error(err),
+					zap.Uint64("toNode", node.LeaderId),
+					zap.String("channelId", channelID),
+					zap.Int("batchLen", len(grp.evs)))
+			}
 		}
 	}
 
@@ -542,19 +680,21 @@ func (h *Handler) distributePersistedOnChannelLeader(
 			localDeliv := evLocalReq
 			localLeased := false
 			if hasWMKey {
-				localDeliv, localLeased = h.seqTracker.BeginSlotStage(wmKey, StageLocalDistribute, active[i].ev.MessageSeq, evLocalReq)
-				if !localLeased || localDeliv.IsZero() {
-					if h.seqTracker.HasCommitted(wmKey, StageLocalDistribute, active[i].ev.MessageSeq) {
-						active[i].succeeded = active[i].succeeded.Or(evLocalReq)
-					}
+				var st StageBeginStatus
+				localDeliv, st = h.seqTracker.BeginSlotStageChecked(wmKey, StageLocalDistribute, active[i].ev.MessageSeq, evLocalReq)
+				if st == StageBeginAlreadyCommitted {
+					active[i].succeeded = active[i].succeeded.Or(evLocalReq)
 					continue
 				}
+				if st != StageBeginLeased || localDeliv.IsZero() {
+					continue
+				}
+				localLeased = true
 			}
 			succLocal, _ := h.deliverLocalUsersForMask(cl, localNode, tag, channelID, channelType, []*eventbus.Event{active[i].ev}, localDeliv)
 			if localLeased && hasWMKey {
 				h.seqTracker.FinishSlotStage(wmKey, StageLocalDistribute, active[i].ev.MessageSeq, localDeliv, succLocal, localMask)
 			}
-			// Already-completed local bits in evLocalReq \ localDeliv also count toward Stage 2 completion.
 			alreadyDoneLocal := evLocalReq.AndNot(localDeliv)
 			active[i].succeeded = active[i].succeeded.Or(succLocal).Or(alreadyDoneLocal)
 		}
@@ -563,21 +703,25 @@ func (h *Handler) distributePersistedOnChannelLeader(
 	// 3. Finalize Stage 2 per event and retain ONLY failed slots in RecoveryManager.
 	for i := range active {
 		item := &active[i]
+		effectiveAllSlots := allRecipientSlots
+		if hasTopologyUnknown {
+			// Prevent full-sequence completion if some recipient UID's slot could not be resolved.
+			effectiveAllSlots = eventbus.SlotBitset{}
+		}
 		if item.leased && hasWMKey {
-			h.seqTracker.FinishSlotStage(wmKey, StageChannelDistribute, item.ev.MessageSeq, item.deliverMask, item.succeeded, allRecipientSlots)
+			h.seqTracker.FinishSlotStage(wmKey, StageChannelDistribute, item.ev.MessageSeq, item.deliverMask, item.succeeded, effectiveAllSlots)
 		}
 		failed := item.deliverMask.AndNot(item.succeeded)
-		if failed.IsZero() {
+		if failed.IsZero() && !hasTopologyUnknown {
 			if item.ev.Ticket != nil {
 				item.ev.Ticket.Release()
 				item.ev.Ticket = nil
 			}
 		} else {
-			// Refresh tag on failure in case user slots migrated across nodes.
 			if tm := h.tagManager(); tm != nil {
 				tm.RemoveTag(tag.Key)
 			}
-			_ = h.recoveryMgr.Enqueue(channelID, channelType, RecoveryStageDistribute, failed, allRecipientSlots, item.ev)
+			h.enqueueDistributeRecoveryWithTicket(channelID, channelType, failed, allRecipientSlots, item.ev)
 		}
 	}
 }
@@ -590,6 +734,7 @@ func (h *Handler) distributePersistedOnRecipientNode(
 	tag *types.Tag,
 	allRecipientSlots eventbus.SlotBitset,
 	nodeSlotMasks map[uint64]eventbus.SlotBitset,
+	hasTopologyUnknown bool,
 	channelID string,
 	channelType uint8,
 	events []*eventbus.Event,
@@ -606,22 +751,28 @@ func (h *Handler) distributePersistedOnRecipientNode(
 		if !reqMask.IsZero() {
 			localDeliv := reqMask
 			localLeased := false
+			var st StageBeginStatus = StageBeginLeased
 			if hasWMKey {
-				localDeliv, localLeased = h.seqTracker.BeginSlotStage(wmKey, StageLocalDistribute, ev.MessageSeq, reqMask)
+				localDeliv, st = h.seqTracker.BeginSlotStageChecked(wmKey, StageLocalDistribute, ev.MessageSeq, reqMask)
+				localLeased = st == StageBeginLeased
 			}
 			if !hasWMKey || (localLeased && !localDeliv.IsZero()) {
 				var migLocal eventbus.SlotBitset
 				succLocal, migLocal = h.deliverLocalUsersForMask(cl, localNode, tag, channelID, channelType, []*eventbus.Event{ev}, localDeliv)
 				migratedOutMask = migratedOutMask.Or(migLocal)
 				if localLeased && hasWMKey {
-					h.seqTracker.FinishSlotStage(wmKey, StageLocalDistribute, ev.MessageSeq, localDeliv, succLocal, localMask)
+					effectiveLocalAll := localMask
+					if hasTopologyUnknown {
+						effectiveLocalAll = eventbus.SlotBitset{}
+					}
+					h.seqTracker.FinishSlotStage(wmKey, StageLocalDistribute, ev.MessageSeq, localDeliv, succLocal, effectiveLocalAll)
 				}
-			} else if hasWMKey && !h.seqTracker.HasCommitted(wmKey, StageLocalDistribute, ev.MessageSeq) {
+			} else if st != StageBeginAlreadyCommitted {
 				migratedOutMask = migratedOutMask.Or(reqMask)
 			}
 		}
 
-		if migratedOutMask.IsZero() {
+		if migratedOutMask.IsZero() && !hasTopologyUnknown {
 			if ev.Ticket != nil {
 				ev.Ticket.Release()
 				ev.Ticket = nil
@@ -633,7 +784,7 @@ func (h *Handler) distributePersistedOnRecipientNode(
 			ev.TagKey = ""
 			ev.HasTargetSlotMask = true
 			ev.TargetSlotMask = migratedOutMask
-			_ = h.recoveryMgr.Enqueue(channelID, channelType, RecoveryStageDistribute, migratedOutMask, allRecipientSlots, ev)
+			h.enqueueDistributeRecoveryWithTicket(channelID, channelType, migratedOutMask, allRecipientSlots, ev)
 		}
 	}
 }
@@ -661,7 +812,6 @@ func (h *Handler) executeSingleEventDistributeRecovery(
 		return eventbus.SlotBitset{}, knownAllSlots, true
 	}
 
-	// Build a fresh tag on the channel slot leader so any user-slot migration is reflected immediately.
 	var tag *types.Tag
 	var err error
 	if h.isLocalNode(slotLeaderID) {
@@ -689,13 +839,20 @@ func (h *Handler) executeSingleEventDistributeRecovery(
 	cl := h.cluster()
 	localNode := h.localNodeId()
 	wmKey, hasWMKey := MakeChannelWatermarkKey(channelID, channelType)
-	allRecipientSlots, nodeSlotMasks := computeTagSlotTopology(cl, tag)
+	allRecipientSlots, nodeSlotMasks, hasTopologyUnknown := computeTagSlotTopologyChecked(cl, tag)
+	if hasTopologyUnknown && allRecipientSlots.IsZero() {
+		return pendingSlots, knownAllSlots, false
+	}
 	if allRecipientSlots.IsZero() {
 		if hasWMKey {
 			if h.isLocalNode(slotLeaderID) {
-				_ = h.seqTracker.RecordCommittedForce(wmKey, StageChannelDistribute, ev.MessageSeq)
+				if !h.seqTracker.RecordCommittedForce(wmKey, StageChannelDistribute, ev.MessageSeq) {
+					return pendingSlots, knownAllSlots, false
+				}
 			}
-			_ = h.seqTracker.RecordCommittedForce(wmKey, StageLocalDistribute, ev.MessageSeq)
+			if !h.seqTracker.RecordCommittedForce(wmKey, StageLocalDistribute, ev.MessageSeq) {
+				return pendingSlots, knownAllSlots, false
+			}
 		}
 		return eventbus.SlotBitset{}, allRecipientSlots, true
 	}
@@ -705,6 +862,9 @@ func (h *Handler) executeSingleEventDistributeRecovery(
 		reqMask = pendingSlots.And(allRecipientSlots)
 	}
 	if reqMask.IsZero() {
+		if hasTopologyUnknown {
+			return pendingSlots, allRecipientSlots, false
+		}
 		return eventbus.SlotBitset{}, allRecipientSlots, true
 	}
 
@@ -715,23 +875,28 @@ func (h *Handler) executeSingleEventDistributeRecovery(
 		if !localReq.IsZero() {
 			localDeliv := localReq
 			localLeased := false
+			var st StageBeginStatus = StageBeginLeased
 			if hasWMKey {
-				localDeliv, localLeased = h.seqTracker.BeginSlotStage(wmKey, StageLocalDistribute, ev.MessageSeq, localReq)
+				localDeliv, st = h.seqTracker.BeginSlotStageChecked(wmKey, StageLocalDistribute, ev.MessageSeq, localReq)
+				localLeased = st == StageBeginLeased
 			}
 			if !hasWMKey || (localLeased && !localDeliv.IsZero()) {
 				succLocal, migLocal := h.deliverLocalUsersForMask(cl, localNode, tag, channelID, channelType, []*eventbus.Event{ev}, localDeliv)
 				if localLeased && hasWMKey {
-					h.seqTracker.FinishSlotStage(wmKey, StageLocalDistribute, ev.MessageSeq, localDeliv, succLocal, localMask)
+					effectiveLocalAll := localMask
+					if hasTopologyUnknown {
+						effectiveLocalAll = eventbus.SlotBitset{}
+					}
+					h.seqTracker.FinishSlotStage(wmKey, StageLocalDistribute, ev.MessageSeq, localDeliv, succLocal, effectiveLocalAll)
 				}
 				remOutside = remOutside.Or(migLocal).Or(localDeliv.AndNot(succLocal))
-			} else if hasWMKey && !h.seqTracker.HasCommitted(wmKey, StageLocalDistribute, ev.MessageSeq) {
+			} else if st != StageBeginAlreadyCommitted {
 				remOutside = remOutside.Or(localReq)
 			}
 		}
-		if remOutside.IsZero() {
+		if remOutside.IsZero() && !hasTopologyUnknown {
 			return eventbus.SlotBitset{}, allRecipientSlots, true
 		}
-		// Remaining migrated slots must be re-routed via channel slot leader.
 		clone := ev.Clone()
 		clone.Type = eventbus.EventChannelDistribute
 		clone.TagKey = ""
@@ -740,20 +905,22 @@ func (h *Handler) executeSingleEventDistributeRecovery(
 		if err := h.distributePersistedToRemoteNode(ctx, slotLeaderID, channelID, channelType, []*eventbus.Event{clone}, remOutside); err != nil {
 			return remOutside, allRecipientSlots, false
 		}
-		return eventbus.SlotBitset{}, allRecipientSlots, true
+		return eventbus.SlotBitset{}, allRecipientSlots, !hasTopologyUnknown
 	}
 
 	// Local node IS channel slot leader:
 	deliverMask := reqMask
 	leased := false
 	if hasWMKey {
-		deliverMask, leased = h.seqTracker.BeginSlotStage(wmKey, StageChannelDistribute, ev.MessageSeq, reqMask)
-		if !leased || deliverMask.IsZero() {
-			if h.seqTracker.HasCommitted(wmKey, StageChannelDistribute, ev.MessageSeq) {
-				return eventbus.SlotBitset{}, allRecipientSlots, true
-			}
+		var st StageBeginStatus
+		deliverMask, st = h.seqTracker.BeginSlotStageChecked(wmKey, StageChannelDistribute, ev.MessageSeq, reqMask)
+		if st == StageBeginAlreadyCommitted && !hasTopologyUnknown {
+			return eventbus.SlotBitset{}, allRecipientSlots, true
+		}
+		if st != StageBeginLeased || deliverMask.IsZero() {
 			return reqMask, allRecipientSlots, false
 		}
+		leased = true
 	}
 
 	var succeeded eventbus.SlotBitset
@@ -780,25 +947,35 @@ func (h *Handler) executeSingleEventDistributeRecovery(
 	if !evLocalReq.IsZero() {
 		localDeliv := evLocalReq
 		localLeased := false
+		var st StageBeginStatus = StageBeginLeased
 		if hasWMKey {
-			localDeliv, localLeased = h.seqTracker.BeginSlotStage(wmKey, StageLocalDistribute, ev.MessageSeq, evLocalReq)
+			localDeliv, st = h.seqTracker.BeginSlotStageChecked(wmKey, StageLocalDistribute, ev.MessageSeq, evLocalReq)
+			localLeased = st == StageBeginLeased
 		}
 		if !hasWMKey || (localLeased && !localDeliv.IsZero()) {
 			succLocal, _ := h.deliverLocalUsersForMask(cl, localNode, tag, channelID, channelType, []*eventbus.Event{ev}, localDeliv)
 			if localLeased && hasWMKey {
-				h.seqTracker.FinishSlotStage(wmKey, StageLocalDistribute, ev.MessageSeq, localDeliv, succLocal, localMask)
+				effectiveLocalAll := localMask
+				if hasTopologyUnknown {
+					effectiveLocalAll = eventbus.SlotBitset{}
+				}
+				h.seqTracker.FinishSlotStage(wmKey, StageLocalDistribute, ev.MessageSeq, localDeliv, succLocal, effectiveLocalAll)
 			}
 			succeeded = succeeded.Or(succLocal).Or(evLocalReq.AndNot(localDeliv))
-		} else if hasWMKey && h.seqTracker.HasCommitted(wmKey, StageLocalDistribute, ev.MessageSeq) {
+		} else if st == StageBeginAlreadyCommitted {
 			succeeded = succeeded.Or(evLocalReq)
 		}
 	}
 
 	if leased && hasWMKey {
-		h.seqTracker.FinishSlotStage(wmKey, StageChannelDistribute, ev.MessageSeq, deliverMask, succeeded, allRecipientSlots)
+		effectiveAll := allRecipientSlots
+		if hasTopologyUnknown {
+			effectiveAll = eventbus.SlotBitset{}
+		}
+		h.seqTracker.FinishSlotStage(wmKey, StageChannelDistribute, ev.MessageSeq, deliverMask, succeeded, effectiveAll)
 	}
 	failed := deliverMask.AndNot(succeeded)
-	return failed, allRecipientSlots, failed.IsZero()
+	return failed, allRecipientSlots, failed.IsZero() && !hasTopologyUnknown
 }
 
 // distributeTransientByTag handles MessageSeq == 0 (NoPersist / online CMD) events using the base transport.
@@ -813,8 +990,11 @@ func (h *Handler) distributeTransientByTag(slotLeaderId uint64, tag *types.Tag, 
 		}
 	}
 	cl := h.cluster()
-	_, nodeMasks := computeTagSlotTopology(cl, tag)
+	_, nodeMasks, _ := computeTagSlotTopologyChecked(cl, tag)
 	localMask := nodeMasks[localNode]
+	if cl == nil {
+		localMask.Set(0)
+	}
 	if !localMask.IsZero() {
 		_, _ = h.deliverLocalUsersForMask(cl, localNode, tag, channelId, channelType, events, localMask)
 	}

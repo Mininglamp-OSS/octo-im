@@ -185,9 +185,9 @@ func (a *realChannelClusterAdapter) RequestWithContext(ctx context.Context, toNo
 			status := peer.eb.chHandler.AcceptForward(body)
 			return &proto.Response{Status: status}, nil
 		case "/wk/ingress/allowSend":
-			if len(body) >= 3 && body[0] == 0xff && body[1] == 0xff {
-				dec := wkproto.NewDecoder(body[3:])
-				switch body[2] {
+			if op, payload, ok := service.DecodeExtendedAllowSendHeader(body); ok {
+				dec := wkproto.NewDecoder(payload)
+				switch op {
 				case 1:
 					chId, _ := dec.String()
 					chType, _ := dec.Uint8()

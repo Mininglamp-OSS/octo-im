@@ -41,8 +41,9 @@ type Server struct {
 	// 槽分布式服务
 	slotServer *slot.Server
 	// channel分布式服务
-	channelServer    *channel.Server
-	configReconciler *channelConfigReconciler
+	channelServer       *channel.Server
+	configReconciler    *channelConfigReconciler
+	configReconcilerPtr atomic.Pointer[channelConfigReconciler]
 	// 分布式存储
 	store *store.Store
 	// 节点管理
@@ -282,13 +283,13 @@ func (s *Server) Start() error {
 	if join { // 需要加入集群
 		s.stopper.RunWorker(s.joinLoop)
 	}
-	s.configReconciler.start()
+	s.getConfigReconciler().start()
 
 	return nil
 }
 
 func (s *Server) Stop() {
-	s.configReconciler.stop()
+	s.getConfigReconciler().stop()
 	s.stopper.Stop()
 	s.eventServer.Stop()
 	s.cfgServer.Stop()
@@ -333,7 +334,7 @@ func (s *Server) GetStore() *store.Store {
 
 // 配置改变
 func (s *Server) OnConfigChange(cfg *types.Config) {
-	s.configReconciler.rescan()
+	s.getConfigReconciler().rescan()
 
 	nodeMap := make(map[uint64]string)
 	for _, node := range cfg.Nodes {

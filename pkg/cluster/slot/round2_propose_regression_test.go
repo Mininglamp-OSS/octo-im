@@ -115,3 +115,63 @@ func TestRound2_BFR2_3_SlotProposeEmptyRespContextDeadlineAndNoStaleForward(t *t
 	require.Equal(t, uint64(10), resp.Index)
 	require.Equal(t, beforeCalls+1, rpcStub.calls.Load(), "general ProposeUntilApplied must forward to remote slot leader")
 }
+
+type transientHandoffMockSlotRPC struct {
+	icluster.RPC
+	calls atomic.Int32
+}
+
+func (r *transientHandoffMockSlotRPC) RequestSlotProposeBatchUntilAppliedWithContext(ctx context.Context, nodeId uint64, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+	n := r.calls.Add(1)
+	if n <= 3 {
+		return nil, context.DeadlineExceeded
+	}
+	return types.ProposeRespSet{{Id: reqs[0].Id, Index: 42}}, nil
+}
+
+type receiveProposeErrMockSlotRPC struct {
+	icluster.RPC
+	calls atomic.Int32
+}
+
+func (r *receiveProposeErrMockSlotRPC) RequestSlotProposeBatchUntilAppliedWithContext(ctx context.Context, nodeId uint64, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
+	n := r.calls.Add(1)
+	if n <= 3 {
+		return nil, &slotRPCErrorString{msg: "rpc request failed, status: 1, err: receive propose resp error"}
+	}
+	return types.ProposeRespSet{{Id: reqs[0].Id, Index: 88}}, nil
+}
+
+type slotRPCErrorString struct{ msg string }
+
+func (e *slotRPCErrorString) Error() string { return e.msg }
+
+func TestXIN2854_V2_SlotProposeRetriesRemoteHandoffReceiveProposeRespError(t *testing.T) {
+	dir := t.TempDir()
+	nodeStub := &round2MockSlotNode{
+		slot: &clustertypes.Slot{
+			Id:          12,
+			Leader:      1003,
+			MigrateFrom: 1002,
+			MigrateTo:   1003,
+			Replicas:    []uint64{1001, 1002, 1003},
+			Term:        2,
+		},
+	}
+	rpcStub := &receiveProposeErrMockSlotRPC{}
+	srv := NewServer(NewOptions(
+		WithNodeId(1002),
+		WithDataDir(dir),
+		WithSlotDbShardNum(1),
+		WithNode(nodeStub),
+		WithRPC(rpcStub),
+	))
+	require.NoError(t, srv.Start())
+	defer srv.Stop()
+
+	resp, err := srv.ProposeUntilApplied(12, []byte("device-token-update"))
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, uint64(88), resp.Index)
+	require.Equal(t, int32(4), rpcStub.calls.Load())
+}

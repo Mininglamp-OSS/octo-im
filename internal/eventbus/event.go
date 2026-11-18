@@ -76,6 +76,16 @@ func (e EventType) Uint8() uint8 {
 	return uint8(e)
 }
 
+type PostCommitStageStatus uint8
+
+const (
+	StageStatusPending PostCommitStageStatus = iota
+	StageStatusRunning
+	StageStatusRetryOwned
+	StageStatusCompleted
+	StageStatusNotRequired
+)
+
 type Event struct {
 	// Forwarding metadata is carried by the versioned RPC envelope, not legacy events.
 	ForwardDeadline int64
@@ -104,11 +114,25 @@ type Event struct {
 	PresenceReconciled bool
 
 	// Post-commit Part A tracking fields (Ticket is never implicitly copied by Clone).
-	HasTargetSlotMask bool
-	TargetSlotMask    SlotBitset
-	Ticket            *PostCommitTicket
-	PluginDone        bool
-	WebhookDone       bool
+	HasTargetSlotMask  bool
+	TargetSlotMask     SlotBitset
+	Ticket             *PostCommitTicket
+	PluginDone         bool
+	WebhookDone        bool
+	HasStageMeta       bool
+	PluginStageStatus  PostCommitStageStatus
+	WebhookStageStatus PostCommitStageStatus
+	StageOwnerNodeId   uint64
+	StageOwnerGen      uint32
+}
+
+func (e *Event) MoveTicket() *PostCommitTicket {
+	if e == nil {
+		return nil
+	}
+	tk := e.Ticket
+	e.Ticket = nil
+	return tk
 }
 
 func (e *Event) Clone() *Event {
@@ -137,6 +161,11 @@ func (e *Event) Clone() *Event {
 		TargetSlotMask:            e.TargetSlotMask.Clone(),
 		PluginDone:                e.PluginDone,
 		WebhookDone:               e.WebhookDone,
+		HasStageMeta:              e.HasStageMeta,
+		PluginStageStatus:         e.PluginStageStatus,
+		WebhookStageStatus:        e.WebhookStageStatus,
+		StageOwnerNodeId:          e.StageOwnerNodeId,
+		StageOwnerGen:             e.StageOwnerGen,
 	}
 }
 
@@ -149,6 +178,22 @@ func (e *Event) MergeRecoveryFlagsFrom(other *Event) {
 	}
 	if other.WebhookDone {
 		e.WebhookDone = true
+	}
+	if other.HasStageMeta {
+		e.HasStageMeta = true
+	}
+	if other.PluginStageStatus > e.PluginStageStatus {
+		e.PluginStageStatus = other.PluginStageStatus
+	}
+	if other.WebhookStageStatus > e.WebhookStageStatus {
+		e.WebhookStageStatus = other.WebhookStageStatus
+	}
+	if e.StageOwnerNodeId == 0 && other.StageOwnerNodeId != 0 {
+		e.StageOwnerNodeId = other.StageOwnerNodeId
+		e.StageOwnerGen = other.StageOwnerGen
+	} else if other.StageOwnerGen > e.StageOwnerGen {
+		e.StageOwnerNodeId = other.StageOwnerNodeId
+		e.StageOwnerGen = other.StageOwnerGen
 	}
 	if e.TagKey == "" && other.TagKey != "" {
 		e.TagKey = other.TagKey

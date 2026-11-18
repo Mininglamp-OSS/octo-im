@@ -946,14 +946,28 @@ func TestRound3_BFR3_3_RemoteSlotPermissionWireDuplicateAndForwardGate(t *testin
 		return onSendCount.Load() == 1 && distributeCount.Load() == 1
 	}, 2*time.Second, 10*time.Millisecond, "deferred EventChannelOnSend and EventChannelDistribute must automatically retry once slotLeaderId resolves")
 
-	// Also verify Handler.OnEvent with saturated forwardGate still forwards already-persisted events (MessageSeq > 0).
+	// Also verify Handler.OnEvent with persisted events (MessageSeq > 0) under B5:
+	// while remote slot leader 1002 lacks confirmed forward admission (StatusNotFound -> PeerCapUnsupported),
+	// fire-and-forget Send is NOT treated as completed and the item stays retained in RecoveryManager until
+	// 1002 upgrades to support confirmed /wk/forward/channel/v1 admission.
 	var forwardedLegacy atomic.Int32
+	var peerUpgraded atomic.Bool
+	var confirmedAccepted atomic.Int32
 	service.Cluster = &r3ClusterWithRPC{
 		realChannelClusterAdapter: adapter,
 		slotLeaderIdFn: func(channelId string, channelType uint8) (uint64, error) {
 			return 1002, nil
 		},
 		requestFn: func(ctx context.Context, toNodeId uint64, path string, body []byte) (*proto.Response, error) {
+			if peerUpgraded.Load() {
+				if path == forward.CapabilityPath {
+					return &proto.Response{Status: proto.StatusOK, Body: []byte("WKF2\x01")}, nil
+				}
+				if path == forward.ChannelPath {
+					confirmedAccepted.Add(1)
+					return &proto.Response{Status: proto.StatusOK}, nil
+				}
+			}
 			return &proto.Response{Status: proto.StatusNotFound}, nil
 		},
 		sendFn: func(toNodeId uint64, msg *proto.Message) error {
@@ -980,7 +994,16 @@ func TestRound3_BFR3_3_RemoteSlotPermissionWireDuplicateAndForwardGate(t *testin
 			},
 		},
 	})
-	require.Equal(t, int32(1), forwardedLegacy.Load(), "already-persisted event batch must be forwarded to remote slot leader")
+	require.Zero(t, forwardedLegacy.Load(), "B5: persisted event batch must not treat unacknowledged fire-and-forget Send as completed")
+	recCh, recItems, _, _ := chHandler.InspectRecoveryQueue()
+	require.Equal(t, 1, recCh)
+	require.Equal(t, 1, recItems)
+
+	peerUpgraded.Store(true)
+	chHandler.TriggerPersistedRecovery()
+	require.Eventually(t, func() bool {
+		return confirmedAccepted.Load() == 1
+	}, 2*time.Second, 10*time.Millisecond, "persisted event batch must be delivered once remote slot leader supports confirmed forward admission")
 }
 
 type r3EventHandler struct {
@@ -2372,14 +2395,16 @@ func TestRound6_BFR6_2_LegacyPeerTrustAndCmdChannelBanDisbandAndReplicaFailClose
 			return 1003, nil
 		},
 		requestFn: func(ctx context.Context, toNodeId uint64, path string, body []byte) (*proto.Response, error) {
-			if path == "/wk/ingress/allowSend" && len(body) >= 3 && body[0] == 0xff && body[1] == 0xff && body[2] == 1 {
-				dec := wkproto.NewDecoder(body[3:])
-				chId, _ := dec.String()
-				upgradedCheckedCh.Store(chId)
-				if chId == "g_upgraded_banned" {
-					return &proto.Response{Status: proto.StatusOK, Body: []byte{1, byte(wkproto.ReasonBan)}}, nil
+			if path == "/wk/ingress/allowSend" {
+				if op, payload, ok := service.DecodeExtendedAllowSendHeader(body); ok && op == 1 {
+					dec := wkproto.NewDecoder(payload)
+					chId, _ := dec.String()
+					upgradedCheckedCh.Store(chId)
+					if chId == "g_upgraded_banned" {
+						return &proto.Response{Status: proto.StatusOK, Body: []byte{1, byte(wkproto.ReasonBan)}}, nil
+					}
+					return &proto.Response{Status: proto.StatusOK, Body: []byte{1, byte(wkproto.ReasonSuccess)}}, nil
 				}
-				return &proto.Response{Status: proto.StatusOK, Body: []byte{1, byte(wkproto.ReasonSuccess)}}, nil
 			}
 			return &proto.Response{Status: proto.StatusOK}, nil
 		},

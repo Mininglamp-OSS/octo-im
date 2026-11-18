@@ -335,7 +335,7 @@ func persistHTTPChannelMessages(ctx context.Context, fakeChannelId string, chann
 
 	delay := 15 * time.Millisecond
 	var lastErr error
-	for attempt := 0; attempt < 8; attempt++ {
+	for attempt := 0; attempt < 24; attempt++ {
 		if err := deadlineCtx.Err(); err != nil {
 			if lastErr != nil {
 				return lastErr
@@ -360,7 +360,7 @@ func persistHTTPChannelMessages(ctx context.Context, fakeChannelId string, chann
 		}
 		lastErr = err
 		retryable := clusterchannel.IsRetryableSendError(err) && !clusterchannel.IsAmbiguousSendError(err)
-		if !retryable || attempt == 7 {
+		if !retryable || attempt == 23 {
 			return err
 		}
 		select {

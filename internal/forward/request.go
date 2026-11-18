@@ -33,6 +33,7 @@ const (
 var (
 	ErrUnavailable    = errors.New("event forwarding unavailable")
 	ErrOutcomeUnknown = errors.New("event forwarding outcome unknown")
+	ErrPeerNoAck      = errors.New("peer does not provide confirmed forward admission (no ACK)")
 
 	capabilityV2Magic = [4]byte{'W', 'K', 'F', '2'}
 )
@@ -46,8 +47,21 @@ const (
 	PeerCapUnsupported
 )
 
+// ForwardOutcome explicitly distinguishes confirmed admission from retryable rejection,
+// ambiguous transport failure, and unsupported no-ACK peers (B5).
+type ForwardOutcome uint8
+
+const (
+	ForwardAccepted ForwardOutcome = iota + 1
+	ForwardExplicitRetry
+	ForwardOutcomeUnknown
+	ForwardUnsupportedPeerNoAck
+)
+
 type capabilityEntry struct {
+	nodeID    uint64
 	mode      PeerCapMode
+	version   uint8
 	expiresAt time.Time
 }
 
@@ -134,6 +148,15 @@ func (c *CapabilityCache) InvalidateAll() {
 	c.mu.Unlock()
 }
 
+func (c *CapabilityCache) InvalidateNode(node uint64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.entries, node)
+	c.mu.Unlock()
+}
+
 func (c *CapabilityCache) ProbeOn(ctx context.Context, cl icluster.ICluster, node uint64) PeerCapMode {
 	if c == nil {
 		return PeerCapUnknown
@@ -146,7 +169,7 @@ func (c *CapabilityCache) ProbeOn(ctx context.Context, cl icluster.ICluster, nod
 	}
 	now := time.Now()
 	c.mu.Lock()
-	if entry, ok := c.entries[node]; ok && entry.mode != PeerCapUnknown && now.Before(entry.expiresAt) {
+	if entry, ok := c.entries[node]; ok && entry.nodeID == node && entry.mode != PeerCapUnknown && now.Before(entry.expiresAt) {
 		c.mu.Unlock()
 		return entry.mode
 	}
@@ -163,18 +186,25 @@ func (c *CapabilityCache) ProbeOn(ctx context.Context, cl icluster.ICluster, nod
 	}
 
 	var mode PeerCapMode
+	var ver uint8
 	ttl := 5 * time.Second
 	if resp.Status == proto.StatusOK {
-		if len(resp.Body) >= 5 &&
+		if len(resp.Body) == 0 {
+			mode = PeerCapBaseV1
+			ver = 0
+			ttl = 5 * time.Second
+		} else if len(resp.Body) == 5 &&
 			resp.Body[0] == capabilityV2Magic[0] &&
 			resp.Body[1] == capabilityV2Magic[1] &&
 			resp.Body[2] == capabilityV2Magic[2] &&
 			resp.Body[3] == capabilityV2Magic[3] &&
-			resp.Body[4] >= 1 {
+			resp.Body[4] == 1 {
 			mode = PeerCapPartAV2
+			ver = resp.Body[4]
 			ttl = 30 * time.Second
 		} else {
-			mode = PeerCapBaseV1
+			// Unknown non-empty capability payload or unsupported capability version fails closed (B5).
+			mode = PeerCapUnsupported
 			ttl = 5 * time.Second
 		}
 	} else {
@@ -186,7 +216,7 @@ func (c *CapabilityCache) ProbeOn(ctx context.Context, cl icluster.ICluster, nod
 	if c.entries == nil {
 		c.entries = make(map[uint64]capabilityEntry)
 	}
-	c.entries[node] = capabilityEntry{mode: mode, expiresAt: now.Add(ttl)}
+	c.entries[node] = capabilityEntry{nodeID: node, mode: mode, version: ver, expiresAt: now.Add(ttl)}
 	c.mu.Unlock()
 	return mode
 }
@@ -256,26 +286,46 @@ func Request(path string, body []byte, events []*eventbus.Event, target func() u
 }
 
 // RequestCompatible uses a read-only capability probe before any remote v1
-// admission. Legacy fallback is allowed only while no v1 outcome is ambiguous.
+// admission. Legacy fallback is allowed only while no v1 outcome is ambiguous
+// and only for pre-persistence events.
 func RequestCompatible(path string, body []byte, events []*eventbus.Event, target func() uint64, local uint64, accept func([]byte) proto.Status, capabilities *CapabilityCache, legacy func(uint64) error) error {
 	return RequestOnCluster(service.Cluster, path, body, events, target, local, accept, capabilities, legacy)
 }
 
 func RequestOnCluster(cl icluster.ICluster, path string, body []byte, events []*eventbus.Event, target func() uint64, local uint64, accept func([]byte) proto.Status, capabilities *CapabilityCache, legacy func(uint64) error) error {
+	_, err := RequestDetailedOnCluster(cl, path, body, events, target, local, accept, capabilities, legacy)
+	return err
+}
+
+func RequestDetailedOnCluster(
+	cl icluster.ICluster,
+	path string,
+	body []byte,
+	events []*eventbus.Event,
+	target func() uint64,
+	local uint64,
+	accept func([]byte) proto.Status,
+	capabilities *CapabilityCache,
+	legacy func(uint64) error,
+) (ForwardOutcome, error) {
 	if cl == nil {
 		cl = service.Cluster
 	}
 	data, deadline, err := Envelope(body, events)
 	if err != nil {
-		return err
+		return ForwardExplicitRetry, err
 	}
 	persisted := batchHasPersistedEvent(events)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	zeroTargets := 0
+	sawNoAckPeer := false
 	for attempt := 0; attempt < 6; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			if sawNoAckPeer {
+				return ForwardUnsupportedPeerNoAck, fmt.Errorf("%w: %v", ErrPeerNoAck, err)
+			}
+			return ForwardExplicitRetry, err
 		}
 		node := target()
 		status := StatusRetry
@@ -285,24 +335,32 @@ func RequestOnCluster(cl icluster.ICluster, path string, body []byte, events []*
 		} else if node != 0 {
 			zeroTargets = 0
 			if cl == nil {
-				return ErrUnavailable
+				return ForwardExplicitRetry, ErrUnavailable
 			}
 			if capabilities != nil {
 				mode := capabilities.ProbeOn(ctx, cl, node)
 				if mode != PeerCapBaseV1 && mode != PeerCapPartAV2 {
 					if err := ctx.Err(); err != nil {
-						return err
+						if persisted {
+							return ForwardUnsupportedPeerNoAck, fmt.Errorf("%w: %v", ErrPeerNoAck, err)
+						}
+						return ForwardExplicitRetry, err
 					}
-					// V12-3: Never downgrade persisted (MessageSeq > 0) events to fire-and-forget legacy Send on PeerCapUnknown.
+					// B5 + V12-3: Never downgrade persisted (MessageSeq > 0) events to fire-and-forget legacy Send
+					// on PeerCapUnknown or PeerCapUnsupported. Send-only success is NOT confirmed admission.
 					if persisted {
-						if mode == PeerCapUnsupported && legacy != nil {
-							return legacy(node)
+						sawNoAckPeer = true
+						if mode == PeerCapUnsupported {
+							return ForwardUnsupportedPeerNoAck, fmt.Errorf("%w: peer %d does not support confirmed forward admission", ErrPeerNoAck, node)
 						}
 						status = StatusRetry
 						goto nextAttempt
 					}
 					if legacy != nil {
-						return legacy(node)
+						if lErr := legacy(node); lErr != nil {
+							return ForwardExplicitRetry, lErr
+						}
+						return ForwardAccepted, nil
 					}
 					status = StatusRetry
 					goto nextAttempt
@@ -312,22 +370,21 @@ func RequestOnCluster(cl icluster.ICluster, path string, body []byte, events []*
 			resp, requestErr := cl.RequestWithContext(attemptCtx, node, path, data)
 			done()
 			if requestErr != nil || resp == nil {
-				return fmt.Errorf("%w: request outcome unknown", ErrOutcomeUnknown)
-			} else {
-				status = resp.Status
+				return ForwardOutcomeUnknown, fmt.Errorf("%w: request outcome unknown", ErrOutcomeUnknown)
 			}
+			status = resp.Status
 		} else {
 			zeroTargets++
 			if zeroTargets >= 2 {
-				return ErrUnavailable
+				return ForwardExplicitRetry, ErrUnavailable
 			}
 		}
 	nextAttempt:
 		if status == proto.StatusOK {
-			return nil
+			return ForwardAccepted, nil
 		}
 		if status != StatusRetry {
-			return fmt.Errorf("%w: status %d", ErrUnavailable, status)
+			return ForwardExplicitRetry, fmt.Errorf("%w: status %d", ErrUnavailable, status)
 		}
 		if attempt == 5 {
 			break
@@ -336,11 +393,17 @@ func RequestOnCluster(cl icluster.ICluster, path string, body []byte, events []*
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			if sawNoAckPeer {
+				return ForwardUnsupportedPeerNoAck, fmt.Errorf("%w: %v", ErrPeerNoAck, ctx.Err())
+			}
+			return ForwardExplicitRetry, ctx.Err()
 		case <-timer.C:
 		}
 	}
-	return ErrUnavailable
+	if sawNoAckPeer {
+		return ForwardUnsupportedPeerNoAck, fmt.Errorf("%w: peer capability unconfirmed", ErrPeerNoAck)
+	}
+	return ForwardExplicitRetry, ErrUnavailable
 }
 
 // Fail only answers pre-persistence SEND events. A post-commit distribution

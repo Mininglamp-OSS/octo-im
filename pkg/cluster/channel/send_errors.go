@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 )
@@ -13,6 +14,20 @@ var (
 	ErrSendOutcomeUnknown = errors.New("channel send outcome unknown")
 )
 
+func isTransientPreSendWireError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connect not authed") ||
+		strings.Contains(msg, "conn is nil") ||
+		strings.Contains(msg, "connect is not connected") ||
+		strings.Contains(msg, "node not found") ||
+		strings.Contains(msg, "raftgroup: stopped") ||
+		strings.Contains(msg, "raft group stopped") ||
+		strings.Contains(msg, "is stopped")
+}
+
 // IsRetryableSendError classifies availability failures without making content
 // conflicts or malformed results retryable. It never implies a write was absent.
 func IsRetryableSendError(err error) bool {
@@ -20,7 +35,8 @@ func IsRetryableSendError(err error) bool {
 	return errors.Is(err, ErrSendUnavailable) || errors.Is(err, ErrSendOutcomeUnknown) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, context.Canceled) || errors.Is(err, types.ErrNotLeader) ||
 		errors.Is(err, types.ErrStopped) || errors.Is(err, types.ErrPaused) ||
-		errors.Is(err, types.ErrProposalDropped) || errors.Is(err, ErrNoLeader) || errors.As(err, &networkError)
+		errors.Is(err, types.ErrProposalDropped) || errors.Is(err, ErrNoLeader) || errors.As(err, &networkError) ||
+		isTransientPreSendWireError(err)
 }
 
 // IsAmbiguousSendError reports failures that can happen after a proposal or

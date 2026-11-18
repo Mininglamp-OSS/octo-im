@@ -165,8 +165,14 @@ func (r *rpcServer) handleChannelConfig(c *wkserver.Context) {
 		c.WriteErr(err)
 		return
 	}
-	cfg, err := r.s.db.GetChannelClusterConfig(req.channelId, req.channelType)
-	if err != nil && err != wkdb.ErrNotFound {
+	baseCtx := context.Background()
+	if r.s != nil && r.s.cancelCtx != nil {
+		baseCtx = r.s.cancelCtx
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, r.s.conversationReadTimeout())
+	defer cancel()
+	cfg, err := r.s.loadConversationConfigLocal(ctx, req.channelId, req.channelType)
+	if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
 		r.Error("get channel config failed", zap.Error(err))
 		c.WriteErr(err)
 		return

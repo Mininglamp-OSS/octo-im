@@ -193,9 +193,9 @@ func (i *Ingress) handleGetTag(c *wkserver.Context) {
 
 func (i *Ingress) handleAllowSend(ctx *wkserver.Context) {
 	body := ctx.Body()
-	if len(body) >= 3 && body[0] == 0xff && body[1] == 0xff {
-		dec := wkproto.NewDecoder(body[3:])
-		switch body[2] {
+	if op, payload, ok := service.DecodeExtendedAllowSendHeader(body); ok {
+		dec := wkproto.NewDecoder(payload)
+		switch op {
 		case 1:
 			channelId, err := dec.String()
 			if err != nil {

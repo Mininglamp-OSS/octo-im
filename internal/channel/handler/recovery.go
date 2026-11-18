@@ -12,11 +12,14 @@ import (
 )
 
 const (
-	MaxActiveRecoveryAttempts = 6
-	recoveryBaseBackoff       = 50 * time.Millisecond
-	recoveryMaxActiveBackoff  = 1600 * time.Millisecond
-	recoveryCooldownBackoff   = 5 * time.Second
-	maxRecoveryWorkers        = 4
+	MaxActiveRecoveryAttempts    = 6
+	recoveryBaseBackoff          = 50 * time.Millisecond
+	recoveryMaxActiveBackoff     = 1600 * time.Millisecond
+	recoveryCooldownBackoff      = 5 * time.Second
+	maxRecoveryWorkers           = 4
+	DefaultMaxRecoveryItems      = int(eventbus.MaxPostCommitItems + eventbus.MaxLegacyInboundItems)
+	DefaultMaxRecoveryMetaBytes  = int64(8 * 1024 * 1024)
+	perRecoveryItemBaseMetaBytes = int64(256)
 )
 
 // RecoveryStage identifies which post-commit side-effect stage is owed recovery.
@@ -29,6 +32,19 @@ const (
 	RecoveryStageDistribute     RecoveryStage = 4 // Stage 2/3: Remote/local per-user-slot distribution
 )
 
+// EnqueueResult explicitly reports the outcome and ticket ownership disposition of RecoveryManager.EnqueueWithResult (B7).
+// Ticket ownership moves to RecoveryManager ONLY on EnqueueInserted or EnqueueMerged; on any failure result
+// (EnqueueBackpressure, EnqueueStopped, EnqueueInvalid), ev.Ticket remains untouched on the caller's Event.
+type EnqueueResult uint8
+
+const (
+	EnqueueInserted EnqueueResult = iota + 1
+	EnqueueMerged
+	EnqueueBackpressure
+	EnqueueStopped
+	EnqueueInvalid
+)
+
 type RecoveryItem struct {
 	Seq               uint64
 	Stage             RecoveryStage
@@ -38,7 +54,9 @@ type RecoveryItem struct {
 	Ticket            *eventbus.PostCommitTicket
 	Attempts          uint8
 	TotalAttempts     uint32
+	EnqueuedAt        time.Time
 	NextRetryAt       time.Time
+	MetadataBytes     int64
 }
 
 type channelRecoveryEntry struct {
@@ -57,34 +75,63 @@ type leasedRecoveryBatch struct {
 
 type RecoveryExecutor func(ctx context.Context, channelID string, channelType uint8, item RecoveryItem) (remainingSlots eventbus.SlotBitset, allSlots eventbus.SlotBitset, updatedEv *eventbus.Event, done bool)
 
+type RecoveryDetailedMetrics struct {
+	ActiveChannels        int
+	QueuedItems           int
+	InFlightItems         int
+	QueuedMetadataBytes   int64
+	InFlightMetadataBytes int64
+	EnqueueRejectedTotal  uint64
+	CooldownProbesTotal   uint64
+	OldestPendingAge      time.Duration
+}
+
 type RecoveryManager struct {
-	mu                  sync.Mutex
-	entries             map[ChannelWatermarkKey]*channelRecoveryEntry
-	totalItems          int
-	inFlightItems       int
-	inFlightChannels    int
-	stopped             bool
-	timer               *time.Timer
-	wakeCh              chan struct{}
-	stopCh              chan struct{}
-	workerCtx           context.Context
-	workerCancel        context.CancelFunc
-	wg                  sync.WaitGroup
-	startedOnce         sync.Once
-	exec                RecoveryExecutor
-	cooldownProbesTotal atomic.Uint64
+	mu                    sync.Mutex
+	cycleMu               sync.Mutex
+	entries               map[ChannelWatermarkKey]*channelRecoveryEntry
+	totalItems            int
+	inFlightItems         int
+	inFlightChannels      int
+	queuedMetadataBytes   int64
+	inFlightMetadataBytes int64
+	maxItems              int
+	maxMetadataBytes      int64
+	stopped               bool
+	timer                 *time.Timer
+	wakeCh                chan struct{}
+	stopCh                chan struct{}
+	workerCtx             context.Context
+	workerCancel          context.CancelFunc
+	wg                    sync.WaitGroup
+	startedOnce           sync.Once
+	exec                  RecoveryExecutor
+	cooldownProbesTotal   atomic.Uint64
+	enqueueRejectedTotal  atomic.Uint64
 }
 
 func NewRecoveryManager(exec RecoveryExecutor) *RecoveryManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &RecoveryManager{
-		entries:      make(map[ChannelWatermarkKey]*channelRecoveryEntry, 64),
-		wakeCh:       make(chan struct{}, 1),
-		stopCh:       make(chan struct{}),
-		workerCtx:    ctx,
-		workerCancel: cancel,
-		exec:         exec,
+		entries:          make(map[ChannelWatermarkKey]*channelRecoveryEntry, 64),
+		maxItems:         DefaultMaxRecoveryItems,
+		maxMetadataBytes: DefaultMaxRecoveryMetaBytes,
+		wakeCh:           make(chan struct{}, 1),
+		stopCh:           make(chan struct{}),
+		workerCtx:        ctx,
+		workerCancel:     cancel,
+		exec:             exec,
 	}
+}
+
+func (m *RecoveryManager) SetCapacityLimits(maxItems int, maxMetadataBytes int64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.maxItems = maxItems
+	m.maxMetadataBytes = maxMetadataBytes
+	m.mu.Unlock()
 }
 
 func (m *RecoveryManager) ensureStarted() {
@@ -135,10 +182,15 @@ func insertRecoveryItemAt(items []RecoveryItem, idx int, item RecoveryItem) []Re
 	return items
 }
 
+// resolveMergedTickets merges two TicketHandles (A4):
+//   - If preferred and secondary are the SAME handle (SameHandle == true), keep preferred and do NOT release secondary
+//     (never inspect shared Entry.Refs() to guess same-stage duplicate retention).
+//   - If preferred and secondary are DISTINCT handles (either distinct entries or distinct handles on a shared entry),
+//     keep preferred and release secondary once.
 func resolveMergedTickets(preferred, secondary *eventbus.PostCommitTicket) (keep, release *eventbus.PostCommitTicket) {
 	if preferred != nil {
 		keep = preferred
-		if secondary != nil && (secondary != preferred || secondary.Refs() > 1) {
+		if secondary != nil && !preferred.SameHandle(secondary) {
 			release = secondary
 		}
 		return keep, release
@@ -146,44 +198,37 @@ func resolveMergedTickets(preferred, secondary *eventbus.PostCommitTicket) (keep
 	return secondary, nil
 }
 
-// Enqueue transfers ownership of ev.Ticket into RecoveryManager (clearing ev.Ticket on the caller's Event if still set)
-// or releases any redundant ticket safely outside m.mu if merged with an existing item or rejected after shutdown.
-func (m *RecoveryManager) Enqueue(
+// EnqueueWithResult enforces RecoveryManager as a mandatory budget boundary (B7):
+// 1. Validates ev.Ticket is non-nil and live BEFORE cloning ev or mutating ev.Ticket.
+// 2. Merges duplicate (channel, seq, stage) items in place without re-cloning SendPacket/Payload.
+// 3. Accounts queued + inFlight item count and metadata bytes (including sparse slot-mask capacity).
+// 4. Moves ev.Ticket ownership ONLY on EnqueueInserted or EnqueueMerged; on failure, ev.Ticket remains with the caller.
+func (m *RecoveryManager) EnqueueWithResult(
 	channelID string,
 	channelType uint8,
 	stage RecoveryStage,
 	pendingSlots eventbus.SlotBitset,
 	allRecipientSlots eventbus.SlotBitset,
 	ev *eventbus.Event,
-) bool {
+) EnqueueResult {
 	if m == nil || ev == nil || ev.MessageSeq == 0 {
-		if ev != nil && ev.Ticket != nil {
-			ev.Ticket.Release()
-			ev.Ticket = nil
+		if m != nil {
+			m.enqueueRejectedTotal.Add(1)
 		}
-		return false
+		return EnqueueInvalid
 	}
-	incomingTicket := ev.Ticket
-	ev.Ticket = nil
-
+	if ev.Ticket == nil || ev.Ticket.IsReleased() {
+		m.enqueueRejectedTotal.Add(1)
+		return EnqueueInvalid
+	}
 	k, ok := MakeChannelWatermarkKey(channelID, channelType)
 	if !ok {
-		if incomingTicket != nil {
-			incomingTicket.Release()
-		}
-		return false
+		m.enqueueRejectedTotal.Add(1)
+		return EnqueueInvalid
 	}
-
-	compacted := eventbus.CompactSendPayloadClone(ev)
-	compacted.Ticket = nil
-	if compacted.Conn == nil {
-		compacted.Conn = &eventbus.Conn{}
-	}
-	if sp, ok := compacted.Frame.(*wkproto.SendPacket); !ok || sp == nil {
-		if incomingTicket != nil {
-			incomingTicket.Release()
-		}
-		return false
+	if sp, ok := ev.Frame.(*wkproto.SendPacket); !ok || sp == nil {
+		m.enqueueRejectedTotal.Add(1)
+		return EnqueueInvalid
 	}
 
 	m.ensureStarted()
@@ -195,15 +240,110 @@ func (m *RecoveryManager) Enqueue(
 	m.mu.Lock()
 	if m.stopped {
 		m.mu.Unlock()
-		if incomingTicket != nil {
-			incomingTicket.Release()
-		}
-		return false
+		m.enqueueRejectedTotal.Add(1)
+		return EnqueueStopped
 	}
 	if m.entries == nil {
 		m.entries = make(map[ChannelWatermarkKey]*channelRecoveryEntry, 64)
 	}
 	entry := m.entries[k]
+	var (
+		idx   int
+		found bool
+	)
+	if entry != nil {
+		idx, found = findRecoveryItemIndex(entry.items, ev.MessageSeq, stage)
+	}
+
+	if found {
+		existing := &entry.items[idx]
+		mergedPending := existing.PendingSlots.Or(pendingSlots)
+		mergedAll := existing.AllRecipientSlots.Or(allRecipientSlots)
+		oldMaskBytes := existing.PendingSlots.ExtraHeapBytes() + existing.AllRecipientSlots.ExtraHeapBytes()
+		newMaskBytes := mergedPending.ExtraHeapBytes() + mergedAll.ExtraHeapBytes()
+		deltaBytes := newMaskBytes - oldMaskBytes
+		if deltaBytes > 0 {
+			if m.maxMetadataBytes > 0 && m.queuedMetadataBytes+m.inFlightMetadataBytes+deltaBytes > m.maxMetadataBytes {
+				m.mu.Unlock()
+				m.enqueueRejectedTotal.Add(1)
+				eventbus.RecoveryBackpressureTotal.Add(1)
+				return EnqueueBackpressure
+			}
+			chargeTarget := existing.Ticket
+			if chargeTarget == nil || chargeTarget.IsReleased() {
+				chargeTarget = ev.Ticket
+			}
+			if !chargeTarget.TryAddExtraBytes(deltaBytes) {
+				m.mu.Unlock()
+				m.enqueueRejectedTotal.Add(1)
+				eventbus.RecoveryBackpressureTotal.Add(1)
+				return EnqueueBackpressure
+			}
+		} else if deltaBytes < 0 && existing.Ticket != nil {
+			_ = existing.Ticket.TryAddExtraBytes(deltaBytes)
+		}
+
+		incomingTicket := ev.MoveTicket()
+		existing.PendingSlots = mergedPending
+		existing.AllRecipientSlots = mergedAll
+		existing.MetadataBytes += deltaBytes
+		m.queuedMetadataBytes += deltaBytes
+		if existing.Event == nil {
+			compacted := eventbus.CompactSendPayloadClone(ev)
+			compacted.Ticket = nil
+			if compacted.Conn == nil {
+				compacted.Conn = &eventbus.Conn{}
+			}
+			existing.Event = compacted
+		} else {
+			existing.Event.MergeRecoveryFlagsFrom(ev)
+		}
+		keep, rel := resolveMergedTickets(existing.Ticket, incomingTicket)
+		existing.Ticket = keep
+		releaseTicket = rel
+		m.armTimerLocked(now)
+		m.mu.Unlock()
+
+		if releaseTicket != nil {
+			releaseTicket.Release()
+		}
+		return EnqueueMerged
+	}
+
+	if m.maxItems > 0 && m.totalItems+m.inFlightItems >= m.maxItems {
+		m.mu.Unlock()
+		m.enqueueRejectedTotal.Add(1)
+		eventbus.RecoveryBackpressureTotal.Add(1)
+		return EnqueueBackpressure
+	}
+	clonedPending := pendingSlots.Clone()
+	clonedAll := allRecipientSlots.Clone()
+	maskExtraBytes := clonedPending.ExtraHeapBytes() + clonedAll.ExtraHeapBytes()
+	itemMetaBytes := perRecoveryItemBaseMetaBytes + maskExtraBytes
+	if m.maxMetadataBytes > 0 && m.queuedMetadataBytes+m.inFlightMetadataBytes+itemMetaBytes > m.maxMetadataBytes {
+		m.mu.Unlock()
+		m.enqueueRejectedTotal.Add(1)
+		eventbus.RecoveryBackpressureTotal.Add(1)
+		return EnqueueBackpressure
+	}
+	// Charge incremental mask bytes beyond the initial event.TargetSlotMask already charged in EstimatePostCommitEventBytes.
+	initialEvMaskBytes := ev.TargetSlotMask.ExtraHeapBytes()
+	if extraMaskDelta := maskExtraBytes - initialEvMaskBytes; extraMaskDelta > 0 {
+		if !ev.Ticket.TryAddExtraBytes(extraMaskDelta) {
+			m.mu.Unlock()
+			m.enqueueRejectedTotal.Add(1)
+			eventbus.RecoveryBackpressureTotal.Add(1)
+			return EnqueueBackpressure
+		}
+	}
+
+	incomingTicket := ev.MoveTicket()
+	compacted := eventbus.CompactSendPayloadClone(ev)
+	compacted.Ticket = nil
+	if compacted.Conn == nil {
+		compacted.Conn = &eventbus.Conn{}
+	}
+
 	if entry == nil {
 		entry = &channelRecoveryEntry{
 			key:         k,
@@ -212,41 +352,38 @@ func (m *RecoveryManager) Enqueue(
 		}
 		m.entries[k] = entry
 	}
-	idx, found := findRecoveryItemIndex(entry.items, compacted.MessageSeq, stage)
-	if found {
-		existing := &entry.items[idx]
-		existing.PendingSlots = existing.PendingSlots.Or(pendingSlots)
-		existing.AllRecipientSlots = existing.AllRecipientSlots.Or(allRecipientSlots)
-		if existing.Event == nil {
-			existing.Event = compacted
-		} else {
-			existing.Event.MergeRecoveryFlagsFrom(compacted)
-		}
-		keep, rel := resolveMergedTickets(existing.Ticket, incomingTicket)
-		existing.Ticket = keep
-		releaseTicket = rel
-	} else {
-		item := RecoveryItem{
-			Seq:               compacted.MessageSeq,
-			Stage:             stage,
-			PendingSlots:      pendingSlots.Clone(),
-			AllRecipientSlots: allRecipientSlots.Clone(),
-			Event:             compacted,
-			Ticket:            incomingTicket,
-			Attempts:          0,
-			TotalAttempts:     0,
-			NextRetryAt:       nextDue,
-		}
-		entry.items = insertRecoveryItemAt(entry.items, idx, item)
-		m.totalItems++
+	item := RecoveryItem{
+		Seq:               compacted.MessageSeq,
+		Stage:             stage,
+		PendingSlots:      clonedPending,
+		AllRecipientSlots: clonedAll,
+		Event:             compacted,
+		Ticket:            incomingTicket,
+		Attempts:          0,
+		TotalAttempts:     0,
+		EnqueuedAt:        now,
+		NextRetryAt:       nextDue,
+		MetadataBytes:     itemMetaBytes,
 	}
+	entry.items = insertRecoveryItemAt(entry.items, idx, item)
+	m.totalItems++
+	m.queuedMetadataBytes += itemMetaBytes
 	m.armTimerLocked(now)
 	m.mu.Unlock()
 
-	if releaseTicket != nil {
-		releaseTicket.Release()
-	}
-	return true
+	return EnqueueInserted
+}
+
+func (m *RecoveryManager) Enqueue(
+	channelID string,
+	channelType uint8,
+	stage RecoveryStage,
+	pendingSlots eventbus.SlotBitset,
+	allRecipientSlots eventbus.SlotBitset,
+	ev *eventbus.Event,
+) bool {
+	res := m.EnqueueWithResult(channelID, channelType, stage, pendingSlots, allRecipientSlots, ev)
+	return res == EnqueueInserted || res == EnqueueMerged
 }
 
 func (m *RecoveryManager) armTimerLocked(now time.Time) {
@@ -295,11 +432,13 @@ func (m *RecoveryManager) leaseReadyBatchesLocked(now time.Time) []leasedRecover
 	var batches []leasedRecoveryBatch
 	for k, entry := range m.entries {
 		var due []RecoveryItem
+		var dueMetaBytes int64
 		writeIdx := 0
 		for i := range entry.items {
 			it := entry.items[i]
 			if !now.Before(it.NextRetryAt) {
 				due = append(due, it)
+				dueMetaBytes += it.MetadataBytes
 			} else {
 				entry.items[writeIdx] = it
 				writeIdx++
@@ -317,6 +456,8 @@ func (m *RecoveryManager) leaseReadyBatchesLocked(now time.Time) []leasedRecover
 		}
 		m.totalItems -= len(due)
 		m.inFlightItems += len(due)
+		m.queuedMetadataBytes -= dueMetaBytes
+		m.inFlightMetadataBytes += dueMetaBytes
 		m.inFlightChannels++
 		batches = append(batches, leasedRecoveryBatch{
 			key:         k,
@@ -329,7 +470,7 @@ func (m *RecoveryManager) leaseReadyBatchesLocked(now time.Time) []leasedRecover
 	return batches
 }
 
-// completeRecoveryLease re-inserts or merges failed leased items and releases completed/superseded tickets outside m.mu (closing V13-1).
+// completeRecoveryLease re-inserts or merges failed leased items and releases completed/superseded tickets outside m.mu (closing V13-1 & A4).
 func (m *RecoveryManager) completeRecoveryLease(
 	b leasedRecoveryBatch,
 	failedItems []RecoveryItem,
@@ -342,9 +483,18 @@ func (m *RecoveryManager) completeRecoveryLease(
 		}
 	}
 
+	var batchMetaBytes int64
+	for i := range b.items {
+		batchMetaBytes += b.items[i].MetadataBytes
+	}
+
 	now := time.Now()
 	m.mu.Lock()
 	m.inFlightItems -= len(b.items)
+	m.inFlightMetadataBytes -= batchMetaBytes
+	if m.inFlightMetadataBytes < 0 {
+		m.inFlightMetadataBytes = 0
+	}
 	m.inFlightChannels--
 
 	if m.stopped {
@@ -381,17 +531,18 @@ func (m *RecoveryManager) completeRecoveryLease(
 				m.cooldownProbesTotal.Add(1)
 			}
 			fi.NextRetryAt = now.Add(backoffForRecoveryAttempt(fi.Attempts))
+			fi.MetadataBytes = perRecoveryItemBaseMetaBytes + fi.PendingSlots.ExtraHeapBytes() + fi.AllRecipientSlots.ExtraHeapBytes()
 
 			idx, found := findRecoveryItemIndex(entry.items, fi.Seq, fi.Stage)
 			if !found {
 				entry.items = insertRecoveryItemAt(entry.items, idx, fi)
 				m.totalItems++
+				m.queuedMetadataBytes += fi.MetadataBytes
 				continue
 			}
 
-			// V13-1 fix: concurrent duplicate item arrived while fi was leased.
-			// Keep exactly one live ticket on entry.items[idx] and release the superseded ticket outside m.mu.
 			concurrent := entry.items[idx]
+			m.queuedMetadataBytes -= concurrent.MetadataBytes
 			keepTicket, relTicket := resolveMergedTickets(fi.Ticket, concurrent.Ticket)
 			if relTicket != nil {
 				ticketsToRelease = append(ticketsToRelease, relTicket)
@@ -406,6 +557,11 @@ func (m *RecoveryManager) completeRecoveryLease(
 			fi.PendingSlots = concurrent.PendingSlots.Or(fi.PendingSlots)
 			fi.AllRecipientSlots = concurrent.AllRecipientSlots.Or(fi.AllRecipientSlots)
 			fi.Ticket = keepTicket
+			if !concurrent.EnqueuedAt.IsZero() && (fi.EnqueuedAt.IsZero() || concurrent.EnqueuedAt.Before(fi.EnqueuedAt)) {
+				fi.EnqueuedAt = concurrent.EnqueuedAt
+			}
+			fi.MetadataBytes = perRecoveryItemBaseMetaBytes + fi.PendingSlots.ExtraHeapBytes() + fi.AllRecipientSlots.ExtraHeapBytes()
+			m.queuedMetadataBytes += fi.MetadataBytes
 			entry.items[idx] = fi
 		}
 	}
@@ -448,6 +604,12 @@ func (m *RecoveryManager) executeBatch(ctx context.Context, b leasedRecoveryBatc
 }
 
 func (m *RecoveryManager) runDueCycle(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	m.cycleMu.Lock()
+	defer m.cycleMu.Unlock()
+
 	m.mu.Lock()
 	batches := m.leaseReadyBatchesLocked(time.Now())
 	m.mu.Unlock()
@@ -478,12 +640,12 @@ func (m *RecoveryManager) runDueCycle(ctx context.Context) {
 func (m *RecoveryManager) loop() {
 	defer m.wg.Done()
 	for {
-		m.runDueCycle(m.workerCtx)
 		select {
 		case <-m.wakeCh:
 		case <-m.stopCh:
 			return
 		}
+		m.runDueCycle(m.workerCtx)
 	}
 }
 
@@ -533,6 +695,39 @@ func (m *RecoveryManager) Inspect() (channels int, activeItems int, cooldownProb
 	return channels, activeItems, m.cooldownProbesTotal.Load()
 }
 
+func (m *RecoveryManager) InspectDetailed() RecoveryDetailedMetrics {
+	if m == nil {
+		return RecoveryDetailedMetrics{}
+	}
+	now := time.Now()
+	var oldest time.Time
+	m.mu.Lock()
+	for _, entry := range m.entries {
+		for i := range entry.items {
+			ts := entry.items[i].EnqueuedAt
+			if !ts.IsZero() && (oldest.IsZero() || ts.Before(oldest)) {
+				oldest = ts
+			}
+		}
+	}
+	var oldestAge time.Duration
+	if !oldest.IsZero() && now.After(oldest) {
+		oldestAge = now.Sub(oldest)
+	}
+	out := RecoveryDetailedMetrics{
+		ActiveChannels:        len(m.entries) + m.inFlightChannels,
+		QueuedItems:           m.totalItems,
+		InFlightItems:         m.inFlightItems,
+		QueuedMetadataBytes:   m.queuedMetadataBytes,
+		InFlightMetadataBytes: m.inFlightMetadataBytes,
+		EnqueueRejectedTotal:  m.enqueueRejectedTotal.Load(),
+		CooldownProbesTotal:   m.cooldownProbesTotal.Load(),
+		OldestPendingAge:      oldestAge,
+	}
+	m.mu.Unlock()
+	return out
+}
+
 func (m *RecoveryManager) DrainAndStop(timeout time.Duration) {
 	if m == nil {
 		return
@@ -577,6 +772,7 @@ func (m *RecoveryManager) DrainAndStop(timeout time.Duration) {
 		delete(m.entries, k)
 	}
 	m.totalItems = 0
+	m.queuedMetadataBytes = 0
 	m.mu.Unlock()
 
 	for _, tk := range ticketsToRelease {

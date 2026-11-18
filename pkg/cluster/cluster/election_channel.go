@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
@@ -49,12 +50,9 @@ func (s *Server) getOrCreateChannelClusterConfigAttempt(ctx context.Context, cha
 		s.Error("not slot leader", zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
 		return wkdb.EmptyChannelClusterConfig, errors.New("not slot leader")
 	}
-	if err := s.waitLocalSlotApplied(ctx, s.getSlotId(channelId)); err != nil {
-		return wkdb.EmptyChannelClusterConfig, err
-	}
 
-	cfg, err := s.db.GetChannelClusterConfig(channelId, channelType)
-	if err != nil && err != wkdb.ErrNotFound {
+	cfg, err := s.loadConversationConfigLocal(ctx, channelId, channelType)
+	if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
 		return wkdb.EmptyChannelClusterConfig, err
 	}
 
@@ -172,7 +170,7 @@ func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, err
 	if len(newReplicaIds) == 0 {
 		return false, nil
 	}
-	if s.configReconciler != nil && !s.configReconciler.tryAcquireMigration(channelConfigKey{id: cfg.ChannelId, typ: cfg.ChannelType}) {
+	if rec := s.getConfigReconciler(); rec != nil && !rec.tryAcquireMigration(channelConfigKey{id: cfg.ChannelId, typ: cfg.ChannelType}) {
 		return false, nil
 	}
 	// 打乱顺序，防止每次都是相同的节点加入
@@ -196,13 +194,25 @@ func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, err
 
 // 视情况是否需要变更领导节点
 func (s *Server) switchLeaderIfNeed(ctx context.Context, cfg *wkdb.ChannelClusterConfig) (bool, error) {
-	if cfg.LeaderId != 0 && s.cfgServer.NodeIsOnline(cfg.LeaderId) {
+	suspect := uint64(0)
+	if cfg != nil && cfg.LeaderId != 0 && cfg.LeaderId != s.opts.ConfigOptions.NodeId && !s.isPeerRPCAuthed(cfg.LeaderId) {
+		suspect = cfg.LeaderId
+	}
+	return s.switchLeaderIfNeedWithSuspect(ctx, cfg, suspect)
+}
+
+func (s *Server) switchLeaderIfNeedWithSuspect(ctx context.Context, cfg *wkdb.ChannelClusterConfig, suspectLeaderID uint64) (bool, error) {
+	leaderSuspectedDown := suspectLeaderID != 0 && cfg.LeaderId == suspectLeaderID && (!s.cfgServer.NodeIsOnline(suspectLeaderID) || !s.isPeerRPCAuthed(suspectLeaderID))
+	if cfg.LeaderId != 0 && s.cfgServer.NodeIsOnline(cfg.LeaderId) && !leaderSuspectedDown {
 		return false, nil
 	}
 
-	// 获得在线的副本
+	// 获得在线的副本（若 suspectLeaderID 的集群 RPC 连接已断开，不将其作为候选连接等待超时）
 	onlineRepics := make([]uint64, 0, len(cfg.Replicas))
 	for _, replicaId := range cfg.Replicas {
+		if leaderSuspectedDown && replicaId == suspectLeaderID && !s.isPeerRPCAuthed(replicaId) {
+			continue
+		}
 		if s.cfgServer.NodeIsOnline(replicaId) {
 			onlineRepics = append(onlineRepics, replicaId)
 		}
@@ -215,6 +225,89 @@ func (s *Server) switchLeaderIfNeed(ctx context.Context, cfg *wkdb.ChannelCluste
 		return false, err
 	}
 	return electChannelLeader(cfg, replicaLastLogInfos)
+}
+
+// MaintainExistingChannelLeader re-elects an existing channel's leader when reads observe
+// suspectLeaderID is unreachable/disconnected, without ever creating metadata for missing channels.
+func (s *Server) MaintainExistingChannelLeader(ctx context.Context, channelID string, channelType uint8, suspectLeaderID uint64) {
+	if s == nil || channelID == "" || channelType == 0 || suspectLeaderID == 0 {
+		return
+	}
+	mCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
+	defer cancel()
+
+	slotLeaderID, err := s.SlotLeaderIdOfChannel(channelID, channelType)
+	if err != nil || slotLeaderID == 0 {
+		return
+	}
+	if slotLeaderID != s.opts.ConfigOptions.NodeId {
+		// Verify channel already exists before asking remote slot leader to maintain it:
+		existing, lErr := s.LoadOnlyChannelClusterConfig(channelID, channelType)
+		if lErr != nil || wkdb.IsEmptyChannelClusterConfig(existing) || existing.LeaderId != suspectLeaderID {
+			return
+		}
+		// Ask remote slot leader to maintain/re-elect it (upgraded v2 peers re-elect immediately on !isPeerRPCAuthed):
+		remoteCfg, rErr := s.rpcClient.RequestGetOrCreateChannelClusterConfig(slotLeaderID, channelID, channelType)
+		if rErr != nil || wkdb.IsEmptyChannelClusterConfig(remoteCfg) || remoteCfg.LeaderId != suspectLeaderID || s.isPeerRPCAuthed(suspectLeaderID) {
+			return
+		}
+		// Legacy 21cd8f88 remote slot leader: its NodeIsOnline TTL has not expired yet, so elect among live
+		// voting replicas by majority log freshness and commit CMDChannelClusterConfigSave via the slot Raft log.
+		nextCfg := remoteCfg.Clone()
+		changed, cErr := s.switchLeaderIfNeedWithSuspect(mCtx, &nextCfg, suspectLeaderID)
+		if cErr != nil || !changed || s.slotServer == nil {
+			return
+		}
+		cfgBytes, mErr := nextCfg.Marshal()
+		if mErr != nil {
+			return
+		}
+		encBytes, eErr := store.EncodeCMDChannelClusterConfigSave(nextCfg.ChannelId, nextCfg.ChannelType, cfgBytes)
+		if eErr != nil {
+			return
+		}
+		cmdBytes, cMarshalErr := store.NewCMD(store.CMDChannelClusterConfigSave, encBytes).Marshal()
+		if cMarshalErr != nil {
+			return
+		}
+		slotID := s.getSlotId(channelID)
+		propResp, pErr := s.slotServer.ProposeUntilAppliedTimeout(mCtx, slotID, cmdBytes)
+		if pErr != nil || propResp == nil {
+			return
+		}
+		nextCfg.ConfVersion = propResp.Index
+		if nextCfg.LeaderId == s.opts.ConfigOptions.NodeId && s.channelServer != nil {
+			_, _ = s.reconcileLocalChannelConfig(mCtx, nextCfg)
+		} else if nextCfg.LeaderId != 0 && s.rpcClient != nil {
+			_ = s.rpcClient.RequestWakeLeaderIfNeed(nextCfg.LeaderId, nextCfg)
+		}
+		return
+	}
+
+	s.channelKeyLock.Lock(channelID)
+	defer s.channelKeyLock.Unlock(channelID)
+
+	cfg, err := s.loadConversationConfigLocal(mCtx, channelID, channelType)
+	if err != nil || wkdb.IsEmptyChannelClusterConfig(cfg) || cfg.LeaderId != suspectLeaderID {
+		return
+	}
+	s.hintChannelConfig(channelID, channelType)
+
+	nextCfg := cfg.Clone()
+	changed, err := s.switchLeaderIfNeedWithSuspect(mCtx, &nextCfg, suspectLeaderID)
+	if err != nil || !changed {
+		return
+	}
+	ver, err := s.saveChannelConfig(mCtx, nextCfg)
+	if err != nil {
+		return
+	}
+	nextCfg.ConfVersion = ver
+	if nextCfg.LeaderId == s.opts.ConfigOptions.NodeId && s.channelServer != nil {
+		_, _ = s.reconcileLocalChannelConfig(mCtx, nextCfg)
+	} else if nextCfg.LeaderId != 0 && s.rpcClient != nil {
+		_ = s.rpcClient.RequestWakeLeaderIfNeed(nextCfg.LeaderId, nextCfg)
+	}
 }
 
 // Only current voting replicas count. Desired capacity and learners do not

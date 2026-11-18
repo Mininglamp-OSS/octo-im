@@ -10,11 +10,30 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/types"
 	"github.com/WuKongIM/WuKongIM/internal/types/pluginproto"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
+
+func (h *Handler) ensureEventHasTicket(channelId string, e *eventbus.Event) *eventbus.PostCommitTicket {
+	if e == nil {
+		return nil
+	}
+	if e.Ticket != nil && !e.Ticket.IsReleased() {
+		return e.Ticket
+	}
+	if h == nil {
+		return nil
+	}
+	tks, ok := h.postCommitBudget().TryReserve(channelId, []*eventbus.Event{e})
+	if !ok || len(tks) == 0 {
+		return nil
+	}
+	e.Ticket = tks[0]
+	return e.Ticket
+}
 
 // 消息持久化
 func (h *Handler) persist(ctx *eventbus.ChannelContext) {
@@ -94,7 +113,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		}
 	}
 
-	// Stage 0: PluginPersistAfter (commit watermark ONLY on err == nil; retain ticket in RecoveryManager on error).
+	// Stage 0: PluginPersistAfter (commit watermark ONLY on err == nil; retain ticket in RecoveryManager on error or capacity retry).
 	h.runStage0PluginPersistAfter(ctx.ChannelId, ctx.ChannelType, wmKey, hasWMKey, events)
 
 	opts := h.opts()
@@ -112,7 +131,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	webhookEnabled := opts != nil && opts.WebhookOn(types.EventMsgNotify)
 	queuedToBus := false
 
-	// Stage 1: WebhookNotify & Stage 2/3: Distribute (each gets an explicit Retained reference on e.Ticket).
+	// Stage 1: WebhookNotify & Stage 2/3: Distribute (each gets an explicit Acquired handle on e.Ticket's entry).
 	for _, e := range events {
 		if e == nil {
 			continue
@@ -127,9 +146,17 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		}
 
 		// Stage 1: EventChannelWebhook
-		if webhookEnabled && shouldRunPersistSideEffects(e) && !sp.NoPersist && !e.WebhookDone {
+		if !webhookEnabled {
+			e.HasStageMeta = true
+			e.WebhookStageStatus = eventbus.StageStatusNotRequired
+			e.WebhookDone = true
+		} else if shouldRunPersistSideEffects(e) && !sp.NoPersist && !e.WebhookDone {
 			alreadyWebhook := hasWMKey && h.seqTracker.HasCommitted(wmKey, StageWebhookNotify, e.MessageSeq)
-			if !alreadyWebhook {
+			if alreadyWebhook {
+				e.HasStageMeta = true
+				e.WebhookStageStatus = eventbus.StageStatusCompleted
+				e.WebhookDone = true
+			} else {
 				whClone := e.Clone()
 				whClone.ForwardDeadline, whClone.ForwardHops = 0, 0
 				whClone.Type = eventbus.EventChannelWebhook
@@ -137,7 +164,11 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 				if chBus != nil && h.tryAddEventToChannelBus(ctx.ChannelId, ctx.ChannelType, whClone) {
 					queuedToBus = true
 				} else if whClone.MessageSeq > 0 {
-					_ = h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, whClone)
+					_ = h.ensureEventHasTicket(ctx.ChannelId, whClone)
+					if !h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, whClone) && whClone.Ticket != nil {
+						whClone.Ticket.Release()
+						whClone.Ticket = nil
+					}
 				} else if whClone.Ticket != nil {
 					whClone.Ticket.Release()
 					whClone.Ticket = nil
@@ -160,7 +191,14 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 					queuedToBus = true
 					dispatched = true
 				} else if distClone.MessageSeq > 0 {
+					if !sp.NoPersist {
+						_ = h.ensureEventHasTicket(ctx.ChannelId, distClone)
+					}
 					dispatched = h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageDistribute, eventbus.SlotBitset{}, eventbus.SlotBitset{}, distClone)
+					if !dispatched && distClone.Ticket != nil {
+						distClone.Ticket.Release()
+						distClone.Ticket = nil
+					}
 				} else if distClone.Ticket != nil {
 					distClone.Ticket.Release()
 					distClone.Ticket = nil
@@ -190,6 +228,28 @@ func (h *Handler) hasPersistAfterPlugins() bool {
 	return len(pm.Plugins(types.PluginPersistAfter)) > 0
 }
 
+func (h *Handler) enqueueStage0PluginRecovery(channelId string, channelType uint8, e *eventbus.Event) {
+	if h == nil || h.recoveryMgr == nil || e == nil || e.MessageSeq == 0 {
+		return
+	}
+	_ = h.ensureEventHasTicket(channelId, e)
+	recEv := e.Clone()
+	recEv.PluginDone = false
+	recEv.HasStageMeta = true
+	recEv.PluginStageStatus = eventbus.StageStatusPending
+	recEv.Ticket = retainTicketOrNil(e.Ticket)
+	if !h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStagePluginAfter, eventbus.SlotBitset{}, eventbus.SlotBitset{}, recEv) && recEv.Ticket != nil {
+		recEv.Ticket.Release()
+		recEv.Ticket = nil
+	}
+	// Mark Stage 0 as RetryOwned by this node so a downstream remote slot leader does not execute Stage 0 concurrently (A2).
+	e.HasStageMeta = true
+	e.PluginStageStatus = eventbus.StageStatusRetryOwned
+	e.StageOwnerNodeId = h.localNodeId()
+	e.StageOwnerGen++
+	e.PluginDone = true
+}
+
 func (h *Handler) runStage0PluginPersistAfter(
 	channelId string,
 	channelType uint8,
@@ -200,7 +260,20 @@ func (h *Handler) runStage0PluginPersistAfter(
 	hasPlugins := h.hasPersistAfterPlugins()
 	var leasedEvents []*eventbus.Event
 	for _, e := range events {
-		if e == nil || e.MessageSeq == 0 || e.ReasonCode != wkproto.ReasonSuccess || e.PersistedDuplicate || e.PluginDone {
+		if e == nil || e.MessageSeq == 0 || e.ReasonCode != wkproto.ReasonSuccess || e.PersistedDuplicate {
+			continue
+		}
+		if e.PluginDone || e.PluginStageStatus == eventbus.StageStatusCompleted || e.PluginStageStatus == eventbus.StageStatusNotRequired {
+			e.HasStageMeta = true
+			if e.PluginStageStatus == eventbus.StageStatusPending {
+				e.PluginStageStatus = eventbus.StageStatusCompleted
+			}
+			e.PluginDone = true
+			continue
+		}
+		if e.PluginStageStatus == eventbus.StageStatusRetryOwned && e.StageOwnerNodeId != 0 && !h.isLocalNode(e.StageOwnerNodeId) {
+			e.HasStageMeta = true
+			e.PluginDone = true
 			continue
 		}
 		sp, ok := e.Frame.(*wkproto.SendPacket)
@@ -211,6 +284,8 @@ func (h *Handler) runStage0PluginPersistAfter(
 			if hasWMKey {
 				_ = h.seqTracker.RecordCommittedForce(wmKey, StagePluginPersistAfter, e.MessageSeq)
 			}
+			e.HasStageMeta = true
+			e.PluginStageStatus = eventbus.StageStatusNotRequired
 			e.PluginDone = true
 			continue
 		}
@@ -218,14 +293,17 @@ func (h *Handler) runStage0PluginPersistAfter(
 			leasedEvents = append(leasedEvents, e)
 			continue
 		}
-		skip, leased := h.seqTracker.BeginStage(wmKey, StagePluginPersistAfter, e.MessageSeq)
-		if skip {
-			if h.seqTracker.HasCommitted(wmKey, StagePluginPersistAfter, e.MessageSeq) {
-				e.PluginDone = true
-			}
-			continue
-		}
-		if leased {
+		status := h.seqTracker.BeginStageChecked(wmKey, StagePluginPersistAfter, e.MessageSeq)
+		switch status {
+		case StageBeginAlreadyCommitted:
+			e.HasStageMeta = true
+			e.PluginStageStatus = eventbus.StageStatusCompleted
+			e.PluginDone = true
+		case StageBeginInFlight, StageBeginCapacityRetry:
+			h.enqueueStage0PluginRecovery(channelId, channelType, e)
+		case StageBeginLeased:
+			e.HasStageMeta = true
+			e.PluginStageStatus = eventbus.StageStatusRunning
 			leasedEvents = append(leasedEvents, e)
 		}
 	}
@@ -239,9 +317,7 @@ func (h *Handler) runStage0PluginPersistAfter(
 			if hasWMKey {
 				h.seqTracker.AbortStage(wmKey, StagePluginPersistAfter, e.MessageSeq)
 			}
-			recEv := e.Clone()
-			recEv.Ticket = retainTicketOrNil(e.Ticket)
-			_ = h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStagePluginAfter, eventbus.SlotBitset{}, eventbus.SlotBitset{}, recEv)
+			h.enqueueStage0PluginRecovery(channelId, channelType, e)
 		}
 		return
 	}
@@ -249,6 +325,8 @@ func (h *Handler) runStage0PluginPersistAfter(
 		if hasWMKey {
 			h.seqTracker.CommitStage(wmKey, StagePluginPersistAfter, e.MessageSeq)
 		}
+		e.HasStageMeta = true
+		e.PluginStageStatus = eventbus.StageStatusCompleted
 		e.PluginDone = true
 	}
 }
@@ -263,6 +341,8 @@ func (h *Handler) executePersistedLocalSideEffects(channelId string, channelType
 	if !webhookEnabled {
 		for _, e := range events {
 			if e != nil && e.MessageSeq > 0 && e.ReasonCode == wkproto.ReasonSuccess && !e.PersistedDuplicate {
+				e.HasStageMeta = true
+				e.WebhookStageStatus = eventbus.StageStatusNotRequired
 				e.WebhookDone = true
 			}
 		}
@@ -271,7 +351,20 @@ func (h *Handler) executePersistedLocalSideEffects(channelId string, channelType
 
 	queued := false
 	for _, e := range events {
-		if e == nil || e.MessageSeq == 0 || e.ReasonCode != wkproto.ReasonSuccess || e.PersistedDuplicate || e.WebhookDone {
+		if e == nil || e.MessageSeq == 0 || e.ReasonCode != wkproto.ReasonSuccess || e.PersistedDuplicate {
+			continue
+		}
+		if e.WebhookDone || e.WebhookStageStatus == eventbus.StageStatusCompleted || e.WebhookStageStatus == eventbus.StageStatusNotRequired {
+			e.HasStageMeta = true
+			if e.WebhookStageStatus == eventbus.StageStatusPending {
+				e.WebhookStageStatus = eventbus.StageStatusCompleted
+			}
+			e.WebhookDone = true
+			continue
+		}
+		if e.WebhookStageStatus == eventbus.StageStatusRetryOwned && e.StageOwnerNodeId != 0 && !h.isLocalNode(e.StageOwnerNodeId) {
+			e.HasStageMeta = true
+			e.WebhookDone = true
 			continue
 		}
 		sp, ok := e.Frame.(*wkproto.SendPacket)
@@ -279,19 +372,33 @@ func (h *Handler) executePersistedLocalSideEffects(channelId string, channelType
 			continue
 		}
 		if hasWMKey && h.seqTracker.HasCommitted(wmKey, StageWebhookNotify, e.MessageSeq) {
+			e.HasStageMeta = true
+			e.WebhookStageStatus = eventbus.StageStatusCompleted
 			e.WebhookDone = true
 			continue
 		}
 		cloneEvent := e.Clone()
 		cloneEvent.ForwardDeadline, cloneEvent.ForwardHops = 0, 0
 		cloneEvent.Type = eventbus.EventChannelWebhook
+		cloneEvent.WebhookDone = false
+		cloneEvent.WebhookStageStatus = eventbus.StageStatusPending
 		cloneEvent.Ticket = retainTicketOrNil(e.Ticket)
-		// Mark WebhookDone on the outgoing forwarded event because this node now owns Stage 1 (either via chBus or RecoveryManager).
+		// Mark Stage 1 as RetryOwned by this node on the outgoing forwarded event so remote leader does not duplicate Stage 1 (A2).
+		e.HasStageMeta = true
+		e.WebhookStageStatus = eventbus.StageStatusRetryOwned
+		if e.StageOwnerNodeId == 0 {
+			e.StageOwnerNodeId = h.localNodeId()
+		}
+		e.StageOwnerGen++
 		e.WebhookDone = true
 		if chBus != nil && h.tryAddEventToChannelBus(channelId, channelType, cloneEvent) {
 			queued = true
 		} else {
-			_ = h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, cloneEvent)
+			_ = h.ensureEventHasTicket(channelId, cloneEvent)
+			if !h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, cloneEvent) && cloneEvent.Ticket != nil {
+				cloneEvent.Ticket.Release()
+				cloneEvent.Ticket = nil
+			}
 		}
 	}
 	if queued && chBus != nil {
@@ -367,7 +474,7 @@ func (h *Handler) pluginInvokePersistAfterChecked(channelId string, channelType 
 		return h.executePluginPersistAfterLocal(channelId, channelType, msgBatch)
 	}
 
-	leaderId, err := cl.LeaderIdOfChannel(channelId, channelType)
+	leaderId, err := resolvePluginChannelLeader(cl, channelId, channelType)
 	if err != nil || leaderId == 0 {
 		h.Error("pluginInvokePersistAfter: get channel leader failed", zap.Error(err), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
 		return h.executePluginPersistAfterLocal(channelId, channelType, msgBatch)
@@ -378,6 +485,31 @@ func (h *Handler) pluginInvokePersistAfterChecked(channelId string, channelType 
 	}
 
 	return h.forwardPersistAfterToLeader(leaderId, channelId, channelType, msgBatch)
+}
+
+func resolvePluginChannelLeader(cl icluster.ICluster, channelId string, channelType uint8) (leaderId uint64, err error) {
+	if cl == nil {
+		return 0, errors.New("cluster is nil")
+	}
+	panicked := false
+	func() {
+		defer func() {
+			if recover() != nil {
+				panicked = true
+			}
+		}()
+		leaderId, err = cl.LeaderIdOfChannel(channelId, channelType)
+	}()
+	if panicked {
+		defer func() {
+			if recover() != nil {
+				leaderId = 0
+				err = errors.New("SlotLeaderIdOfChannel panicked")
+			}
+		}()
+		return cl.SlotLeaderIdOfChannel(channelId, channelType)
+	}
+	return leaderId, err
 }
 
 func newlyPersistedMessages(events []*eventbus.Event, messages []wkdb.Message) []wkdb.Message {

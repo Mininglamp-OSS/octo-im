@@ -1,9 +1,16 @@
 package store
 
 import (
+	"hash/fnv"
+
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/lni/goutils/syncutil"
+)
+
+const (
+	channelCfgWorkerShards = 32
+	channelCfgShardBufSize = 256
 )
 
 type Store struct {
@@ -12,20 +19,33 @@ type Store struct {
 
 	wdb wkdb.DB
 
-	channelCfgCh chan *channelCfgReq
-	stopper      *syncutil.Stopper
+	channelCfgChs [channelCfgWorkerShards]chan *channelCfgReq
+	stopper       *syncutil.Stopper
 }
 
 func New(opts *Options) *Store {
 	s := &Store{
-		opts:         opts,
-		Log:          wklog.NewWKLog("store"),
-		wdb:          opts.DB,
-		channelCfgCh: make(chan *channelCfgReq, 2048),
-		stopper:      syncutil.NewStopper(),
+		opts:    opts,
+		Log:     wklog.NewWKLog("store"),
+		wdb:     opts.DB,
+		stopper: syncutil.NewStopper(),
+	}
+	for i := 0; i < channelCfgWorkerShards; i++ {
+		s.channelCfgChs[i] = make(chan *channelCfgReq, channelCfgShardBufSize)
 	}
 
 	return s
+}
+
+func channelCfgShardIndex(channelId string, channelType uint8) int {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(channelId))
+	_, _ = h.Write([]byte{':', channelType})
+	return int(h.Sum64() % channelCfgWorkerShards)
+}
+
+func (s *Store) channelCfgChanFor(channelId string, channelType uint8) chan *channelCfgReq {
+	return s.channelCfgChs[channelCfgShardIndex(channelId, channelType)]
 }
 
 func (s *Store) NextPrimaryKey() uint64 {
@@ -51,10 +71,12 @@ func (s *Store) GetChannelShardIndex(channelId string, channelType uint8) uint32
 }
 
 func (s *Store) Start() error {
-	for i := 0; i < 50; i++ {
-		go s.loopSaveChannelClusterConfig()
+	for i := 0; i < channelCfgWorkerShards; i++ {
+		ch := s.channelCfgChs[i]
+		s.stopper.RunWorker(func() {
+			s.loopSaveChannelClusterConfig(ch)
+		})
 	}
-	// s.stopper.RunWorker(s.loopSaveChannelClusterConfig)
 	return nil
 }
 

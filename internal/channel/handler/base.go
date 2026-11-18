@@ -55,6 +55,7 @@ type Handler struct {
 	commonService       *common.Service
 	forwardCapabilities forward.CapabilityCache
 	forwardGate         *forward.Gate
+	forwardDedup        forwardAdmittedDedupCache
 	boundNodeId         uint64
 	boundChannelBus     eventbus.IChannel
 	boundCluster        icluster.ICluster
@@ -71,8 +72,9 @@ type Handler struct {
 
 	latchedGlobals atomic.Pointer[handlerGlobals]
 
-	seqTracker  StageSeqTracker
-	recoveryMgr *RecoveryManager
+	seqTracker        StageSeqTracker
+	recoveryMgr       *RecoveryManager
+	pendingPersistMgr *PendingPersistManager
 }
 
 func NewHandler() *Handler {
@@ -88,6 +90,7 @@ func NewHandler() *Handler {
 	}
 	h.latchGlobals()
 	h.recoveryMgr = NewRecoveryManager(h.executeRecoveredItem)
+	h.pendingPersistMgr = NewPendingPersistManager(h.drainSinglePendingPersistEvent)
 	h.routes()
 	return h
 }
@@ -114,16 +117,10 @@ func (h *Handler) RegisterGlobalPartAHooks() {
 	}
 	eventbus.RegisterPartATelemetryProvider(h.SnapshotTelemetry)
 	eventbus.RegisterPersistedRecoveryFallback(func(channelID string, channelType uint8, ev *eventbus.Event) bool {
-		if ev == nil || ev.MessageSeq == 0 {
-			return false
-		}
-		stage := RecoveryStageChannelForward
-		if ev.Type == eventbus.EventChannelWebhook {
-			stage = RecoveryStageWebhook
-		} else if ev.Type == eventbus.EventChannelDistribute {
-			stage = RecoveryStageDistribute
-		}
-		return h.recoveryMgr.Enqueue(channelID, channelType, stage, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
+		return h.EnqueuePersistedRecovery(channelID, channelType, ev)
+	})
+	eventbus.RegisterPendingPersistFallback(func(channelID string, channelType uint8, ev *eventbus.Event) bool {
+		return h.EnqueuePendingPersist(channelID, channelType, ev)
 	})
 }
 
@@ -131,7 +128,8 @@ func (h *Handler) SnapshotTelemetry() eventbus.PartATelemetrySnapshot {
 	pcB, pcI, pcRej := h.postCommitBudget().Stats()
 	lgB, lgI, _ := h.legacyInboundBudget().Stats()
 	trB, trI, _ := h.transientBudget().Stats()
-	recCh, recItems, cooldownProbes := h.recoveryMgr.Inspect()
+	recDet := h.recoveryMgr.InspectDetailed()
+	_, ppItems := h.pendingPersistMgr.Inspect()
 	stMetrics := h.seqTracker.Metrics()
 	return eventbus.PartATelemetrySnapshot{
 		PostCommitInflightItems:       pcI,
@@ -142,9 +140,17 @@ func (h *Handler) SnapshotTelemetry() eventbus.PartATelemetrySnapshot {
 		TransientInflightBytes:        trB,
 		PostCommitBackpressureRejects: pcRej,
 		LegacyForwardDroppedTotal:     eventbus.LegacyForwardDroppedTotal.Load(),
-		RecoveryChannelsActive:        recCh,
-		RecoveryItemsActive:           recItems,
-		RecoveryCooldownProbesTotal:   cooldownProbes,
+		PendingPersistActiveItems:     ppItems,
+		PendingPersistFullTotal:       eventbus.PendingPersistFullTotal.Load(),
+		LegacyBudgetExhaustedTotal:    eventbus.LegacyBudgetExhaustedTotal.Load(),
+		RecoveryBackpressureTotal:     eventbus.RecoveryBackpressureTotal.Load(),
+		RecoveryChannelsActive:        recDet.ActiveChannels,
+		RecoveryItemsActive:           recDet.QueuedItems + recDet.InFlightItems,
+		RecoveryQueuedMetadataBytes:   recDet.QueuedMetadataBytes,
+		RecoveryInFlightMetadataBytes: recDet.InFlightMetadataBytes,
+		RecoveryEnqueueRejectedTotal:  recDet.EnqueueRejectedTotal,
+		RecoveryCooldownProbesTotal:   recDet.CooldownProbesTotal,
+		TicketDoubleReleasesTotal:     h.postCommitBudget().DoubleReleases() + h.legacyInboundBudget().DoubleReleases(),
 		SeqTrackerActiveOOOWindows:    stMetrics.ActiveOOOWindows,
 		SeqTrackerActiveSlotExts:      stMetrics.ActiveSlotExts,
 		SeqTrackerExtraSlotBytes:      stMetrics.ExtraSlotBytes,
@@ -488,20 +494,77 @@ func (h *Handler) EnqueuePersistedRecovery(channelId string, channelType uint8, 
 		}
 		return false
 	}
+	_ = h.ensureEventHasTicket(channelId, ev)
 	stage := RecoveryStageChannelForward
 	if ev.Type == eventbus.EventChannelWebhook {
 		stage = RecoveryStageWebhook
 	} else if ev.Type == eventbus.EventChannelDistribute {
 		stage = RecoveryStageDistribute
 	}
-	return h.recoveryMgr.Enqueue(channelId, channelType, stage, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
+	ok := h.recoveryMgr.Enqueue(channelId, channelType, stage, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
+	if !ok && ev.Ticket != nil {
+		ev.Ticket.Release()
+		ev.Ticket = nil
+	}
+	return ok
+}
+
+// EnqueuePendingPersist admits an UnpersistedDurable (MessageSeq == 0, !NoPersist) event that already holds a live ticket
+// into the per-channel PendingPersist FIFO when the primary 2048-event channel queue is full (A3).
+func (h *Handler) EnqueuePendingPersist(channelId string, channelType uint8, ev *eventbus.Event) bool {
+	if h == nil || h.pendingPersistMgr == nil || ev == nil || ClassifyEventDurability(ev) != DurabilityUnpersistedDurable {
+		return false
+	}
+	if ev.Ticket == nil || ev.Ticket.IsReleased() {
+		return false
+	}
+	res := h.pendingPersistMgr.Enqueue(channelId, channelType, ev)
+	return res == EnqueueInserted || res == EnqueueMerged
+}
+
+func (h *Handler) drainSinglePendingPersistEvent(channelId string, channelType uint8, ev *eventbus.Event) bool {
+	if h == nil || ev == nil {
+		return true
+	}
+	if chBus := h.channelBus(); chBus != nil {
+		if h.tryAddEventToChannelBus(channelId, channelType, ev) {
+			chBus.Advance(channelId, channelType)
+			return true
+		}
+	}
+	// If the channel bus is still saturated, execute the serialized channel persistence pipeline directly
+	// when a local Store and local slot leadership are available.
+	if h.store() != nil {
+		slotLeaderID := h.localNodeId()
+		if cl := h.cluster(); cl != nil {
+			if lid, err := cl.SlotLeaderIdOfChannel(channelId, channelType); err == nil && lid != 0 {
+				slotLeaderID = lid
+			}
+		}
+		if slotLeaderID != 0 && h.isLocalNode(slotLeaderID) {
+			h.onSend(&eventbus.ChannelContext{
+				ChannelId:    channelId,
+				ChannelType:  channelType,
+				EventType:    eventbus.EventChannelOnSend,
+				SlotLeaderId: slotLeaderID,
+				Events:       []*eventbus.Event{ev},
+			})
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) DrainAndStop(timeout time.Duration) {
-	if h == nil || h.recoveryMgr == nil {
+	if h == nil {
 		return
 	}
-	h.recoveryMgr.DrainAndStop(timeout)
+	if h.pendingPersistMgr != nil {
+		h.pendingPersistMgr.DrainAndStop(timeout)
+	}
+	if h.recoveryMgr != nil {
+		h.recoveryMgr.DrainAndStop(timeout)
+	}
 }
 
 func (h *Handler) Stop() {
@@ -608,12 +671,108 @@ func (h *Handler) retainPersistedForwardFailures(channelId string, channelType u
 			}
 			continue
 		}
+		_ = h.ensureEventHasTicket(channelId, ev)
 		stage := RecoveryStageChannelForward
 		if ev.Type == eventbus.EventChannelDistribute && strings.TrimSpace(ev.TagKey) != "" {
 			stage = RecoveryStageDistribute
 		}
-		_ = h.recoveryMgr.Enqueue(channelId, channelType, stage, ev.TargetSlotMask, eventbus.SlotBitset{}, ev)
+		if !h.recoveryMgr.Enqueue(channelId, channelType, stage, ev.TargetSlotMask, eventbus.SlotBitset{}, ev) && ev.Ticket != nil {
+			ev.Ticket.Release()
+			ev.Ticket = nil
+		}
 	}
+}
+
+// advanceRecoveredPreDistributeStages unifies normal and recovery post-commit progression (A2 + B2):
+// Before a persisted EventChannelOnSend in RecoveryStageChannelForward can enter Stage 2/3 distribution
+// or be forwarded to a remote slot leader, Stage 0 (PluginPersistAfter) and Stage 1 (WebhookNotify)
+// are checked and executed in order. Disabled hooks transition to StageStatusNotRequired.
+func (h *Handler) advanceRecoveredPreDistributeStages(
+	channelID string,
+	channelType uint8,
+	wmKey ChannelWatermarkKey,
+	ev *eventbus.Event,
+) bool {
+	if ev == nil || ev.MessageSeq == 0 || ev.Type != eventbus.EventChannelOnSend {
+		return true
+	}
+	sp, ok := ev.Frame.(*wkproto.SendPacket)
+	if !ok || sp == nil || sp.NoPersist || ev.PersistedDuplicate {
+		return true
+	}
+	ev.HasStageMeta = true
+
+	// 1. Stage 0: PluginPersistAfter
+	if !ev.PluginDone && ev.PluginStageStatus != eventbus.StageStatusCompleted && ev.PluginStageStatus != eventbus.StageStatusNotRequired {
+		if ev.PluginStageStatus == eventbus.StageStatusRetryOwned && ev.StageOwnerNodeId != 0 && !h.isLocalNode(ev.StageOwnerNodeId) {
+			ev.PluginDone = true
+		} else if !h.hasPersistAfterPlugins() {
+			if !h.seqTracker.RecordCommittedForce(wmKey, StagePluginPersistAfter, ev.MessageSeq) {
+				return false
+			}
+			ev.PluginStageStatus = eventbus.StageStatusNotRequired
+			ev.PluginDone = true
+		} else {
+			st := h.seqTracker.BeginStageChecked(wmKey, StagePluginPersistAfter, ev.MessageSeq)
+			switch st {
+			case StageBeginAlreadyCommitted:
+				ev.PluginStageStatus = eventbus.StageStatusCompleted
+				ev.PluginDone = true
+			case StageBeginInFlight, StageBeginCapacityRetry:
+				return false
+			case StageBeginLeased:
+				ev.PluginStageStatus = eventbus.StageStatusRunning
+				msgs := h.toPersistMessages(channelID, channelType, []*eventbus.Event{ev})
+				if err := h.pluginInvokePersistAfterChecked(channelID, channelType, msgs); err != nil {
+					h.seqTracker.AbortStage(wmKey, StagePluginPersistAfter, ev.MessageSeq)
+					ev.PluginStageStatus = eventbus.StageStatusRetryOwned
+					ev.StageOwnerNodeId = h.localNodeId()
+					return false
+				}
+				h.seqTracker.CommitStage(wmKey, StagePluginPersistAfter, ev.MessageSeq)
+				ev.PluginStageStatus = eventbus.StageStatusCompleted
+				ev.PluginDone = true
+			}
+		}
+	}
+
+	// 2. Stage 1: WebhookNotify
+	if !ev.WebhookDone && ev.WebhookStageStatus != eventbus.StageStatusCompleted && ev.WebhookStageStatus != eventbus.StageStatusNotRequired {
+		opts := h.opts()
+		whSvc := h.webhookService()
+		if ev.WebhookStageStatus == eventbus.StageStatusRetryOwned && ev.StageOwnerNodeId != 0 && !h.isLocalNode(ev.StageOwnerNodeId) {
+			ev.WebhookDone = true
+		} else if opts == nil || !opts.WebhookOn(types.EventMsgNotify) || whSvc == nil {
+			if !h.seqTracker.RecordCommittedForce(wmKey, StageWebhookNotify, ev.MessageSeq) {
+				return false
+			}
+			ev.WebhookStageStatus = eventbus.StageStatusNotRequired
+			ev.WebhookDone = true
+		} else {
+			st := h.seqTracker.BeginStageChecked(wmKey, StageWebhookNotify, ev.MessageSeq)
+			switch st {
+			case StageBeginAlreadyCommitted:
+				ev.WebhookStageStatus = eventbus.StageStatusCompleted
+				ev.WebhookDone = true
+			case StageBeginInFlight, StageBeginCapacityRetry:
+				return false
+			case StageBeginLeased:
+				ev.WebhookStageStatus = eventbus.StageStatusRunning
+				msgs := h.toPersistMessages(channelID, channelType, []*eventbus.Event{ev})
+				if err := whSvc.AppendMessageOfNotifyQueue(msgs); err != nil {
+					h.seqTracker.AbortStage(wmKey, StageWebhookNotify, ev.MessageSeq)
+					ev.WebhookStageStatus = eventbus.StageStatusRetryOwned
+					ev.StageOwnerNodeId = h.localNodeId()
+					return false
+				}
+				h.seqTracker.CommitStage(wmKey, StageWebhookNotify, ev.MessageSeq)
+				ev.WebhookStageStatus = eventbus.StageStatusCompleted
+				ev.WebhookDone = true
+			}
+		}
+	}
+
+	return true
 }
 
 // executeRecoveredItem runs inside RecoveryManager worker pool without putting unacked items back onto blind queues.
@@ -636,19 +795,22 @@ func (h *Handler) executeRecoveredItem(
 	switch item.Stage {
 	case RecoveryStagePluginAfter:
 		if !h.hasPersistAfterPlugins() {
-			_ = h.seqTracker.RecordCommittedForce(wmKey, StagePluginPersistAfter, ev.MessageSeq)
+			if !h.seqTracker.RecordCommittedForce(wmKey, StagePluginPersistAfter, ev.MessageSeq) {
+				return item.PendingSlots, item.AllRecipientSlots, ev, false
+			}
+			ev.HasStageMeta = true
+			ev.PluginStageStatus = eventbus.StageStatusNotRequired
 			ev.PluginDone = true
 			return eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev, true
 		}
-		skip, leased := h.seqTracker.BeginStage(wmKey, StagePluginPersistAfter, ev.MessageSeq)
-		if skip {
-			if h.seqTracker.HasCommitted(wmKey, StagePluginPersistAfter, ev.MessageSeq) {
-				ev.PluginDone = true
-				return eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev, true
-			}
-			return item.PendingSlots, item.AllRecipientSlots, ev, false
-		}
-		if !leased {
+		st := h.seqTracker.BeginStageChecked(wmKey, StagePluginPersistAfter, ev.MessageSeq)
+		switch st {
+		case StageBeginAlreadyCommitted:
+			ev.HasStageMeta = true
+			ev.PluginStageStatus = eventbus.StageStatusCompleted
+			ev.PluginDone = true
+			return eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev, true
+		case StageBeginInFlight, StageBeginCapacityRetry:
 			return item.PendingSlots, item.AllRecipientSlots, ev, false
 		}
 		msgs := h.toPersistMessages(channelID, channelType, []*eventbus.Event{ev})
@@ -657,6 +819,8 @@ func (h *Handler) executeRecoveredItem(
 			return item.PendingSlots, item.AllRecipientSlots, ev, false
 		}
 		h.seqTracker.CommitStage(wmKey, StagePluginPersistAfter, ev.MessageSeq)
+		ev.HasStageMeta = true
+		ev.PluginStageStatus = eventbus.StageStatusCompleted
 		ev.PluginDone = true
 		return eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev, true
 
@@ -664,19 +828,22 @@ func (h *Handler) executeRecoveredItem(
 		opts := h.opts()
 		whSvc := h.webhookService()
 		if opts == nil || !opts.WebhookOn(types.EventMsgNotify) || whSvc == nil {
-			_ = h.seqTracker.RecordCommittedForce(wmKey, StageWebhookNotify, ev.MessageSeq)
+			if !h.seqTracker.RecordCommittedForce(wmKey, StageWebhookNotify, ev.MessageSeq) {
+				return item.PendingSlots, item.AllRecipientSlots, ev, false
+			}
+			ev.HasStageMeta = true
+			ev.WebhookStageStatus = eventbus.StageStatusNotRequired
 			ev.WebhookDone = true
 			return eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev, true
 		}
-		skip, leased := h.seqTracker.BeginStage(wmKey, StageWebhookNotify, ev.MessageSeq)
-		if skip {
-			if h.seqTracker.HasCommitted(wmKey, StageWebhookNotify, ev.MessageSeq) {
-				ev.WebhookDone = true
-				return eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev, true
-			}
-			return item.PendingSlots, item.AllRecipientSlots, ev, false
-		}
-		if !leased {
+		st := h.seqTracker.BeginStageChecked(wmKey, StageWebhookNotify, ev.MessageSeq)
+		switch st {
+		case StageBeginAlreadyCommitted:
+			ev.HasStageMeta = true
+			ev.WebhookStageStatus = eventbus.StageStatusCompleted
+			ev.WebhookDone = true
+			return eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev, true
+		case StageBeginInFlight, StageBeginCapacityRetry:
 			return item.PendingSlots, item.AllRecipientSlots, ev, false
 		}
 		msgs := h.toPersistMessages(channelID, channelType, []*eventbus.Event{ev})
@@ -685,10 +852,15 @@ func (h *Handler) executeRecoveredItem(
 			return item.PendingSlots, item.AllRecipientSlots, ev, false
 		}
 		h.seqTracker.CommitStage(wmKey, StageWebhookNotify, ev.MessageSeq)
+		ev.HasStageMeta = true
+		ev.WebhookStageStatus = eventbus.StageStatusCompleted
 		ev.WebhookDone = true
 		return eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev, true
 
 	case RecoveryStageChannelForward:
+		if !h.advanceRecoveredPreDistributeStages(channelID, channelType, wmKey, ev) {
+			return item.PendingSlots, item.AllRecipientSlots, ev, false
+		}
 		if h.hasDistributed(channelID, channelType, ev.MessageSeq) {
 			return eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev, true
 		}
@@ -740,6 +912,10 @@ func (h *Handler) forwardPersistedBatchToSlotLeader(
 
 	wireEvents := make([]*eventbus.Event, 0, len(events))
 	persistedLegacySlotLeader := permSvc != nil && permSvc.CheckOrProbeLegacyPeer(nodeId, channelId, channelType)
+	peerMode := forward.PeerCapUnknown
+	if cl != nil && nodeId != 0 && nodeId != localNode {
+		peerMode = h.forwardCapabilities.ProbeOn(ctx, cl, nodeId)
+	}
 
 	for _, ev := range events {
 		if ev == nil || !shouldDistributePersistResult(ev) || h.hasDistributed(channelId, channelType, ev.MessageSeq) {
@@ -765,12 +941,10 @@ func (h *Handler) forwardPersistedBatchToSlotLeader(
 		fromNode:    localNode,
 		events:      wireEvents,
 	}
-	data, err := req.encode()
+	includeTrailer := peerMode == forward.PeerCapPartAV2 || (nodeId == localNode && nodeId != 0)
+	data, err := req.encodeWithTrailer(includeTrailer)
 	if err != nil {
 		return err
-	}
-	legacy := func(targetNode uint64) error {
-		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardChannelEvent), Content: data})
 	}
 	target := func() uint64 {
 		if cl == nil {
@@ -782,16 +956,14 @@ func (h *Handler) forwardPersistedBatchToSlotLeader(
 		}
 		return leader
 	}
-	err = forward.RequestOnCluster(cl, forward.ChannelPath, data, wireEvents, target, localNode, h.acceptForward, &h.forwardCapabilities, legacy)
-	if err != nil {
-		return err
-	}
-	if persistedLegacySlotLeader {
-		for _, ev := range wireEvents {
-			if ev != nil && ev.MessageSeq > 0 {
-				_ = h.recordDistributeSideEffect(channelId, channelType, ev.MessageSeq)
-			}
+	// B5: Never pass an unacknowledged fire-and-forget legacy Send callback for persisted events!
+	// Only confirmed RPC admission (ForwardAccepted) may succeed.
+	outcome, err := forward.RequestDetailedOnCluster(cl, forward.ChannelPath, data, wireEvents, target, localNode, h.acceptForward, &h.forwardCapabilities, nil)
+	if err != nil || outcome != forward.ForwardAccepted {
+		if err != nil {
+			return err
 		}
+		return forward.ErrPeerNoAck
 	}
 	return nil
 }
@@ -905,7 +1077,7 @@ func (h *Handler) sendToNode(toNodeId uint64, msg *proto.Message) error {
 }
 
 // onForwardChannelEvent handles fire-and-forget msgForwardChannelEvent (3002) packets,
-// including rolling-upgrade 21cd8f88 HTTP/Plugin sends and legacy distributions.
+// including rolling-upgrade 21cd8f88 HTTP/Plugin sends and legacy distributions (A3).
 func (h *Handler) onForwardChannelEvent(m *proto.Message) {
 	req := &forwardChannelEventReq{}
 	if err := req.decode(m.Content); err != nil {
@@ -921,12 +1093,14 @@ func (h *Handler) onForwardChannelEvent(m *proto.Message) {
 		if e == nil {
 			continue
 		}
-		if isDurableForwardEvent(e) {
+		durability := ClassifyEventDurability(e)
+		if durability != DurabilityTransient {
 			tks, ok := h.postCommitBudget().TryReserve(req.channelId, []*eventbus.Event{e})
 			if !ok {
 				tks, ok = h.legacyInboundBudget().TryReserve(req.channelId, []*eventbus.Event{e})
 			}
 			if !ok {
+				eventbus.LegacyBudgetExhaustedTotal.Add(1)
 				dropped := eventbus.LegacyForwardDroppedTotal.Add(1)
 				h.Error("legacy 21cd8f88 inbound event dropped: 24MiB post-commit + legacy spillover budget exhausted",
 					zap.String("channelId", req.channelId),
@@ -941,11 +1115,26 @@ func (h *Handler) onForwardChannelEvent(m *proto.Message) {
 				admitted = true
 				continue
 			}
-			if e.MessageSeq > 0 && h.EnqueuePersistedRecovery(req.channelId, req.channelType, e) {
-				continue
+			if durability == DurabilityPersisted {
+				if h.EnqueuePersistedRecovery(req.channelId, req.channelType, e) {
+					continue
+				}
+			} else if durability == DurabilityUnpersistedDurable {
+				if h.EnqueuePendingPersist(req.channelId, req.channelType, e) {
+					continue
+				}
 			}
-			e.Ticket.Release()
-			e.Ticket = nil
+			if e.Ticket != nil {
+				e.Ticket.Release()
+				e.Ticket = nil
+			}
+			dropped := eventbus.LegacyForwardDroppedTotal.Add(1)
+			h.Error("legacy 21cd8f88 inbound durable event rejected: channel queue and fallback saturated",
+				zap.String("channelId", req.channelId),
+				zap.Uint8("channelType", req.channelType),
+				zap.Uint64("fromNode", req.fromNode),
+				zap.Uint64("messageSeq", e.MessageSeq),
+				zap.Uint64("legacyDroppedTotal", dropped))
 			continue
 		}
 

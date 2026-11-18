@@ -228,7 +228,8 @@ func TestPartA_V12_2_ConcurrentSlotStageDedupUnderExhaustedSlotExts(t *testing.T
 	// Now launch 16 concurrent workers requesting overlapping slots {0..7} on target channel with 0 free SlotHandoffExts.
 	targetKey, ok := MakeChannelWatermarkKey("target_exhausted_ext", wkproto.ChannelTypeGroup)
 	require.True(t, ok)
-	reqSlots := eventbus.AllSlotsUpTo(8)
+	reqSlots, err := eventbus.AllSlotsUpTo(8)
+	require.NoError(t, err)
 
 	var startBarrier sync.WaitGroup
 	startBarrier.Add(1)
@@ -726,6 +727,8 @@ func (c *capProbeMockCluster) RequestWithContext(ctx context.Context, toNodeId u
 			return &proto.Response{Status: proto.StatusOK}, nil
 		case 2:
 			return &proto.Response{Status: proto.StatusOK, Body: forward.BuildCapabilityBody()}, nil
+		default:
+			return &proto.Response{Status: proto.StatusNotFound}, nil
 		}
 	}
 	if path == forward.ChannelPath {

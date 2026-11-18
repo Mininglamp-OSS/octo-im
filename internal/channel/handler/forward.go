@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/forward"
@@ -9,6 +11,78 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
+
+const maxForwardAdmittedDedupEntries = 4096
+
+type forwardAdmittedDedupCache struct {
+	mu      sync.Mutex
+	order   []string
+	entries map[string]struct{}
+}
+
+func (c *forwardAdmittedDedupCache) checkAndRecord(keys []string) []bool {
+	out := make([]bool, len(keys))
+	if len(keys) == 0 {
+		return out
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]struct{}, 256)
+	}
+	for i, k := range keys {
+		if k == "" {
+			continue
+		}
+		if _, exists := c.entries[k]; exists {
+			out[i] = true
+		}
+	}
+	return out
+}
+
+func (c *forwardAdmittedDedupCache) commitRecorded(keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]struct{}, 256)
+	}
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if _, exists := c.entries[k]; exists {
+			continue
+		}
+		if len(c.order) >= maxForwardAdmittedDedupEntries {
+			evict := c.order[0]
+			c.order = c.order[1:]
+			delete(c.entries, evict)
+		}
+		c.entries[k] = struct{}{}
+		c.order = append(c.order, k)
+	}
+}
+
+func forwardEventDedupKey(channelId string, channelType uint8, e *eventbus.Event) string {
+	if e == nil || e.MessageSeq == 0 {
+		return ""
+	}
+	// Only deduplicate across remote RPC retries (fromNode/SourceNodeId or explicit stage meta / target mask)
+	// when the event carries a persisted MessageSeq > 0.
+	return fmt.Sprintf("%s#%d#%d#%d#%d#%v#%v",
+		channelId,
+		channelType,
+		e.MessageSeq,
+		e.MessageId,
+		e.Type,
+		e.HasTargetSlotMask,
+		e.TargetSlotMask,
+	)
+}
 
 func (h *Handler) SetForwardRoutes() {
 	cl := h.cluster()
@@ -24,18 +98,7 @@ func (h *Handler) AcceptForward(data []byte) proto.Status {
 }
 
 func isDurableForwardEvent(e *eventbus.Event) bool {
-	if e == nil {
-		return false
-	}
-	if e.MessageSeq > 0 {
-		return true
-	}
-	if e.Type == eventbus.EventChannelOnSend {
-		if sp, ok := e.Frame.(*wkproto.SendPacket); ok && sp != nil && !sp.NoPersist {
-			return true
-		}
-	}
-	return false
+	return ClassifyEventDurability(e) != DurabilityTransient
 }
 
 func (h *Handler) acceptForward(data []byte) proto.Status {
@@ -68,11 +131,35 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 		return forward.StatusRetry
 	}
 
+	// B5: Filter out events in req.events that were already admitted by an earlier RPC whose ACK was lost.
+	dedupKeys := make([]string, len(req.events))
+	for i, e := range req.events {
+		if req.fromNode != 0 && e != nil && e.MessageSeq > 0 {
+			dedupKeys[i] = forwardEventDedupKey(req.channelId, req.channelType, e)
+		}
+	}
+	alreadyAdmitted := h.forwardDedup.checkAndRecord(dedupKeys)
+
+	var pendingEvents []*eventbus.Event
+	var pendingDedupKeys []string
+	for i, e := range req.events {
+		if alreadyAdmitted[i] {
+			continue
+		}
+		pendingEvents = append(pendingEvents, e)
+		if dedupKeys[i] != "" {
+			pendingDedupKeys = append(pendingDedupKeys, dedupKeys[i])
+		}
+	}
+	if len(pendingEvents) == 0 {
+		return proto.StatusOK
+	}
+
 	var durableIdx []int
 	var durableEvs []*eventbus.Event
 	var transientIdx []int
 	var transientEvs []*eventbus.Event
-	for i, e := range req.events {
+	for i, e := range pendingEvents {
 		if isDurableForwardEvent(e) {
 			durableIdx = append(durableIdx, i)
 			durableEvs = append(durableEvs, e)
@@ -103,31 +190,64 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 	}
 
 	for i, idx := range durableIdx {
-		req.events[idx].Ticket = durableTickets[i]
+		pendingEvents[idx].Ticket = durableTickets[i]
 	}
 	for i, idx := range transientIdx {
-		req.events[idx].Ticket = transientTickets[i]
+		pendingEvents[idx].Ticket = transientTickets[i]
 	}
 
-	for _, e := range req.events {
+	for _, e := range pendingEvents {
 		e.ForwardDeadline, e.ForwardHops = deadline, hops
 		if req.fromNode != 0 && e.Type == eventbus.EventChannelOnSend && e.MessageSeq > 0 {
-			if !e.PluginDone && !e.WebhookDone {
-				// BaseV1 / pre-PartA sender ran local side effects before forwarding without explicit wire flags.
-				e.PluginDone = true
-				e.WebhookDone = true
-			}
-			if e.PluginDone {
-				_ = h.recordPluginSideEffect(req.channelId, req.channelType, e.MessageSeq)
-			}
-			if e.WebhookDone {
-				_ = h.recordWebhookSideEffect(req.channelId, req.channelType, e.MessageSeq)
+			if e.HasStageMeta {
+				// A2: PartAV2 sender explicitly provided stage statuses and owner node.
+				// Never infer completion from (!PluginDone && !WebhookDone).
+				switch e.PluginStageStatus {
+				case eventbus.StageStatusCompleted, eventbus.StageStatusNotRequired:
+					e.PluginDone = true
+					_ = h.recordPluginSideEffect(req.channelId, req.channelType, e.MessageSeq)
+				case eventbus.StageStatusRetryOwned:
+					if e.StageOwnerNodeId != 0 && !h.isLocalNode(e.StageOwnerNodeId) {
+						// Ingress node owns the Stage 0 retry; do not double-execute on leader.
+						e.PluginDone = true
+					} else {
+						e.PluginDone = false
+					}
+				default:
+					e.PluginDone = false
+				}
+
+				switch e.WebhookStageStatus {
+				case eventbus.StageStatusCompleted, eventbus.StageStatusNotRequired:
+					e.WebhookDone = true
+					_ = h.recordWebhookSideEffect(req.channelId, req.channelType, e.MessageSeq)
+				case eventbus.StageStatusRetryOwned:
+					if e.StageOwnerNodeId != 0 && !h.isLocalNode(e.StageOwnerNodeId) {
+						e.WebhookDone = true
+					} else {
+						e.WebhookDone = false
+					}
+				default:
+					e.WebhookDone = false
+				}
+			} else {
+				if !e.PluginDone && !e.WebhookDone {
+					// Genuine BaseV1 (21cd8f88) frame without WKST stage metadata ran local side effects before forwarding.
+					e.PluginDone = true
+					e.WebhookDone = true
+				}
+				if e.PluginDone {
+					_ = h.recordPluginSideEffect(req.channelId, req.channelType, e.MessageSeq)
+				}
+				if e.WebhookDone {
+					_ = h.recordWebhookSideEffect(req.channelId, req.channelType, e.MessageSeq)
+				}
 			}
 		}
 	}
 
-	if !h.tryAddBatchToChannelBus(req.channelId, req.channelType, req.events) {
-		for _, e := range req.events {
+	if !h.tryAddBatchToChannelBus(req.channelId, req.channelType, pendingEvents) {
+		for _, e := range pendingEvents {
 			if e != nil && e.Ticket != nil {
 				e.Ticket.Release()
 				e.Ticket = nil
@@ -135,6 +255,7 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 		}
 		return forward.StatusRetry
 	}
+	h.forwardDedup.commitRecorded(pendingDedupKeys)
 	chBus.Advance(req.channelId, req.channelType)
 	return proto.StatusOK
 }

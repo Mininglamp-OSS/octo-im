@@ -40,6 +40,12 @@ type ILocalHealthChecker interface {
 	CheckLocalServiceReady() error
 }
 
+type IChannelLeaderMaintainer interface {
+	// MaintainExistingChannelLeader triggers bounded leader re-election for an already-existing
+	// channel when reads observe its recorded leader is offline or disconnected, without creating new channels.
+	MaintainExistingChannelLeader(ctx context.Context, channelID string, channelType uint8, suspectLeaderID uint64)
+}
+
 type IClusterSlot interface {
 	// GetOrCreateChannelClusterConfigFromSlotLeader 从频道槽领导获取或创建频道分布式配置
 	GetOrCreateChannelClusterConfigFromSlotLeader(channelId string, channelType uint8) (wkdb.ChannelClusterConfig, error)

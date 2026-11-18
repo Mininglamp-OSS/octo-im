@@ -181,17 +181,17 @@ func (s *Store) applyLog(_ uint32, log types.Log) error {
 	return s.applyCMD(cmd, log.Index)
 }
 
-func (s *Store) loopSaveChannelClusterConfig() {
+func (s *Store) loopSaveChannelClusterConfig(ch <-chan *channelCfgReq) {
 	maxSizeBatch := 1000
 	done := false
 	cfgs := make([]*channelCfgReq, 0, maxSizeBatch)
 	for {
 		select {
-		case cfg := <-s.channelCfgCh:
+		case cfg := <-ch:
 			cfgs = append(cfgs, cfg)
 			for !done {
 				select {
-				case cfg = <-s.channelCfgCh:
+				case cfg = <-ch:
 					cfgs = append(cfgs, cfg)
 				default:
 					done = true
@@ -225,9 +225,10 @@ func (s *Store) handleChannelClusterConfigSave(cmd *CMD, confVersion uint64) err
 	channelClusterConfig.ConfVersion = confVersion
 
 	waitC := make(chan error, 1)
+	shardCh := s.channelCfgChanFor(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
 
 	select {
-	case s.channelCfgCh <- &channelCfgReq{
+	case shardCh <- &channelCfgReq{
 		cfg:   channelClusterConfig,
 		errCh: waitC,
 	}:
@@ -259,8 +260,9 @@ func (s *Store) handleChannelClusterConfigSavesForCMDs(cmds []*CMD, confVersions
 		channelClusterConfig.ConfVersion = confVersions[i]
 		waitC := make(chan error, 1)
 		waits = append(waits, waitC)
+		shardCh := s.channelCfgChanFor(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
 		select {
-		case s.channelCfgCh <- &channelCfgReq{
+		case shardCh <- &channelCfgReq{
 			cfg:   channelClusterConfig,
 			errCh: waitC,
 		}:
@@ -461,12 +463,33 @@ func (s *Store) handleDeleteConversations(cmd *CMD) error {
 }
 
 func (s *Store) handleChannelClusterConfigSaves(reqs []*channelCfgReq) error {
-	if len(reqs) > 10 {
-		fmt.Println("handleChannelClusterConfigSaves...", len(reqs))
+	if len(reqs) == 0 {
+		return nil
 	}
+	// Coalesce multiple updates for the same (ChannelId, ChannelType) within this drained worker batch
+	// to the highest ConfVersion (keeping the later entry when ConfVersion ties), while preserving all
+	// waiter channels until SaveChannelClusterConfigs (CommitWait + cache update) finishes.
+	type cfgSlot struct {
+		idx int
+		cfg wkdb.ChannelClusterConfig
+	}
+	byKey := make(map[string]cfgSlot, len(reqs))
 	cfgs := make([]wkdb.ChannelClusterConfig, 0, len(reqs))
 	for _, req := range reqs {
+		if req == nil {
+			continue
+		}
+		k := fmt.Sprintf("%s:%d", req.cfg.ChannelId, req.cfg.ChannelType)
+		if prev, exists := byKey[k]; exists {
+			if req.cfg.ConfVersion >= prev.cfg.ConfVersion {
+				cfgs[prev.idx] = req.cfg
+				byKey[k] = cfgSlot{idx: prev.idx, cfg: req.cfg}
+			}
+			continue
+		}
+		idx := len(cfgs)
 		cfgs = append(cfgs, req.cfg)
+		byKey[k] = cfgSlot{idx: idx, cfg: req.cfg}
 	}
 	err := s.wdb.SaveChannelClusterConfigs(cfgs)
 	if err != nil {
@@ -477,7 +500,7 @@ func (s *Store) handleChannelClusterConfigSaves(reqs []*channelCfgReq) error {
 		}
 	}
 	for _, req := range reqs {
-		if req.errCh == nil {
+		if req == nil || req.errCh == nil {
 			continue
 		}
 		select {

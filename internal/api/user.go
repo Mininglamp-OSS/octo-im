@@ -268,95 +268,120 @@ func (u *user) updateToken(c *wkhttp.Context) {
 		return
 	}
 
-	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson) // 获取频道的领导节点
-	if err != nil {
-		u.Error("获取频道所在节点失败！", zap.Error(err), zap.String("channelID", req.UID), zap.Uint8("channelType", wkproto.ChannelTypePerson))
-		c.ResponseError(errors.New("获取频道所在节点失败！"))
-		return
-	}
-	leaderIsSelf := leaderInfo.Id == options.G.Cluster.NodeId
-	if !leaderIsSelf {
-		u.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
-		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
-		return
-	}
+	writeDeadline := time.Now().Add(userSlotRetryBudget())
+	writeDelay := 25 * time.Millisecond
+	for {
+		if options.G.ClusterOn() {
+			if !forwardRequestToUserSlotLeader(u.Log, c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
+				return
+			}
+		} else {
+			leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.UID, wkproto.ChannelTypePerson) // 获取频道的领导节点
+			if err != nil {
+				u.Error("获取频道所在节点失败！", zap.Error(err), zap.String("channelID", req.UID), zap.Uint8("channelType", wkproto.ChannelTypePerson))
+				c.ResponseError(errors.New("获取频道所在节点失败！"))
+				return
+			}
+			if leaderInfo.Id != options.G.Cluster.NodeId {
+				u.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
+				c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+				return
+			}
+		}
 
-	u.Debug("req", zap.Any("req", req))
+		u.Debug("req", zap.Any("req", req))
 
-	// 使用共享权限服务检查频道权限
-	reasonCode, err := service.Permission.HasPermissionForChannel(req.UID, wkproto.ChannelTypePerson)
-	if err != nil {
-		u.Error("检查频道权限失败！", zap.Error(err), zap.String("uid", req.UID))
-		c.ResponseError(err)
-		return
-	}
-	if reasonCode != wkproto.ReasonSuccess {
-		c.ResponseStatus(int(reasonCode))
-		return
-	}
-
-	user, err := service.Store.GetUser(req.UID) // 确保用户存在
-	if err != nil && err != wkdb.ErrNotFound {
-		u.Error("获取用户信息失败！", zap.Error(err), zap.String("uid", req.UID))
-		c.ResponseError(err)
-		return
-	}
-
-	// 如果用户不存在，则添加用户
-	if wkdb.IsEmptyUser(user) {
-		createdAt := time.Now()
-		updatedAt := time.Now()
-		err = service.Store.AddUser(wkdb.User{
-			Uid:       req.UID,
-			CreatedAt: &createdAt,
-			UpdatedAt: &updatedAt,
-		})
+		// 使用共享权限服务检查频道权限
+		reasonCode, err := service.Permission.HasPermissionForChannel(req.UID, wkproto.ChannelTypePerson)
 		if err != nil {
-			u.Error("添加用户失败！", zap.Error(err), zap.String("uid", req.UID))
+			u.Error("检查频道权限失败！", zap.Error(err), zap.String("uid", req.UID))
 			c.ResponseError(err)
 			return
 		}
-	}
+		if reasonCode != wkproto.ReasonSuccess {
+			c.ResponseStatus(int(reasonCode))
+			return
+		}
 
-	device, err := service.Store.GetDevice(req.UID, req.DeviceFlag)
-	if err != nil && err != wkdb.ErrNotFound {
-		u.Error("获取设备信息失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
-		c.ResponseError(err)
-		return
-	}
-
-	// 不存在设备则添加设备，存在则更新设备
-	if wkdb.IsEmptyDevice(device) {
-		createdAt := time.Now()
-		err = service.Store.AddDevice(wkdb.Device{
-			Id:          service.Store.NextPrimaryKey(),
-			Uid:         req.UID,
-			DeviceFlag:  uint64(req.DeviceFlag),
-			DeviceLevel: uint8(req.DeviceLevel),
-			Token:       req.Token,
-			CreatedAt:   &createdAt,
-			UpdatedAt:   &createdAt,
-		})
-		if err != nil {
-			u.Error("添加设备失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
+		user, err := service.Store.GetUser(req.UID) // 确保用户存在
+		if err != nil && err != wkdb.ErrNotFound {
+			u.Error("获取用户信息失败！", zap.Error(err), zap.String("uid", req.UID))
 			c.ResponseError(err)
 			return
 		}
-	} else {
-		updatedAt := time.Now()
-		err = service.Store.UpdateDevice(wkdb.Device{
-			Id:          device.Id,
-			Uid:         req.UID,
-			DeviceFlag:  uint64(req.DeviceFlag),
-			DeviceLevel: uint8(req.DeviceLevel),
-			Token:       req.Token,
-			UpdatedAt:   &updatedAt,
-		})
-		if err != nil {
-			u.Error("更新设备失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
+
+		// 如果用户不存在，则添加用户
+		if wkdb.IsEmptyUser(user) {
+			createdAt := time.Now()
+			updatedAt := time.Now()
+			err = service.Store.AddUser(wkdb.User{
+				Uid:       req.UID,
+				CreatedAt: &createdAt,
+				UpdatedAt: &updatedAt,
+			})
+			if err != nil {
+				if options.G.ClusterOn() && isTransientConversationSlotHandoffError(err) && time.Now().Before(writeDeadline) && c.Request.Context().Err() == nil {
+					time.Sleep(writeDelay)
+					writeDelay = min(writeDelay*2, 200*time.Millisecond)
+					continue
+				}
+				u.Error("添加用户失败！", zap.Error(err), zap.String("uid", req.UID))
+				c.ResponseError(err)
+				return
+			}
+		}
+
+		device, err := service.Store.GetDevice(req.UID, req.DeviceFlag)
+		if err != nil && err != wkdb.ErrNotFound {
+			u.Error("获取设备信息失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
 			c.ResponseError(err)
 			return
 		}
+
+		// 不存在设备则添加设备，存在则更新设备
+		if wkdb.IsEmptyDevice(device) {
+			createdAt := time.Now()
+			err = service.Store.AddDevice(wkdb.Device{
+				Id:          service.Store.NextPrimaryKey(),
+				Uid:         req.UID,
+				DeviceFlag:  uint64(req.DeviceFlag),
+				DeviceLevel: uint8(req.DeviceLevel),
+				Token:       req.Token,
+				CreatedAt:   &createdAt,
+				UpdatedAt:   &createdAt,
+			})
+			if err != nil {
+				if options.G.ClusterOn() && isTransientConversationSlotHandoffError(err) && time.Now().Before(writeDeadline) && c.Request.Context().Err() == nil {
+					time.Sleep(writeDelay)
+					writeDelay = min(writeDelay*2, 200*time.Millisecond)
+					continue
+				}
+				u.Error("添加设备失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
+				c.ResponseError(err)
+				return
+			}
+		} else {
+			updatedAt := time.Now()
+			err = service.Store.UpdateDevice(wkdb.Device{
+				Id:          device.Id,
+				Uid:         req.UID,
+				DeviceFlag:  uint64(req.DeviceFlag),
+				DeviceLevel: uint8(req.DeviceLevel),
+				Token:       req.Token,
+				UpdatedAt:   &updatedAt,
+			})
+			if err != nil {
+				if options.G.ClusterOn() && isTransientConversationSlotHandoffError(err) && time.Now().Before(writeDeadline) && c.Request.Context().Err() == nil {
+					time.Sleep(writeDelay)
+					writeDelay = min(writeDelay*2, 200*time.Millisecond)
+					continue
+				}
+				u.Error("更新设备失败！", zap.Error(err), zap.String("uid", req.UID), zap.Uint8("deviceFlag", req.DeviceFlag.ToUint8()))
+				c.ResponseError(err)
+				return
+			}
+		}
+		break
 	}
 
 	if req.DeviceLevel == wkproto.DeviceLevelMaster {

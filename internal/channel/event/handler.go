@@ -120,6 +120,12 @@ func (c *channelHandler) addEvent(event *eventbus.Event) {
 			zap.Uint64("messageSeq", event.MessageSeq))
 		return
 	}
+	if event.MessageSeq == 0 && event.Ticket != nil && eventbus.EnqueuePendingPersistFallback(c.channelId, c.channelType, event) {
+		c.Warn("addEvent: channel queue full, spilled unpersisted durable event into pending persist manager",
+			zap.String("channelId", c.channelId),
+			zap.Uint8("channelType", c.channelType))
+		return
+	}
 	if event.Ticket != nil {
 		event.Ticket.Release()
 		event.Ticket = nil

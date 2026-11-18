@@ -16,29 +16,94 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
 
+func isTransientClusterRPCError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connect not authed") ||
+		strings.Contains(msg, "conn is nil") ||
+		strings.Contains(msg, "connect is not connected") ||
+		strings.Contains(msg, "leader not found") ||
+		strings.Contains(msg, "not slot leader") ||
+		strings.Contains(msg, "retry required") ||
+		strings.Contains(msg, "not a ready local leader") ||
+		strings.Contains(msg, "receive propose resp error") ||
+		strings.Contains(msg, "foward propose failed") ||
+		strings.Contains(msg, "not leader") ||
+		strings.Contains(msg, "proposal dropped") ||
+		strings.Contains(msg, "stopped") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection refused")
+}
+
 // GetOrCreateChannelClusterConfig 获取或创建频道分布式配置
 func (s *Server) GetOrCreateChannelClusterConfigFromSlotLeader(channelId string, channelType uint8) (wkdb.ChannelClusterConfig, error) {
 
 	s.channelKeyLock.Lock(channelId)
 	defer s.channelKeyLock.Unlock(channelId)
 
-	// 获取频道槽领导
-	slotLeaderId, err := s.SlotLeaderIdOfChannel(channelId, channelType)
-	if err != nil {
-		return wkdb.EmptyChannelClusterConfig, err
+	var lastErr error
+	delay := 25 * time.Millisecond
+	for attempt := 0; attempt < 10; attempt++ {
+		// 获取频道槽领导
+		slotLeaderId, err := s.SlotLeaderIdOfChannel(channelId, channelType)
+		if err != nil {
+			lastErr = err
+		} else if slotLeaderId == 0 {
+			lastErr = fmt.Errorf("slot[%d] leader not found", s.getSlotId(channelId))
+		} else if s.opts.ConfigOptions.NodeId == slotLeaderId {
+			// 如果当前节点是频道槽领导，则直接返回频道分布式配置
+			cfg, lErr := s.getOrCreateChannelClusterConfigFromLocal(channelId, channelType)
+			if lErr == nil || !isTransientClusterRPCError(lErr) {
+				return cfg, lErr
+			}
+			lastErr = lErr
+		} else {
+			// 向频道槽领导请求频道分布式配置
+			cfg, rErr := s.rpcClient.RequestGetOrCreateChannelClusterConfig(slotLeaderId, channelId, channelType)
+			if rErr == nil || !isTransientClusterRPCError(rErr) {
+				return cfg, rErr
+			}
+			lastErr = rErr
+		}
+		if attempt == 9 || !isTransientClusterRPCError(lastErr) {
+			return wkdb.EmptyChannelClusterConfig, lastErr
+		}
+		if s.cancelCtx != nil {
+			select {
+			case <-s.cancelCtx.Done():
+				return wkdb.EmptyChannelClusterConfig, lastErr
+			case <-time.After(delay):
+			}
+		} else {
+			time.Sleep(delay)
+		}
+		delay = min(delay*2, 100*time.Millisecond)
 	}
+	return wkdb.EmptyChannelClusterConfig, lastErr
+}
 
-	if slotLeaderId == 0 {
-		return wkdb.EmptyChannelClusterConfig, fmt.Errorf("slot[%d] leader not found", s.getSlotId(channelId))
+func (s *Server) isPeerRPCAuthed(nodeId uint64) bool {
+	if s == nil || nodeId == 0 {
+		return false
 	}
-
-	// 如果当前节点是频道槽领导，则直接返回频道分布式配置
-	if s.opts.ConfigOptions.NodeId == slotLeaderId {
-		return s.getOrCreateChannelClusterConfigFromLocal(channelId, channelType)
+	if s.opts != nil && s.opts.ConfigOptions != nil && nodeId == s.opts.ConfigOptions.NodeId {
+		return true
 	}
-
-	// 向频道槽领导请求频道分布式配置
-	return s.rpcClient.RequestGetOrCreateChannelClusterConfig(slotLeaderId, channelId, channelType)
+	if s.nodeManager == nil {
+		return true
+	}
+	n := s.nodeManager.node(nodeId)
+	if n == nil {
+		return false
+	}
+	if n.isTestMode() {
+		return true
+	}
+	return n.client != nil && n.client.IsAuthed()
 }
 
 func (s *Server) SlotLeaderOfChannel(channelId string, channelType uint8) (*types.Node, error) {
@@ -63,20 +128,53 @@ func (s *Server) SlotLeaderIdOfChannel(channelId string, channelType uint8) (nod
 	return slotLeaderId, nil
 }
 
+const maxChannelConfigReadAttempts = 3
+
 func (s *Server) LoadOnlyChannelClusterConfig(channelId string, channelType uint8) (wkdb.ChannelClusterConfig, error) {
-	slotId := s.getSlotId(channelId)
-	slotLeaderId := s.cfgServer.SlotLeaderId(slotId)
-	if slotLeaderId == 0 {
-		return wkdb.EmptyChannelClusterConfig, fmt.Errorf("slot[%d] leader not found", slotId)
+	baseCtx := context.Background()
+	if s.cancelCtx != nil {
+		baseCtx = s.cancelCtx
 	}
-	if s.opts.ConfigOptions.NodeId == slotLeaderId {
-		if err := s.waitLocalSlotApplied(s.cancelCtx, slotId); err != nil {
+	ctx, cancel := context.WithTimeout(baseCtx, s.conversationReadTimeout())
+	defer cancel()
+
+	slotId := s.getSlotId(channelId)
+	var lastErr error
+	for attempt := 0; attempt < maxChannelConfigReadAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return wkdb.EmptyChannelClusterConfig, lastErr
+			}
 			return wkdb.EmptyChannelClusterConfig, err
 		}
-		return s.db.GetChannelClusterConfig(channelId, channelType)
+		slotLeaderId := s.cfgServer.SlotLeaderId(slotId)
+		if slotLeaderId == 0 {
+			lastErr = fmt.Errorf("slot[%d] leader not found", slotId)
+		} else if s.opts.ConfigOptions.NodeId == slotLeaderId {
+			cfg, err := s.loadConversationConfigLocal(ctx, channelId, channelType)
+			if err == nil || errors.Is(err, wkdb.ErrNotFound) {
+				return cfg, err
+			}
+			lastErr = err
+			if !errors.Is(err, ErrConversationReadRetry) || s.slotServer == nil {
+				return wkdb.EmptyChannelClusterConfig, err
+			}
+		} else {
+			cfg, err := s.rpcClient.RequestGetChannelClusterConfig(slotLeaderId, channelId, channelType)
+			if err == nil || errors.Is(err, wkdb.ErrNotFound) {
+				return cfg, err
+			}
+			lastErr = err
+		}
+		if attempt+1 < maxChannelConfigReadAttempts {
+			select {
+			case <-ctx.Done():
+				return wkdb.EmptyChannelClusterConfig, lastErr
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
 	}
-
-	return s.rpcClient.RequestGetChannelClusterConfig(slotLeaderId, channelId, channelType)
+	return wkdb.EmptyChannelClusterConfig, lastErr
 }
 
 func (s *Server) maxSlotApplyWait() time.Duration {
@@ -87,29 +185,40 @@ func (s *Server) maxSlotApplyWait() time.Duration {
 }
 
 func (s *Server) waitLocalSlotApplied(ctx context.Context, slotId uint32) error {
-	if s.slotServer == nil {
-		return nil
+	if s == nil || s.slotServer == nil || s.cfgServer == nil {
+		return fmt.Errorf("%w: slot[%d] local slot server not initialized", ErrConversationReadRetry, slotId)
 	}
 	st := s.slotServer.GetSlotRaft(slotId)
 	if st == nil {
-		return fmt.Errorf("slot[%d] local raft not found", slotId)
+		return fmt.Errorf("%w: slot[%d] local raft not found", ErrConversationReadRetry, slotId)
 	}
-	target := st.CommittedIndex()
-	if st.AppliedIndex() >= target {
+	before, err := s.slotServer.ReadLeaderState(ctx, slotId)
+	if err != nil {
+		return err
+	}
+	if !before.Exists || !before.Ready || before.LeaderID != s.opts.ConfigOptions.NodeId || s.cfgServer.SlotLeaderId(slotId) != s.opts.ConfigOptions.NodeId {
+		return fmt.Errorf("%w: slot[%d] is not a ready local leader", ErrConversationReadRetry, slotId)
+	}
+	if before.AppliedIndex >= before.CommittedIndex {
 		return nil
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, s.maxSlotApplyWait())
 	defer cancel()
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
-	for st.AppliedIndex() < target {
+	current := before
+	for current.AppliedIndex < before.CommittedIndex {
 		select {
 		case <-waitCtx.Done():
-			return fmt.Errorf("slot[%d] local apply lagging: applied=%d committed=%d: %w", slotId, st.AppliedIndex(), target, waitCtx.Err())
+			return fmt.Errorf("%w: slot[%d] local apply lagging: applied=%d committed=%d: %w", ErrConversationReadRetry, slotId, current.AppliedIndex, before.CommittedIndex, waitCtx.Err())
 		case <-ticker.C:
 		}
-		if s.cfgServer.SlotLeaderId(slotId) != s.opts.ConfigOptions.NodeId {
-			return fmt.Errorf("slot[%d] leadership changed while waiting for apply", slotId)
+		current, err = s.slotServer.ReadLeaderState(waitCtx, slotId)
+		if err != nil {
+			return err
+		}
+		if !sameConversationLeader(before, current) || s.cfgServer.SlotLeaderId(slotId) != s.opts.ConfigOptions.NodeId {
+			return fmt.Errorf("%w: slot[%d] leadership changed while waiting for apply", ErrConversationReadRetry, slotId)
 		}
 	}
 	return nil
@@ -324,6 +433,9 @@ func (s *Server) CheckLocalServiceReady() (retErr error) {
 		return err
 	}
 	localNodeId := s.opts.ConfigOptions.NodeId
+	if s.cfgServer == nil {
+		return errors.New("clusterconfig server not initialized")
+	}
 	localNode := s.cfgServer.Node(localNodeId)
 	if localNode == nil {
 		return errors.New("local node not found in cluster config")
@@ -333,6 +445,27 @@ func (s *Server) CheckLocalServiceReady() (retErr error) {
 	}
 	if s.opts.Role != types.NodeRole_NodeRoleProxy && localNode.Status != types.NodeStatus_NodeStatusJoined {
 		return fmt.Errorf("local node status %v not joined", localNode.Status)
+	}
+	cfgLeaderId := s.cfgServer.LeaderId()
+	if cfgLeaderId == 0 {
+		return errors.New("clusterconfig leader not found")
+	}
+	cfgLeaderNode := s.cfgServer.Node(cfgLeaderId)
+	if cfgLeaderNode == nil {
+		return fmt.Errorf("clusterconfig leader node[%d] not found", cfgLeaderId)
+	}
+	if !cfgLeaderNode.Online {
+		return fmt.Errorf("clusterconfig leader node[%d] is offline", cfgLeaderId)
+	}
+	if cfgLeaderId == localNodeId {
+		if !s.cfgServer.IsLeader() {
+			return errors.New("local clusterconfig leader not ready")
+		}
+		if s.cfgServer.GetClusterConfig() == nil {
+			return errors.New("local clusterconfig not initialized")
+		}
+	} else if strings.TrimSpace(localNode.ApiServerAddr) != "" && strings.TrimSpace(cfgLeaderNode.ApiServerAddr) == "" {
+		return fmt.Errorf("clusterconfig leader node[%d] api server addr not ready", cfgLeaderId)
 	}
 
 	slots := s.Slots()

@@ -157,6 +157,14 @@ func (s *Server) channelClusterConfig(c *wkhttp.Context) {
 		return
 	}
 
+	if s.slotServer != nil {
+		reqCtx := context.Background()
+		if c.Request != nil && c.Request.Context() != nil {
+			reqCtx = c.Request.Context()
+		}
+		_ = s.waitLocalSlotApplied(reqCtx, slotId)
+	}
+
 	clusterConfig, err := s.db.GetChannelClusterConfig(channelId, channelType)
 	if err != nil {
 		s.Error("getChannelClusterConfig error", zap.Error(err))
@@ -641,17 +649,52 @@ func (s *Server) clusterLogs(c *wkhttp.Context) {
 }
 
 func (s *Server) clusterInfoGet(c *wkhttp.Context) {
-
-	leaderId := s.cfgServer.LeaderId()
-	if leaderId == 0 {
-		c.ResponseError(errors.New("leader not found"))
-		return
+	deadline := time.Now().Add(800 * time.Millisecond)
+	var lastErr error
+	for {
+		leaderId := s.cfgServer.LeaderId()
+		if leaderId == 0 {
+			lastErr = errors.New("leader not found")
+		} else if leaderId == s.opts.ConfigOptions.NodeId {
+			cfg := s.cfgServer.GetClusterConfig()
+			c.JSON(http.StatusOK, cfg)
+			return
+		} else {
+			leaderNode := s.cfgServer.Node(leaderId)
+			if leaderNode == nil || leaderNode.ApiServerAddr == "" {
+				lastErr = errors.New("leader node api server addr not found")
+			} else {
+				var baseHeaders map[string]string
+				if c.Request != nil {
+					baseHeaders = c.CopyRequestHeader(c.Request)
+				}
+				targetURL := fmt.Sprintf("%s%s", leaderNode.ApiServerAddr, c.Request.URL.Path)
+				resp, err := network.Get(targetURL, nil, baseHeaders)
+				if err == nil && resp != nil && resp.StatusCode == http.StatusOK {
+					c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+					c.Writer.WriteHeader(resp.StatusCode)
+					_, _ = c.Writer.Write([]byte(resp.Body))
+					return
+				}
+				if err != nil {
+					lastErr = err
+				} else if resp != nil && resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusServiceUnavailable {
+					c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+					c.Writer.WriteHeader(resp.StatusCode)
+					_, _ = c.Writer.Write([]byte(resp.Body))
+					return
+				} else {
+					lastErr = errors.New("leader cluster info temporarily unavailable")
+				}
+			}
+		}
+		if time.Now().After(deadline) || (c.Request != nil && c.Request.Context().Err() != nil) {
+			if lastErr == nil {
+				lastErr = errors.New("leader not found")
+			}
+			c.ResponseError(lastErr)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if leaderId != s.opts.ConfigOptions.NodeId {
-		leaderNode := s.cfgServer.Node(leaderId)
-		c.Forward(fmt.Sprintf("%s%s", leaderNode.ApiServerAddr, c.Request.URL.Path))
-		return
-	}
-	cfg := s.cfgServer.GetClusterConfig()
-	c.JSON(http.StatusOK, cfg)
 }

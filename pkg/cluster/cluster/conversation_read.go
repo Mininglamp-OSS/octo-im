@@ -39,22 +39,24 @@ type conversationReadResponse struct {
 }
 
 type conversationReader struct {
-	nodeID uint64
-	load   func(context.Context, string, uint8) (wkdb.ChannelClusterConfig, error)
-	state  func(context.Context, string, uint8) (raftgroup.ReadState, error)
-	local  func(string, uint8) (uint64, uint64, error)
-	remote func(context.Context, uint64, string, conversationReadRequest) (conversationReadResponse, error)
-	hint   func(string, uint8)
+	nodeID   uint64
+	load     func(context.Context, string, uint8) (wkdb.ChannelClusterConfig, error)
+	state    func(context.Context, string, uint8) (raftgroup.ReadState, error)
+	local    func(string, uint8) (uint64, uint64, error)
+	remote   func(context.Context, uint64, string, conversationReadRequest) (conversationReadResponse, error)
+	hint     func(string, uint8)
+	maintain func(context.Context, string, uint8, uint64)
 }
 
 func (s *Server) conversationReader() conversationReader {
 	return conversationReader{
-		nodeID: s.opts.ConfigOptions.NodeId,
-		load:   s.loadConversationConfig,
-		state:  s.channelServer.ReadLeaderState,
-		local:  s.db.GetChannelLastMessageSeq,
-		remote: s.requestConversationRead,
-		hint:   s.hintChannelConfig,
+		nodeID:   s.opts.ConfigOptions.NodeId,
+		load:     s.loadConversationConfig,
+		state:    s.channelServer.ReadLeaderState,
+		local:    s.db.GetChannelLastMessageSeq,
+		remote:   s.requestConversationRead,
+		hint:     s.hintChannelConfig,
+		maintain: s.MaintainExistingChannelLeader,
 	}
 }
 
@@ -80,11 +82,14 @@ func (r conversationReader) latest(ctx context.Context, id string, typ uint8) (u
 		if deadline, ok := ctx.Deadline(); ok {
 			attemptCtx, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(2-attempt))
 		}
-		seq, found, err := r.attempt(attemptCtx, id, typ, !seenConfig)
+		seq, found, suspectLeader, err := r.attemptWithSuspect(attemptCtx, id, typ, !seenConfig)
 		cancel()
 		seenConfig = seenConfig || found
 		if err == nil {
 			return seq, ctx.Err()
+		}
+		if suspectLeader != 0 && r.maintain != nil && ctx.Err() == nil {
+			r.maintain(ctx, id, typ, suspectLeader)
 		}
 		lastErr = fmt.Errorf("attempt %d: %w", attempt+1, err)
 		if attempt == 0 && ctx.Err() == nil {
@@ -108,20 +113,28 @@ func (r conversationReader) latest(ctx context.Context, id string, typ uint8) (u
 }
 
 func (r conversationReader) attempt(ctx context.Context, id string, typ uint8, allowMissing bool) (uint64, bool, error) {
+	seq, found, _, err := r.attemptWithSuspect(ctx, id, typ, allowMissing)
+	return seq, found, err
+}
+
+func (r conversationReader) attemptWithSuspect(ctx context.Context, id string, typ uint8, allowMissing bool) (uint64, bool, uint64, error) {
 	cfg, err := r.load(ctx, id, typ)
 	if errors.Is(err, wkdb.ErrNotFound) && allowMissing {
 		// Preserve v2.2.5's unused-channel semantics without creating metadata.
-		return 0, false, ctx.Err()
+		return 0, false, 0, ctx.Err()
 	}
 	if err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 	if !validConversationConfig(cfg, id, typ) {
-		return 0, true, ErrConversationReadRetry
+		return 0, true, 0, ErrConversationReadRetry
 	}
 	var seq uint64
 	if cfg.LeaderId == r.nodeID {
 		seq, err = r.readLocal(ctx, cfg)
+		if err != nil {
+			return 0, true, 0, fmt.Errorf("channel leader %d: %w", cfg.LeaderId, err)
+		}
 	} else {
 		var resp conversationReadResponse
 		resp, err = r.remote(ctx, cfg.LeaderId, conversationBoundaryPath,
@@ -133,18 +146,18 @@ func (r conversationReader) attempt(ctx context.Context, id string, typ uint8, a
 				seq = *resp.Sequence
 			}
 		}
-	}
-	if err != nil {
-		return 0, true, fmt.Errorf("channel leader %d: %w", cfg.LeaderId, err)
+		if err != nil {
+			return 0, true, cfg.LeaderId, fmt.Errorf("channel leader %d: %w", cfg.LeaderId, err)
+		}
 	}
 	after, err := r.load(ctx, id, typ)
 	if err != nil {
-		return 0, true, err
+		return 0, true, 0, err
 	}
 	if !cfg.Equal(after) {
-		return 0, true, ErrConversationReadRetry
+		return 0, true, 0, ErrConversationReadRetry
 	}
-	return seq, true, ctx.Err()
+	return seq, true, 0, ctx.Err()
 }
 
 func validConversationConfig(cfg wkdb.ChannelClusterConfig, id string, typ uint8) bool {
@@ -241,16 +254,27 @@ func (s *Server) requestConversationRead(ctx context.Context, nodeID uint64, pat
 	if err := ctx.Err(); err != nil {
 		return conversationReadResponse{}, err
 	}
+	rpcCtx := ctx
+	cancel := func() {}
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem > 800*time.Millisecond {
+			rpcCtx, cancel = context.WithTimeout(ctx, min(800*time.Millisecond, max(250*time.Millisecond, rem/2)))
+		}
+	}
+	defer cancel()
 	req.Budget = s.conversationReadTimeout()
-	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < req.Budget {
+	if deadline, ok := rpcCtx.Deadline(); ok && time.Until(deadline) < req.Budget {
 		req.Budget = time.Until(deadline)
 	}
 	data, err := json.Marshal(req)
 	if err != nil {
 		return conversationReadResponse{}, err
 	}
-	resp, err := s.RequestWithContext(ctx, nodeID, path, data)
+	resp, err := s.RequestWithContext(rpcCtx, nodeID, path, data)
 	if err != nil {
+		if ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || isTransientClusterRPCError(err)) {
+			return conversationReadResponse{}, fmt.Errorf("%w: %v", ErrConversationReadRetry, err)
+		}
 		return conversationReadResponse{}, err
 	}
 	if resp == nil {
@@ -283,14 +307,14 @@ func (s *Server) loadConversationConfig(ctx context.Context, id string, typ uint
 	rpcCtx := ctx
 	cancel := func() {}
 	if deadline, ok := ctx.Deadline(); ok {
-		if rem := time.Until(deadline); rem > 2*time.Second {
-			rpcCtx, cancel = context.WithTimeout(ctx, max(1200*time.Millisecond, rem/2))
+		if rem := time.Until(deadline); rem > 800*time.Millisecond {
+			rpcCtx, cancel = context.WithTimeout(ctx, min(800*time.Millisecond, max(250*time.Millisecond, rem/2)))
 		}
 	}
 	resp, err := s.requestConversationRead(rpcCtx, leader, conversationConfigPath, conversationReadRequest{ChannelID: id, ChannelType: typ})
 	cancel()
 	if err != nil {
-		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		if ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || isTransientClusterRPCError(err)) {
 			return wkdb.EmptyChannelClusterConfig, fmt.Errorf("%w: %v", ErrConversationReadRetry, err)
 		}
 		return wkdb.EmptyChannelClusterConfig, err
@@ -308,19 +332,32 @@ func (s *Server) loadConversationConfig(ctx context.Context, id string, typ uint
 }
 
 func (s *Server) loadConversationConfigLocal(ctx context.Context, id string, typ uint8) (wkdb.ChannelClusterConfig, error) {
+	if s == nil || s.slotServer == nil || s.cfgServer == nil || s.db == nil {
+		return wkdb.EmptyChannelClusterConfig, fmt.Errorf("%w: local slot server not initialized", ErrConversationReadRetry)
+	}
 	slotID := s.getSlotId(id)
 	reader := conversationConfigReader{
 		nodeID:  s.opts.ConfigOptions.NodeId,
 		maxWait: s.maxSlotApplyWait(),
 		leader:  func() uint64 { return s.cfgServer.SlotLeaderId(slotID) },
+		epoch: func() (uint32, uint64) {
+			var slotTerm uint32
+			if st := s.cfgServer.Slot(slotID); st != nil {
+				slotTerm = st.Term
+			}
+			return slotTerm, s.cfgServer.GetClusterConfig().Version
+		},
 		state: func(ctx context.Context) (raftgroup.ReadState, error) {
+			if s.slotServer == nil {
+				return raftgroup.ReadState{}, fmt.Errorf("%w: slot server not initialized", ErrConversationReadRetry)
+			}
 			return s.slotServer.ReadLeaderState(ctx, slotID)
 		},
 		load: func() (wkdb.ChannelClusterConfig, error) { return s.db.GetChannelClusterConfig(id, typ) },
 	}
 	cfg, err := reader.read(ctx)
 	if err != nil {
-		return cfg, fmt.Errorf("slot %d config: %w", slotID, err)
+		return wkdb.EmptyChannelClusterConfig, fmt.Errorf("slot %d config: %w", slotID, err)
 	}
 	return cfg, nil
 }

@@ -2,13 +2,124 @@ package wkdb
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
 	"github.com/cockroachdb/pebble"
 	"go.uber.org/zap"
 )
+
+func canonicalChannelConfigLockKey(channelId string, channelType uint8) string {
+	var builder strings.Builder
+	builder.Grow(len(channelId) + 4)
+	builder.WriteString(channelId)
+	builder.WriteByte(':')
+	builder.WriteString(strconv.FormatUint(uint64(channelType), 10))
+	return builder.String()
+}
+
+func (wk *wukongDB) getChannelClusterConfigVersionByPrimaryKey(primaryKey uint64) (uint64, error) {
+	result, closer, err := wk.defaultShardDB().Get(key.NewChannelClusterConfigColumnKey(primaryKey, key.TableChannelClusterConfig.Column.ConfVersion))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer closer.Close()
+	if len(result) < 8 {
+		return 0, nil
+	}
+	return binary.BigEndian.Uint64(result), nil
+}
+
+func (wk *wukongDB) saveChannelClusterConfigsMonotonic(channelClusterConfigs []ChannelClusterConfig, assignPrimaryKeyId bool) error {
+	if len(channelClusterConfigs) == 0 {
+		return nil
+	}
+
+	// 1. Coalesce duplicate (ChannelId, ChannelType) entries in the input slice to the highest ConfVersion
+	//    (keeping the later entry when ConfVersion ties, e.g. ConfVersion == 0 in unit tests).
+	dedup := make(map[string]ChannelClusterConfig, len(channelClusterConfigs))
+	for _, cfg := range channelClusterConfigs {
+		lockKey := canonicalChannelConfigLockKey(cfg.ChannelId, cfg.ChannelType)
+		if prev, exists := dedup[lockKey]; exists {
+			if cfg.ConfVersion < prev.ConfVersion {
+				continue
+			}
+		}
+		dedup[lockKey] = cfg.Clone()
+	}
+
+	// 2. Acquire per-channel locks in strict canonical lexicographical order to prevent any lock-order inversion.
+	sortedKeys := make([]string, 0, len(dedup))
+	for k := range dedup {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Strings(sortedKeys)
+	for _, k := range sortedKeys {
+		wk.dblock.channelClusterConfig.Lock(k)
+	}
+	defer func() {
+		for i := len(sortedKeys) - 1; i >= 0; i-- {
+			wk.dblock.channelClusterConfig.Unlock(sortedKeys[i])
+		}
+	}()
+
+	// 3. Under per-channel locks, atomically compare incoming ConfVersion against persisted ConfVersion in Pebble.
+	//    Never allow an older ConfVersion write finishing last to downgrade Pebble or ChannelClusterConfigCache.
+	db := wk.defaultShardBatchDB()
+	batch := db.NewBatch()
+	written := make([]ChannelClusterConfig, 0, len(sortedKeys))
+	refreshPrimaryKeys := make([]uint64, 0)
+
+	for _, k := range sortedKeys {
+		cfg := dedup[k]
+		primaryKey := key.ChannelToNum(cfg.ChannelId, cfg.ChannelType)
+		if assignPrimaryKeyId {
+			cfg.Id = primaryKey
+		}
+
+		persistedVer, err := wk.getChannelClusterConfigVersionByPrimaryKey(primaryKey)
+		if err != nil {
+			return err
+		}
+		if persistedVer > 0 && cfg.ConfVersion < persistedVer {
+			if cached, found := wk.clusterConfigCache.GetChannelClusterConfig(cfg.ChannelId, cfg.ChannelType); !found || cached.ConfVersion < persistedVer {
+				refreshPrimaryKeys = append(refreshPrimaryKeys, primaryKey)
+			}
+			continue
+		}
+
+		if err := wk.writeChannelClusterConfig(primaryKey, cfg, batch); err != nil {
+			return err
+		}
+		written = append(written, cfg)
+	}
+
+	if len(written) > 0 {
+		if err := batch.CommitWait(); err != nil {
+			return err
+		}
+		wk.clusterConfigCache.BatchSetChannelClusterConfigs(written)
+	}
+
+	for _, pk := range refreshPrimaryKeys {
+		if persistedCfg, err := wk.getChannelClusterConfigById(pk); err == nil {
+			if !assignPrimaryKeyId {
+				persistedCfg.Id = 0
+			}
+			wk.clusterConfigCache.SetChannelClusterConfig(persistedCfg)
+		}
+	}
+
+	return nil
+}
 
 func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelClusterConfig) error {
 
@@ -24,51 +135,7 @@ func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelCluster
 		}()
 	}
 
-	wk.dblock.channelClusterConfig.lockByChannel(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
-	defer wk.dblock.channelClusterConfig.unlockByChannel(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
-
-	primaryKey := key.ChannelToNum(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
-
-	// oldChannelClusterConfig, err := wk.getChannelClusterConfigById(primaryKey)
-	// if err != nil && err != ErrNotFound {
-	// 	return err
-	// }
-
-	db := wk.defaultShardBatchDB()
-
-	batch := db.NewBatch()
-
-	// existConfig := !IsEmptyChannelClusterConfig(oldChannelClusterConfig)
-
-	// // 删除旧的索引
-	// if existConfig {
-	// 	oldChannelClusterConfig.CreatedAt = nil // 旧的创建时间不参与索引
-	// 	err = wk.deleteChannelClusterConfigIndex(oldChannelClusterConfig.Id, oldChannelClusterConfig, batch)
-	// 	if err != nil {
-	// 		wk.Error("delete channel cluster config index error", zap.Error(err), zap.String("channelId", channelClusterConfig.ChannelId), zap.Uint8("channelType", channelClusterConfig.ChannelType))
-	// 		return err
-	// 	}
-	// }
-
-	channelClusterConfig.Id = primaryKey
-
-	// if existConfig {
-	// 	channelClusterConfig.CreatedAt = nil // 创建时间不参与更新
-	// }
-
-	if err := wk.writeChannelClusterConfig(primaryKey, channelClusterConfig, batch); err != nil {
-		return err
-	}
-
-	err := batch.CommitWait()
-	if err != nil {
-		return err
-	}
-
-	// 更新缓存
-	wk.clusterConfigCache.SetChannelClusterConfig(channelClusterConfig)
-
-	return nil
+	return wk.saveChannelClusterConfigsMonotonic([]ChannelClusterConfig{channelClusterConfig}, true)
 }
 
 func (wk *wukongDB) SaveChannelClusterConfigs(channelClusterConfigs []ChannelClusterConfig) error {
@@ -85,53 +152,7 @@ func (wk *wukongDB) SaveChannelClusterConfigs(channelClusterConfigs []ChannelClu
 
 	wk.metrics.SaveChannelClusterConfigsAdd(1)
 
-	db := wk.defaultShardBatchDB()
-	// batch := db.NewBatch()
-	// 先删除旧的
-
-	// for i, cfg := range channelClusterConfigs {
-	// 	primaryKey := key.ChannelToNum(cfg.ChannelId, cfg.ChannelType)
-	// 	oldChannelClusterConfig, err := wk.getChannelClusterConfigById(primaryKey)
-	// 	if err != nil && err != ErrNotFound {
-	// 		return err
-	// 	}
-	// 	existConfig := !IsEmptyChannelClusterConfig(oldChannelClusterConfig)
-
-	// 	// 删除旧的索引
-	// 	if existConfig {
-	// 		oldChannelClusterConfig.CreatedAt = nil // 旧的创建时间不参与索引
-	// 		err = wk.deleteChannelClusterConfigIndex(oldChannelClusterConfig.Id, oldChannelClusterConfig, batch)
-	// 		if err != nil {
-	// 			wk.Error("delete channel cluster config index error", zap.Error(err), zap.String("channelId", cfg.ChannelId), zap.Uint8("channelType", cfg.ChannelType))
-	// 			return err
-	// 		}
-	// 	}
-	// 	channelClusterConfigs[i].Id = primaryKey
-	// 	if existConfig {
-	// 		channelClusterConfigs[i].CreatedAt = nil // 创建时间不参与更新
-	// 	}
-	// }
-
-	// if err := batch.CommitWait(); err != nil {
-	// 	return err
-	// }
-	// 再添加新的
-	batch := db.NewBatch()
-	for _, cfg := range channelClusterConfigs {
-		primaryKey := key.ChannelToNum(cfg.ChannelId, cfg.ChannelType)
-		if err := wk.writeChannelClusterConfig(primaryKey, cfg, batch); err != nil {
-			return err
-		}
-	}
-	err := batch.CommitWait()
-	if err != nil {
-		return err
-	}
-
-	// 批量更新缓存
-	wk.clusterConfigCache.BatchSetChannelClusterConfigs(channelClusterConfigs)
-
-	return nil
+	return wk.saveChannelClusterConfigsMonotonic(channelClusterConfigs, false)
 }
 
 func (wk *wukongDB) GetChannelClusterConfig(channelId string, channelType uint8) (ChannelClusterConfig, error) {
@@ -151,6 +172,14 @@ func (wk *wukongDB) GetChannelClusterConfig(channelId string, channelType uint8)
 		}
 	}()
 
+	// 持频道锁重检缓存并回源 Pebble，防止并发保存与缓存回填乱序覆盖
+	wk.dblock.channelClusterConfig.lockByChannel(channelId, channelType)
+	defer wk.dblock.channelClusterConfig.unlockByChannel(channelId, channelType)
+
+	if config, found := wk.clusterConfigCache.GetChannelClusterConfig(channelId, channelType); found {
+		return config, nil
+	}
+
 	primaryKey := key.ChannelToNum(channelId, channelType)
 
 	config, err := wk.getChannelClusterConfigById(primaryKey)
@@ -161,7 +190,7 @@ func (wk *wukongDB) GetChannelClusterConfig(channelId string, channelType uint8)
 	// 将结果写入缓存
 	wk.clusterConfigCache.SetChannelClusterConfig(config)
 
-	return config, nil
+	return config.Clone(), nil
 }
 
 func (wk *wukongDB) getChannelClusterConfigById(id uint64) (ChannelClusterConfig, error) {

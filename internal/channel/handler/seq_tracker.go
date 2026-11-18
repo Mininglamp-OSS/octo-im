@@ -20,16 +20,34 @@ const (
 	StagePersistEnqueued    TrackStage = 4
 	numTrackStages                     = 5
 
-	seqTrackerShards      = 64
-	MaxChannelsPerShard   = 256 // 64 * 256 = 16,384 max tracked channels globally
-	MaxGlobalOOOWindows   = 8192
-	MaxGlobalSlotExts     = 2048
-	MaxInFlightPerShard   = 1024
-	oooWindowBits         = 2048
-	oooWindowWords        = oooWindowBits / 64 // 32 uint64s = 256 B
-	maxHistIntervals      = 4
-	maxPartialSeqsPerExt  = 8
-	MaxExtraSlotMaskBytes = int64(2 * 1024 * 1024)
+	seqTrackerShards        = 64
+	MaxChannelsPerShard     = 256 // 64 * 256 = 16,384 max tracked channels globally
+	MaxGlobalOOOWindows     = 8192
+	MaxGlobalSlotExts       = 2048
+	MaxInFlightPerShard     = 1024
+	oooWindowBits           = 2048
+	oooWindowWords          = oooWindowBits / 64 // 32 uint64s = 256 B
+	maxHistIntervals        = 4
+	maxExtraHistIntervals   = 16384
+	sparsePageBits          = 4096
+	sparsePageWords         = sparsePageBits / 64 // 64 uint64s = 512 B
+	sparseRunThreshold      = 64
+	maxPartialSeqsPerExt    = 8
+	maxOverflowPartialSeqs  = 1016
+	MaxExtraSlotMaskBytes   = int64(8 * 1024 * 1024)
+	histIntervalExtraBytes  = int64(16)
+	histPageExtraBytes      = int64(544)
+	partialSeqEntryOverhead = int64(48)
+)
+
+// StageBeginStatus explicitly distinguishes already-committed, in-flight, newly leased, and capacity-backpressured outcomes (A1 + B2).
+type StageBeginStatus uint8
+
+const (
+	StageBeginAlreadyCommitted StageBeginStatus = iota + 1
+	StageBeginInFlight
+	StageBeginLeased
+	StageBeginCapacityRetry
 )
 
 // ChannelWatermarkKey is a fixed-size 40-byte value key that retains zero heap string slices
@@ -67,9 +85,12 @@ type seqInterval struct {
 }
 
 type OOOWindow struct {
-	base uint64
-	bits [oooWindowWords]uint64
-	hist [maxHistIntervals]seqInterval
+	base        uint64
+	bits        [oooWindowWords]uint64
+	hist        [maxHistIntervals]seqInterval
+	extraHist   []seqInterval
+	sparsePages map[uint64]*[sparsePageWords]uint64
+	extraBytes  int64
 }
 
 func (w *OOOWindow) isBitsEmpty() bool {
@@ -88,8 +109,16 @@ func (w *OOOWindow) isHistEmpty() bool {
 	if w == nil {
 		return true
 	}
+	if len(w.sparsePages) > 0 {
+		return false
+	}
 	for i := range w.hist {
 		if w.hist[i].hi != 0 {
+			return false
+		}
+	}
+	for i := range w.extraHist {
+		if w.extraHist[i].hi != 0 {
 			return false
 		}
 	}
@@ -115,18 +144,115 @@ func (w *OOOWindow) histCount() int {
 	if w == nil {
 		return 0
 	}
-	n := 0
+	n := len(w.sparsePages)
 	for i := range w.hist {
 		if w.hist[i].hi != 0 {
+			n++
+		}
+	}
+	for i := range w.extraHist {
+		if w.extraHist[i].hi != 0 {
 			n++
 		}
 	}
 	return n
 }
 
+func (w *OOOWindow) hasSparseBit(seq uint64) bool {
+	if w == nil || seq == 0 || len(w.sparsePages) == 0 {
+		return false
+	}
+	pg := w.sparsePages[seq/sparsePageBits]
+	if pg == nil {
+		return false
+	}
+	off := seq % sparsePageBits
+	return (pg[off/64] & (uint64(1) << (off % 64))) != 0
+}
+
+func (w *OOOWindow) clearSparseBit(t *StageSeqTracker, seq uint64) {
+	if w == nil || seq == 0 || len(w.sparsePages) == 0 {
+		return
+	}
+	pIdx := seq / sparsePageBits
+	pg := w.sparsePages[pIdx]
+	if pg == nil {
+		return
+	}
+	off := seq % sparsePageBits
+	pg[off/64] &^= uint64(1) << (off % 64)
+	for i := range pg {
+		if pg[i] != 0 {
+			return
+		}
+	}
+	delete(w.sparsePages, pIdx)
+	w.extraBytes -= histPageExtraBytes
+	if t != nil {
+		t.extraSlotBytes.Add(-histPageExtraBytes)
+	}
+}
+
+func (w *OOOWindow) setSparseBit(t *StageSeqTracker, seq uint64) bool {
+	if w == nil || seq == 0 {
+		return false
+	}
+	pIdx := seq / sparsePageBits
+	pg := w.sparsePages[pIdx]
+	if pg == nil {
+		if t != nil && !t.tryReserveExtraBytes(histPageExtraBytes) {
+			return false
+		}
+		if w.sparsePages == nil {
+			w.sparsePages = make(map[uint64]*[sparsePageWords]uint64, 4)
+		}
+		pg = &[sparsePageWords]uint64{}
+		w.sparsePages[pIdx] = pg
+		w.extraBytes += histPageExtraBytes
+	}
+	off := seq % sparsePageBits
+	pg[off/64] |= uint64(1) << (off % 64)
+
+	// If all 4096 bits in this page are now committed (except seq 0 on page 0), promote to a compact 16B interval!
+	full := true
+	for i := range pg {
+		expected := ^uint64(0)
+		if pIdx == 0 && i == 0 {
+			expected = ^uint64(1)
+		}
+		if pg[i] != expected {
+			full = false
+			break
+		}
+	}
+	if full {
+		lo := pIdx * sparsePageBits
+		if lo == 0 {
+			lo = 1
+		}
+		hi := pIdx*sparsePageBits + (sparsePageBits - 1)
+		delete(w.sparsePages, pIdx)
+		w.extraBytes -= histPageExtraBytes
+		if t != nil {
+			t.extraSlotBytes.Add(-histPageExtraBytes)
+		}
+		if !w.storeContiguousInterval(t, lo, hi) {
+			// Restore page if interval list could not grow
+			if t == nil || t.tryReserveExtraBytes(histPageExtraBytes) {
+				w.sparsePages[pIdx] = pg
+				w.extraBytes += histPageExtraBytes
+			}
+		}
+	}
+	return true
+}
+
 func (w *OOOWindow) hasInHist(seq uint64) bool {
 	if w == nil || seq == 0 {
 		return false
+	}
+	if w.hasSparseBit(seq) {
+		return true
 	}
 	for i := range w.hist {
 		iv := w.hist[i]
@@ -134,78 +260,137 @@ func (w *OOOWindow) hasInHist(seq uint64) bool {
 			return true
 		}
 	}
+	for i := range w.extraHist {
+		iv := w.extraHist[i]
+		if iv.hi != 0 && seq >= iv.lo && seq <= iv.hi {
+			return true
+		}
+	}
 	return false
 }
 
-// recordHistInterval records [lo, hi] strictly without bridging uncommitted gaps (closing BF-R7-1a).
-// Adjacent intervals (hi+1 == lo) merge cleanly; if all 4 slots are occupied by disjoint intervals,
-// the lowest (oldest) committed interval is retired rather than coalescing across an uncommitted gap.
-func (w *OOOWindow) recordHistInterval(lo, hi uint64) {
-	if w == nil || hi == 0 || lo > hi {
-		return
+func (w *OOOWindow) allHistIntervals() []seqInterval {
+	if w == nil {
+		return nil
 	}
+	out := make([]seqInterval, 0, len(w.hist)+len(w.extraHist)+1)
 	for i := range w.hist {
-		iv := &w.hist[i]
-		if iv.hi == 0 {
-			continue
-		}
-		if lo >= iv.lo && hi <= iv.hi {
-			return
-		}
-		if hi+1 >= iv.lo && lo <= iv.hi+1 {
-			if lo < iv.lo {
-				iv.lo = lo
-			}
-			if hi > iv.hi {
-				iv.hi = hi
-			}
-			// Merge with any other now-adjacent slot.
-			for j := range w.hist {
-				if j == i || w.hist[j].hi == 0 {
-					continue
-				}
-				other := w.hist[j]
-				if iv.hi+1 >= other.lo && iv.lo <= other.hi+1 {
-					if other.lo < iv.lo {
-						iv.lo = other.lo
-					}
-					if other.hi > iv.hi {
-						iv.hi = other.hi
-					}
-					w.hist[j] = seqInterval{}
-				}
-			}
-			return
+		if w.hist[i].hi != 0 {
+			out = append(out, w.hist[i])
 		}
 	}
-	for i := range w.hist {
-		if w.hist[i].hi == 0 {
-			w.hist[i] = seqInterval{lo: lo, hi: hi}
-			return
+	for i := range w.extraHist {
+		if w.extraHist[i].hi != 0 {
+			out = append(out, w.extraHist[i])
 		}
 	}
-	// Retire lowest historical committed interval; never bridge uncommitted gaps.
-	minIdx := 0
-	for i := 1; i < len(w.hist); i++ {
-		if w.hist[i].hi < w.hist[minIdx].hi {
-			minIdx = i
-		}
-	}
-	w.hist[minIdx] = seqInterval{lo: lo, hi: hi}
+	return out
 }
 
-func (w *OOOWindow) absorbAdjacentToFrontier(frontierLo, frontierHi uint64) (uint64, uint64) {
+func (w *OOOWindow) intervalExtraBytes() int64 {
+	if len(w.extraHist) == 0 {
+		return 0
+	}
+	return int64(len(w.extraHist)) * histIntervalExtraBytes
+}
+
+func (w *OOOWindow) storeHistIntervals(t *StageSeqTracker, intervals []seqInterval) bool {
+	// Compact adjacent/overlapping intervals without ever bridging uncommitted gaps (hi+1 < next.lo).
+	for i := 0; i < len(intervals); i++ {
+		for j := i + 1; j < len(intervals); {
+			a, b := intervals[i], intervals[j]
+			if a.hi+1 >= b.lo && a.lo <= b.hi+1 {
+				if b.lo < a.lo {
+					a.lo = b.lo
+				}
+				if b.hi > a.hi {
+					a.hi = b.hi
+				}
+				intervals[i] = a
+				intervals = append(intervals[:j], intervals[j+1:]...)
+				j = i + 1
+				continue
+			}
+			j++
+		}
+	}
+	needExtra := 0
+	if len(intervals) > maxHistIntervals {
+		needExtra = len(intervals) - maxHistIntervals
+	}
+	if needExtra > maxExtraHistIntervals {
+		return false
+	}
+	oldIvBytes := w.intervalExtraBytes()
+	newIvBytes := int64(needExtra) * histIntervalExtraBytes
+	delta := newIvBytes - oldIvBytes
+	if delta > 0 && t != nil && !t.tryReserveExtraBytes(delta) {
+		return false
+	}
+	if delta < 0 && t != nil {
+		t.extraSlotBytes.Add(delta)
+	}
+	w.extraBytes += delta
+	for i := range w.hist {
+		if i < len(intervals) {
+			w.hist[i] = intervals[i]
+		} else {
+			w.hist[i] = seqInterval{}
+		}
+	}
+	if needExtra > 0 {
+		w.extraHist = append(w.extraHist[:0], intervals[maxHistIntervals:]...)
+	} else {
+		w.extraHist = nil
+	}
+	return true
+}
+
+func (w *OOOWindow) storeContiguousInterval(t *StageSeqTracker, lo, hi uint64) bool {
+	all := w.allHistIntervals()
+	all = append(all, seqInterval{lo: lo, hi: hi})
+	return w.storeHistIntervals(t, all)
+}
+
+// recordHistInterval records [lo, hi] strictly without bridging uncommitted gaps and without retiring/forgetting committed intervals (A1).
+// Long contiguous runs (>= sparseRunThreshold) are stored as 16B intervals; short/sparse runs (such as multi-node round-robin sequences)
+// are stored in 4096-bit sparse bitmap pages (O(1) lookup, 1 bit/seq, zero interval fragmentation).
+func (w *OOOWindow) recordHistInterval(t *StageSeqTracker, lo, hi uint64) bool {
+	if w == nil || hi == 0 || lo > hi {
+		return false
+	}
+	if hi-lo >= sparseRunThreshold {
+		return w.storeContiguousInterval(t, lo, hi)
+	}
+	for s := lo; s <= hi; s++ {
+		if !w.setSparseBit(t, s) {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *OOOWindow) absorbAdjacentToFrontier(t *StageSeqTracker, frontierLo, frontierHi uint64) (uint64, uint64) {
 	if w == nil || frontierHi == 0 {
 		return frontierLo, frontierHi
 	}
+	all := w.allHistIntervals()
+	hasIv := len(all) > 0
 	changed := true
 	for changed {
 		changed = false
-		for i := range w.hist {
-			iv := w.hist[i]
-			if iv.hi == 0 {
-				continue
-			}
+		for len(w.sparsePages) > 0 && w.hasSparseBit(frontierHi+1) {
+			frontierHi++
+			w.clearSparseBit(t, frontierHi)
+			changed = true
+		}
+		for len(w.sparsePages) > 0 && frontierLo > 1 && w.hasSparseBit(frontierLo-1) {
+			frontierLo--
+			w.clearSparseBit(t, frontierLo)
+			changed = true
+		}
+		for i := 0; i < len(all); {
+			iv := all[i]
 			if iv.hi+1 >= frontierLo && iv.lo <= frontierHi+1 {
 				if iv.lo < frontierLo {
 					frontierLo = iv.lo
@@ -213,8 +398,41 @@ func (w *OOOWindow) absorbAdjacentToFrontier(frontierLo, frontierHi uint64) (uin
 				if iv.hi > frontierHi {
 					frontierHi = iv.hi
 				}
-				w.hist[i] = seqInterval{}
+				all = append(all[:i], all[i+1:]...)
 				changed = true
+				continue
+			}
+			i++
+		}
+	}
+	if hasIv {
+		_ = w.storeHistIntervals(t, all)
+	}
+	// Clear any sparse bits now subsumed inside [frontierLo, frontierHi]:
+	if len(w.sparsePages) > 0 {
+		startPg := frontierLo / sparsePageBits
+		endPg := frontierHi / sparsePageBits
+		if endPg-startPg <= uint64(len(w.sparsePages)) {
+			for pIdx := startPg; pIdx <= endPg; pIdx++ {
+				if w.sparsePages[pIdx] == nil {
+					continue
+				}
+				loSeq := max(frontierLo, pIdx*sparsePageBits)
+				hiSeq := min(frontierHi, pIdx*sparsePageBits+(sparsePageBits-1))
+				for s := loSeq; s <= hiSeq; s++ {
+					w.clearSparseBit(t, s)
+				}
+			}
+		} else {
+			for pIdx := range w.sparsePages {
+				if pIdx < startPg || pIdx > endPg {
+					continue
+				}
+				loSeq := max(frontierLo, pIdx*sparsePageBits)
+				hiSeq := min(frontierHi, pIdx*sparsePageBits+(sparsePageBits-1))
+				for s := loSeq; s <= hiSeq; s++ {
+					w.clearSparseBit(t, s)
+				}
 			}
 		}
 	}
@@ -232,6 +450,25 @@ func (w *OOOWindow) maxOffsetSet() (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func (w *OOOWindow) countBitRuns() int {
+	if w == nil {
+		return 0
+	}
+	runs := 0
+	for i := 0; i < oooWindowBits; {
+		word := w.bits[i/64] >> uint(i%64)
+		if (word & 1) == 0 {
+			i++
+			continue
+		}
+		runs++
+		for i < oooWindowBits && ((w.bits[i/64]>>uint(i%64))&1) != 0 {
+			i++
+		}
+	}
+	return runs
 }
 
 func (w *OOOWindow) shiftLeftBits(delta uint64) {
@@ -307,7 +544,9 @@ type slotSeqMask struct {
 }
 
 type SlotHandoffExt struct {
-	entries [maxPartialSeqsPerExt]slotSeqMask
+	entries       [maxPartialSeqsPerExt]slotSeqMask
+	overflow      []slotSeqMask
+	countedInPool bool
 }
 
 func (ext *SlotHandoffExt) isEmpty() bool {
@@ -319,26 +558,114 @@ func (ext *SlotHandoffExt) isEmpty() bool {
 			return false
 		}
 	}
+	for i := range ext.overflow {
+		if ext.overflow[i].seq != 0 {
+			return false
+		}
+	}
 	return true
+}
+
+func (ext *SlotHandoffExt) findDoneSlots(seq uint64) (eventbus.SlotBitset, bool) {
+	if ext == nil || seq == 0 {
+		return eventbus.SlotBitset{}, false
+	}
+	for i := range ext.entries {
+		if ext.entries[i].seq == seq {
+			return ext.entries[i].doneSlots, true
+		}
+	}
+	for i := range ext.overflow {
+		if ext.overflow[i].seq == seq {
+			return ext.overflow[i].doneSlots, true
+		}
+	}
+	return eventbus.SlotBitset{}, false
+}
+
+func (ext *SlotHandoffExt) countActiveEntries() int {
+	if ext == nil {
+		return 0
+	}
+	n := 0
+	for i := range ext.entries {
+		if ext.entries[i].seq != 0 {
+			n++
+		}
+	}
+	for i := range ext.overflow {
+		if ext.overflow[i].seq != 0 {
+			n++
+		}
+	}
+	return n
 }
 
 type ChannelWatermark struct {
 	key        ChannelWatermarkKey
 	lastAccess uint64
+	retirable  bool
 	frontierLo [numTrackStages]uint64
 	frontierHi [numTrackStages]uint64
 	ooo        [numTrackStages]*OOOWindow
 	slotExt    [2]*SlotHandoffExt // [0]: StageChannelDistribute, [1]: StageLocalDistribute
 }
 
+func (wm *ChannelWatermark) hasUnclosedStateLocked() bool {
+	if wm == nil {
+		return false
+	}
+	if wm.slotExt[0] != nil || wm.slotExt[1] != nil {
+		return true
+	}
+	for st := 0; st < numTrackStages; st++ {
+		if wm.ooo[st] != nil && !wm.ooo[st].isEmpty() {
+			return true
+		}
+		if wm.frontierHi[st] > 0 && wm.frontierLo[st] > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func (wm *ChannelWatermark) hasAnyCommittedLocked() bool {
+	if wm == nil {
+		return false
+	}
+	for st := 0; st < numTrackStages; st++ {
+		if wm.frontierHi[st] > 0 || (wm.ooo[st] != nil && !wm.ooo[st].isEmpty()) {
+			return true
+		}
+	}
+	return wm.slotExt[0] != nil || wm.slotExt[1] != nil
+}
+
+// isPinnedLocked reports whether wm must remain pinned in the shard map (A1 + B2).
+// A channel watermark is pinned whenever it has in-flight leases, partial slot extensions,
+// out-of-order gaps, or active committed watermarks that have not been explicitly marked retirable.
+func (wm *ChannelWatermark) isPinnedLocked(s *seqTrackerShard, k ChannelWatermarkKey) bool {
+	if wm == nil {
+		return false
+	}
+	if s.hasInFlightKeyLocked(k) || wm.hasUnclosedStateLocked() {
+		return true
+	}
+	if wm.hasAnyCommittedLocked() && !wm.retirable {
+		return true
+	}
+	return false
+}
+
 type shardInFlightSlot struct {
-	inUse      bool
-	key        ChannelWatermarkKey
-	seq        uint64
-	stage      TrackStage
-	hasMask    bool
-	mask       eventbus.SlotBitset
-	extraBytes int64
+	inUse         bool
+	key           ChannelWatermarkKey
+	seq           uint64
+	stage         TrackStage
+	hasMask       bool
+	mask          eventbus.SlotBitset
+	extraBytes    int64
+	reservedBytes int64
 }
 
 type seqTrackerShard struct {
@@ -422,39 +749,49 @@ func (s *seqTrackerShard) hasExactInFlightLocked(k ChannelWatermarkKey, stage Tr
 	return false
 }
 
-func (s *seqTrackerShard) allocInFlightLocked(t *StageSeqTracker, k ChannelWatermarkKey, stage TrackStage, seq uint64, hasMask bool, mask eventbus.SlotBitset) bool {
+func (s *seqTrackerShard) allocInFlightLocked(
+	t *StageSeqTracker,
+	k ChannelWatermarkKey,
+	stage TrackStage,
+	seq uint64,
+	hasMask bool,
+	mask eventbus.SlotBitset,
+	reservedCommitBytes int64,
+) bool {
 	if s.inFlightUsed >= MaxInFlightPerShard {
 		return false
 	}
 	clonedMask := mask.Clone()
 	extra := clonedMask.ExtraHeapBytes()
-	if extra > 0 && !t.tryReserveExtraBytes(extra) {
+	totalReserve := extra + reservedCommitBytes
+	if totalReserve > 0 && !t.tryReserveExtraBytes(totalReserve) {
 		return false
 	}
 	for i := range s.inFlight {
 		if !s.inFlight[i].inUse {
 			s.inFlight[i] = shardInFlightSlot{
-				inUse:      true,
-				key:        k,
-				seq:        seq,
-				stage:      stage,
-				hasMask:    hasMask,
-				mask:       clonedMask,
-				extraBytes: extra,
+				inUse:         true,
+				key:           k,
+				seq:           seq,
+				stage:         stage,
+				hasMask:       hasMask,
+				mask:          clonedMask,
+				extraBytes:    extra,
+				reservedBytes: reservedCommitBytes,
 			}
 			s.inFlightUsed++
 			return true
 		}
 	}
-	if extra > 0 {
-		t.extraSlotBytes.Add(-extra)
+	if totalReserve > 0 {
+		t.extraSlotBytes.Add(-totalReserve)
 	}
 	return false
 }
 
-func (s *seqTrackerShard) releaseInFlightLocked(t *StageSeqTracker, k ChannelWatermarkKey, stage TrackStage, seq uint64, matchMask *eventbus.SlotBitset) {
+func (s *seqTrackerShard) releaseInFlightLocked(t *StageSeqTracker, k ChannelWatermarkKey, stage TrackStage, seq uint64, matchMask *eventbus.SlotBitset) int64 {
 	if s.inFlightUsed == 0 {
-		return
+		return 0
 	}
 	for i := range s.inFlight {
 		it := &s.inFlight[i]
@@ -473,9 +810,46 @@ func (s *seqTrackerShard) releaseInFlightLocked(t *StageSeqTracker, k ChannelWat
 		if it.extraBytes > 0 {
 			t.extraSlotBytes.Add(-it.extraBytes)
 		}
+		reserved := it.reservedBytes
 		*it = shardInFlightSlot{}
 		s.inFlightUsed--
+		return reserved
+	}
+	return 0
+}
+
+func (t *StageSeqTracker) freeOOOWindowLocked(wm *ChannelWatermark, stage TrackStage) {
+	if wm == nil || wm.ooo[stage] == nil {
 		return
+	}
+	w := wm.ooo[stage]
+	if w.extraBytes > 0 {
+		t.extraSlotBytes.Add(-w.extraBytes)
+		w.extraBytes = 0
+	}
+	wm.ooo[stage] = nil
+	t.activeOOOWindows.Add(-1)
+}
+
+func (t *StageSeqTracker) freeSlotExtLocked(wm *ChannelWatermark, idx int) {
+	if wm == nil || wm.slotExt[idx] == nil {
+		return
+	}
+	ext := wm.slotExt[idx]
+	var extra int64
+	for i := range ext.entries {
+		extra += ext.entries[i].doneSlots.ExtraHeapBytes()
+	}
+	for i := range ext.overflow {
+		extra += ext.overflow[i].doneSlots.ExtraHeapBytes() + partialSeqEntryOverhead
+	}
+	if extra > 0 {
+		t.extraSlotBytes.Add(-extra)
+	}
+	counted := ext.countedInPool
+	wm.slotExt[idx] = nil
+	if counted {
+		t.activeSlotExts.Add(-1)
 	}
 }
 
@@ -483,25 +857,49 @@ func (t *StageSeqTracker) freeWatermarkResourcesLocked(wm *ChannelWatermark) {
 	if wm == nil {
 		return
 	}
-	for st := 0; st < numTrackStages; st++ {
-		if wm.ooo[st] != nil {
-			wm.ooo[st] = nil
-			t.activeOOOWindows.Add(-1)
-		}
+	for st := TrackStage(0); st < numTrackStages; st++ {
+		t.freeOOOWindowLocked(wm, st)
 	}
 	for idx := 0; idx < 2; idx++ {
-		if ext := wm.slotExt[idx]; ext != nil {
-			var extra int64
-			for i := range ext.entries {
-				extra += ext.entries[i].doneSlots.ExtraHeapBytes()
+		t.freeSlotExtLocked(wm, idx)
+	}
+}
+
+// ReleaseChannelWatermarkIfSafe marks a channel watermark retirable (or removes it) ONLY if it has
+// no in-flight leases, no partial slot extensions, no out-of-order holes, and has committed up to upToSeq (A1 + B2).
+func (t *StageSeqTracker) ReleaseChannelWatermarkIfSafe(k ChannelWatermarkKey, upToSeq uint64) bool {
+	if t == nil {
+		return false
+	}
+	s := &t.shards[k.shardIndex()]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.channels == nil {
+		return false
+	}
+	wm := s.channels[k]
+	if wm == nil {
+		return false
+	}
+	if s.hasInFlightKeyLocked(k) || wm.hasUnclosedStateLocked() {
+		return false
+	}
+	if upToSeq > 0 {
+		hasCoveredStage := false
+		for st := 0; st < numTrackStages; st++ {
+			if wm.frontierHi[st] > 0 {
+				if wm.frontierLo[st] > 1 || wm.frontierHi[st] < upToSeq {
+					return false
+				}
+				hasCoveredStage = true
 			}
-			if extra > 0 {
-				t.extraSlotBytes.Add(-extra)
-			}
-			wm.slotExt[idx] = nil
-			t.activeSlotExts.Add(-1)
+		}
+		if !hasCoveredStage {
+			return false
 		}
 	}
+	wm.retirable = true
+	return true
 }
 
 func (t *StageSeqTracker) getOrCreateWatermarkLocked(s *seqTrackerShard, k ChannelWatermarkKey) *ChannelWatermark {
@@ -511,6 +909,7 @@ func (t *StageSeqTracker) getOrCreateWatermarkLocked(s *seqTrackerShard, k Chann
 	if wm := s.channels[k]; wm != nil {
 		s.accessClock++
 		wm.lastAccess = s.accessClock
+		wm.retirable = false
 		return wm
 	}
 	if len(s.channels) >= MaxChannelsPerShard {
@@ -520,7 +919,7 @@ func (t *StageSeqTracker) getOrCreateWatermarkLocked(s *seqTrackerShard, k Chann
 			found    bool
 		)
 		for ck, cwm := range s.channels {
-			if cwm.slotExt[0] != nil || cwm.slotExt[1] != nil || s.hasInFlightKeyLocked(ck) {
+			if cwm.isPinnedLocked(s, ck) {
 				continue
 			}
 			if !found || cwm.lastAccess < oldest {
@@ -588,25 +987,91 @@ func (t *StageSeqTracker) allocOOOWindowLocked(wm *ChannelWatermark, stage Track
 	return w
 }
 
+// precheckSeqCommitCapacityLocked verifies and pre-allocates OOOWindow / worst-case hist interval capacity
+// BEFORE granting a stage lease so CommitStage never silently fails after side effects have executed (A1 + B2).
+func (t *StageSeqTracker) precheckSeqCommitCapacityLocked(wm *ChannelWatermark, stage TrackStage, seq uint64) (int64, bool) {
+	if wm == nil || seq == 0 {
+		return 0, false
+	}
+	if isSeqCommittedInWindow(wm, stage, seq) {
+		return 0, true
+	}
+	if wm.frontierHi[stage] == 0 || seq == wm.frontierHi[stage]+1 || seq+1 == wm.frontierLo[stage] {
+		return 0, true
+	}
+	w := t.allocOOOWindowLocked(wm, stage, wm.frontierHi[stage]+2)
+	if w == nil {
+		return 0, false
+	}
+	if seq < wm.frontierLo[stage] {
+		if w.sparsePages != nil && w.sparsePages[seq/sparsePageBits] != nil {
+			return 0, true
+		}
+		return histPageExtraBytes, true
+	}
+	if w.base > 0 && !w.isBitsEmpty() && seq >= w.base+oooWindowBits {
+		var worstBytes int64
+		if wm.frontierHi[stage]-wm.frontierLo[stage] >= sparseRunThreshold {
+			curIv := len(w.allHistIntervals())
+			if curIv+1 > maxHistIntervals+maxExtraHistIntervals {
+				return 0, false
+			}
+			if curIv >= maxHistIntervals {
+				worstBytes += histIntervalExtraBytes
+			}
+		} else {
+			pStart := wm.frontierLo[stage] / sparsePageBits
+			pEnd := wm.frontierHi[stage] / sparsePageBits
+			for p := pStart; p <= pEnd; p++ {
+				if w.sparsePages == nil || w.sparsePages[p] == nil {
+					worstBytes += histPageExtraBytes
+				}
+			}
+		}
+		bStart := w.base / sparsePageBits
+		bEnd := (w.base + oooWindowBits - 1) / sparsePageBits
+		fStart := wm.frontierLo[stage] / sparsePageBits
+		fEnd := wm.frontierHi[stage] / sparsePageBits
+		hasFrontierSparse := wm.frontierHi[stage]-wm.frontierLo[stage] < sparseRunThreshold
+		for p := bStart; p <= bEnd; p++ {
+			if hasFrontierSparse && p >= fStart && p <= fEnd {
+				continue
+			}
+			if w.sparsePages == nil || w.sparsePages[p] == nil {
+				worstBytes += histPageExtraBytes
+			}
+		}
+		return worstBytes, true
+	}
+	return 0, true
+}
+
+// drainOOOBitsIntoFrontierLocked loops "absorb adjacent hist intervals -> drain contiguous bitmap bits"
+// until a fixed point is reached, ensuring no contiguous bit at w.base is stranded after hist absorption (A1).
 func (t *StageSeqTracker) drainOOOBitsIntoFrontierLocked(wm *ChannelWatermark, stage TrackStage) {
 	w := wm.ooo[stage]
 	if w == nil {
 		return
 	}
-	if w.base > 0 && !w.isBitsEmpty() {
-		if wm.frontierHi[stage]+1 > w.base {
-			w.shiftLeftBits((wm.frontierHi[stage] + 1) - w.base)
+	for {
+		prevLo, prevHi := wm.frontierLo[stage], wm.frontierHi[stage]
+		wm.frontierLo[stage], wm.frontierHi[stage] = w.absorbAdjacentToFrontier(t, wm.frontierLo[stage], wm.frontierHi[stage])
+		if w.base > 0 && !w.isBitsEmpty() {
+			if wm.frontierHi[stage]+1 > w.base {
+				w.shiftLeftBits((wm.frontierHi[stage] + 1) - w.base)
+			}
+			for w.base == wm.frontierHi[stage]+1 && (w.bits[0]&1) != 0 {
+				adv := uint64(bits.TrailingZeros64(^w.bits[0]))
+				wm.frontierHi[stage] += adv
+				w.shiftLeftBits(adv)
+			}
 		}
-		for w.base == wm.frontierHi[stage]+1 && (w.bits[0]&1) != 0 {
-			adv := uint64(bits.TrailingZeros64(^w.bits[0]))
-			wm.frontierHi[stage] += adv
-			w.shiftLeftBits(adv)
+		if wm.frontierLo[stage] == prevLo && wm.frontierHi[stage] == prevHi {
+			break
 		}
 	}
-	wm.frontierLo[stage], wm.frontierHi[stage] = w.absorbAdjacentToFrontier(wm.frontierLo[stage], wm.frontierHi[stage])
 	if w.isEmpty() {
-		wm.ooo[stage] = nil
-		t.activeOOOWindows.Add(-1)
+		t.freeOOOWindowLocked(wm, stage)
 	}
 }
 
@@ -614,6 +1079,7 @@ func (t *StageSeqTracker) commitFullSeqLocked(wm *ChannelWatermark, stage TrackS
 	if wm == nil || seq == 0 {
 		return false
 	}
+	wm.retirable = false
 	if isSeqCommittedInWindow(wm, stage, seq) {
 		return true
 	}
@@ -639,22 +1105,23 @@ func (t *StageSeqTracker) commitFullSeqLocked(wm *ChannelWatermark, stage TrackS
 		return true
 	}
 
-	// Historical out-of-order sequence below frontierLo - 1: record in bounded hist intervals without gap-bridging.
+	// Historical out-of-order sequence below frontierLo - 1: record in exact hist intervals without gap-bridging or eviction.
 	if seq < wm.frontierLo[stage] {
 		w := t.allocOOOWindowLocked(wm, stage, wm.frontierHi[stage]+2)
 		if w == nil {
 			return false
 		}
-		w.recordHistInterval(seq, seq)
-		wm.frontierLo[stage], wm.frontierHi[stage] = w.absorbAdjacentToFrontier(wm.frontierLo[stage], wm.frontierHi[stage])
-		if w.isEmpty() {
-			wm.ooo[stage] = nil
-			t.activeOOOWindows.Add(-1)
+		if !w.recordHistInterval(t, seq, seq) {
+			if w.isEmpty() {
+				t.freeOOOWindowLocked(wm, stage)
+			}
+			return false
 		}
+		t.drainOOOBitsIntoFrontierLocked(wm, stage)
 		return true
 	}
 
-	// Above frontierHi + 1: record in bounded 2048-bit bitmap (or slide frontier up if >2048 ahead while preserving old frontier in hist).
+	// Above frontierHi + 1: record in 2048-bit bitmap (or slide frontier up if >= base+2048 while preserving old frontier and runs in hist).
 	w := t.allocOOOWindowLocked(wm, stage, wm.frontierHi[stage]+2)
 	if w == nil {
 		return false
@@ -670,7 +1137,10 @@ func (t *StageSeqTracker) commitFullSeqLocked(wm *ChannelWatermark, stage TrackS
 		w.base = base
 	} else if seq < w.base {
 		if !w.rebaseDown(seq) {
-			w.recordHistInterval(seq, seq)
+			if !w.recordHistInterval(t, seq, seq) {
+				return false
+			}
+			t.drainOOOBitsIntoFrontierLocked(wm, stage)
 			return true
 		}
 	}
@@ -678,13 +1148,15 @@ func (t *StageSeqTracker) commitFullSeqLocked(wm *ChannelWatermark, stage TrackS
 	if seq >= w.base && seq-w.base < oooWindowBits {
 		off := seq - w.base
 		w.bits[off/64] |= uint64(1) << (off % 64)
+		t.drainOOOBitsIntoFrontierLocked(wm, stage)
 		return true
 	}
 
-	// seq exceeds w.base + 2048 while older bits exist: promote current frontier into hist and advance frontier to seq
-	// without bridging any uncommitted gap.
-	w.recordHistInterval(wm.frontierLo[stage], wm.frontierHi[stage])
-	// Also flush any contiguous runs in w.bits into hist before resetting bitmap at seq.
+	// seq exceeds w.base + 2048 while older bits exist: promote current frontier and all bitmap runs into hist
+	// without bridging any uncommitted gap and without retiring any committed interval.
+	if !w.recordHistInterval(t, wm.frontierLo[stage], wm.frontierHi[stage]) {
+		return false
+	}
 	for i := 0; i < oooWindowBits; {
 		word := w.bits[i/64] >> uint(i%64)
 		if (word & 1) == 0 {
@@ -697,7 +1169,9 @@ func (t *StageSeqTracker) commitFullSeqLocked(wm *ChannelWatermark, stage TrackS
 			runHi = w.base + uint64(i)
 			i++
 		}
-		w.recordHistInterval(runLo, runHi)
+		if !w.recordHistInterval(t, runLo, runHi) {
+			return false
+		}
 	}
 	for i := range w.bits {
 		w.bits[i] = 0
@@ -705,11 +1179,7 @@ func (t *StageSeqTracker) commitFullSeqLocked(wm *ChannelWatermark, stage TrackS
 	wm.frontierLo[stage] = seq
 	wm.frontierHi[stage] = seq
 	w.base = seq + 2
-	wm.frontierLo[stage], wm.frontierHi[stage] = w.absorbAdjacentToFrontier(wm.frontierLo[stage], wm.frontierHi[stage])
-	if w.isEmpty() {
-		wm.ooo[stage] = nil
-		t.activeOOOWindows.Add(-1)
-	}
+	t.drainOOOBitsIntoFrontierLocked(wm, stage)
 	return true
 }
 
@@ -737,9 +1207,14 @@ func (t *StageSeqTracker) HasCommitted(k ChannelWatermarkKey, stage TrackStage, 
 	return isSeqCommittedInWindow(s.channels[k], stage, seq)
 }
 
-func (t *StageSeqTracker) BeginStage(k ChannelWatermarkKey, stage TrackStage, seq uint64) (skip bool, leased bool) {
+// BeginStageChecked enforces fail-closed admission (A1 + B2):
+// 1. Returns StageBeginAlreadyCommitted if already committed.
+// 2. Returns StageBeginInFlight if another worker already holds the in-flight lease.
+// 3. Obtains/pins ChannelWatermark and pre-reserves worst-case completion state BEFORE granting StageBeginLeased.
+// 4. Returns StageBeginCapacityRetry if shard/watermark/OOO/inFlight capacity is unavailable (zero side effects run).
+func (t *StageSeqTracker) BeginStageChecked(k ChannelWatermarkKey, stage TrackStage, seq uint64) StageBeginStatus {
 	if t == nil || seq == 0 {
-		return false, false
+		return StageBeginCapacityRetry
 	}
 	s := &t.shards[k.shardIndex()]
 	s.mu.Lock()
@@ -748,17 +1223,42 @@ func (t *StageSeqTracker) BeginStage(k ChannelWatermarkKey, stage TrackStage, se
 		if wm := s.channels[k]; isSeqCommittedInWindow(wm, stage, seq) {
 			s.accessClock++
 			wm.lastAccess = s.accessClock
-			return true, false
+			return StageBeginAlreadyCommitted
 		}
 	}
 	if s.hasExactInFlightLocked(k, stage, seq) {
-		return true, false
+		return StageBeginInFlight
 	}
-	_ = t.getOrCreateWatermarkLocked(s, k)
-	if !s.allocInFlightLocked(t, k, stage, seq, false, eventbus.SlotBitset{}) {
-		return true, false
+	wm := t.getOrCreateWatermarkLocked(s, k)
+	if wm == nil {
+		return StageBeginCapacityRetry
 	}
-	return false, true
+	reserveBytes, okCap := t.precheckSeqCommitCapacityLocked(wm, stage, seq)
+	if !okCap {
+		if wm.ooo[stage] != nil && wm.ooo[stage].isEmpty() {
+			t.freeOOOWindowLocked(wm, stage)
+		}
+		return StageBeginCapacityRetry
+	}
+	if !s.allocInFlightLocked(t, k, stage, seq, false, eventbus.SlotBitset{}, reserveBytes) {
+		if wm.ooo[stage] != nil && wm.ooo[stage].isEmpty() {
+			t.freeOOOWindowLocked(wm, stage)
+		}
+		return StageBeginCapacityRetry
+	}
+	return StageBeginLeased
+}
+
+func (t *StageSeqTracker) BeginStage(k ChannelWatermarkKey, stage TrackStage, seq uint64) (skip bool, leased bool) {
+	status := t.BeginStageChecked(k, stage, seq)
+	switch status {
+	case StageBeginAlreadyCommitted, StageBeginInFlight:
+		return true, false
+	case StageBeginLeased:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func (t *StageSeqTracker) CommitStage(k ChannelWatermarkKey, stage TrackStage, seq uint64) {
@@ -768,7 +1268,10 @@ func (t *StageSeqTracker) CommitStage(k ChannelWatermarkKey, stage TrackStage, s
 	s := &t.shards[k.shardIndex()]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.releaseInFlightLocked(t, k, stage, seq, nil)
+	reserved := s.releaseInFlightLocked(t, k, stage, seq, nil)
+	if reserved > 0 {
+		t.extraSlotBytes.Add(-reserved)
+	}
 	wm := t.getOrCreateWatermarkLocked(s, k)
 	if wm != nil {
 		_ = t.commitFullSeqLocked(wm, stage, seq)
@@ -782,7 +1285,15 @@ func (t *StageSeqTracker) AbortStage(k ChannelWatermarkKey, stage TrackStage, se
 	s := &t.shards[k.shardIndex()]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.releaseInFlightLocked(t, k, stage, seq, nil)
+	reserved := s.releaseInFlightLocked(t, k, stage, seq, nil)
+	if reserved > 0 {
+		t.extraSlotBytes.Add(-reserved)
+	}
+	if s.channels != nil {
+		if wm := s.channels[k]; wm != nil && wm.ooo[stage] != nil && wm.ooo[stage].isEmpty() {
+			t.freeOOOWindowLocked(wm, stage)
+		}
+	}
 }
 
 func (t *StageSeqTracker) RecordCommittedForce(k ChannelWatermarkKey, stage TrackStage, seq uint64) bool {
@@ -799,17 +1310,21 @@ func (t *StageSeqTracker) RecordCommittedForce(k ChannelWatermarkKey, stage Trac
 	if isSeqCommittedInWindow(wm, stage, seq) {
 		return true
 	}
-	_ = t.commitFullSeqLocked(wm, stage, seq)
-	return false
+	return t.commitFullSeqLocked(wm, stage, seq)
 }
 
-func (t *StageSeqTracker) BeginSlotStage(k ChannelWatermarkKey, stage TrackStage, seq uint64, requestedMask eventbus.SlotBitset) (deliverMask eventbus.SlotBitset, leased bool) {
+func (t *StageSeqTracker) BeginSlotStageChecked(
+	k ChannelWatermarkKey,
+	stage TrackStage,
+	seq uint64,
+	requestedMask eventbus.SlotBitset,
+) (deliverMask eventbus.SlotBitset, status StageBeginStatus) {
 	if t == nil || seq == 0 || requestedMask.IsZero() {
-		return eventbus.SlotBitset{}, false
+		return eventbus.SlotBitset{}, StageBeginCapacityRetry
 	}
 	extIdx, ok := stageSlotExtIndex(stage)
 	if !ok {
-		return eventbus.SlotBitset{}, false
+		return eventbus.SlotBitset{}, StageBeginCapacityRetry
 	}
 
 	s := &t.shards[k.shardIndex()]
@@ -823,18 +1338,21 @@ func (t *StageSeqTracker) BeginSlotStage(k ChannelWatermarkKey, stage TrackStage
 	if isSeqCommittedInWindow(wm, stage, seq) {
 		s.accessClock++
 		wm.lastAccess = s.accessClock
-		return eventbus.SlotBitset{}, false
+		return eventbus.SlotBitset{}, StageBeginAlreadyCommitted
 	}
 
 	todo := requestedMask.Clone()
+	var existingDone eventbus.SlotBitset
+	hasExistingEntry := false
 	if wm != nil && wm.slotExt[extIdx] != nil {
-		ext := wm.slotExt[extIdx]
-		for i := range ext.entries {
-			if ext.entries[i].seq == seq {
-				todo = todo.AndNot(ext.entries[i].doneSlots)
-				break
-			}
+		if done, found := wm.slotExt[extIdx].findDoneSlots(seq); found {
+			existingDone = done
+			hasExistingEntry = true
+			todo = todo.AndNot(done)
 		}
+	}
+	if todo.IsZero() {
+		return eventbus.SlotBitset{}, StageBeginAlreadyCommitted
 	}
 	if s.inFlightUsed > 0 {
 		for i := range s.inFlight {
@@ -843,21 +1361,62 @@ func (t *StageSeqTracker) BeginSlotStage(k ChannelWatermarkKey, stage TrackStage
 				continue
 			}
 			if !it.hasMask {
-				return eventbus.SlotBitset{}, false
+				return eventbus.SlotBitset{}, StageBeginInFlight
 			}
 			todo = todo.AndNot(it.mask)
 		}
 	}
 	if todo.IsZero() {
-		return eventbus.SlotBitset{}, false
+		return eventbus.SlotBitset{}, StageBeginInFlight
 	}
-	_ = t.getOrCreateWatermarkLocked(s, k)
-	if !s.allocInFlightLocked(t, k, stage, seq, true, todo) {
-		return eventbus.SlotBitset{}, false
+
+	wm = t.getOrCreateWatermarkLocked(s, k)
+	if wm == nil {
+		return eventbus.SlotBitset{}, StageBeginCapacityRetry
 	}
-	return todo, true
+
+	reserveCommitBytes, okCap := t.precheckSeqCommitCapacityLocked(wm, stage, seq)
+	if !okCap {
+		if wm.ooo[stage] != nil && wm.ooo[stage].isEmpty() {
+			t.freeOOOWindowLocked(wm, stage)
+		}
+		return eventbus.SlotBitset{}, StageBeginCapacityRetry
+	}
+
+	// Pre-calculate worst-case partial-slot mask storage requirement so FinishSlotStage never drops succeededMask.
+	worstMerged := existingDone.Or(todo)
+	deltaMaskBytes := worstMerged.ExtraHeapBytes() - existingDone.ExtraHeapBytes()
+	if deltaMaskBytes < 0 {
+		deltaMaskBytes = 0
+	}
+	ext := wm.slotExt[extIdx]
+	if !hasExistingEntry && ext != nil {
+		activeEntries := ext.countActiveEntries()
+		if activeEntries >= maxPartialSeqsPerExt+maxOverflowPartialSeqs {
+			return eventbus.SlotBitset{}, StageBeginCapacityRetry
+		}
+		if activeEntries >= maxPartialSeqsPerExt {
+			deltaMaskBytes += partialSeqEntryOverhead
+		}
+	}
+	totalReserve := reserveCommitBytes + deltaMaskBytes
+	if !s.allocInFlightLocked(t, k, stage, seq, true, todo, totalReserve) {
+		if wm.ooo[stage] != nil && wm.ooo[stage].isEmpty() {
+			t.freeOOOWindowLocked(wm, stage)
+		}
+		return eventbus.SlotBitset{}, StageBeginCapacityRetry
+	}
+	return todo, StageBeginLeased
 }
 
+func (t *StageSeqTracker) BeginSlotStage(k ChannelWatermarkKey, stage TrackStage, seq uint64, requestedMask eventbus.SlotBitset) (deliverMask eventbus.SlotBitset, leased bool) {
+	deliv, status := t.BeginSlotStageChecked(k, stage, seq, requestedMask)
+	return deliv, status == StageBeginLeased
+}
+
+// FinishSlotStage writes succeededMask BEFORE releasing the in-flight lease within the same shard lock (A1 + B2).
+// Because BeginSlotStageChecked already pinned wm and pre-reserved worst-case completion state bytes,
+// FinishSlotStage never silently drops partial or full completion state.
 func (t *StageSeqTracker) FinishSlotStage(
 	k ChannelWatermarkKey,
 	stage TrackStage,
@@ -877,25 +1436,55 @@ func (t *StageSeqTracker) FinishSlotStage(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.releaseInFlightLocked(t, k, stage, seq, &leasedMask)
 	if succeededMask.IsZero() {
+		reserved := s.releaseInFlightLocked(t, k, stage, seq, &leasedMask)
+		if reserved > 0 {
+			t.extraSlotBytes.Add(-reserved)
+		}
 		return
 	}
 
 	wm := t.getOrCreateWatermarkLocked(s, k)
 	if wm == nil || isSeqCommittedInWindow(wm, stage, seq) {
+		reserved := s.releaseInFlightLocked(t, k, stage, seq, &leasedMask)
+		if reserved > 0 {
+			t.extraSlotBytes.Add(-reserved)
+		}
 		return
+	}
+
+	// Credit back the in-flight pre-reservation right before recording the actual committed state under the same shard lock,
+	// then release the inFlight slot after the state update completes.
+	for i := range s.inFlight {
+		it := &s.inFlight[i]
+		if it.inUse && it.key == k && it.stage == stage && it.seq == seq && it.hasMask && it.mask.Equal(leasedMask) {
+			if it.reservedBytes > 0 {
+				t.extraSlotBytes.Add(-it.reservedBytes)
+				it.reservedBytes = 0
+			}
+			break
+		}
 	}
 
 	mergedDone := succeededMask
 	ext := wm.slotExt[extIdx]
-	entryIdx := -1
+	inlineIdx := -1
+	overflowIdx := -1
 	if ext != nil {
 		for i := range ext.entries {
 			if ext.entries[i].seq == seq {
-				entryIdx = i
+				inlineIdx = i
 				mergedDone = ext.entries[i].doneSlots.Or(succeededMask)
 				break
+			}
+		}
+		if inlineIdx < 0 {
+			for i := range ext.overflow {
+				if ext.overflow[i].seq == seq {
+					overflowIdx = i
+					mergedDone = ext.overflow[i].doneSlots.Or(succeededMask)
+					break
+				}
 			}
 		}
 	}
@@ -903,63 +1492,89 @@ func (t *StageSeqTracker) FinishSlotStage(
 	fullyCovered := !allRecipientSlots.IsZero() && allRecipientSlots.AndNot(mergedDone).IsZero()
 	if fullyCovered {
 		if t.commitFullSeqLocked(wm, stage, seq) {
-			if ext != nil && entryIdx >= 0 {
-				oldExtra := ext.entries[entryIdx].doneSlots.ExtraHeapBytes()
-				if oldExtra > 0 {
-					t.extraSlotBytes.Add(-oldExtra)
+			if ext != nil {
+				if inlineIdx >= 0 {
+					oldExtra := ext.entries[inlineIdx].doneSlots.ExtraHeapBytes()
+					if oldExtra > 0 {
+						t.extraSlotBytes.Add(-oldExtra)
+					}
+					ext.entries[inlineIdx] = slotSeqMask{}
+				} else if overflowIdx >= 0 {
+					oldExtra := ext.overflow[overflowIdx].doneSlots.ExtraHeapBytes() + partialSeqEntryOverhead
+					if oldExtra > 0 {
+						t.extraSlotBytes.Add(-oldExtra)
+					}
+					ext.overflow = append(ext.overflow[:overflowIdx], ext.overflow[overflowIdx+1:]...)
 				}
-				ext.entries[entryIdx] = slotSeqMask{}
 				if ext.isEmpty() {
-					wm.slotExt[extIdx] = nil
-					t.activeSlotExts.Add(-1)
+					t.freeSlotExtLocked(wm, extIdx)
 				}
 			}
+			_ = s.releaseInFlightLocked(t, k, stage, seq, &leasedMask)
 			return
 		}
 	}
 
 	if ext == nil {
+		counted := false
 		for {
 			cur := t.activeSlotExts.Load()
 			if cur >= MaxGlobalSlotExts {
-				return
+				break
 			}
 			if t.activeSlotExts.CompareAndSwap(cur, cur+1) {
+				counted = true
 				break
 			}
 		}
-		ext = &SlotHandoffExt{}
+		ext = &SlotHandoffExt{countedInPool: counted}
 		wm.slotExt[extIdx] = ext
 	}
-	if entryIdx >= 0 {
-		oldExtra := ext.entries[entryIdx].doneSlots.ExtraHeapBytes()
+
+	if inlineIdx >= 0 {
+		oldExtra := ext.entries[inlineIdx].doneSlots.ExtraHeapBytes()
 		newExtra := mergedDone.ExtraHeapBytes()
-		if newExtra > oldExtra && !t.tryReserveExtraBytes(newExtra-oldExtra) {
-			return
-		}
-		if newExtra < oldExtra {
+		if newExtra != oldExtra {
 			t.extraSlotBytes.Add(newExtra - oldExtra)
 		}
-		ext.entries[entryIdx].doneSlots = mergedDone
+		ext.entries[inlineIdx].doneSlots = mergedDone
+		_ = s.releaseInFlightLocked(t, k, stage, seq, &leasedMask)
 		return
 	}
+	if overflowIdx >= 0 {
+		oldExtra := ext.overflow[overflowIdx].doneSlots.ExtraHeapBytes()
+		newExtra := mergedDone.ExtraHeapBytes()
+		if newExtra != oldExtra {
+			t.extraSlotBytes.Add(newExtra - oldExtra)
+		}
+		ext.overflow[overflowIdx].doneSlots = mergedDone
+		_ = s.releaseInFlightLocked(t, k, stage, seq, &leasedMask)
+		return
+	}
+
 	for i := range ext.entries {
 		if ext.entries[i].seq == 0 {
 			newExtra := mergedDone.ExtraHeapBytes()
-			if newExtra > 0 && !t.tryReserveExtraBytes(newExtra) {
-				if ext.isEmpty() {
-					wm.slotExt[extIdx] = nil
-					t.activeSlotExts.Add(-1)
-				}
-				return
+			if newExtra > 0 {
+				t.extraSlotBytes.Add(newExtra)
 			}
 			ext.entries[i] = slotSeqMask{
 				seq:       seq,
 				doneSlots: mergedDone,
 			}
+			_ = s.releaseInFlightLocked(t, k, stage, seq, &leasedMask)
 			return
 		}
 	}
+
+	// Inline 8 entries are full: append to overflow (never drop partial completion mask!).
+	newExtra := mergedDone.ExtraHeapBytes() + partialSeqEntryOverhead
+	t.extraSlotBytes.Add(newExtra)
+	ext.overflow = append(ext.overflow, slotSeqMask{
+		seq:       seq,
+		doneSlots: mergedDone,
+	})
+	_ = s.releaseInFlightLocked(t, k, stage, seq, &leasedMask)
 }
 
 func (t *StageSeqTracker) InspectChannelStage(channelID string, channelType uint8, stage TrackStage) (contiguous uint64, oooSetBits int, intervalCount int, totalChannels int) {

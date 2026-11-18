@@ -299,35 +299,44 @@ func (s *Server) initChannelConfigReconciler() {
 			zap.Uint64("completed", completed), zap.Uint64("retries", retries), zap.Uint64("overflow", overflow))
 	}
 	s.configReconciler = r
+	s.configReconcilerPtr.Store(r)
+}
+
+func (s *Server) getConfigReconciler() *channelConfigReconciler {
+	if s == nil {
+		return nil
+	}
+	return s.configReconcilerPtr.Load()
 }
 
 func (s *Server) hintChannelConfig(id string, typ uint8) {
-	if s.configReconciler != nil {
+	if rec := s.getConfigReconciler(); rec != nil {
 		// A repeated read observes the same durable work; it is not a new write.
-		s.configReconciler.add(channelConfigKey{id, typ}, false)
+		rec.add(channelConfigKey{id, typ}, false)
 	}
 }
 
 func (s *Server) onChannelConfigSaved(id string, typ uint8) {
 	// Store apply runs on replicas too. Only the slot owner distributes updates.
 	if s.cfgServer.SlotLeaderId(s.getSlotId(id)) == s.opts.ConfigOptions.NodeId {
-		s.configReconciler.add(channelConfigKey{id, typ}, true)
+		s.getConfigReconciler().add(channelConfigKey{id, typ}, true)
 	}
 }
 
 func (s *Server) reconcileChannelConfig(ctx context.Context, key channelConfigKey) error {
+	rec := s.getConfigReconciler()
 	cfg, err := s.loadConversationConfig(ctx, key.id, key.typ)
 	if errors.Is(err, wkdb.ErrNotFound) {
-		if s.configReconciler != nil {
-			s.configReconciler.releaseMigration(key)
+		if rec != nil {
+			rec.releaseMigration(key)
 		}
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 && s.configReconciler != nil {
-		s.configReconciler.releaseMigration(key)
+	if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 && rec != nil {
+		rec.releaseMigration(key)
 	}
 	owner, err := s.SlotLeaderIdOfChannel(key.id, key.typ)
 	if err != nil {
@@ -346,11 +355,11 @@ func (s *Server) reconcileChannelConfig(ctx context.Context, key channelConfigKe
 		if err != nil {
 			return err
 		}
-		if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 && s.configReconciler != nil {
-			s.configReconciler.releaseMigration(key)
+		if len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0 && rec != nil {
+			rec.releaseMigration(key)
 		}
-		if s.channelNeedsFollowUpReconcile(cfg) && s.configReconciler != nil {
-			s.configReconciler.deferReconcile(key, 150*time.Millisecond)
+		if s.channelNeedsFollowUpReconcile(cfg) && rec != nil {
+			rec.deferReconcile(key, 150*time.Millisecond)
 		}
 	}
 	if !validConversationConfig(cfg, key.id, key.typ) {

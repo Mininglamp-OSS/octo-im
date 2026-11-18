@@ -348,7 +348,8 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 		return
 	}
 
-	if !s.forwardToUserSlotLeader(c, req.UID, wkproto.ChannelTypePerson, bodyBytes) {
+	peerConversations, hasPeerConversations, handleHere := s.forwardOrHydrateConversationSync(c, req.UID, req.MsgCount, bodyBytes)
+	if !handleHere {
 		return
 	}
 
@@ -360,15 +361,20 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 	// 获取用户最近会话基础数据
 
 	var (
-		resps = make([]*syncUserConversationResp, 0)
+		resps         = make([]*syncUserConversationResp, 0)
+		conversations []wkdb.Conversation
 	)
 
 	// ==================== 获取用户活跃的最近会话 ====================
-	conversations, err := service.Store.GetLastConversations(req.UID, wkdb.ConversationTypeChat, 0, nil, options.G.Conversation.UserMaxCount)
-	if err != nil && err != wkdb.ErrNotFound {
-		s.Error("获取conversation失败！", zap.Error(err), zap.String("uid", req.UID))
-		c.ResponseError(errors.New("获取conversation失败！"))
-		return
+	if hasPeerConversations {
+		conversations = peerConversations
+	} else {
+		conversations, err = service.Store.GetLastConversations(req.UID, wkdb.ConversationTypeChat, 0, nil, options.G.Conversation.UserMaxCount)
+		if err != nil && err != wkdb.ErrNotFound {
+			s.Error("获取conversation失败！", zap.Error(err), zap.String("uid", req.UID))
+			c.ResponseError(errors.New("获取conversation失败！"))
+			return
+		}
 	}
 
 	if len(conversations) > options.G.Conversation.UserMaxCount/2 {
@@ -389,14 +395,6 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 		return realChannelId
 	}
 
-	// 获取用户缓存的最近会话
-	cacheChannels, err := service.ConversationManager.GetUserChannelsFromCache(req.UID, wkdb.ConversationTypeChat)
-	if err != nil {
-		s.Error("获取用户缓存的最近会话失败！", zap.Error(err), zap.String("uid", req.UID))
-		c.ResponseError(errors.New("获取用户缓存的最近会话失败！"))
-		return
-	}
-
 	// 是否允许同步
 	isAllowSync := func(channelId string, channelType uint8) bool {
 		if len(req.ExcludeChannelTypes) > 0 {
@@ -412,27 +410,35 @@ func (s *conversation) syncUserConversation(c *wkhttp.Context) {
 		return true
 	}
 
-	// 将用户缓存的新的频道添加到会话列表中
-	for _, cacheChannel := range cacheChannels {
-		notNeedAdd := false
-		for _, conversation := range conversations {
-			if cacheChannel.ChannelID == conversation.ChannelId && cacheChannel.ChannelType == conversation.ChannelType {
-				notNeedAdd = true
-				break
+	// 获取用户缓存的最近会话并将新的频道添加到会话列表中
+	if !hasPeerConversations {
+		cacheChannels, err := service.ConversationManager.GetUserChannelsFromCache(req.UID, wkdb.ConversationTypeChat)
+		if err != nil {
+			s.Error("获取用户缓存的最近会话失败！", zap.Error(err), zap.String("uid", req.UID))
+			c.ResponseError(errors.New("获取用户缓存的最近会话失败！"))
+			return
+		}
+		for _, cacheChannel := range cacheChannels {
+			notNeedAdd := false
+			for _, conversation := range conversations {
+				if cacheChannel.ChannelID == conversation.ChannelId && cacheChannel.ChannelType == conversation.ChannelType {
+					notNeedAdd = true
+					break
+				}
 			}
-		}
 
-		if !isAllowSync(cacheChannel.ChannelID, cacheChannel.ChannelType) {
-			continue
-		}
+			if !isAllowSync(cacheChannel.ChannelID, cacheChannel.ChannelType) {
+				continue
+			}
 
-		if !notNeedAdd {
-			conversations = append(conversations, wkdb.Conversation{
-				ChannelId:   cacheChannel.ChannelID,
-				ChannelType: cacheChannel.ChannelType,
-				Uid:         req.UID,
-				Type:        wkdb.ConversationTypeChat,
-			})
+			if !notNeedAdd {
+				conversations = append(conversations, wkdb.Conversation{
+					ChannelId:   cacheChannel.ChannelID,
+					ChannelType: cacheChannel.ChannelType,
+					Uid:         req.UID,
+					Type:        wkdb.ConversationTypeChat,
+				})
+			}
 		}
 	}
 

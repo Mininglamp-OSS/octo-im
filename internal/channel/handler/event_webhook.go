@@ -15,6 +15,8 @@ func (h *Handler) webhook(ctx *eventbus.ChannelContext) {
 			for _, ev := range ctx.Events {
 				if ev != nil && ev.MessageSeq > 0 {
 					_ = h.seqTracker.RecordCommittedForce(wmKey, StageWebhookNotify, ev.MessageSeq)
+					ev.HasStageMeta = true
+					ev.WebhookStageStatus = eventbus.StageStatusNotRequired
 					ev.WebhookDone = true
 				}
 			}
@@ -39,26 +41,28 @@ func (h *Handler) webhook(ctx *eventbus.ChannelContext) {
 			leasedFlags = append(leasedFlags, false)
 			continue
 		}
-		skip, leased := h.seqTracker.BeginStage(wmKey, StageWebhookNotify, ev.MessageSeq)
-		if skip {
-			if h.seqTracker.HasCommitted(wmKey, StageWebhookNotify, ev.MessageSeq) {
-				ev.WebhookDone = true
-				if ev.Ticket != nil {
-					ev.Ticket.Release()
-					ev.Ticket = nil
-				}
-			} else {
-				// Concurrent worker is executing StageWebhookNotify; retain in recovery only if it fails, or re-check shortly.
-				_ = h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev)
+		status := h.seqTracker.BeginStageChecked(wmKey, StageWebhookNotify, ev.MessageSeq)
+		switch status {
+		case StageBeginAlreadyCommitted:
+			ev.HasStageMeta = true
+			ev.WebhookStageStatus = eventbus.StageStatusCompleted
+			ev.WebhookDone = true
+			if ev.Ticket != nil {
+				ev.Ticket.Release()
+				ev.Ticket = nil
 			}
-			continue
+		case StageBeginInFlight, StageBeginCapacityRetry:
+			_ = h.ensureEventHasTicket(ctx.ChannelId, ev)
+			if !h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev) && ev.Ticket != nil {
+				ev.Ticket.Release()
+				ev.Ticket = nil
+			}
+		case StageBeginLeased:
+			ev.HasStageMeta = true
+			ev.WebhookStageStatus = eventbus.StageStatusRunning
+			leasedEvents = append(leasedEvents, ev)
+			leasedFlags = append(leasedFlags, true)
 		}
-		if !leased {
-			_ = h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev)
-			continue
-		}
-		leasedEvents = append(leasedEvents, ev)
-		leasedFlags = append(leasedFlags, true)
 	}
 
 	if len(leasedEvents) == 0 {
@@ -78,7 +82,11 @@ func (h *Handler) webhook(ctx *eventbus.ChannelContext) {
 					h.seqTracker.AbortStage(wmKey, StageWebhookNotify, ev.MessageSeq)
 				}
 				if ev.MessageSeq > 0 {
-					_ = h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev)
+					_ = h.ensureEventHasTicket(ctx.ChannelId, ev)
+					if !h.recoveryMgr.Enqueue(ctx.ChannelId, ctx.ChannelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, ev) && ev.Ticket != nil {
+						ev.Ticket.Release()
+						ev.Ticket = nil
+					}
 				} else if ev.Ticket != nil {
 					ev.Ticket.Release()
 					ev.Ticket = nil
@@ -92,6 +100,8 @@ func (h *Handler) webhook(ctx *eventbus.ChannelContext) {
 		if leasedFlags[i] && hasWMKey {
 			h.seqTracker.CommitStage(wmKey, StageWebhookNotify, ev.MessageSeq)
 		}
+		ev.HasStageMeta = true
+		ev.WebhookStageStatus = eventbus.StageStatusCompleted
 		ev.WebhookDone = true
 		if ev.Ticket != nil {
 			ev.Ticket.Release()

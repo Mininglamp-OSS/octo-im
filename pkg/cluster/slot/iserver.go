@@ -25,8 +25,19 @@ func isTransientSlotHandoffError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "proposal dropped") || strings.Contains(msg, "not leader")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "proposal dropped") ||
+		strings.Contains(msg, "not leader") ||
+		strings.Contains(msg, "receive propose resp error") ||
+		strings.Contains(msg, "foward propose failed") ||
+		strings.Contains(msg, "raft not found") ||
+		strings.Contains(msg, "raft not exist") ||
+		strings.Contains(msg, "stopped") ||
+		strings.Contains(msg, "connect not authed") ||
+		strings.Contains(msg, "conn is nil") ||
+		strings.Contains(msg, "connect is not connected") ||
+		strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection refused")
 }
 
 func (s *Server) requestSlotProposeBatchWithContext(ctx context.Context, leaderId uint64, slotId uint32, reqs types.ProposeReqSet) (types.ProposeRespSet, error) {
@@ -108,7 +119,13 @@ func (s *Server) ProposeUntilApplied(slotId uint32, data []byte) (*types.Propose
 
 	shardNo := SlotIdToKey(slotId)
 	logId := s.GenLogId()
-	deadline := time.Now().Add(150 * time.Millisecond)
+	retryBudget := 150 * time.Millisecond
+	if s.opts != nil && s.opts.Node != nil {
+		if sc := s.opts.Node.Slot(slotId); sc != nil && (sc.Leader != 0 || sc.MigrateFrom != 0 || sc.MigrateTo != 0) {
+			retryBudget = 3 * time.Second
+		}
+	}
+	deadline := time.Now().Add(retryBudget)
 	delay := 15 * time.Millisecond
 	for {
 		var (
@@ -117,7 +134,11 @@ func (s *Server) ProposeUntilApplied(slotId uint32, data []byte) (*types.Propose
 		)
 		if s.opts != nil && s.opts.Node != nil {
 			if slotConfig := s.opts.Node.Slot(slotId); slotConfig != nil && slotConfig.Leader != 0 && slotConfig.Leader != s.opts.NodeId && s.opts.RPC != nil {
-				rpcCtx, cancel := context.WithDeadline(context.Background(), deadline)
+				attemptTimeout := min(time.Until(deadline), 1200*time.Millisecond)
+				if attemptTimeout <= 0 {
+					attemptTimeout = 50 * time.Millisecond
+				}
+				rpcCtx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
 				resps, rpcErr := s.requestSlotProposeBatchWithContext(rpcCtx, slotConfig.Leader, slotId, types.ProposeReqSet{
 					{
 						Id:   logId,

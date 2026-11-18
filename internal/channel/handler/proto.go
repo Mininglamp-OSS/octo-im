@@ -44,12 +44,15 @@ func (f *forwardChannelEventReq) encodeWithTrailer(includeTrailer bool) ([]byte,
 		enc.WriteBytes(data)
 	}
 	out := enc.Bytes()
-	if includeTrailer && f.hasSlotMask {
-		var err error
-		out, err = eventbus.EncodeSlotMaskTrailer(out, true, true, f.slotMask)
-		if err != nil {
-			return nil, err
+	if includeTrailer {
+		if f.hasSlotMask {
+			var err error
+			out, err = eventbus.EncodeSlotMaskTrailer(out, true, true, f.slotMask)
+			if err != nil {
+				return nil, err
+			}
 		}
+		out = eventbus.EncodeStageMetaTrailer(out, true, f.events)
 	}
 	return out, nil
 }
@@ -77,7 +80,7 @@ func (f *forwardChannelEventReq) decode(data []byte) error {
 			return err
 		}
 		if len(rem) > 0 {
-			hasMask, mask, err := eventbus.DecodeSlotMaskTrailer(rem)
+			hasMask, mask, rest, err := eventbus.DecodeSlotMaskTrailer(rem)
 			if err != nil {
 				return err
 			}
@@ -89,6 +92,11 @@ func (f *forwardChannelEventReq) decode(data []byte) error {
 						ev.HasTargetSlotMask = true
 						ev.TargetSlotMask = mask.Clone()
 					}
+				}
+			}
+			if len(rest) > 0 {
+				if err := eventbus.DecodeStageMetaTrailer(rest, f.events); err != nil {
+					return err
 				}
 			}
 		}
