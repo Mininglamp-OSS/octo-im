@@ -12,57 +12,113 @@ import (
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
 
-const maxForwardAdmittedDedupEntries = 4096
+const (
+	maxForwardAdmittedDedupEntries = 4096
+
+	forwardDedupAbsent    uint8 = 0
+	forwardDedupInFlight  uint8 = 1
+	forwardDedupCommitted uint8 = 2
+)
 
 type forwardAdmittedDedupCache struct {
 	mu      sync.Mutex
 	order   []string
-	entries map[string]struct{}
+	entries map[string]uint8
 }
 
-func (c *forwardAdmittedDedupCache) checkAndRecord(keys []string) []bool {
-	out := make([]bool, len(keys))
+func (c *forwardAdmittedDedupCache) evictOldestCommittedLocked() bool {
+	for len(c.order) > 0 {
+		evict := c.order[0]
+		c.order = c.order[1:]
+		if c.entries[evict] == forwardDedupCommitted {
+			delete(c.entries, evict)
+			return true
+		}
+	}
+	return false
+}
+
+func (c *forwardAdmittedDedupCache) reserveBatch(keys []string) (alreadyCommitted []bool, reservedKeys []string, conflictInFlight bool) {
+	alreadyCommitted = make([]bool, len(keys))
 	if len(keys) == 0 {
-		return out
+		return alreadyCommitted, nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
-		c.entries = make(map[string]struct{}, 256)
+		c.entries = make(map[string]uint8, 256)
 	}
+	batchReserved := make(map[string]struct{}, len(keys))
 	for i, k := range keys {
 		if k == "" {
 			continue
 		}
-		if _, exists := c.entries[k]; exists {
-			out[i] = true
+		if _, sameBatch := batchReserved[k]; sameBatch {
+			alreadyCommitted[i] = true
+			continue
+		}
+		switch c.entries[k] {
+		case forwardDedupCommitted:
+			alreadyCommitted[i] = true
+		case forwardDedupInFlight:
+			for rk := range batchReserved {
+				delete(c.entries, rk)
+			}
+			return nil, nil, true
+		default:
+			for len(c.entries) >= maxForwardAdmittedDedupEntries {
+				if !c.evictOldestCommittedLocked() {
+					for rk := range batchReserved {
+						delete(c.entries, rk)
+					}
+					return nil, nil, true
+				}
+			}
+			c.entries[k] = forwardDedupInFlight
+			batchReserved[k] = struct{}{}
+			reservedKeys = append(reservedKeys, k)
 		}
 	}
-	return out
+	return alreadyCommitted, reservedKeys, false
 }
 
-func (c *forwardAdmittedDedupCache) commitRecorded(keys []string) {
+func (c *forwardAdmittedDedupCache) rollbackReserved(keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, k := range keys {
+		if k != "" && c.entries[k] == forwardDedupInFlight {
+			delete(c.entries, k)
+		}
+	}
+}
+
+func (c *forwardAdmittedDedupCache) commitReserved(keys []string) {
 	if len(keys) == 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
-		c.entries = make(map[string]struct{}, 256)
+		c.entries = make(map[string]uint8, 256)
 	}
 	for _, k := range keys {
 		if k == "" {
 			continue
 		}
-		if _, exists := c.entries[k]; exists {
+		if c.entries[k] == forwardDedupCommitted {
 			continue
 		}
-		if len(c.order) >= maxForwardAdmittedDedupEntries {
+		for len(c.order) >= maxForwardAdmittedDedupEntries {
 			evict := c.order[0]
 			c.order = c.order[1:]
-			delete(c.entries, evict)
+			if c.entries[evict] == forwardDedupCommitted {
+				delete(c.entries, evict)
+			}
 		}
-		c.entries[k] = struct{}{}
+		c.entries[k] = forwardDedupCommitted
 		c.order = append(c.order, k)
 	}
 }
@@ -138,20 +194,20 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 			dedupKeys[i] = forwardEventDedupKey(req.channelId, req.channelType, e)
 		}
 	}
-	alreadyAdmitted := h.forwardDedup.checkAndRecord(dedupKeys)
+	alreadyAdmitted, pendingDedupKeys, conflictInFlight := h.forwardDedup.reserveBatch(dedupKeys)
+	if conflictInFlight {
+		return forward.StatusRetry
+	}
 
 	var pendingEvents []*eventbus.Event
-	var pendingDedupKeys []string
 	for i, e := range req.events {
 		if alreadyAdmitted[i] {
 			continue
 		}
 		pendingEvents = append(pendingEvents, e)
-		if dedupKeys[i] != "" {
-			pendingDedupKeys = append(pendingDedupKeys, dedupKeys[i])
-		}
 	}
 	if len(pendingEvents) == 0 {
+		h.forwardDedup.rollbackReserved(pendingDedupKeys)
 		return proto.StatusOK
 	}
 
@@ -174,6 +230,7 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 		var ok bool
 		durableTickets, ok = h.postCommitBudget().TryReserve(req.channelId, durableEvs)
 		if !ok {
+			h.forwardDedup.rollbackReserved(pendingDedupKeys)
 			return forward.StatusRetry
 		}
 	}
@@ -185,6 +242,7 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 			for _, tk := range durableTickets {
 				tk.Release()
 			}
+			h.forwardDedup.rollbackReserved(pendingDedupKeys)
 			return forward.StatusRetry
 		}
 	}
@@ -253,9 +311,10 @@ func (h *Handler) acceptForward(data []byte) proto.Status {
 				e.Ticket = nil
 			}
 		}
+		h.forwardDedup.rollbackReserved(pendingDedupKeys)
 		return forward.StatusRetry
 	}
-	h.forwardDedup.commitRecorded(pendingDedupKeys)
+	h.forwardDedup.commitReserved(pendingDedupKeys)
 	chBus.Advance(req.channelId, req.channelType)
 	return proto.StatusOK
 }

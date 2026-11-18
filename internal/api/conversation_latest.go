@@ -259,7 +259,7 @@ func (s *conversation) forwardOrHydrateConversationSync(c *wkhttp.Context, uid s
 					Body:    bodyBytes,
 				})
 				attemptCancel()
-				if sendErr == nil && resp != nil && !isTransientPeerForwardResponse(resp) {
+				if sendErr == nil && resp != nil {
 					if resp.StatusCode == http.StatusServiceUnavailable && msgCount > 0 &&
 						s != nil && s.s != nil && s.s.apiServer != nil &&
 						s.s.apiServer.probeVerifiedLegacy21cd8f88Peer(deadlineCtx, service.Cluster, leaderInfo.Id) {
@@ -267,10 +267,12 @@ func (s *conversation) forwardOrHydrateConversationSync(c *wkhttp.Context, uid s
 							return convs, true, true
 						}
 					}
-					c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-					c.Writer.WriteHeader(resp.StatusCode)
-					_, _ = c.Writer.Write([]byte(resp.Body))
-					return nil, false, false
+					if !isTransientPeerForwardResponse(resp) {
+						c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+						c.Writer.WriteHeader(resp.StatusCode)
+						_, _ = c.Writer.Write([]byte(resp.Body))
+						return nil, false, false
+					}
 				}
 			}
 		} else if err != nil && !isTransientConversationSlotHandoffError(err) && !options.G.ClusterOn() {

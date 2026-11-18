@@ -146,11 +146,18 @@ func (rg *RaftGroup) Advance() {
 func (rg *RaftGroup) AddEvent(raftKey string, e types.Event) {
 
 	if e.Type == types.SendPropose {
+		reqs, ok := rg.validateAndDecodeProposeReqs(raftKey, e)
+		if !ok {
+			return
+		}
 		err := rg.submitWork(nil, false, func() {
-			rg.handleSendPropose(raftKey, e)
+			rg.handleSendProposeDecoded(raftKey, e, reqs)
 		})
 		if err != nil {
 			rg.Error("submit go pool failed", zap.Error(err))
+			if raft := rg.raftList.get(raftKey); raft != nil {
+				rg.sendProposeRespError(raft, reqs, e.From)
+			}
 		}
 		return
 	} else if e.Type == types.SendProposeResp {

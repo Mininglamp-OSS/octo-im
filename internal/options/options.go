@@ -255,6 +255,7 @@ type Options struct {
 		MaxConcurrentChannelMigrations int           // 后台并发执行的频道 Learner 迁移上限
 		RejectConnBeforeReady          bool          // 节点就绪前是否拒绝外部客户端连接
 		ChannelLeaderAutoBalance       bool          // 是否开启后台频道领导权自动均衡
+		AllowLegacyHeaderlessPeerHTTP  bool          // 滚动升级期间是否允许已验证唯一IP的旧节点无头内部HTTP请求
 	}
 
 	Trace struct {
@@ -605,6 +606,7 @@ func New(op ...Option) *Options {
 			MaxConcurrentChannelMigrations int
 			RejectConnBeforeReady          bool
 			ChannelLeaderAutoBalance       bool
+			AllowLegacyHeaderlessPeerHTTP  bool
 		}{
 			NodeId:                         1001,
 			Addr:                           "tcp://0.0.0.0:11110",
@@ -633,6 +635,7 @@ func New(op ...Option) *Options {
 			MaxConcurrentChannelMigrations: 8,
 			RejectConnBeforeReady:          true,
 			ChannelLeaderAutoBalance:       false,
+			AllowLegacyHeaderlessPeerHTTP:  true,
 		},
 		Trace: struct {
 			ServiceName      string
@@ -1064,6 +1067,7 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.Cluster.MaxConcurrentChannelMigrations = o.getInt("cluster.maxConcurrentChannelMigrations", o.Cluster.MaxConcurrentChannelMigrations)
 	o.Cluster.RejectConnBeforeReady = o.getBool("cluster.rejectConnBeforeReady", o.Cluster.RejectConnBeforeReady)
 	o.Cluster.ChannelLeaderAutoBalance = o.getBool("cluster.channelLeaderAutoBalance", o.Cluster.ChannelLeaderAutoBalance)
+	o.Cluster.AllowLegacyHeaderlessPeerHTTP = o.getBool("cluster.allowLegacyHeaderlessPeerHTTP", o.Cluster.AllowLegacyHeaderlessPeerHTTP)
 
 	// =================== trace ===================
 	o.Trace.ServiceName = o.getString("trace.serviceName", o.Trace.ServiceName)

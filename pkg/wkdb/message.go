@@ -539,6 +539,11 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 
 	wk.metrics.TruncateLogToAdd(1)
 
+	if wk.dblock != nil && wk.dblock.messageAppendLock != nil {
+		wk.dblock.messageAppendLock.lockByChannel(channelId, channelType)
+		defer wk.dblock.messageAppendLock.unlockByChannel(channelId, channelType)
+	}
+
 	applied, err := wk.GetChannelAppliedIndex(channelId, channelType)
 	if err != nil {
 		return err
@@ -1030,6 +1035,9 @@ func (wk *wukongDB) loadMsgByClientMsgNo(ctx context.Context, channelId string, 
 	})
 	defer iter.Close()
 	if !iter.First() {
+		if err := iter.Error(); err != nil {
+			return EmptyMessage, err
+		}
 		return EmptyMessage, ErrNotFound
 	}
 
@@ -1045,7 +1053,12 @@ func (wk *wukongDB) loadMsgByClientMsgNo(ctx context.Context, channelId string, 
 			UpperBound: key.NewMessageSecondIndexFromUidKey(fromUID, highPrimary),
 		})
 		defer senderIter.Close()
-		senderIter.First()
+		if !senderIter.First() {
+			if err := senderIter.Error(); err != nil {
+				return EmptyMessage, err
+			}
+			return EmptyMessage, ErrNotFound
+		}
 	}
 	for iter.Valid() {
 		if err := ctx.Err(); err != nil {

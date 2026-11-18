@@ -99,6 +99,9 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 		if err != nil {
 			return nil, err
 		}
+		if len(resps) == 0 || resps[len(resps)-1] == nil {
+			return nil, errors.New("raftgroup: empty forwarded proposal response")
+		}
 		maxLogIndex = resps[len(resps)-1].Index
 		// 如果最大的日志下标大于已应用的日志下标，则不需要等待
 		// 如果最大的日志下标大于已应用的日志下标，则不需要等待
@@ -279,19 +282,38 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 	}
 }
 
-func (rg *RaftGroup) handleSendPropose(raftKey string, e types.Event) {
+func (rg *RaftGroup) validateAndDecodeProposeReqs(raftKey string, e types.Event) (types.ProposeReqSet, bool) {
+	if len(e.Logs) == 0 || len(e.Logs[0].Data) == 0 {
+		rg.Error("raftgroup: handleSendPropose: empty proposal event logs", zap.String("raftKey", raftKey), zap.Uint64("from", e.From))
+		return nil, false
+	}
+	var reqs types.ProposeReqSet
+	if err := reqs.Unmarshal(e.Logs[0].Data); err != nil {
+		rg.Error("raftgroup: unmarshal propose req failed", zap.Error(err), zap.String("raftKey", raftKey), zap.Uint64("from", e.From))
+		return nil, false
+	}
+	if len(reqs) == 0 {
+		rg.Error("raftgroup: handleSendPropose: decoded proposal request batch is empty", zap.String("raftKey", raftKey), zap.Uint64("from", e.From))
+		return nil, false
+	}
+	return reqs, true
+}
 
+func (rg *RaftGroup) handleSendPropose(raftKey string, e types.Event) {
+	reqs, ok := rg.validateAndDecodeProposeReqs(raftKey, e)
+	if !ok {
+		return
+	}
+	rg.handleSendProposeDecoded(raftKey, e, reqs)
+}
+
+func (rg *RaftGroup) handleSendProposeDecoded(raftKey string, e types.Event, reqs types.ProposeReqSet) {
+	if len(reqs) == 0 {
+		return
+	}
 	raft := rg.raftList.get(raftKey)
 	if raft == nil {
 		rg.Error("raftgroup: raft not exist", zap.String("raftKey", raftKey))
-		return
-	}
-
-	var reqs types.ProposeReqSet
-	err := reqs.Unmarshal(e.Logs[0].Data)
-	if err != nil {
-		rg.Error("raftgroup: unmarshal propose req failed", zap.Error(err))
-		rg.sendProposeRespError(raft, reqs, e.From)
 		return
 	}
 
@@ -330,6 +352,9 @@ func (rg *RaftGroup) handleSendPropose(raftKey string, e types.Event) {
 }
 
 func (rg *RaftGroup) sendProposeRespError(r IRaft, reqs types.ProposeReqSet, to uint64) {
+	if len(reqs) == 0 || rg == nil || r == nil || rg.opts == nil || rg.opts.Transport == nil {
+		return
+	}
 	resps := types.ProposeRespSet{}
 	for _, req := range reqs {
 		resps = append(resps, &types.ProposeResp{
@@ -356,11 +381,18 @@ func (rg *RaftGroup) sendProposeRespError(r IRaft, reqs types.ProposeReqSet, to 
 }
 
 func (rg *RaftGroup) handleSendProposeResp(e types.Event) {
-
+	if len(e.Logs) == 0 || len(e.Logs[0].Data) == 0 {
+		rg.Error("raftgroup: handleSendProposeResp: empty proposal response event logs", zap.Uint64("from", e.From))
+		return
+	}
 	var resps types.ProposeRespSet
 	err := resps.Unmarshal(e.Logs[0].Data)
 	if err != nil {
 		rg.Error("unmarshal propose resp failed", zap.Error(err))
+		return
+	}
+	if len(resps) == 0 || resps[len(resps)-1] == nil {
+		rg.Error("raftgroup: handleSendProposeResp: decoded proposal response batch is empty", zap.Uint64("from", e.From))
 		return
 	}
 

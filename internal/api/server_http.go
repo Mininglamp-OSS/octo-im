@@ -281,9 +281,9 @@ func (s *apiServer) managerTokenMiddleware() wkhttp.HandlerFunc {
 			strings.TrimSpace(c.GetHeader("Authorization")) == "" &&
 			strings.TrimSpace(c.Query("Authorization")) == "" &&
 			s.isVerifiedLegacyPeerInternalRequest(c) {
-			if c.GetString("username") == "" {
-				c.Set("username", options.G.ManagerUID)
-			}
+			// Y-P1-01: Never grant ManagerUID privilege to headerless legacy peer compatibility requests;
+			// mark only the narrowly scoped verified_legacy_peer_internal flag.
+			c.Set("verified_legacy_peer_internal", true)
 			c.Next()
 			return
 		}
@@ -377,8 +377,27 @@ func (s *apiServer) resolvePeerHostIPs(host string) []net.IP {
 	return ips
 }
 
+func (s *apiServer) endpointMatchesIP(rawEndpoint string, targetIP net.IP) bool {
+	if targetIP == nil {
+		return false
+	}
+	peerHost := extractHostFromPeerEndpoint(rawEndpoint)
+	if peerHost == "" {
+		return false
+	}
+	for _, peerIP := range s.resolvePeerHostIPs(peerHost) {
+		if peerIP != nil && peerIP.Equal(targetIP) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *apiServer) isVerifiedLegacyPeerInternalRequest(c *wkhttp.Context) bool {
 	if s == nil || c == nil || c.Request == nil || c.Request.URL == nil {
+		return false
+	}
+	if options.G != nil && !options.G.Cluster.AllowLegacyHeaderlessPeerHTTP {
 		return false
 	}
 	if !isLegacyHeaderlessPeerRoute(c.Request.Method, c.Request.URL.Path) {
@@ -416,33 +435,42 @@ func (s *apiServer) isVerifiedLegacyPeerInternalRequest(c *wkhttp.Context) bool 
 	localNodeID := uint64(0)
 	if options.G != nil {
 		localNodeID = options.G.Cluster.NodeId
+		// Fail closed if remoteIP matches the local node's configured ServerAddr, APIUrl, or InitNodes entry (co-located/shared host IP).
+		if s.endpointMatchesIP(options.G.Cluster.ServerAddr, remoteIP) || s.endpointMatchesIP(options.G.Cluster.APIUrl, remoteIP) {
+			return false
+		}
+		for _, initNode := range options.G.Cluster.InitNodes {
+			if initNode != nil && initNode.Id == localNodeID && s.endpointMatchesIP(initNode.ServerAddr, remoteIP) {
+				return false
+			}
+		}
 	}
 
+	var matchedPeerIDs []uint64
+	seenPeerID := make(map[uint64]struct{}, len(nodes))
 	for _, n := range nodes {
-		if n == nil || n.Id == 0 || n.Id == localNodeID {
+		if n == nil || n.Id == 0 {
 			continue
 		}
-		matchedIP := false
-		for _, rawEndpoint := range []string{n.ClusterAddr, n.ApiServerAddr} {
-			peerHost := extractHostFromPeerEndpoint(rawEndpoint)
-			for _, peerIP := range s.resolvePeerHostIPs(peerHost) {
-				if peerIP != nil && peerIP.Equal(remoteIP) {
-					matchedIP = true
-					break
-				}
-			}
-			if matchedIP {
-				break
-			}
-		}
+		matchedIP := s.endpointMatchesIP(n.ClusterAddr, remoteIP) || s.endpointMatchesIP(n.ApiServerAddr, remoteIP)
 		if !matchedIP {
 			continue
 		}
-		if s.probeVerifiedLegacy21cd8f88Peer(c.Request.Context(), cl, n.Id) {
-			return true
+		if n.Id == localNodeID {
+			// Local node shares remoteIP with incoming request: fail closed.
+			return false
+		}
+		if _, dup := seenPeerID[n.Id]; !dup {
+			seenPeerID[n.Id] = struct{}{}
+			matchedPeerIDs = append(matchedPeerIDs, n.Id)
 		}
 	}
-	return false
+	// Require an unambiguous 1-to-1 IP mapping to a single registered non-local peer node;
+	// if multiple peers share remoteIP (e.g. NAT/LB/shared host), fail closed.
+	if len(matchedPeerIDs) != 1 {
+		return false
+	}
+	return s.probeVerifiedLegacy21cd8f88Peer(c.Request.Context(), cl, matchedPeerIDs[0])
 }
 
 func (s *apiServer) cacheLegacyPeerVerdict(nodeID uint64, isLegacy bool, ttl time.Duration) {

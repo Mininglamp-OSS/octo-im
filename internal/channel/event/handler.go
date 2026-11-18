@@ -34,6 +34,8 @@ type channelHandler struct {
 	processingIndex uint64
 	// 是否正在处理
 	processing           atomic.Bool
+	admitting            atomic.Int32
+	removed              atomic.Bool
 	leaderRetryScheduled atomic.Bool
 }
 
@@ -335,7 +337,7 @@ func (c *channelHandler) checkAndUpdateLeaderIdChange() error {
 
 // isTimeout 判断用户是否超时
 func (c *channelHandler) isTimeout() bool {
-	if c.processing.Load() {
+	if c.processing.Load() || c.admitting.Load() > 0 {
 		return false
 	}
 	c.pending.RLock()

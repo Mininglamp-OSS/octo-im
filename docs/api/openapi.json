@@ -69,6 +69,71 @@
         }
       }
     },
+    "/healthz": {
+      "get": {
+        "summary": "Process Liveness Probe",
+        "description": "Checks local process liveness without failing on Raft catch-up or peer unavailability",
+        "tags": ["System"],
+        "responses": {
+          "200": {
+            "description": "Process is alive"
+          },
+          "503": {
+            "description": "Process liveness check failed"
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Local Service Readiness Probe",
+        "description": "Checks reversible local storage write health, slot bootstrap/apply readiness, and stall bounds",
+        "tags": ["System"],
+        "responses": {
+          "200": {
+            "description": "Local node is ready to serve traffic"
+          },
+          "503": {
+            "description": "Local node is not ready"
+          }
+        }
+      }
+    },
+    "/cluster/slots/{id}/digest": {
+      "get": {
+        "summary": "Slot Log Rolling Digest",
+        "description": "Computes a streaming SHA-256 rolling digest over slot Raft logs in [from, to] (max 10,000 entries per request)",
+        "tags": ["System"],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Rolling digest computed"
+          },
+          "400": {
+            "description": "Invalid range or unauthorized"
+          }
+        }
+      }
+    },
     "/migrate/result": {
       "get": {
         "summary": "Get Migration Result",

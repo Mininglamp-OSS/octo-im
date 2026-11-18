@@ -33,8 +33,11 @@ type Raft struct {
 
 	fowardProposeWait wt.Wait // 转发提按给领导等待领导的回应
 
-	pool *ants.Pool
+	pool       *ants.Pool
+	proposeSem chan struct{}
 }
+
+const defaultMaxInFlightSendPropose = 128
 
 func New(opts *Options) *Raft {
 	opts.SaveHardState = opts.Storage.SaveHardState
@@ -65,6 +68,7 @@ func New(opts *Options) *Raft {
 		wait:              newWait("raft"),
 		fowardProposeWait: wt.New(),
 		pool:              pool,
+		proposeSem:        make(chan struct{}, defaultMaxInFlightSendPropose),
 	}
 	opts.Advance = r.advance
 
@@ -103,7 +107,24 @@ func (r *Raft) Step(e types.Event) {
 		return
 	}
 	if e.Type == types.SendPropose {
-		go r.handleSendPropose(e)
+		reqs, ok := r.validateAndDecodeProposeReqs(e)
+		if !ok {
+			return
+		}
+		if r.proposeSem == nil {
+			go r.handleSendProposeDecoded(e, reqs)
+			return
+		}
+		select {
+		case r.proposeSem <- struct{}{}:
+			go func() {
+				defer func() { <-r.proposeSem }()
+				r.handleSendProposeDecoded(e, reqs)
+			}()
+		default:
+			r.Error("handleSendPropose: in-flight proposal admission limit reached", zap.Uint64("from", e.From), zap.Int("batchLen", len(reqs)))
+			r.sendProposeRespError(reqs, e.From)
+		}
 		return
 	} else if e.Type == types.SendProposeResp {
 		r.handleSendProposeResp(e)

@@ -232,6 +232,8 @@ func (h *Handler) distributePersistedToRemoteNode(
 	channelType uint8,
 	events []*eventbus.Event,
 	targetMask eventbus.SlotBitset,
+	fullPeerMask eventbus.SlotBitset,
+	allowBaseV1FullNode bool,
 ) error {
 	if len(events) == 0 || toNodeID == 0 {
 		return forward.ErrUnavailable
@@ -243,6 +245,14 @@ func (h *Handler) distributePersistedToRemoteNode(
 	mode := h.forwardCapabilities.ProbeOn(ctx, cl, toNodeID)
 	if mode != forward.PeerCapPartAV2 && mode != forward.PeerCapBaseV1 {
 		return forward.ErrPeerNoAck
+	}
+	if mode == forward.PeerCapBaseV1 {
+		// J-P1-01: BaseV1 (21cd8f88) drops target slot masks and delivers to every user slot on the node.
+		// Never broaden a partial subset retry to all recipients on a BaseV1 node; allow BaseV1 only when
+		// sending the complete recipient mask for that node.
+		if !allowBaseV1FullNode || !targetMask.Equal(fullPeerMask) {
+			return forward.ErrPeerNoAck
+		}
 	}
 
 	wireEvents := make([]*eventbus.Event, 0, len(events))
@@ -655,7 +665,7 @@ func (h *Handler) distributePersistedOnChannelLeader(
 			}
 		}
 		for _, grp := range groups {
-			if err := h.distributePersistedToRemoteNode(ctx, node.LeaderId, channelID, channelType, grp.evs, grp.mask); err == nil {
+			if err := h.distributePersistedToRemoteNode(ctx, node.LeaderId, channelID, channelType, grp.evs, grp.mask, remoteMask, true); err == nil {
 				for _, idx := range grp.idxs {
 					active[idx].succeeded = active[idx].succeeded.Or(grp.mask)
 				}
@@ -806,7 +816,8 @@ func (h *Handler) executeSingleEventDistributeRecovery(
 			clone.HasTargetSlotMask = true
 			clone.TargetSlotMask = pendingSlots.Clone()
 		}
-		if err := h.distributePersistedToRemoteNode(ctx, slotLeaderID, channelID, channelType, []*eventbus.Event{clone}, pendingSlots); err != nil {
+		allowFull := pendingSlots.IsZero() && (!ev.HasTargetSlotMask || ev.TargetSlotMask.IsZero())
+		if err := h.distributePersistedToRemoteNode(ctx, slotLeaderID, channelID, channelType, []*eventbus.Event{clone}, pendingSlots, eventbus.SlotBitset{}, allowFull); err != nil {
 			return pendingSlots, knownAllSlots, false
 		}
 		return eventbus.SlotBitset{}, knownAllSlots, true
@@ -902,7 +913,7 @@ func (h *Handler) executeSingleEventDistributeRecovery(
 		clone.TagKey = ""
 		clone.HasTargetSlotMask = true
 		clone.TargetSlotMask = remOutside.Clone()
-		if err := h.distributePersistedToRemoteNode(ctx, slotLeaderID, channelID, channelType, []*eventbus.Event{clone}, remOutside); err != nil {
+		if err := h.distributePersistedToRemoteNode(ctx, slotLeaderID, channelID, channelType, []*eventbus.Event{clone}, remOutside, allRecipientSlots, false); err != nil {
 			return remOutside, allRecipientSlots, false
 		}
 		return eventbus.SlotBitset{}, allRecipientSlots, !hasTopologyUnknown
@@ -937,7 +948,7 @@ func (h *Handler) executeSingleEventDistributeRecovery(
 			succeeded = succeeded.Or(evMask)
 			continue
 		}
-		if err := h.distributePersistedToRemoteNode(ctx, node.LeaderId, channelID, channelType, []*eventbus.Event{ev}, evMask); err == nil {
+		if err := h.distributePersistedToRemoteNode(ctx, node.LeaderId, channelID, channelType, []*eventbus.Event{ev}, evMask, remoteMask, true); err == nil {
 			succeeded = succeeded.Or(evMask)
 		}
 	}

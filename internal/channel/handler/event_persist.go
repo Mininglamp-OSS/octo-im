@@ -238,11 +238,18 @@ func (h *Handler) enqueueStage0PluginRecovery(channelId string, channelType uint
 	recEv.HasStageMeta = true
 	recEv.PluginStageStatus = eventbus.StageStatusPending
 	recEv.Ticket = retainTicketOrNil(e.Ticket)
-	if !h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStagePluginAfter, eventbus.SlotBitset{}, eventbus.SlotBitset{}, recEv) && recEv.Ticket != nil {
-		recEv.Ticket.Release()
-		recEv.Ticket = nil
+	if !h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStagePluginAfter, eventbus.SlotBitset{}, eventbus.SlotBitset{}, recEv) {
+		if recEv.Ticket != nil {
+			recEv.Ticket.Release()
+			recEv.Ticket = nil
+		}
+		e.HasStageMeta = true
+		e.PluginStageStatus = eventbus.StageStatusPending
+		e.PluginDone = false
+		return
 	}
-	// Mark Stage 0 as RetryOwned by this node so a downstream remote slot leader does not execute Stage 0 concurrently (A2).
+	// Mark Stage 0 as RetryOwned by this node ONLY after recovery admission succeeds so a downstream remote slot leader
+	// does not execute Stage 0 concurrently when local recovery owns it, and does not skip Stage 0 when admission fails (A2 + Y-P1-05).
 	e.HasStageMeta = true
 	e.PluginStageStatus = eventbus.StageStatusRetryOwned
 	e.StageOwnerNodeId = h.localNodeId()
@@ -383,22 +390,31 @@ func (h *Handler) executePersistedLocalSideEffects(channelId string, channelType
 		cloneEvent.WebhookDone = false
 		cloneEvent.WebhookStageStatus = eventbus.StageStatusPending
 		cloneEvent.Ticket = retainTicketOrNil(e.Ticket)
-		// Mark Stage 1 as RetryOwned by this node on the outgoing forwarded event so remote leader does not duplicate Stage 1 (A2).
-		e.HasStageMeta = true
-		e.WebhookStageStatus = eventbus.StageStatusRetryOwned
-		if e.StageOwnerNodeId == 0 {
-			e.StageOwnerNodeId = h.localNodeId()
-		}
-		e.StageOwnerGen++
-		e.WebhookDone = true
+		admitted := false
 		if chBus != nil && h.tryAddEventToChannelBus(channelId, channelType, cloneEvent) {
 			queued = true
+			admitted = true
 		} else {
 			_ = h.ensureEventHasTicket(channelId, cloneEvent)
-			if !h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, cloneEvent) && cloneEvent.Ticket != nil {
+			if h.recoveryMgr.Enqueue(channelId, channelType, RecoveryStageWebhook, eventbus.SlotBitset{}, eventbus.SlotBitset{}, cloneEvent) {
+				admitted = true
+			} else if cloneEvent.Ticket != nil {
 				cloneEvent.Ticket.Release()
 				cloneEvent.Ticket = nil
 			}
+		}
+		e.HasStageMeta = true
+		if admitted {
+			// Mark Stage 1 as RetryOwned by this node on the outgoing forwarded event ONLY after admission succeeds (A2 + Y-P1-05).
+			e.WebhookStageStatus = eventbus.StageStatusRetryOwned
+			if e.StageOwnerNodeId == 0 {
+				e.StageOwnerNodeId = h.localNodeId()
+			}
+			e.StageOwnerGen++
+			e.WebhookDone = true
+		} else {
+			e.WebhookStageStatus = eventbus.StageStatusPending
+			e.WebhookDone = false
 		}
 	}
 	if queued && chBus != nil {

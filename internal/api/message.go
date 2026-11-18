@@ -1512,8 +1512,13 @@ func (m *message) syncMessages(c *wkhttp.Context) {
 		limit = 10000
 	}
 
-	if req.ChannelType == wkproto.ChannelTypePerson && !strings.Contains(req.ChannelID, "@") {
-		fakeChannelID = options.GetFakeChannelIDWith(req.LoginUID, req.ChannelID)
+	if req.ChannelType == wkproto.ChannelTypePerson {
+		var err error
+		fakeChannelID, err = resolveAuthorizedPersonFakeChannelID(c, req.LoginUID, req.ChannelID, false)
+		if err != nil {
+			c.ResponseError(err)
+			return
+		}
 	}
 
 	leaderInfo, err := service.Cluster.LeaderOfChannel(fakeChannelID, req.ChannelType) // 获取频道的领导节点
@@ -1817,6 +1822,51 @@ func isTerminalStreamEventType(eventType string) bool {
 	}
 }
 
+func resolveAuthorizedPersonFakeChannelID(c *wkhttp.Context, loginUID, rawChannelID string, allowAdminCanonicalWithoutLogin bool) (string, error) {
+	loginUID = strings.TrimSpace(loginUID)
+	rawChannelID = strings.TrimSpace(rawChannelID)
+	if rawChannelID == "" {
+		return "", errors.New("channel_id不能为空")
+	}
+	managerUID := "____manager"
+	if options.G != nil && strings.TrimSpace(options.G.ManagerUID) != "" {
+		managerUID = strings.TrimSpace(options.G.ManagerUID)
+	}
+	jwtUser := ""
+	if c != nil {
+		jwtUser = strings.TrimSpace(c.Username())
+	}
+	if jwtUser != "" && jwtUser != managerUID {
+		if loginUID == "" || loginUID != jwtUser {
+			return "", errors.New("login_uid与认证用户不一致")
+		}
+	}
+
+	if !strings.Contains(rawChannelID, "@") {
+		if loginUID == "" {
+			return "", errors.New("login_uid不能为空")
+		}
+		return options.GetFakeChannelIDWith(loginUID, rawChannelID), nil
+	}
+
+	parts := strings.Split(rawChannelID, "@")
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return "", errors.New("非法个人频道channel_id")
+	}
+	u1, u2 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	canonical := u1 + "@" + u2
+	if loginUID != "" {
+		if loginUID != u1 && loginUID != u2 {
+			return "", errors.New("无权访问非本人参与的个人频道")
+		}
+		return canonical, nil
+	}
+	if allowAdminCanonicalWithoutLogin && jwtUser != "" && jwtUser == managerUID {
+		return canonical, nil
+	}
+	return "", errors.New("login_uid不能为空")
+}
+
 func (m *message) getChannelMaxMessageSeq(c *wkhttp.Context) {
 	channelId := c.Query("channel_id")
 	channelType := wkutil.StringToUint8(c.Query("channel_type"))
@@ -1830,14 +1880,11 @@ func (m *message) getChannelMaxMessageSeq(c *wkhttp.Context) {
 	fakeChannelId := channelId
 
 	if channelType == wkproto.ChannelTypePerson {
-		if strings.Contains(channelId, "@") {
-			fakeChannelId = channelId
-		} else {
-			if strings.TrimSpace(loginUid) == "" {
-				c.ResponseError(errors.New("login_uid不能为空"))
-				return
-			}
-			fakeChannelId = options.GetFakeChannelIDWith(loginUid, channelId)
+		var err error
+		fakeChannelId, err = resolveAuthorizedPersonFakeChannelID(c, loginUid, channelId, true)
+		if err != nil {
+			c.ResponseError(err)
+			return
 		}
 	}
 
@@ -1882,14 +1929,11 @@ func (m *message) getChannelLastMessage(c *wkhttp.Context) {
 
 	fakeChannelId := channelId
 	if channelType == wkproto.ChannelTypePerson {
-		if strings.Contains(channelId, "@") {
-			fakeChannelId = channelId
-		} else {
-			if strings.TrimSpace(loginUid) == "" {
-				c.ResponseError(errors.New("login_uid不能为空"))
-				return
-			}
-			fakeChannelId = options.GetFakeChannelIDWith(loginUid, channelId)
+		var err error
+		fakeChannelId, err = resolveAuthorizedPersonFakeChannelID(c, loginUid, channelId, false)
+		if err != nil {
+			c.ResponseError(err)
+			return
 		}
 	}
 

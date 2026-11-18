@@ -69,36 +69,37 @@ func (p *poller) stop() {
 	p.stopper.Stop()
 }
 
-func (p *poller) addEvent(channelId string, channelType uint8, event *eventbus.Event) {
+func (p *poller) acquireHandlerForAdmission(channelId string, channelType uint8) *channelHandler {
 	p.Lock()
 	h := p.handler(channelId, channelType)
+	if h != nil && h.removed.Load() {
+		p.waitlist.remove(channelId, channelType)
+		h = nil
+	}
 	if h == nil {
 		h = newChannelHandler(channelId, channelType, p)
 		p.waitlist.push(h)
 	}
+	h.admitting.Add(1)
 	p.Unlock()
+	return h
+}
+
+func (p *poller) addEvent(channelId string, channelType uint8, event *eventbus.Event) {
+	h := p.acquireHandlerForAdmission(channelId, channelType)
+	defer h.admitting.Add(-1)
 	h.addEvent(event)
 }
 
 func (p *poller) tryAddEvent(channelId string, channelType uint8, event *eventbus.Event) bool {
-	p.Lock()
-	h := p.handler(channelId, channelType)
-	if h == nil {
-		h = newChannelHandler(channelId, channelType, p)
-		p.waitlist.push(h)
-	}
-	p.Unlock()
+	h := p.acquireHandlerForAdmission(channelId, channelType)
+	defer h.admitting.Add(-1)
 	return h.tryAddEvent(event)
 }
 
 func (p *poller) tryAddBatch(channelId string, channelType uint8, events []*eventbus.Event) bool {
-	p.Lock()
-	h := p.handler(channelId, channelType)
-	if h == nil {
-		h = newChannelHandler(channelId, channelType, p)
-		p.waitlist.push(h)
-	}
-	p.Unlock()
+	h := p.acquireHandlerForAdmission(channelId, channelType)
+	defer h.admitting.Add(-1)
 	return h.tryAddBatch(events)
 }
 
@@ -128,13 +129,18 @@ func (p *poller) tick() {
 func (p *poller) clear() {
 	p.Lock()
 	defer p.Unlock()
+	p.tmpHandlers = p.tmpHandlers[:0]
 	p.waitlist.readHandlers(&p.tmpHandlers)
 	for _, h := range p.tmpHandlers {
 		if h.isTimeout() {
+			h.removed.Store(true)
 			p.waitlist.remove(h.channelId, h.channelType)
 		}
 	}
-
+	for i := range p.tmpHandlers {
+		p.tmpHandlers[i] = nil
+	}
+	p.tmpHandlers = p.tmpHandlers[:0]
 }
 
 func (p *poller) handleEvents() {

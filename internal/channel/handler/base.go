@@ -531,9 +531,10 @@ func (h *Handler) drainSinglePendingPersistEvent(channelId string, channelType u
 			chBus.Advance(channelId, channelType)
 			return true
 		}
+		return false
 	}
-	// If the channel bus is still saturated, execute the serialized channel persistence pipeline directly
-	// when a local Store and local slot leadership are available.
+	// Unit-test stub fallback when no ChannelBus is wired: execute onSend only with a retained ticket handle
+	// and never treat a retryable or ambiguous persistence failure as a successful drain (Y-P1-04).
 	if h.store() != nil {
 		slotLeaderID := h.localNodeId()
 		if cl := h.cluster(); cl != nil {
@@ -542,6 +543,11 @@ func (h *Handler) drainSinglePendingPersistEvent(channelId string, channelType u
 			}
 		}
 		if slotLeaderID != 0 && h.isLocalNode(slotLeaderID) {
+			origTicket := ev.Ticket
+			ev.Ticket = retainTicketOrNil(origTicket)
+			if ev.MessageSeq == 0 && ev.ReasonCode == 0 {
+				ev.ReasonCode = wkproto.ReasonSuccess
+			}
 			h.onSend(&eventbus.ChannelContext{
 				ChannelId:    channelId,
 				ChannelType:  channelType,
@@ -549,6 +555,22 @@ func (h *Handler) drainSinglePendingPersistEvent(channelId string, channelType u
 				SlotLeaderId: slotLeaderID,
 				Events:       []*eventbus.Event{ev},
 			})
+			if ev.MessageSeq > 0 && ev.ReasonCode == wkproto.ReasonSuccess {
+				if origTicket != nil {
+					origTicket.Release()
+				}
+				return true
+			}
+			if ev.MessageSeq == 0 && (ev.ReasonCode == wkproto.ReasonNodeNotMatch || ev.ReasonCode == wkproto.ReasonSystemError || ev.PersistenceOutcomeUnknown) {
+				if ev.Ticket != nil {
+					ev.Ticket.Release()
+					ev.Ticket = nil
+				}
+				return false
+			}
+			if origTicket != nil {
+				origTicket.Release()
+			}
 			return true
 		}
 	}
